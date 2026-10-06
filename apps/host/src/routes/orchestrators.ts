@@ -56,6 +56,7 @@ const ReviewSchema = z
         expectedVersion: z.number().int().positive(),
         decisionId: z.string().min(1),
         decisionVersion: z.number().int().positive(),
+        continueEligible: z.boolean().optional(),
       })
       .strict()
       .optional(),
@@ -222,6 +223,9 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           : undefined;
     return {
       records,
+      effectiveStates: Object.fromEntries(
+        records.map((record) => [record.id, store.prMaintenance.effectiveState(record)]),
+      ),
       proposal: store.prMaintenance.getProposal(id),
       canAuthorize: Boolean(maintenanceOperator(request)),
       ...(unsupportedReason ? { unsupportedReason } : {}),
@@ -649,7 +653,8 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           decisionId: reference.decisionId,
           decisionVersion: reference.decisionVersion,
           direction: outcome.note,
-          resume: false,
+          resume: reference.continueEligible ?? false,
+          continueEligible: reference.continueEligible ?? false,
         },
         actor,
         () => {
@@ -666,17 +671,29 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           service.resolveRunReview(id);
           store.updateRun(id, {
             ...(run!.state === "awaiting_human" ? { state: "running" as const } : {}),
-            pendingPrompt: owedPrompt(
-              store.getRun(id)?.pendingPrompt ?? "",
-              maintenanceDirectionPrompt(run!.name, reference.decisionId, outcome.note),
-            ),
+            pendingPrompt: reference.continueEligible
+              ? (store.getRun(id)?.pendingPrompt ?? "")
+              : owedPrompt(
+                  store.getRun(id)?.pendingPrompt ?? "",
+                  maintenanceDirectionPrompt(
+                    run!.name,
+                    reference.decisionId,
+                    outcome.note,
+                  ),
+                ),
           });
         },
       );
       const directed = store.getRun(id)!;
       service.publishRun(directed);
-      engine.tick();
-      return { ok: true, run: directed, maintenance: record };
+      // Durable consent is admitted by the ordinary tick, not inside the committed request.
+      if (!reference.continueEligible) engine.tick();
+      return reply.code(reference.continueEligible ? 202 : 200).send({
+        ok: true,
+        run: directed,
+        maintenance: record,
+        effectiveState: store.prMaintenance.effectiveState(record),
+      });
     }
     if (input.maintenance)
       return reply.code(409).send({

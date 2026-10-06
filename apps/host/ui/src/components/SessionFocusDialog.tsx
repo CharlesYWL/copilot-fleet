@@ -36,7 +36,12 @@ type SessionFocusDialogProps = {
   pendingPermission?: SessionEvent | null | undefined;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => Promise<boolean>;
+  onPrompt: (
+    prompt: string,
+    attachments?: PromptAttachment[],
+    handback?: "ongoing" | "after_turn",
+  ) => Promise<boolean>;
+  maintenanceWorker?: boolean | undefined;
   onCancel: () => void;
   onStop: () => void;
   onDismiss: () => void;
@@ -64,6 +69,7 @@ export const SessionFocusDialog = ({
   open,
   onOpenChange,
   onPrompt,
+  maintenanceWorker,
   onCancel,
   onStop,
   onDismiss,
@@ -94,6 +100,7 @@ export const SessionFocusDialog = ({
           activity={activity}
           pendingPermission={pendingPermission}
           onPrompt={onPrompt}
+          maintenanceWorker={maintenanceWorker}
           onCancel={onCancel}
           onStop={onStop}
           onDismiss={onDismiss}

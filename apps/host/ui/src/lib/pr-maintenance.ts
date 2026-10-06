@@ -3,6 +3,7 @@ import type {
   PrMaintenanceOperatorAction,
   PrMaintenanceRegistration,
   PrMaintenanceProposal,
+  PrMaintenanceEffectiveState,
 } from "@fleet/protocol";
 import { api } from "../hooks/useFleet";
 
@@ -11,10 +12,12 @@ export type MaintenanceReviewReference = {
   expectedVersion: number;
   decisionId: string;
   decisionVersion: number;
+  continueEligible?: boolean;
 };
 
 export type TaskMaintenanceView = {
   records: PrMaintenanceRegistration[];
+  effectiveStates?: Record<string, PrMaintenanceEffectiveState>;
   proposal?: PrMaintenanceProposal;
   canAuthorize: boolean;
   unsupportedReason?: string;

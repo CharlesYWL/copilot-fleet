@@ -309,11 +309,37 @@ They cannot change this policy or the authenticated grant.
 Use maintenance-aware `fleet_escalate` with a stable decision ID, feedback links,
 current HEAD, affected criteria, smallest options and recommendation. The Host
 atomically preserves the hold/question. A second escalation cannot overwrite it.
-Only authenticated **Send back with instructions** linked to that decision/version
+Only authenticated **Send back with instructions** or **Direct and continue** linked to that decision/version
 authorizes bounded direction; ordinary Approve task, reopen, checkpoint, a model
 summary or PR comment cannot clear the hold. Changed assumptions need a new decision.
 Keeping current design does not mark a demonstrated defect fixed or drop criteria.
 Substantial redesign returns to ordinary implementation with a new accepted baseline.
+
+**Direct and continue** is explicit, initially unchecked consent in the same
+direction dialog. The Host records the exact direction, task review transition
+and bounded continuation atomically against the record and decision versions.
+A rejected/stale request records none of them. It pins the current HEAD, PR,
+generation, grant, task scope, checkout binding and retained worker/native session.
+It does not renew allowances or clear independent Stop, access, released
+ownership, or ongoing manual takeover. Resolve the concrete displayed hold;
+never fabricate a human actor or call Resume to evade it.
+
+The consent survives same-database Host restart and offline/busy Nodes.
+A compatible Node receives one logically idempotent wake through existing durable
+lead delivery; older transports leave it pending rather than claiming dispatch.
+Claim the normal bounded visit and refresh evidence after consent. Reuse an
+already accepted batch's exact prompt/attempt; queued is accepted, not a failed
+request to resend. Changed pins require reconciliation and new eligible consent.
+
+Manual supervisor prompts default to **ongoing takeover**. The authenticated
+operator may explicitly choose **one-turn handback** for the retained worker.
+Only the Host can end that takeover, after the exact command receipt settles,
+its correlated turn completes, the worker is quiescent, and external effects
+are reconciled with fresh provider evidence. Idle alone is never consent.
+Later Stop, another manual turn, identity drift or an independent hold wins.
+The worker must not resume maintenance itself or substitute a new worker.
+UI and MCP effective status/action reflect these gates; a raw paused/Released
+lifecycle is historical audit, not authority to continue.
 
 If collection fails before any observation supplies a HEAD, `fleet_escalate`
 still requests a **blocked operational task review**. It does not invent a HEAD
@@ -407,14 +433,17 @@ New feedback while accepted stays pending for later; never overwrite the prompt.
 While the accepted turn is still running, `takeDue` does not offer that PR; its
 completion requests the next check. Routine checks otherwise follow the Host's
 orchestrator heartbeat schedule, so an empty claim is not a reason to poll.
-A merely prepared batch with no accepted step or effects does not block fresh
+A prepared batch, or an accepted pending attempt which the Host proves was
+never dispatched and has no effects, does not block fresh
 complete observations, including claim-bound command receipts. Refresh expired
 observations normally and dispatch the same immutable batch at the same head;
 the retained worker re-reads its assigned PR threads. If a fresh observation
 finds a different head, the Host supersedes the undispatched batch and refunds
-its reservation; prepare a new batch from that observation without human action.
+its reservation once and cancels the exact pending step. An active pinned
+continuation also rejects the changed HEAD; obtain new eligible consent where
+required before preparing replacement work.
 Drafts, merge conflicts, unresolved incidents and observations older than
-30 minutes still refuse dispatch. Accepted/uncertain execution and unsettled
+30 minutes still refuse dispatch. Dispatched/uncertain execution and unsettled
 effects still prevent late receipts from promoting observations or reviving work.
 
 ## Worker publication and settlement

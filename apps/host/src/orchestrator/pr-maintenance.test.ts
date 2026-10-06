@@ -1344,6 +1344,61 @@ describe("PR maintenance orchestration", () => {
     expect(world.store.getSession(worker.id)!.state).toBe("starting");
   });
 
+  it("retains an offline accepted attempt and dispatches the same worker and immutable prompt once after reconnect", () => {
+    const { record, worker } = setup();
+    world.store.appendEvent({
+      eventId: "retained-native",
+      sessionId: worker.id,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "native-worker" },
+      createdAt: new Date().toISOString(),
+    });
+    const prepared = prepare(record.id);
+    world.store.transitionSession(worker.id, "offline");
+    world.store.setNodeOnline(worker.nodeId, false, 0);
+    const dispatch = vi.spyOn(world.service, "dispatch");
+    const followUp = () =>
+      tools.followUp({
+        sessionId: worker.id,
+        prompt: prepared.batches[0]!.prompt,
+        maintenance: reference(record.id),
+      });
+    const first = followUp();
+    expect(first.ok, first.text).toBe(true);
+    const accepted = world.store.prMaintenance.get(record.id)!;
+    const batch = accepted.batches[0]!;
+    expect(batch.state).toBe("accepted");
+    expect(world.store.prMaintenance.effectiveState(accepted).status).toBe("queued");
+    expect(followUp().ok).toBe(true);
+    expect(world.store.prMaintenance.get(record.id)!.batches[0]).toEqual(batch);
+    expect(dispatch).not.toHaveBeenCalled();
+    world.store.setNodeOnline(worker.nodeId, true, 0);
+    // Reconnect inventory proves the retained native conversation is unloaded.
+    world.store.transitionSession(worker.id, "stopped");
+    world.engine.tick();
+    world.store.transitionSession(worker.id, "idle");
+    world.engine.tick();
+    world.engine.tick();
+    expect(
+      dispatch.mock.calls.filter(
+        ([, message]) =>
+          message.type === "resume_session" && message.sessionId === worker.id,
+      ),
+    ).toHaveLength(1);
+    const sends = dispatch.mock.calls.filter(
+      ([, message]) => message.type === "prompt" && message.sessionId === worker.id,
+    );
+    expect(sends).toHaveLength(1);
+    expect(world.store.getRunStep(batch.stepId!)?.prompt).toBe(batch.prompt);
+    expect(world.store.getRunStep(batch.stepId!)?.attempts).toBe(batch.attempt);
+    expect(world.store.prMaintenance.get(record.id)!.counters).toEqual(accepted.counters);
+    const projected = JSON.parse(tools.getPrMaintenance({ recordId: record.id }).text);
+    expect(projected.effectiveState).toEqual(
+      world.store.prMaintenance.effectiveState(world.store.prMaintenance.get(record.id)!),
+    );
+  });
+
   it("makes stalled work discoverable after explicit operator resume without losing effects", () => {
     const { record } = setup();
     let current = record;

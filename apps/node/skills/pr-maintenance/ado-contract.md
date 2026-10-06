@@ -401,6 +401,14 @@ any separately authorized worker publication.
 This helper never mutates. Any repair stays with the existing retained worker and
 its authorized scope and budget:
 
+Authenticated direction with explicit eligible continuation uses that existing
+grant, not a new ADO permission. Routine repair/verification/ordinary publication
+does not require identical authorization again; replies, evidenced resolutions,
+named reviewer requests and check retries remain off unless separately present
+in the grant. One-turn manual handback is Host-owned after correlated settlement,
+quiescence and fresh pinned evidence; an ADO response or idle worker cannot
+clear Stop, ongoing takeover, an access hold or released ownership.
+
 1. Verify remote project/repository GUIDs, exact **registered head repository**
    and case-sensitive **full head ref**, current HEAD, and baseline. For a
    same-project fork do not substitute the target repository.

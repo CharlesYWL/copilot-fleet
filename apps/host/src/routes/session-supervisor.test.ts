@@ -255,6 +255,128 @@ async function setup(
 }
 
 describe("trusted supervisor session handoff", () => {
+  function observeHandback(f: Awaited<ReturnType<typeof setup>>) {
+    const record = f.store.prMaintenance.get(f.record.id)!;
+    return f.store.prMaintenance.checkpoint(f.leadId, record.id, record.version, {
+      kind: "observation",
+      observation: {
+        attemptedAt: new Date().toISOString(),
+        complete: true,
+        identity: record.identity,
+        headSha,
+        baseSha: "b".repeat(40),
+        state: "open",
+        snapshotId: `manual-${Date.now()}`,
+        fingerprint: "manual-current",
+        evidence: "Fresh complete post-turn provider reconciliation",
+        sources: [source],
+      },
+    });
+  }
+
+  it("hands back only the selected completed turn after quiescence and fresh reconciliation, without renewing its grant", async () => {
+    const f = await setup("password", true);
+    const before = observeHandback(f);
+    const payload = {
+      prompt: "Repair the bounded defect then hand back.",
+      handback: "after_turn",
+      operationId: randomUUID(),
+    };
+    const response = await f.command("prompt", payload);
+    expect(response.statusCode, response.body).toBe(202);
+    const intent = f.store.prMaintenance.get(f.record.id)!.continuation!;
+    expect(intent).toMatchObject({
+      state: "handback",
+      operatorId: expect.any(String),
+      manualCommandId: expect.any(String),
+    });
+    expect((await f.command("prompt", payload)).statusCode).toBe(409);
+    expect(f.sent.filter((entry) => entry.type === "prompt")).toHaveLength(1);
+    const engine = new OrchestratorEngine(f.service);
+    f.event("state", { state: "idle" });
+    engine.tick();
+    expect(
+      f.store.prMaintenance.get(f.record.id)!.continuation?.completedAt,
+    ).toBeUndefined();
+    f.event("state", { state: "running" });
+    f.event("turn_complete", { reason: "end_turn" });
+    engine.tick();
+    expect(
+      f.store.prMaintenance.get(f.record.id)!.manualControl?.endedAt,
+    ).toBeUndefined();
+    f.event("state", { state: "idle" });
+    engine.tick();
+    expect(
+      f.store.prMaintenance.get(f.record.id)!.continuation?.completedAt,
+    ).toBeDefined();
+    expect(
+      f.store.prMaintenance.get(f.record.id)!.manualControl?.endedAt,
+    ).toBeUndefined();
+    observeHandback(f);
+    engine.tick();
+    const handedBack = f.store.prMaintenance.get(f.record.id)!;
+    expect(handedBack.lifecycle).toBe("active");
+    expect(handedBack.manualControl?.endedAt).toBeDefined();
+    expect(handedBack.continuation?.state).toBe("checking");
+    expect(handedBack.authorization).toEqual(before.authorization);
+    expect(handedBack.counters).toEqual(before.counters);
+    expect(handedBack.renewedAt).toBe(before.renewedAt);
+    engine.tick();
+    expect(f.sent.filter((entry) => entry.type === "prompt")).toHaveLength(1);
+  });
+
+  it.each(["stop", "pause", "task", "worker"] as const)(
+    "keeps a selected handback held after a later %s change",
+    async (change) => {
+      const f = await setup("password", true);
+      observeHandback(f);
+      expect(
+        (await f.command("prompt", { prompt: "One turn", handback: "after_turn" }))
+          .statusCode,
+      ).toBe(202);
+      if (change === "stop")
+        f.store.setSessionControls(f.worker.id, { stopRequested: true });
+      if (change === "pause") {
+        const record = f.store.prMaintenance.get(f.record.id)!;
+        f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          { action: "pause", reason: "Independent operator hold" },
+          "operator",
+        );
+      }
+      if (change === "task")
+        f.store.updateRun(f.task.id, { objective: "A different objective" });
+      if (change === "worker")
+        f.event("agent_session", { agentSessionId: "different-conversation" });
+      f.settle();
+      const engine = new OrchestratorEngine(f.service);
+      engine.tick();
+      expect(
+        f.store.prMaintenance.get(f.record.id)!.manualControl?.endedAt,
+      ).toBeUndefined();
+      expect(f.store.prMaintenance.get(f.record.id)!.continuation?.state).toBe(
+        "cancelled",
+      );
+    },
+  );
+
+  it("binds one-turn consent to its operation digest and rejects an unauthenticated handback", async () => {
+    const f = await setup("password", true);
+    observeHandback(f);
+    const payload = {
+      prompt: "One turn",
+      operationId: randomUUID(),
+      handback: "after_turn",
+    };
+    expect((await f.command("prompt", payload)).statusCode).toBe(202);
+    expect(
+      (await f.command("prompt", { ...payload, handback: "ongoing" })).statusCode,
+    ).toBe(409);
+    expect((await f.command("prompt", payload, {})).statusCode).toBe(401);
+    expect(f.sent.filter((entry) => entry.type === "prompt")).toHaveLength(1);
+  });
+
   it.each(["subscription", "restart", "failure"] as const)(
     "never settles a stopped repair with a later manual %s event",
     async (path) => {

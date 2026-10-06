@@ -260,7 +260,7 @@ describe("prepared maintenance observation recovery", () => {
     });
   }
 
-  it("promotes a fresh claim-bound receipt for an aged prepared batch, but not accepted work", () => {
+  it("promotes a fresh claim-bound receipt for prepared and accepted-but-unsent work without changing its immutable batch", () => {
     const { f, record } = agedPreparation();
     expect(dispatch(f, record).reason).toBe("stale_observation");
     const fresh = receipt(f, record);
@@ -275,8 +275,8 @@ describe("prepared maintenance observation recovery", () => {
       accepted = accept(f, fresh.saved);
     });
     expect(late.saved.lastAttempt).toEqual(late.observation);
-    expect(late.saved.observation).toEqual(fresh.observation);
-    expect(late.saved.observationHostAt).toBe(fresh.hostAt);
+    expect(late.saved.observation).toEqual(late.observation);
+    expect(late.saved.observationHostAt).toBe(late.hostAt);
     expect(late.saved.batches).toEqual(accepted!.batches);
     expect(dispatch(f, late.saved).allowed).toBe(false);
   });
@@ -284,7 +284,11 @@ describe("prepared maintenance observation recovery", () => {
   it("does not claim a PR while its retained worker is still on an accepted batch", () => {
     const { f, record } = agedPreparation();
     const fresh = receipt(f, record);
-    accept(f, fresh.saved);
+    const accepted = accept(f, fresh.saved);
+    f.store.updateRunStep(accepted.batches[0]!.stepId!, {
+      state: "running",
+      dispatchedAt: new Date().toISOString(),
+    });
     const wake = randomUUID();
     f.store.prMaintenance.beginWake(f.lead.id, wake);
     expect(f.store.prMaintenance.takeDue(f.lead.id, wake)).toBeUndefined();
@@ -293,6 +297,28 @@ describe("prepared maintenance observation recovery", () => {
       state: "succeeded",
     });
     expect(f.store.prMaintenance.takeDue(f.lead.id, wake)?.id).toBe(record.id);
+  });
+
+  it("supersedes a changed-HEAD accepted-but-unsent batch and refunds its reservation exactly once", () => {
+    const { f, record } = agedPreparation();
+    const fresh = receipt(f, record);
+    const accepted = accept(f, fresh.saved);
+    const batch = accepted.batches[0]!;
+    vi.setSystemTime(Date.now() + 1_000);
+    const changed = receipt(f, accepted, { headSha: otherSha }).saved;
+    expect(changed.batches[0]).toMatchObject({
+      id: batch.id,
+      prompt: batch.prompt,
+      state: "superseded",
+      executionNotDispatched: true,
+    });
+    expect(f.store.getRunStep(batch.stepId!)?.state).toBe("cancelled");
+    expect(changed.counters.repairBatches).toBe(0);
+    expect(changed.counters.mutationAttempts).toBe(0);
+    expect(
+      observe(f, changed, { headSha: otherSha, attemptedAt: new Date().toISOString() })
+        .counters,
+    ).toEqual(changed.counters);
   });
 
   it.each(["receipt", "checkpoint"] as const)(
@@ -503,6 +529,241 @@ function observe(
     },
   });
 }
+
+describe("pinned eligible continuation", () => {
+  function consent(
+    f: ReturnType<typeof setup>,
+    beforeConsent?: (record: PrMaintenanceRegistration) => void,
+  ) {
+    let record = observe(
+      f,
+      f.store.prMaintenance.enableFromOperator(f.input, "operator"),
+    );
+    record = f.store.prMaintenance.holdForDecision(
+      f.lead.id,
+      record.id,
+      record.version,
+      {
+        id: "bounded-decision",
+        version: 1,
+        proposal: "Retain the public contract?",
+        scope: "Existing null invariant",
+        headSha: sha,
+      },
+      () => f.store.updateRun(f.task.id, { state: "awaiting_human" }),
+    );
+    beforeConsent?.(record);
+    return f.store.prMaintenance.operatorAction(
+      record.id,
+      record.version,
+      {
+        action: "direction",
+        decisionId: "bounded-decision",
+        decisionVersion: 1,
+        direction: "Keep the contract; repair and verify within the grant.",
+        resume: true,
+        continueEligible: true,
+      },
+      "operator",
+      () => f.store.updateRun(f.task.id, { state: "running" }),
+    );
+  }
+
+  it.each(["budget", "released", "publication", "manual", "access"] as const)(
+    "does not let explicit continuation clear an independent %s boundary",
+    (boundary) => {
+      const directory = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+      mkdirSync(directory, { recursive: true });
+      paths.push(directory);
+      const path = join(directory, "host.sqlite");
+      const f = setup(storeAt(path));
+      let before: PrMaintenanceRegistration | undefined;
+      expect(() =>
+        consent(f, (record) => {
+          if (boundary === "budget")
+            record.counters.mutationAttempts =
+              record.authorization.budgets.mutationAttempts;
+          if (boundary === "released") record.ownershipReleasedAt = at;
+          if (boundary === "publication")
+            Object.assign(record.authorization.scope, {
+              publicationAuthorized: false,
+              replies: false,
+              resolveThreads: false,
+              reviewers: [],
+              retryChecks: false,
+            });
+          if (boundary === "manual")
+            record.manualControl = { operatorId: "human", takenAt: at, commands: [] };
+          if (boundary === "access") record.pauseReason = "access_blocked";
+          before = structuredClone(record);
+          const db = new DatabaseSync(path);
+          try {
+            db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+              JSON.stringify(record),
+              record.id,
+            );
+          } finally {
+            db.close();
+          }
+        }),
+      ).toThrow(PrMaintenanceError);
+      expect(f.store.prMaintenance.get(before!.id)).toEqual(before);
+      expect(f.store.getRun(f.task.id)!.state).toBe("awaiting_human");
+      expect(before!.continuation).toBeUndefined();
+    },
+  );
+
+  it.each(["HEAD", "task", "PR", "generation", "grant", "binding", "worker"] as const)(
+    "invalidates queued consent on a changed %s without replacing the retained worker",
+    (change) => {
+      const directory = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+      mkdirSync(directory, { recursive: true });
+      paths.push(directory);
+      const path = join(directory, "host.sqlite");
+      const f = setup(storeAt(path));
+      const record = consent(f);
+      if (change === "task")
+        f.store.updateRun(f.task.id, { objective: "Expanded scope" });
+      else if (change === "worker")
+        f.store.appendEvent({
+          eventId: randomUUID(),
+          sessionId: f.worker.id,
+          sequence: 1,
+          type: "agent_session",
+          payload: { agentSessionId: "different-native-session" },
+          createdAt: at,
+        });
+      else {
+        const changed = structuredClone(record);
+        if (change === "HEAD") changed.observation!.headSha = otherSha;
+        if (change === "PR") changed.identity.prNumber++;
+        if (change === "generation") changed.generation++;
+        if (change === "grant") changed.authorization.id = "replacement-grant";
+        if (change === "binding") changed.bindingGeneration++;
+        const db = new DatabaseSync(path);
+        try {
+          db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+            JSON.stringify(changed),
+            record.id,
+          );
+        } finally {
+          db.close();
+        }
+      }
+      expect(
+        f.store.prMaintenance.admission({ action: "discover", recordId: record.id })
+          .allowed,
+      ).toBe(false);
+      expect(f.store.prMaintenance.reconcileContinuations()).toBe(true);
+      const held = f.store.prMaintenance.get(record.id)!;
+      expect(held.continuation).toMatchObject({
+        id: record.continuation!.id,
+        state: "cancelled",
+        reason: "continuation_identity_changed",
+      });
+      expect(held.workerSessionId).toBe(f.worker.id);
+      expect(f.store.prMaintenance.reconcileContinuations()).toBe(false);
+    },
+  );
+
+  it("requires a fresh observation after consent and keeps the accepted prompt and budget on duplicate admission", () => {
+    const f = setup();
+    vi.setSystemTime(Date.parse(at) + 1_000);
+    const record = consent(f);
+    const prepared = prepare(f, record);
+    expect(
+      f.store.prMaintenance.admission({
+        action: "dispatch",
+        recordId: record.id,
+        generation: record.generation,
+        batchId: "batch-1",
+        sessionId: f.worker.id,
+        taskId: f.task.id,
+      }).reason,
+    ).toBe("fresh_observation_required");
+    const refreshed = observe(f, prepared, { attemptedAt: new Date().toISOString() });
+    const accepted = accept(f, refreshed);
+    expect(accepted.continuation).toMatchObject({
+      state: "consumed",
+      batchId: "batch-1",
+    });
+    expect(
+      f.store.prMaintenance.acceptBatch(
+        f.lead.id,
+        record.id,
+        record.generation,
+        "batch-1",
+        accepted.batches[0]!.stepId!,
+        accepted.batches[0]!.attempt!,
+        accepted.batches[0]!.prompt,
+      ),
+    ).toEqual(accepted);
+    expect(accepted.authorization).toEqual(record.authorization);
+    expect(accepted.renewedAt).toBe(record.renewedAt);
+    expect(f.store.prMaintenance.effectiveState(accepted).status).toBe("queued");
+    f.store.setSessionControls(f.worker.id, { stopRequested: true });
+    expect(f.store.prMaintenance.get(record.id)!.continuation?.state).toBe("cancelled");
+    expect(
+      f.store.prMaintenance.effectiveState(f.store.prMaintenance.get(record.id)!).status,
+    ).toBe("needs_decision");
+  });
+
+  it("never restores continuation authority from a portable archive or revives Released audit state", () => {
+    const f = setup();
+    const record = consent(f);
+    const backup = f.store.prMaintenance.exportBackup();
+    f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+    expect(f.store.prMaintenance.get(record.id)!.continuation?.state).toBe("cancelled");
+    const current = f.store.prMaintenance.get(record.id)!;
+    const released = f.store.prMaintenance.operatorAction(
+      current.id,
+      current.version,
+      { action: "release", reason: "Released" },
+      "operator",
+    );
+    expect(released.lifecycle).toBe("paused");
+    expect(f.store.prMaintenance.effectiveState(released).status).toBe("released");
+    expect(prMaintenanceTaskStatuses([released])[0]).toMatchObject({
+      stage: "released",
+      workerSessionId: f.worker.id,
+    });
+    expect(() =>
+      f.store.prMaintenance.operatorAction(
+        released.id,
+        released.version,
+        { action: "resume" },
+        "operator",
+      ),
+    ).toThrow();
+  });
+
+  it("projects an independent permission hold without altering continuation or granting it", () => {
+    const f = setup();
+    const record = consent(f);
+    const event = {
+      eventId: randomUUID(),
+      sessionId: f.worker.id,
+      sequence: f.store.maxEventSequence(f.worker.id) + 1,
+      type: "permission" as const,
+      payload: { requestId: "access", options: [] },
+      createdAt: at,
+    };
+    f.store.appendEvent(event);
+    expect(f.store.prMaintenance.effectiveState(record)).toMatchObject({
+      status: "needs_decision",
+      reason: "An independent session permission request is pending.",
+    });
+    expect(f.store.prMaintenance.get(record.id)).toEqual(record);
+    f.store.appendEvent({
+      ...event,
+      eventId: randomUUID(),
+      sequence: event.sequence + 1,
+      type: "permission_result",
+      payload: { requestId: "access", outcome: "denied" },
+    });
+    expect(f.store.prMaintenance.effectiveState(record).status).toBe("checking");
+  });
+});
 
 function restoreLegacy(f: ReturnType<typeof setup>) {
   const record = f.store.prMaintenance.enableFromOperator(f.input, "legacy-operator");

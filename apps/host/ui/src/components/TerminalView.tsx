@@ -585,7 +585,12 @@ type TerminalViewProps = {
   activity?: TranscriptActivity | undefined;
   /** Null means the independently hydrated permission ledger has no pending request. */
   pendingPermission?: SessionEvent | null | undefined;
-  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => Promise<boolean>;
+  onPrompt: (
+    prompt: string,
+    attachments?: PromptAttachment[],
+    handback?: "ongoing" | "after_turn",
+  ) => Promise<boolean>;
+  maintenanceWorker?: boolean | undefined;
   onCancel: () => void;
   onStop: () => void;
   onPermission: (
@@ -612,6 +617,7 @@ export const TerminalView = ({
   activity,
   pendingPermission: knownPermission,
   onPrompt,
+  maintenanceWorker,
   onCancel,
   onStop,
   onPermission,
@@ -626,6 +632,7 @@ export const TerminalView = ({
 }: TerminalViewProps) => {
   const styles = useStyles();
   const [draftName, setDraftName] = useState<string>();
+  const [handbackSession, setHandbackSession] = useState("");
   // Dismissal is remembered per keystroke, not per session: Escape closes the
   // menu, and typing another character is what asks for it back.
   const [menuDismissed, setMenuDismissed] = useState(false);
@@ -961,7 +968,10 @@ export const TerminalView = ({
     // A file with no words is still a message: "look at this" is implied, and
     // refusing to send it would strand the attachment the operator just added.
     if ((!text && files.length === 0) || !canPrompt) return;
-    const accepted = onPrompt(text || "(see attachment)", files);
+    const accepted =
+      maintenanceWorker && handbackSession === session.id
+        ? onPrompt(text || "(see attachment)", files, "after_turn")
+        : onPrompt(text || "(see attachment)", files);
     setAttachError(undefined);
     setMenuDismissed(false);
     // Sending is a request to watch what happens next, so it re-pins the
@@ -969,6 +979,7 @@ export const TerminalView = ({
     // operator staring at old output while the answer arrived below the fold.
     jumpToLatest();
     if (await accepted) {
+      setHandbackSession("");
       onDraftChange((current) => (current === draft ? EMPTY_DRAFT : current));
     }
   };
@@ -1362,6 +1373,20 @@ export const TerminalView = ({
             setAttachments((current) => current.filter((entry) => entry.id !== id))
           }
         />
+        {maintenanceWorker ? (
+          <label>
+            <input
+              type="checkbox"
+              checked={handbackSession === session.id}
+              disabled={!canPrompt}
+              onChange={(event) =>
+                setHandbackSession(event.target.checked ? session.id : "")
+              }
+            />
+            One-turn handback after completion and effect checks (unchecked: ongoing
+            takeover)
+          </label>
+        ) : null}
         <Textarea
           className={styles.input}
           textarea={{ ref: inputRef }}

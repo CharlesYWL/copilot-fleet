@@ -30,6 +30,7 @@ import {
   PromptSchema,
   type PrMaintenanceIdentity,
   type PrMaintenanceObservation,
+  PrMaintenanceObservationSchema,
   CommandExecutionPageSchema,
 } from "@fleet/protocol";
 import type { AuthenticatedChannel } from "@fleet/protocol/node-auth";
@@ -2561,6 +2562,129 @@ describe("durable command output", () => {
 });
 
 describe("PR maintenance with durable commands", () => {
+  it("retains authenticated continuation offline, queues it once while busy, and recovers the same delivery after restart", () => {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-continuation-"));
+    directories.push(directory);
+    const path = join(directory, "host.sqlite");
+    const f = setup(path);
+    let record = enableMaintenance(f);
+    record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+      kind: "observation",
+      observation: PrMaintenanceObservationSchema.parse({
+        attemptedAt: new Date().toISOString(),
+        complete: true,
+        identity: record.identity,
+        snapshotId: "before-consent",
+        headSha: "a".repeat(40),
+        baseSha: "b".repeat(40),
+        state: "open",
+        fingerprint: "before-consent",
+        checksComplete: true,
+        reviewsComplete: true,
+        evidence: "Isolated provider fixture.",
+      }),
+    });
+    record = f.store.prMaintenance.holdForDecision(
+      f.lead.id,
+      record.id,
+      record.version,
+      {
+        id: "decision",
+        version: 1,
+        proposal: "Keep API?",
+        scope: "Existing contract",
+        headSha: "a".repeat(40),
+      },
+      () => f.store.updateRun(record.taskId, { state: "awaiting_human" }),
+    );
+    record = f.store.prMaintenance.operatorAction(
+      record.id,
+      record.version,
+      {
+        action: "direction",
+        decisionId: "decision",
+        decisionVersion: 1,
+        direction: "Keep the approved API; repair within the existing grant.",
+        resume: true,
+        continueEligible: true,
+      },
+      "operator",
+      () => f.store.updateRun(record.taskId, { state: "running" }),
+    );
+    const offline = vi.spyOn(f.service, "nodeSocket").mockReturnValue(undefined);
+    const engine = new OrchestratorEngine(f.service);
+    engine.tick();
+    expect(f.store.commands.prompts(f.lead.id)).toHaveLength(0);
+    expect(f.store.prMaintenance.get(record.id)!.continuation).toEqual(
+      record.continuation,
+    );
+    offline.mockRestore();
+    f.store.transitionSession(f.lead.id, "running");
+    const enqueue = vi
+      .spyOn(f.service.commands, "queueLeadPrompt")
+      .mockImplementationOnce(() => {
+        throw new Error("Fixture queue unavailable");
+      });
+    expect(() => engine.tick()).toThrow("Fixture queue unavailable");
+    expect(f.store.commands.prompts(f.lead.id)).toHaveLength(0);
+    expect(f.store.prMaintenance.get(record.id)!.continuation).toEqual(
+      record.continuation,
+    );
+    enqueue.mockRestore();
+    engine.tick();
+    engine.tick();
+    const queued = f.store.commands
+      .prompts(f.lead.id)
+      .filter((entry) => entry.delivery.prompt.includes(record.continuation!.id));
+    expect(queued).toHaveLength(1);
+    const delivery = queued[0]!.delivery;
+    expect(
+      f.frames.filter(
+        (frame) =>
+          frame.type === "deliver_lead_prompt" &&
+          frame.delivery.deliveryId === delivery.deliveryId,
+      ),
+    ).toHaveLength(0);
+    const restored = open(path);
+    expect(
+      restored.prMaintenance.get(record.id)!.continuation?.wakeQueuedAt,
+    ).toBeTruthy();
+    expect(restored.commands.prompt(delivery.deliveryId)!.delivery).toEqual(delivery);
+    const restarted = new FleetService(restored, log, "test");
+    restarted.attachNode(f.node.id, f.service.nodeSocket(f.node.id)!);
+    restarted.commands.nodeReady(f.node.id, {
+      capabilities,
+      commandExecution: readiness,
+    });
+    restored.transitionSession(f.lead.id, "idle");
+    const restartedEngine = new OrchestratorEngine(restarted);
+    restartedEngine.tick();
+    expect(
+      restarted.commands.handleNodeMessage(f.node.id, {
+        type: "lead_prompt_receipt",
+        receipt: nativeReceipt({
+          deliveryId: delivery.deliveryId,
+          sessionId: f.lead.id,
+          state: "accepted",
+          at: new Date().toISOString(),
+        }),
+      }),
+    ).toBe(true);
+    restartedEngine.tick();
+    restarted.commands.pumpLead(f.lead.id);
+    expect(
+      f.frames.filter(
+        (frame) =>
+          frame.type === "deliver_lead_prompt" &&
+          frame.delivery.deliveryId === delivery.deliveryId,
+      ),
+    ).toHaveLength(1);
+    expect(restored.prMaintenance.get(record.id)!.authorization).toEqual(
+      record.authorization,
+    );
+    expect(restored.prMaintenance.get(record.id)!.counters).toEqual(record.counters);
+  });
+
   function enableMaintenance(
     f: ReturnType<typeof setup>,
     identity?: PrMaintenanceIdentity,

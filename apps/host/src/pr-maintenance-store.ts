@@ -41,6 +41,7 @@ import {
   type PrMaintenanceOperatorAction,
   type PrMaintenanceProposal,
   type PrMaintenanceRegistration,
+  type PrMaintenanceEffectiveState,
   type CommandExecution,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
@@ -109,6 +110,7 @@ export type SupervisorCommand = {
   digest: string;
   kind: "prompt" | "resume_session";
   operatorId: string;
+  handback?: "ongoing" | "after_turn" | undefined;
 };
 
 export class PrMaintenanceError extends Error {
@@ -1000,6 +1002,21 @@ export class PrMaintenanceStore {
       actorId: string;
     } = { actor: "system", actorId: "host" },
   ): void {
+    if (
+      record.continuation &&
+      record.continuation.state !== "cancelled" &&
+      (["checking", "handback"].includes(record.continuation.state) ||
+        record.batches.some(
+          (batch) =>
+            batch.id === record.continuation?.batchId &&
+            outstanding.has(batch.state) &&
+            this.neverDispatched(record, batch),
+        ))
+    ) {
+      record.continuation.state = "cancelled";
+      record.continuation.reason = reason;
+      record.continuation.settledAt = at;
+    }
     if (record.lifecycle === "active") {
       record.lifecycle = "paused";
       record.pausedAt = at;
@@ -1458,6 +1475,14 @@ export class PrMaintenanceStore {
       this.assertManualAvailable(sessionId);
       this.assertManualOperationUnambiguous(sessionId, command.id);
       const record = this.manualRecord(sessionId);
+      if (command.handback === "after_turn") {
+        if (!record || command.kind !== "prompt")
+          refuse(
+            "handback_unavailable",
+            "One-turn handback requires a retained maintenance worker prompt.",
+          );
+        this.assertEligibleContinuation(record, true);
+      }
       if (this.manualCommand(sessionId, command.id))
         refuse(
           "manual_duplicate",
@@ -1500,6 +1525,9 @@ export class PrMaintenanceStore {
       };
       delete record.manualControl.endedAt;
       record.manualControl.commands.push(receipt);
+      if (command.handback === "after_turn") {
+        this.requestContinuation(record, command.operatorId, now, command.id);
+      }
       this.save(record);
     });
   }
@@ -1578,10 +1606,440 @@ export class PrMaintenanceStore {
       );
   }
 
+  private authorityHash(record: PrMaintenanceRegistration): string {
+    const task = this.store.getRun(record.taskId);
+    const worker = this.store.getSession(record.workerSessionId);
+    return createHash("sha256")
+      .update(
+        JSON.stringify({
+          identity: record.identity,
+          generation: record.generation,
+          taskId: record.taskId,
+          leadSessionId: record.leadSessionId,
+          workerSessionId: record.workerSessionId,
+          placementId: record.placementId,
+          checkoutKey: record.checkoutKey,
+          bindingGeneration: record.bindingGeneration,
+          authorization: record.authorization,
+          decision: record.decision,
+          objective: task?.objective,
+          policy: task?.policy,
+          workspaceBinding: task?.workspaceBinding,
+          agentSessionId: worker?.agentSessionId,
+        }),
+      )
+      .digest("hex");
+  }
+
+  /** Consent to a design decision is not consent to clear another kind of hold. */
+  private assertEligibleContinuation(
+    record: PrMaintenanceRegistration,
+    manual = false,
+  ): void {
+    const task = this.store.getRun(record.taskId);
+    const worker = this.store.getSession(record.workerSessionId);
+    const lead = this.store.getSession(record.leadSessionId);
+    const reason = this.binding(record);
+    if (reason) refuse(reason, "The retained task, worker or checkout binding changed.");
+    if (record.ownershipReleasedAt)
+      refuse("released", "Released ownership cannot continue.");
+    if (!record.authorization.scope.publicationAuthorized)
+      refuse(
+        "repair_authorization_required",
+        "Repair authorization is required; continuation grants no permissions.",
+      );
+    if (
+      !record.observation?.complete ||
+      !record.lastAttempt?.complete ||
+      record.lastAttempt.failure ||
+      record.observation.state !== "open" ||
+      record.observation.headSha !== record.lastAttempt.headSha ||
+      !prMaintenanceObservationFresh(
+        record.observation,
+        Date.now(),
+        record.observationHostAt,
+      )
+    )
+      refuse(
+        "stale_observation",
+        "Read the current PR HEAD before consenting to continuation.",
+      );
+    if (worker?.stopRequested || lead?.stopRequested || task?.state === "cancelled")
+      refuse(
+        "stopped",
+        "Stop is independent. Explicitly resume the stopped task/session before requesting continuation.",
+      );
+    if (worker?.dismissed || lead?.dismissed)
+      refuse("dismissed", "Restore the retained session before requesting continuation.");
+    if (
+      task &&
+      ["awaiting_approval", "blocked", "failed", "completed", "aggregating"].includes(
+        task.state,
+      )
+    )
+      refuse(
+        "task_not_eligible",
+        "Resolve the task's independent approval or lifecycle hold first.",
+      );
+    if (!manual && record.manualControl && !record.manualControl.endedAt)
+      refuse(
+        "manual_control",
+        "Ongoing manual takeover requires explicit handback; direction cannot end it.",
+      );
+    if (manual && record.decision?.state === "pending")
+      refuse("wait_for_human", "Handback cannot approve a pending design decision.");
+    if (
+      record.lifecycle !== "active" &&
+      !(
+        record.lifecycle === "paused" &&
+        (["wait_for_human", "finding_needs_human"].includes(record.pauseReason) ||
+          (manual && record.pauseReason === "manual_control"))
+      )
+    )
+      refuse(
+        "independent_hold",
+        `Continuation cannot clear this hold: ${record.pauseReason || record.lifecycle}.`,
+      );
+    if (record.incidents.some((incident) => !incident.resolvedAt))
+      refuse(
+        "independent_hold",
+        "Reconcile the recorded access, identity or effect incident first.",
+      );
+    if (prMaintenanceUnsettled(record))
+      refuse(
+        "unsettled",
+        "Reconcile existing execution and effects before requesting continuation.",
+      );
+    if (
+      record.counters.mutationAttempts >= record.authorization.budgets.mutationAttempts ||
+      (record.counters.repairBatches >= record.authorization.budgets.repairBatches &&
+        record.counters.answerBatches >= record.authorization.budgets.answerBatches)
+    )
+      refuse(
+        "budget_exhausted",
+        "Renew exhausted allowances explicitly; continuation never resets budgets.",
+      );
+  }
+
+  private requestContinuation(
+    record: PrMaintenanceRegistration,
+    operatorId: string,
+    at: string,
+    manualCommandId?: string,
+  ): void {
+    const headSha = record.observation?.headSha;
+    if (!headSha) refuse("stale_observation", "A pinned PR HEAD is required.");
+    if (record.continuation)
+      (record.continuationHistory ??= []).push(record.continuation);
+    record.continuation = {
+      id: randomUUID(),
+      operatorId,
+      requestedAt: at,
+      expectedVersion: record.version,
+      authorityHash: this.authorityHash(record),
+      headSha,
+      state: manualCommandId ? "handback" : "checking",
+      ...(manualCommandId ? { manualCommandId } : {}),
+    };
+    delete record.readyFingerprint;
+    record.nextCheckAt = at;
+  }
+
+  private continuationChanged(record: PrMaintenanceRegistration): boolean {
+    const intent = record.continuation;
+    const pinned =
+      intent &&
+      (["checking", "handback"].includes(intent.state) ||
+        (intent.state === "consumed" &&
+          record.batches.some(
+            (batch) =>
+              batch.id === intent.batchId &&
+              outstanding.has(batch.state) &&
+              this.neverDispatched(record, batch),
+          )));
+    return Boolean(
+      pinned &&
+      (intent.authorityHash !== this.authorityHash(record) ||
+        intent.headSha !== record.observation?.headSha ||
+        this.binding(record)),
+    );
+  }
+
+  /** Called on existing engine wakes, never by a new polling loop. */
+  reconcileContinuations(): boolean {
+    return this.store.writeAtomically(() => {
+      let changed = false;
+      for (const record of this.retained()) {
+        const intent = record.continuation;
+        if (!intent || intent.state === "cancelled") continue;
+        const retainedWorker = this.store.getSession(record.workerSessionId);
+        const retainedLead = this.store.getSession(record.leadSessionId);
+        if (
+          ["checking", "handback"].includes(intent.state) &&
+          (retainedWorker?.stopRequested ||
+            retainedLead?.stopRequested ||
+            this.store.getRun(record.taskId)?.state === "cancelled")
+        ) {
+          this.pause(record, "stopped");
+          this.save(record);
+          changed = true;
+          continue;
+        }
+        if (this.continuationChanged(record)) {
+          this.pause(record, "continuation_identity_changed");
+          this.save(record);
+          changed = true;
+          continue;
+        }
+        if (intent.state !== "handback") continue;
+        const worker = this.store.getSession(record.workerSessionId);
+        const command =
+          intent.manualCommandId &&
+          this.manualCommand(record.workerSessionId, intent.manualCommandId);
+        const dispatch = this.store.getSessionDispatchAttempt(record.workerSessionId);
+        const task = this.store.getRun(record.taskId);
+        if (
+          !command ||
+          command.state !== "settled" ||
+          !worker ||
+          worker.state !== "idle" ||
+          worker.stopRequested ||
+          worker.cleanupRequested ||
+          this.store.getSessionTransitionIntent(worker.id) ||
+          worker.dismissed ||
+          !retainedLead ||
+          retainedLead.cleanupRequested ||
+          retainedLead.dismissed ||
+          this.store.getSessionTransitionIntent(retainedLead.id) ||
+          task?.state !== "running" ||
+          dispatch?.commandId !== command.id ||
+          !this.store.hasEventAfter(worker.id, command.eventSeqFrom, "turn_complete") ||
+          prMaintenanceUnsettled(record) ||
+          record.decision?.state === "pending" ||
+          record.pauseReason !== "manual_control" ||
+          record.incidents.some((incident) => !incident.resolvedAt)
+        )
+          continue;
+        if (!intent.completedAt) {
+          intent.completedAt = nowIso();
+          record.nextCheckAt = intent.completedAt;
+          this.save(record);
+          changed = true;
+          continue;
+        }
+        if (
+          !record.observation?.complete ||
+          !record.lastAttempt?.complete ||
+          record.lastAttempt.failure ||
+          record.lastAttempt.snapshotId !== record.observation.snapshotId ||
+          (record.observationHostAt ?? record.observation.attemptedAt) <
+            intent.completedAt ||
+          !prMaintenanceObservationFresh(
+            record.observation,
+            Date.now(),
+            record.observationHostAt,
+          )
+        )
+          continue;
+        this.applyResume(
+          record,
+          { actor: "operator", actorId: intent.operatorId },
+          nowIso(),
+          true,
+        );
+        intent.state = "checking";
+        delete intent.wakeQueuedAt;
+        // Reobserve after the manual turn, not merely after it was requested.
+        intent.requestedAt = nowIso();
+        this.save(record);
+        changed = true;
+      }
+      return changed;
+    });
+  }
+
+  effectiveState(record: PrMaintenanceRegistration): PrMaintenanceEffectiveState {
+    const state = (
+      status: PrMaintenanceEffectiveState["status"],
+      reason: string,
+      action: string,
+    ) => ({ status, reason, action });
+    if (record.ownershipReleasedAt)
+      return state(
+        "released",
+        "Ownership released; historical lifecycle is retained for audit.",
+        "No continuation. A new registration requires explicit authorization.",
+      );
+    const worker = this.store.getSession(record.workerSessionId);
+    const lead = this.store.getSession(record.leadSessionId);
+    if (
+      worker?.stopRequested ||
+      lead?.stopRequested ||
+      this.store.getRun(record.taskId)?.state === "cancelled"
+    )
+      return state(
+        "needs_decision",
+        "Independent Stop is still in effect.",
+        "Explicitly resume the stopped task/session; recording design direction cannot clear Stop.",
+      );
+    if (
+      this.store
+        .listPermissionEvents()
+        .some(
+          (event) =>
+            event.type === "permission" &&
+            [record.workerSessionId, record.leadSessionId].includes(event.sessionId),
+        )
+    )
+      return state(
+        "needs_decision",
+        "An independent session permission request is pending.",
+        "Open the requesting session and review the actual permission; continuation does not approve it.",
+      );
+    const bindingHold = this.binding(record);
+    if (bindingHold)
+      return state(
+        "needs_decision",
+        bindingHold,
+        "Resolve the retained checkout or session binding; continuation cannot replace it.",
+      );
+    if (record.decision?.state === "pending")
+      return state(
+        "needs_decision",
+        record.decision.proposal,
+        "Record bounded direction; select continuation to queue fresh checks within the existing grant.",
+      );
+    if (record.manualControl && !record.manualControl.endedAt)
+      return state(
+        "running_manually",
+        record.continuation?.state === "handback"
+          ? "Selected one-turn handback is waiting for correlated completion, quiescence and effect reconciliation."
+          : "Ongoing manual takeover; idleness is not handback consent.",
+        "Wait for selected handback or explicitly resume maintenance after settlement. Stop remains available.",
+      );
+    const admission = this.admission({
+      action: "discover",
+      recordId: record.id,
+      taskId: record.taskId,
+    });
+    if (!admission.allowed)
+      return state(
+        "needs_decision",
+        record.pauseReason || admission.reason || "Admission held",
+        "Resolve this specific hold; direction does not clear independent Stop or access controls.",
+      );
+    const batch = record.batches.find((entry) => entry.state === "accepted");
+    if (batch?.stepId) {
+      const step = this.store.getRunStep(batch.stepId);
+      if (step?.state === "pending") {
+        const gate = this.admission({
+          action: "execute",
+          taskId: record.taskId,
+          sessionId: record.workerSessionId,
+          recordId: record.id,
+          generation: record.generation,
+          batchId: batch.id,
+        });
+        return state(
+          "queued",
+          gate.allowed
+            ? "Accepted immutable work is waiting for normal Node admission."
+            : `Accepted work retained; ${gate.reason}.`,
+          "Do not resend or replace the worker. Refresh evidence/reconcile before normal admission.",
+        );
+      }
+      if (step && ["starting", "running"].includes(step.state))
+        return state(
+          "running",
+          "The accepted retained-worker attempt is in flight.",
+          "Wait for correlated completion; Stop remains available.",
+        );
+    }
+    if (
+      record.incidents.some((incident) => !incident.resolvedAt) ||
+      prMaintenanceUnsettled(record)
+    )
+      return state(
+        "checking",
+        "Execution or external effects still require reconciliation.",
+        "Settle the recorded effects before preparing another batch; never replay an uncertain effect.",
+      );
+    if (
+      record.counters.mutationAttempts >= record.authorization.budgets.mutationAttempts ||
+      (record.counters.repairBatches >= record.authorization.budgets.repairBatches &&
+        record.counters.answerBatches >= record.authorization.budgets.answerBatches)
+    )
+      return state(
+        "needs_decision",
+        "The existing batch or mutation budget is exhausted.",
+        "Renew the specific allowance explicitly; continuation cannot reset it.",
+      );
+    return state(
+      "checking",
+      record.continuation?.state === "checking" && !record.continuation.wakeQueuedAt
+        ? "Continuation accepted; awaiting durable lead delivery. Reconnect a compatible Node; older transports cannot safely acknowledge this wake."
+        : "Checking current PR evidence, remaining authority and effects.",
+      "Use the existing bounded maintenance visit; no new approval for already-granted actions.",
+    );
+  }
+
+  pendingContinuationWakes(): PrMaintenanceRegistration[] {
+    return this.retained().filter((record) => {
+      const intent = record.continuation;
+      return (
+        intent &&
+        !intent.wakeQueuedAt &&
+        (intent.state === "checking" ||
+          (intent.state === "handback" &&
+            intent.completedAt &&
+            intent.manualCommandId &&
+            this.manualCommand(record.workerSessionId, intent.manualCommandId)?.state ===
+              "settled"))
+      );
+    });
+  }
+
+  markContinuationWake(recordId: string, intentId: string, at: string): boolean {
+    const record = this.required(recordId);
+    if (
+      record.continuation?.id !== intentId ||
+      record.continuation.wakeQueuedAt ||
+      !["checking", "handback"].includes(record.continuation.state) ||
+      this.continuationChanged(record)
+    )
+      return false;
+    record.continuation.wakeQueuedAt = at;
+    this.save(record);
+    return true;
+  }
+
+  private executionInFlight(record: PrMaintenanceRegistration): boolean {
+    return prMaintenanceInFlight({
+      ...record,
+      batches: record.batches.filter((batch) => !this.neverDispatched(record, batch)),
+    });
+  }
+
+  private observingHandback(record: PrMaintenanceRegistration): boolean {
+    const worker = this.store.getSession(record.workerSessionId);
+    return Boolean(
+      record.continuation?.state === "handback" &&
+      record.continuation.completedAt &&
+      !this.continuationChanged(record) &&
+      record.pauseReason === "manual_control" &&
+      worker?.state === "idle" &&
+      !worker.stopRequested &&
+      !worker.cleanupRequested &&
+      !worker.dismissed &&
+      !this.store.getSessionTransitionIntent(worker.id),
+    );
+  }
+
   private applyResume(
     record: PrMaintenanceRegistration,
     actor: { actor: "lead" | "operator"; actorId: string },
     at: string,
+    preserveCounters = false,
   ): void {
     record.resumeHistory.push({
       ...actor,
@@ -1593,10 +2051,12 @@ export class PrMaintenanceStore {
     if (record.manualControl) record.manualControl.endedAt = at;
     record.pauseReason = "";
     delete record.pauseOrigin;
-    record.counters.scanStalls = 0;
-    record.counters.reconciliationStalls = 0;
+    if (!preserveCounters) {
+      record.counters.scanStalls = 0;
+      record.counters.reconciliationStalls = 0;
+    }
     record.nextCheckAt = at;
-    record.renewedAt = at;
+    if (!preserveCounters) record.renewedAt = at;
     delete record.pausedNoticeAt;
     for (const incident of record.incidents) {
       if (
@@ -1749,6 +2209,22 @@ export class PrMaintenanceStore {
       } else {
         if (action.action === "direction") {
           this.matchDecision(record, action.decisionId, action.decisionVersion);
+          if (action.continueEligible && !action.resume)
+            refuse(
+              "invalid_continuation",
+              "Continuation must explicitly include resume consent.",
+            );
+          if (
+            action.continueEligible &&
+            (record.decision?.state !== "pending" ||
+              record.decision.headSha !== record.observation?.headSha ||
+              record.decision.headSha !== record.lastAttempt?.headSha)
+          )
+            refuse(
+              "decision_conflict",
+              "Direction requires the pending decision at the same current PR HEAD.",
+            );
+          if (action.continueEligible) this.assertEligibleContinuation(record);
           record.decision = {
             ...record.decision!,
             state: "directed",
@@ -1756,13 +2232,22 @@ export class PrMaintenanceStore {
             direction: action.direction,
             resolvedAt: now,
           };
-          record.renewedAt = now;
-          record.counters.reconciliationStalls = 0;
-          record.counters.scanStalls = 0;
+          if (!action.continueEligible) record.renewedAt = now;
+          if (!action.continueEligible) {
+            record.counters.reconciliationStalls = 0;
+            record.counters.scanStalls = 0;
+          }
         }
         if (action.action !== "direction" || action.resume) {
           this.assertResumeSafety(record, action.decisionId, action.decisionVersion);
-          this.applyResume(record, { actor: "operator", actorId: operatorId }, now);
+          this.applyResume(
+            record,
+            { actor: "operator", actorId: operatorId },
+            now,
+            action.action === "direction" && action.continueEligible,
+          );
+          if (action.action === "direction" && action.continueEligible)
+            this.requestContinuation(record, operatorId, now);
         }
       }
       const saved = this.save(record);
@@ -1965,8 +2450,12 @@ export class PrMaintenanceStore {
         record.decision?.state === "directed"
       )
         continue;
+      if (this.continuationChanged(record))
+        return denied("continuation_identity_changed");
       if (record.lifecycle !== "active")
         return denied(record.lifecycle === "paused" ? "paused" : "terminal_draining");
+      if (record.manualControl && !record.manualControl.endedAt)
+        return denied("manual_control");
       if (action.generation !== undefined && action.generation !== record.generation)
         return denied("stale_generation");
       const reason = this.binding(record);
@@ -2018,6 +2507,11 @@ export class PrMaintenanceStore {
         const batch = record.batches.find((entry) => entry.id === action.batchId);
         if (!batch || !outstanding.has(batch.state) || batch.cancellationRequestedAt)
           return denied("batch_not_admitted");
+        if (
+          batch.authorizationId !== record.authorization.id ||
+          batch.generation !== record.generation
+        )
+          return denied("stale_authorization");
         if (batch.state === "uncertain" || batch.state === "reconciling")
           return denied("execution_uncertain");
         if (action.action === "dispatch" && batch.state !== "prepared")
@@ -2031,6 +2525,12 @@ export class PrMaintenanceStore {
           return denied("observation_incomplete");
         if (!record.observation?.complete || batch.headSha !== record.observation.headSha)
           return denied("stale_observation");
+        if (
+          record.continuation?.state === "checking" &&
+          (record.observationHostAt ?? record.observation.attemptedAt) <
+            record.continuation.requestedAt
+        )
+          return denied("fresh_observation_required");
         if (
           record.lastAttempt.headSha !== record.observation.headSha ||
           record.lastAttempt.snapshotId !== record.observation.snapshotId
@@ -2053,7 +2553,8 @@ export class PrMaintenanceStore {
           action.action === "dispatch" &&
           !(
             worker.state === "idle" ||
-            (["completed", "stopped"].includes(worker.state) && worker.agentSessionId)
+            (["completed", "stopped", "offline"].includes(worker.state) &&
+              worker.agentSessionId)
           )
         )
           return denied("worker_unavailable");
@@ -2168,6 +2669,11 @@ export class PrMaintenanceStore {
       batch.stepId = stepId;
       batch.attempt = attempt;
       batch.updatedAt = nowIso();
+      if (record.continuation?.state === "checking") {
+        record.continuation.state = "consumed";
+        record.continuation.batchId = batch.id;
+        record.continuation.settledAt = nowIso();
+      }
       return this.save(record);
     });
   }
@@ -2485,7 +2991,7 @@ export class PrMaintenanceStore {
       !record.incidents.some(
         (incident) => !incident.resolvedAt && incident.kind !== "capability",
       ) &&
-      !prMaintenanceInFlight(record) &&
+      !this.executionInFlight(record) &&
       !this.binding(record) &&
       !!task &&
       ["running", "awaiting_lead", "completed"].includes(task.state) &&
@@ -2757,29 +3263,34 @@ export class PrMaintenanceStore {
     else delete record.observationHostAt;
     record.lastSuccessAt = hostAttemptedAt;
     for (const batch of record.batches) {
-      if (undispatchedBatch(batch) && batch.headSha !== observation.headSha)
-        this.settleBatch(record, {
-          kind: "batch",
-          batchId: batch.id,
-          generation: record.generation,
-          state: "superseded",
-          findings: batch.sources.map((source) => ({
-            source,
-            outcome: "superseded",
-            stage: "not_attempted",
-            evidence: [],
-            responseRequired: true,
-            responseIds: [],
-            nextAction: "Prepare from the fresh observation at the new head.",
-            progress: false,
-          })),
-          effects: [],
-          executionSettled: true,
-          usedMutations: 0,
-          published: false,
-          reason: "head_changed",
-          evidence: "Observed head changed before dispatch; reserved allowance refunded.",
-        });
+      if (this.neverDispatched(record, batch) && batch.headSha !== observation.headSha)
+        this.settleBatch(
+          record,
+          {
+            kind: "batch",
+            batchId: batch.id,
+            generation: record.generation,
+            state: "superseded",
+            findings: batch.sources.map((source) => ({
+              source,
+              outcome: "superseded",
+              stage: "not_attempted",
+              evidence: [],
+              responseRequired: true,
+              responseIds: [],
+              nextAction: "Prepare from the fresh observation at the new head.",
+              progress: false,
+            })),
+            effects: [],
+            executionSettled: true,
+            usedMutations: 0,
+            published: false,
+            reason: "head_changed",
+            evidence:
+              "Observed head changed before dispatch; reserved allowance refunded.",
+          },
+          true,
+        );
     }
     if (!alternate) {
       record.counters.consecutiveFailures = 0;
@@ -2879,6 +3390,7 @@ export class PrMaintenanceStore {
   private settleBatch(
     record: PrMaintenanceRegistration,
     update: Extract<PrMaintenanceCheckpoint, { kind: "batch" }>,
+    supersedeUnsent = false,
   ): void {
     const batch = record.batches.find((entry) => entry.id === update.batchId);
     if (
@@ -2896,6 +3408,17 @@ export class PrMaintenanceStore {
         return;
       refuse("batch_settled", "A settled batch cannot be rewritten.");
     }
+    const provenUnsent =
+      supersedeUnsent &&
+      update.state === "superseded" &&
+      this.neverDispatched(record, batch);
+    if (provenUnsent && batch.stepId) {
+      this.store.updateRunStep(batch.stepId, {
+        state: "cancelled",
+        output: "Current PR HEAD changed before this accepted attempt was dispatched.",
+      });
+      batch.executionNotDispatched = true;
+    }
     if (
       batch.state === "prepared" &&
       !["failed", "cancelled", "superseded"].includes(update.state)
@@ -2903,6 +3426,7 @@ export class PrMaintenanceStore {
       refuse("not_accepted", "A prepared batch is not execution evidence.");
     if (
       batch.state === "accepted" &&
+      !provenUnsent &&
       !["reconciling", "uncertain"].includes(update.state)
     )
       refuse(
@@ -2918,10 +3442,11 @@ export class PrMaintenanceStore {
         !step ||
         step.attempts !== batch.attempt ||
         !["succeeded", "failed", "cancelled", "skipped"].includes(step.state) ||
-        !worker ||
-        worker.stopRequested ||
-        this.store.getSessionTransitionIntent(worker.id) ||
-        !["idle", "completed", "stopped", "failed"].includes(worker.state)
+        (!provenUnsent &&
+          (!worker ||
+            worker.stopRequested ||
+            this.store.getSessionTransitionIntent(worker.id) ||
+            !["idle", "completed", "stopped", "failed"].includes(worker.state)))
       )
         refuse(
           "execution_unsettled",
@@ -3844,8 +4369,8 @@ export class PrMaintenanceStore {
       if (
         !late &&
         helperError(observation)?.code !== "clock_unverified" &&
-        admission.allowed &&
-        !prMaintenanceInFlight(record) &&
+        (admission.allowed || this.observingHandback(record)) &&
+        !this.executionInFlight(record) &&
         prMaintenanceObservationFresh(observation, Date.now(), hostAttemptedAt)
       ) {
         this.observe(
@@ -3956,6 +4481,7 @@ export class PrMaintenanceStore {
     return record.batches.some((batch) => {
       if (batch.state !== "accepted" || !batch.stepId || batch.executionSettled)
         return false;
+      if (this.neverDispatched(record, batch)) return false;
       const step = this.store.getRunStep(batch.stepId);
       return Boolean(
         step && step.attempts === batch.attempt && !terminalRunStepStates.has(step.state),
@@ -3982,11 +4508,14 @@ export class PrMaintenanceStore {
         : undefined;
       const eligible = (record: PrMaintenanceRegistration) =>
         !record.ownershipReleasedAt &&
-        (!record.manualControl || Boolean(record.manualControl.endedAt)) &&
+        (!record.manualControl ||
+          Boolean(record.manualControl.endedAt) ||
+          this.observingHandback(record)) &&
         record.leadSessionId === leadSessionId &&
         ((record.lifecycle === "active" &&
           record.authorization.scope.publicationAuthorized) ||
-          prMaintenanceUnsettled(record)) &&
+          prMaintenanceUnsettled(record) ||
+          this.observingHandback(record)) &&
         record.counters.scanStalls < 3 &&
         record.counters.reconciliationStalls < 3 &&
         !this.repairInProgress(record);
@@ -4146,6 +4675,15 @@ export class PrMaintenanceStore {
       this.quarantineManualOperation(sessionId, command.id);
     for (const record of backup?.registrations ?? []) {
       if (!record.ownershipReleasedAt) {
+        if (
+          record.continuation &&
+          ["checking", "handback"].includes(record.continuation.state)
+        ) {
+          record.continuation.state = "cancelled";
+          record.continuation.reason =
+            "portable_restore_requires_operator_reconciliation";
+          record.continuation.settledAt = nowIso();
+        }
         if (record.lifecycle === "active") record.lifecycle = "paused";
         record.pauseReason = "portable_restore_requires_operator_reconciliation";
         const pausedAt = nowIso();

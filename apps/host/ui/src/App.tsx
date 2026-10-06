@@ -1582,10 +1582,17 @@ export function App() {
                             .filter((event) => event.sessionId === activeSession.id)
                             .at(-1) ?? null
                         }
-                        onPrompt={(prompt, attachments) =>
+                        maintenanceWorker={snapshot.prMaintenanceTasks?.some(
+                          (status) =>
+                            status.workerSessionId === activeSession.id &&
+                            status.effective?.status !== "released" &&
+                            status.stage !== "released",
+                        )}
+                        onPrompt={(prompt, attachments, handback) =>
                           command(`/api/sessions/${activeSession.id}/prompt`, {
                             prompt,
                             attachments,
+                            ...(handback ? { handback } : {}),
                           })
                         }
                         onCancel={() =>
@@ -1689,10 +1696,17 @@ export function App() {
             }
             open={focusOpen}
             onOpenChange={setFocusOpen}
-            onPrompt={(prompt, attachments) =>
+            maintenanceWorker={snapshot.prMaintenanceTasks?.some(
+              (status) =>
+                status.workerSessionId === activeSession.id &&
+                status.effective?.status !== "released" &&
+                status.stage !== "released",
+            )}
+            onPrompt={(prompt, attachments, handback) =>
               command(`/api/sessions/${activeSession.id}/prompt`, {
                 prompt,
                 attachments,
+                ...(handback ? { handback } : {}),
               })
             }
             onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}

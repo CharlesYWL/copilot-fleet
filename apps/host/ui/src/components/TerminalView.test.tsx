@@ -71,6 +71,7 @@ const show = (
   notify = vi.fn(),
   onDraftChange: ComponentProps<typeof TerminalView>["onDraftChange"] = vi.fn(),
   onPrompt: ComponentProps<typeof TerminalView>["onPrompt"] = vi.fn(),
+  maintenanceWorker = false,
 ) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
@@ -79,6 +80,7 @@ const show = (
           session={session(overrides)}
           {...live(events)}
           onPrompt={onPrompt}
+          maintenanceWorker={maintenanceWorker}
           onCancel={vi.fn()}
           onStop={vi.fn()}
           onResume={vi.fn()}
@@ -106,6 +108,34 @@ const streamEvent = (
 });
 
 describe("TerminalView composer", () => {
+  it.each([false, true])(
+    "sends one-turn handback only with explicit selection=%s",
+    async (selected) => {
+      const prompt = vi.fn().mockResolvedValue(true);
+      show(
+        {},
+        { prompt: "Bounded manual turn", attachments: [] },
+        [],
+        vi.fn(),
+        vi.fn(),
+        prompt,
+        true,
+      );
+      const checkbox = screen.getByRole("checkbox", { name: /handback/i });
+      expect((checkbox as HTMLInputElement).checked).toBe(false);
+      if (selected) fireEvent.click(checkbox);
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() =>
+        expect(prompt).toHaveBeenCalledWith(
+          "Bounded manual turn",
+          [],
+          ...(selected ? ["after_turn"] : []),
+        ),
+      );
+      expect((checkbox as HTMLInputElement).checked).toBe(false);
+    },
+  );
+
   it.each(["idle", "running"] as const)(
     "identifies Hermes and only enables its model picker when idle: %s",
     (state) => {

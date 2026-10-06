@@ -351,6 +351,7 @@ export function PrMaintenancePanel({
       ? { ...observedProgress, stage: "checking" as const }
       : observedProgress;
   const graphRecord = currentMaintenance(records);
+  const effective = graphRecord && view?.effectiveStates?.[graphRecord.id];
   const latestBatch = current?.batches.reduce<
     PrMaintenanceRegistration["batches"][number] | undefined
   >(
@@ -545,6 +546,13 @@ export function PrMaintenancePanel({
       aria-label="PR maintenance"
     >
       <h2>PR maintenance</h2>
+      {effective ? (
+        <p role="status">
+          <strong>{effective.status.replaceAll("_", " ")}</strong>
+          {" — "}
+          {effective.reason} {effective.action}
+        </p>
+      ) : null}
       {error ? (
         <p role="alert" className={styles.error}>
           {error}
@@ -553,11 +561,14 @@ export function PrMaintenancePanel({
       {message ? <p role="status">{message}</p> : null}
       {!view && !error ? <p role="status">Loading maintenance status…</p> : null}
       {compact && graphRecord ? (
-        <PrMaintenanceGraph
-          record={graphRecord}
-          nowMs={nowMs}
-          unavailable={Boolean(view?.statusError)}
-        />
+        <details open={!effective}>
+          <summary>Recorded maintenance lifecycle (audit)</summary>
+          <PrMaintenanceGraph
+            record={graphRecord}
+            nowMs={nowMs}
+            unavailable={Boolean(view?.statusError)}
+          />
+        </details>
       ) : null}
       {compact && view && !graphRecord && !error ? (
         <p className={styles.muted}>
@@ -594,8 +605,10 @@ export function PrMaintenancePanel({
             <p>
               Send a normal prompt to the retained worker, or use its Resume button, to
               take manual control. No Release or unattended publication grant is needed.
-              Maintenance stays paused after your turn; pending design decisions still
-              need explicit direction. In-flight or unknown effects must settle first.
+              Ongoing takeover stays paused. Select one-turn handback in the prompt
+              composer to return control only after completion and fresh effect checks.
+              The pending design decisions still need explicit direction. In-flight or
+              unknown effects must settle first.
             </p>
             {current.manualControl && !current.manualControl.endedAt ? (
               <p role="status">
@@ -612,7 +625,7 @@ export function PrMaintenancePanel({
                 <strong>Repair authorization required</strong> — {readOnlyNotice}
               </p>
             ) : null}
-            {!compact ? (
+            {!compact && !effective ? (
               <ol className={styles.rail} aria-label="Maintenance loop stages">
                 {[
                   ...(!loopStages.some((stage) => stage === currentProgress.stage)
@@ -663,17 +676,19 @@ export function PrMaintenancePanel({
                   : " · incomplete or unavailable; prior success is not current validation"}
               </dd>
               <dt>Next action</dt>
-              <dd>{nextActions[currentProgress.stage]}</dd>
+              <dd>{effective?.action ?? nextActions[currentProgress.stage]}</dd>
               <dt>Next check</dt>
               <dd>
-                {[
-                  "human_hold",
-                  "reconciling",
-                  "paused",
-                  "merged",
-                  "closed",
-                  "authorization_required",
-                ].includes(currentProgress.stage) ? (
+                {effective ? (
+                  effective.reason
+                ) : [
+                    "human_hold",
+                    "reconciling",
+                    "paused",
+                    "merged",
+                    "closed",
+                    "authorization_required",
+                  ].includes(currentProgress.stage) ? (
                   "On hold until the current blocker is resolved."
                 ) : currentProgress.stage === "addressing_review" ? (
                   "After the retained worker finishes its repair turn."
@@ -687,7 +702,7 @@ export function PrMaintenancePanel({
                 )}
               </dd>
             </dl>
-            {attention ? (
+            {attention && !effective ? (
               <p className={styles.attention}>
                 <strong>Needs attention: </strong>
                 {attention}
