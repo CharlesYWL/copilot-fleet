@@ -170,6 +170,15 @@ Ordinary ongoing takeover, later Stop, changed pins and released ownership do no
 receive this exception. Accepted pending batches may refresh evidence only when
 the Host proves the exact attempt was never dispatched and has no effects.
 Neither path resets a visit allowance, deadline, grant or accepted worker prompt.
+The selected-handback exception is checked at the exact observation claim's
+command binding, preparation and approval/dispatch rechecks; it never makes general
+paused-job discovery, repair or publication admissible. A pending permission on
+either the retained worker or its owning lead independently holds continuation,
+handback and observation. Review that request in its actual session. Accepted
+worker work remains unchanged across the hold and restart; resolution returns it
+to normal admission, not a new acceptance or allowance. A later Stop remains a
+durable hold after terminal acknowledgement, even when the historical manual-control
+record has no end timestamp.
 
 The proposal tool's `identity` is **not** the discovery `pr` object: pass a complete
 helper's `observation.identity` unchanged, or construct the same strict provider

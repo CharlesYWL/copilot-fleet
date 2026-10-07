@@ -1413,6 +1413,7 @@ export class PrMaintenanceStore {
       this.assertAdmission({ sessionId, action: "prompt" });
       return;
     }
+    this.assertNoPendingPermission(record);
     const reason = this.binding(record);
     if (reason)
       refuse(reason, `Manual control cannot change the retained checkout: ${reason}.`);
@@ -1564,6 +1565,7 @@ export class PrMaintenanceStore {
     decisionId?: string,
     decisionVersion?: number,
   ): void {
+    this.assertNoPendingPermission(record);
     if (record.ownershipReleasedAt)
       refuse("released", "Released maintenance needs explicit new enablement.");
     if (!record.authorization.scope.publicationAuthorized)
@@ -1636,6 +1638,7 @@ export class PrMaintenanceStore {
     record: PrMaintenanceRegistration,
     manual = false,
   ): void {
+    this.assertNoPendingPermission(record);
     const task = this.store.getRun(record.taskId);
     const worker = this.store.getSession(record.workerSessionId);
     const lead = this.store.getSession(record.leadSessionId);
@@ -1721,6 +1724,24 @@ export class PrMaintenanceStore {
       );
   }
 
+  private hasPendingPermission(record: PrMaintenanceRegistration): boolean {
+    return this.store
+      .listPermissionEvents()
+      .some(
+        (event) =>
+          event.type === "permission" &&
+          [record.workerSessionId, record.leadSessionId].includes(event.sessionId),
+      );
+  }
+
+  private assertNoPendingPermission(record: PrMaintenanceRegistration): void {
+    if (this.hasPendingPermission(record))
+      refuse(
+        "permission_pending",
+        "An independent session permission request is pending; review it in the requesting session.",
+      );
+  }
+
   private requestContinuation(
     record: PrMaintenanceRegistration,
     operatorId: string,
@@ -1792,34 +1813,7 @@ export class PrMaintenanceStore {
           continue;
         }
         if (intent.state !== "handback") continue;
-        const worker = this.store.getSession(record.workerSessionId);
-        const command =
-          intent.manualCommandId &&
-          this.manualCommand(record.workerSessionId, intent.manualCommandId);
-        const dispatch = this.store.getSessionDispatchAttempt(record.workerSessionId);
-        const task = this.store.getRun(record.taskId);
-        if (
-          !command ||
-          command.state !== "settled" ||
-          !worker ||
-          worker.state !== "idle" ||
-          worker.stopRequested ||
-          worker.cleanupRequested ||
-          this.store.getSessionTransitionIntent(worker.id) ||
-          worker.dismissed ||
-          !retainedLead ||
-          retainedLead.cleanupRequested ||
-          retainedLead.dismissed ||
-          this.store.getSessionTransitionIntent(retainedLead.id) ||
-          task?.state !== "running" ||
-          dispatch?.commandId !== command.id ||
-          !this.store.hasEventAfter(worker.id, command.eventSeqFrom, "turn_complete") ||
-          prMaintenanceUnsettled(record) ||
-          record.decision?.state === "pending" ||
-          record.pauseReason !== "manual_control" ||
-          record.incidents.some((incident) => !incident.resolvedAt)
-        )
-          continue;
+        if (!this.handbackQuiescent(record)) continue;
         if (!intent.completedAt) {
           intent.completedAt = nowIso();
           record.nextCheckAt = intent.completedAt;
@@ -1882,15 +1876,7 @@ export class PrMaintenanceStore {
         "Independent Stop is still in effect.",
         "Explicitly resume the stopped task/session; recording design direction cannot clear Stop.",
       );
-    if (
-      this.store
-        .listPermissionEvents()
-        .some(
-          (event) =>
-            event.type === "permission" &&
-            [record.workerSessionId, record.leadSessionId].includes(event.sessionId),
-        )
-    )
+    if (this.hasPendingPermission(record))
       return state(
         "needs_decision",
         "An independent session permission request is pending.",
@@ -1908,6 +1894,21 @@ export class PrMaintenanceStore {
         "needs_decision",
         record.decision.proposal,
         "Record bounded direction; select continuation to queue fresh checks within the existing grant.",
+      );
+    if (
+      (record.lifecycle !== "active" && record.pauseReason !== "manual_control") ||
+      (record.manualControl &&
+        !record.manualControl.endedAt &&
+        (["stopped", "completed", "failed"].includes(worker?.state ?? "") ||
+          (record.continuation?.manualCommandId &&
+            record.continuation.state === "cancelled")))
+    )
+      return state(
+        "needs_decision",
+        record.pauseReason !== "manual_control"
+          ? record.pauseReason || record.lifecycle
+          : "Manual control is stopped or its selected handback was cancelled.",
+        "Review the durable hold with the operator; resumption requires explicit consent after settlement.",
       );
     if (record.manualControl && !record.manualControl.endedAt)
       return state(
@@ -1988,6 +1989,7 @@ export class PrMaintenanceStore {
       const intent = record.continuation;
       return (
         intent &&
+        !this.hasPendingPermission(record) &&
         !intent.wakeQueuedAt &&
         (intent.state === "checking" ||
           (intent.state === "handback" &&
@@ -2004,6 +2006,7 @@ export class PrMaintenanceStore {
     if (
       record.continuation?.id !== intentId ||
       record.continuation.wakeQueuedAt ||
+      this.hasPendingPermission(record) ||
       !["checking", "handback"].includes(record.continuation.state) ||
       this.continuationChanged(record)
     )
@@ -2020,19 +2023,44 @@ export class PrMaintenanceStore {
     });
   }
 
-  private observingHandback(record: PrMaintenanceRegistration): boolean {
+  private handbackQuiescent(record: PrMaintenanceRegistration): boolean {
     const worker = this.store.getSession(record.workerSessionId);
+    const lead = this.store.getSession(record.leadSessionId);
+    const command =
+      record.continuation?.manualCommandId &&
+      this.manualCommand(record.workerSessionId, record.continuation.manualCommandId);
     return Boolean(
       record.continuation?.state === "handback" &&
-      record.continuation.completedAt &&
+      !record.ownershipReleasedAt &&
+      record.lifecycle === "paused" &&
       !this.continuationChanged(record) &&
+      !this.hasPendingPermission(record) &&
+      record.authorization.scope.publicationAuthorized &&
       record.pauseReason === "manual_control" &&
+      command &&
+      command.state === "settled" &&
       worker?.state === "idle" &&
       !worker.stopRequested &&
       !worker.cleanupRequested &&
       !worker.dismissed &&
-      !this.store.getSessionTransitionIntent(worker.id),
+      !this.store.getSessionTransitionIntent(worker.id) &&
+      lead &&
+      !lead.stopRequested &&
+      !lead.cleanupRequested &&
+      !lead.dismissed &&
+      !["stopped", "completed", "failed"].includes(lead.state) &&
+      !this.store.getSessionTransitionIntent(lead.id) &&
+      this.store.getRun(record.taskId)?.state === "running" &&
+      this.store.getSessionDispatchAttempt(worker.id)?.commandId === command.id &&
+      this.store.hasEventAfter(worker.id, command.eventSeqFrom, "turn_complete") &&
+      !prMaintenanceUnsettled(record) &&
+      record.decision?.state !== "pending" &&
+      !record.incidents.some((incident) => !incident.resolvedAt),
     );
+  }
+
+  private observingHandback(record: PrMaintenanceRegistration): boolean {
+    return Boolean(record.continuation?.completedAt && this.handbackQuiescent(record));
   }
 
   private applyResume(
@@ -2443,6 +2471,7 @@ export class PrMaintenanceStore {
       if (action.action === "cleanup") return denied("maintenance_retention");
       if (action.leadSessionId && action.leadSessionId !== record.leadSessionId)
         return denied("ownership");
+      if (this.hasPendingPermission(record)) return denied("permission_pending");
       if (record.decision?.state === "pending") return denied("wait_for_human");
       if (
         action.action === "reopen" &&
@@ -2472,7 +2501,12 @@ export class PrMaintenanceStore {
       if (!record.authorization.scope.publicationAuthorized)
         return denied("repair_authorization_required");
       if (action.action === "reopen") continue;
-      if (worker.stopRequested || task.state === "cancelled") return denied("stopped");
+      if (
+        worker.stopRequested ||
+        this.store.getSession(record.leadSessionId)?.stopRequested ||
+        task.state === "cancelled"
+      )
+        return denied("stopped");
       if (["awaiting_approval", "blocked", "failed", "aggregating"].includes(task.state))
         return denied("task_not_eligible");
       if (action.action === "discover") continue;
@@ -2985,6 +3019,7 @@ export class PrMaintenanceStore {
     const lead = this.store.getSession(record.leadSessionId);
     return (
       record.authorization.scope.publicationAuthorized &&
+      !this.hasPendingPermission(record) &&
       record.lifecycle === "active" &&
       !record.ownershipReleasedAt &&
       record.decision?.state !== "pending" &&
@@ -3196,6 +3231,10 @@ export class PrMaintenanceStore {
     record.lastAttemptAt = hostAttemptedAt;
     if (hostLatestAt !== hostAttemptedAt) record.lastAttemptLatestAt = hostLatestAt;
     else delete record.lastAttemptLatestAt;
+    if (this.hasPendingPermission(record)) {
+      delete record.readyFingerprint;
+      return;
+    }
     record.nextCheckAt = new Date(
       Math.max(
         Date.parse(this.routineCheckAt(hostLatestAt)),
@@ -3909,6 +3948,7 @@ export class PrMaintenanceStore {
         this.retained()
           .filter(
             (record) =>
+              !this.hasPendingPermission(record) &&
               (!record.manualControl || Boolean(record.manualControl.endedAt)) &&
               ((record.lifecycle === "active" &&
                 record.authorization.scope.publicationAuthorized) ||
@@ -4015,6 +4055,7 @@ export class PrMaintenanceStore {
   ) {
     return this.store.writeAtomically(() => {
       const record = this.required(recordId, leadSessionId);
+      this.assertNoPendingPermission(record);
       const before = this.wake(leadSessionId, wakeId);
       if (
         !before.visitedIds.includes(recordId) ||
@@ -4106,6 +4147,8 @@ export class PrMaintenanceStore {
         "wake_exhausted",
         "The original helper deadline expired; do not restart it on command creation or approval.",
       );
+    // Only this bound finite-command path may observe a completed selected handback.
+    if (this.observingHandback(record)) return;
     this.assertAdmission({
       action: "discover",
       recordId: record.id,
@@ -4508,6 +4551,7 @@ export class PrMaintenanceStore {
         : undefined;
       const eligible = (record: PrMaintenanceRegistration) =>
         !record.ownershipReleasedAt &&
+        !this.hasPendingPermission(record) &&
         (!record.manualControl ||
           Boolean(record.manualControl.endedAt) ||
           this.observingHandback(record)) &&

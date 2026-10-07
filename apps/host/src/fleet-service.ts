@@ -1484,6 +1484,7 @@ export class FleetService {
         request.sessionId,
         "Session stop or cancellation requested",
       );
+      this.publishSnapshot();
     }
     if (
       request.type === "start_session" ||
@@ -2479,7 +2480,6 @@ export class FleetService {
     };
 
     const afterCommit = (result: WriteResult): void => {
-      if (manualReceiptChanged) this.publishSnapshot();
       if (result.skipped > 0) {
         this.log.warn(
           { sessionId: event.sessionId, skipped: result.skipped },
@@ -2510,6 +2510,20 @@ export class FleetService {
           sessionId: result.session.id,
         });
       }
+      if (
+        manualReceiptChanged ||
+        (result.publish &&
+          ["state", "permission", "permission_result", "agent_session"].includes(
+            event.type,
+          ) &&
+          (this.store.prMaintenance.manualRecord(event.sessionId) ||
+            this.store.prMaintenance.list({
+              leadSessionId: event.sessionId,
+              retainedOnly: true,
+              limit: 1,
+            }).records.length > 0))
+      )
+        this.publishSnapshot();
     };
 
     try {

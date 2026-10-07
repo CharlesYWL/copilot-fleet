@@ -310,6 +310,41 @@ describe("authenticated PR maintenance controls", () => {
     expect(f.store.prMaintenance.get(f.record.id)?.continuation?.state).toBe("checking");
   });
 
+  it.each(["lead", "worker"] as const)(
+    "rejects atomic continuation while the exact %s has an independent permission request",
+    async (owner) => {
+      const f = await continuationFixture();
+      const sessionId = owner === "lead" ? f.leadId : f.worker.id;
+      f.service.handleEvent({
+        eventId: `permission-${owner}`,
+        sessionId,
+        sequence: f.store.maxEventSequence(sessionId) + 1,
+        type: "permission",
+        payload: { requestId: "independent-access", options: [] },
+        createdAt: new Date().toISOString(),
+      });
+      const before = f.store.prMaintenance.get(f.record.id);
+      const task = f.store.getRun(f.run.id);
+      const notes = f.store.listRunNotes(f.run.id);
+      expect(f.store.prMaintenance.effectiveState(before!).status).toBe("needs_decision");
+      const denied = await f.review();
+      expect(denied.statusCode, denied.body).toBe(409);
+      expect(denied.body).toContain("permission");
+      expect(f.store.prMaintenance.get(f.record.id)).toEqual(before);
+      expect(f.store.getRun(f.run.id)).toEqual(task);
+      expect(f.store.listRunNotes(f.run.id)).toEqual(notes);
+      f.service.handleEvent({
+        eventId: `permission-result-${owner}`,
+        sessionId,
+        sequence: f.store.maxEventSequence(sessionId) + 1,
+        type: "permission_result",
+        payload: { requestId: "independent-access", outcome: "deny" },
+        createdAt: new Date().toISOString(),
+      });
+      expect((await f.review()).statusCode).toBe(202);
+    },
+  );
+
   it.each(["stale", "unauthenticated", "expanded", "stop", "callback"] as const)(
     "rolls back the whole direction transaction for %s",
     async (failure) => {
