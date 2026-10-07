@@ -93,7 +93,9 @@ describe("workspace artifact storage", () => {
     });
     expect(available.state).toBe("available");
     const downloaded = await artifacts.read(metadata.id, metadata.artifactId, 0);
-    expect(Buffer.from(downloaded.data, "base64")).toEqual(first);
+    // Not toEqual: that walks a Buffer one byte at a time in JavaScript, most
+    // of a second for this 256 KiB chunk alone and several under a full run.
+    expect(Buffer.from(downloaded.data, "base64").equals(first)).toBe(true);
   });
 
   it("rejects gaps, oversized chunks, and corrupt completion", async () => {

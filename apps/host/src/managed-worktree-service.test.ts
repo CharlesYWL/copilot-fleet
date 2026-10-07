@@ -747,6 +747,88 @@ describe("Host managed workspace orchestration", () => {
     }
   });
 
+  /*
+   * Shutdown settles every in-flight operation so nothing waits forever, and
+   * the Host closes the store in the same turn. Whatever the scheduler chained
+   * onto those operations then runs against a closed database, and a rejection
+   * nobody handles there turns a clean Host stop into a crash.
+   */
+  it.each([
+    [
+      "task workspace creation",
+      async (
+        kit: ReturnType<typeof fixture>,
+      ): Promise<WorktreeOperationRequest["kind"]> => {
+        const run = kit.create();
+        const preparing = kit.service.worktrees.prepare(run.id);
+        kit.service.worktrees.handleResult(
+          kit.node.id,
+          acknowledgement(lastRequest(kit.frames)),
+        );
+        await preparing;
+        kit.service.worktrees.ensureReady(kit.store.getRun(run.id)!);
+        return "create";
+      },
+    ],
+    [
+      "step workspace reservation",
+      async (
+        kit: ReturnType<typeof fixture>,
+      ): Promise<WorktreeOperationRequest["kind"]> => {
+        const run = await readyManaged(kit, false);
+        const step = kit.store.upsertRunStep(run.id, {
+          stepKey: "one",
+          title: "one",
+          prompt: "one",
+          category: "implement",
+          placementId: kit.placement.id,
+          position: 0,
+        });
+        kit.service.worktrees.ensureStepReady(kit.store.getRun(run.id)!, step);
+        return "reserve";
+      },
+    ],
+    [
+      "aggregation",
+      async (
+        kit: ReturnType<typeof fixture>,
+      ): Promise<WorktreeOperationRequest["kind"]> => {
+        const run = await readyManaged(kit);
+        kit.service.worktrees.advanceAggregation(run.id);
+        return "quiesce";
+      },
+    ],
+  ] as const)(
+    "lets an in-flight %s settle quietly when the Host closes",
+    async (_name, start) => {
+      const kit = fixture();
+      // The engine's tick starts by reading the run, exactly as this does.
+      kit.service.attachOrchestration({
+        leadTokens: { mint: () => "" },
+        mcpUrl: () => "",
+        tickRun: (runId) => void kit.store.getRun(runId),
+      });
+      const seen = kit.frames.length;
+      const kind = await start(kit);
+      await expect
+        .poll(() => kit.frames.length > seen && lastRequest(kit.frames).kind)
+        .toBe(kind);
+      const unhandled: unknown[] = [];
+      const listener = (reason: unknown) => unhandled.push(reason);
+      process.on("unhandledRejection", listener);
+      try {
+        resources.splice(0);
+        kit.service.shutdown();
+        kit.store.close();
+        for (let turn = 0; turn < 5; turn += 1)
+          await new Promise((resolve) => setImmediate(resolve));
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", listener);
+      }
+    },
+  );
+
   it("bounds retention to two operations per minute and skips dirty, unknown, unintegrated and unexpired trees", async () => {
     const { create, frames, node, service, store } = fixture();
     const at = Date.now();

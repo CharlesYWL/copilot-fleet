@@ -2656,6 +2656,10 @@ Press **Ctrl+C** to stop both watchers. To focus on an area:
 npm run test:watch -- --project=services apps/host/src/auth/public-signin.test.ts
 ```
 
+Suites that drive real Git, PowerShell or Node processes are in the
+`services-process` project instead, which runs after the others so it does not
+starve them; select it the same way.
+
 For a browser-readable coverage report, run **`npm run test:coverage`** and open
 `coverage/index.html`. Coverage output is local and ignored by Git.
 

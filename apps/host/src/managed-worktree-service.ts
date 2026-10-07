@@ -49,6 +49,11 @@ export class ManagedWorktreeService {
   private readonly placementProbeFailures = new Map<string, string>();
   private readonly workspacePlacementStartedAt = new Map<string, number>();
   private lastSweep = 0;
+  /**
+   * Set by `shutdown()`, which releases waiters while the Host closes the store in the
+   * same turn. Fire-and-forget continuations check it so they never touch a closed store.
+   */
+  private stopped = false;
   private readonly artifacts: WorkspaceArtifactStore;
 
   private deterministicUuid(value: string): string {
@@ -249,8 +254,11 @@ export class ManagedWorktreeService {
     if (binding.initialization === "pending") void this.prepare(run.id);
     if (binding.initialization === "reserved" && !this.pending(run.id)) {
       void this.request(run.id, { kind: "create", actor: "scheduler" })
-        .then(() => this.service.tickRun(run.id))
+        .then(() => {
+          if (!this.stopped) this.service.tickRun(run.id);
+        })
         .catch((error: unknown) => {
+          if (this.stopped) return;
           this.markSetupFailed(
             run.id,
             error instanceof WorktreeConflict ? error.code : "workspace_setup_failed",
@@ -479,8 +487,11 @@ export class ManagedWorktreeService {
         sourcePlacementId: executionPlacement.id,
         expectedVersion: expected?.version ?? 0,
       })
-        .then(() => this.service.tickRun(run.id))
+        .then(() => {
+          if (!this.stopped) this.service.tickRun(run.id);
+        })
         .catch((error: unknown) => {
+          if (this.stopped) return;
           this.store.updateRunStep(step.id, {
             workspaceState: "blocked",
             workspaceError:
@@ -3063,6 +3074,7 @@ export class ManagedWorktreeService {
   }
 
   shutdown(): void {
+    this.stopped = true;
     for (const [id, waiter] of this.waiters) {
       clearTimeout(waiter.timer);
       const operation = this.store.getWorktreeOperation(id);

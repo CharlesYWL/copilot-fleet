@@ -16,6 +16,36 @@ import type * as VirtuosoModule from "react-virtuoso";
 afterEach(cleanup);
 
 /*
+ * jsdom does no layout: every `offsetParent` is null and <body> measures 0x0.
+ * Tabster, which Fluent uses for focus, reads both to decide what can take
+ * focus, so in jsdom nothing can. An opening Dialog then focuses its own surface
+ * instead of its first control, tabster never activates the dialog's modalizer
+ * (that needs focus strictly inside it), and its next sweep, debounced 250ms
+ * after any DOM change, marks the inactive modalizer aria-hidden. The open
+ * dialog's controls drop out of role queries, so whether a test finds them
+ * depends on how soon its query runs (microsoft/fluentui#33897).
+ *
+ * These stand-ins report what a browser does for a rendered element on a page
+ * with no positioned ancestors. Hidden ancestors are recognised by the `hidden`
+ * attribute only; resolving every ancestor's style would cost more than any
+ * test here needs.
+ */
+Object.defineProperty(HTMLElement.prototype, "offsetParent", {
+  configurable: true,
+  get(this: HTMLElement): Element | null {
+    const { body, documentElement } = this.ownerDocument;
+    if (!this.isConnected || this === body || this === documentElement) return null;
+    if (this.closest("[hidden]")) return null;
+    const { display, position } = getComputedStyle(this);
+    return display === "none" || position === "fixed" ? null : body;
+  },
+});
+Object.defineProperty(document.body, "getBoundingClientRect", {
+  configurable: true,
+  value: () => new DOMRect(0, 0, window.innerWidth, window.innerHeight),
+});
+
+/*
  * react-virtuoso decides what to mount from measured layout, and jsdom has none:
  * a list that opens at its newest item renders nothing there at all. Component
  * tests get every item, through the same props, components and scroll element;

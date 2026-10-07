@@ -174,7 +174,10 @@ describe("notification shell integration", () => {
         <Harness />
       </FluentProvider>,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Notify" }));
+    // The notification panel traps focus, so while it is open tabster hides the
+    // rest of the page from role queries; this harness button is kept by reference.
+    const notify = screen.getByRole("button", { name: "Notify" });
+    fireEvent.click(notify);
     act(() => {
       MockWebSocket.instance.send({
         type: "snapshot",
@@ -195,9 +198,10 @@ describe("notification shell integration", () => {
     expect(screen.queryByText("Permission needed")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Dismiss Application error" }));
     expect(screen.queryByText("Offline operation failed")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Notify" }));
+    fireEvent.click(notify);
+    // That outside click closes the panel; the page is shown again on tabster's next pass.
     fireEvent.click(
-      screen.getByRole("button", { name: "Notifications, 1 unread notification" }),
+      await screen.findByRole("button", { name: "Notifications, 1 unread notification" }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Mark all read" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear all" }));

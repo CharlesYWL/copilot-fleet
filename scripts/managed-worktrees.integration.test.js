@@ -16,9 +16,17 @@ import { GitRunner } from "../apps/node/src/git-runner.ts";
 
 const cleanup = [];
 const fetch = globalThis.fetch;
+/*
+ * Each phase is a chain of real Git processes: one managed task makes about 200
+ * Git calls before its worker even starts, and on Windows each call costs
+ * hundreds of milliseconds to launch, more under a parallel suite. The polls
+ * return as soon as the phase lands, so a healthy run pays nothing for this.
+ */
+const PHASE_TIMEOUT_MS = 180_000;
+const TEST_TIMEOUT_MS = 600_000;
 afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
-});
+}, 120_000);
 const git = new GitRunner();
 const gate = () => {
   let release;
@@ -32,7 +40,11 @@ async function localFleet(capable = true) {
   const root = resolve(".mwi-test-work", randomUUID());
   const source = join(root, "source");
   await mkdir(source, { recursive: true });
-  cleanup.push(() => rm(root, { recursive: true, force: true }));
+  // Windows holds a directory briefly after a Git child exits; retry rather
+  // than fail the next test on EBUSY.
+  cleanup.push(() =>
+    rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }),
+  );
   await git.run(source, ["init", "-b", "target"]);
   await git.run(source, ["config", "user.name", "Fleet Smoke"]);
   await git.run(source, ["config", "user.email", "fleet-smoke@example.invalid"]);
@@ -322,7 +334,7 @@ async function localFleet(capable = true) {
 
 describe(
   "managed orchestration local HTTP/WebSocket/Git smoke",
-  { timeout: 180_000 },
+  { timeout: TEST_TIMEOUT_MS },
   () => {
     it("quiesces the managed Node slot after automatic integration completes", async () => {
       const fleet = await localFleet();
@@ -350,7 +362,7 @@ describe(
             if (fleet.failures.length) throw fleet.failures[0];
             return fleet.entered.size;
           },
-          { timeout: 30_000 },
+          { timeout: PHASE_TIMEOUT_MS },
         )
         .toBe(1);
       fleet.release();
@@ -363,7 +375,7 @@ describe(
               current.state === "completed"
             );
           },
-          { timeout: 60_000 },
+          { timeout: PHASE_TIMEOUT_MS },
         )
         .toBe(true);
       const current = (await fleet.request(`/api/runs/${run.id}`)).body.run;
@@ -371,7 +383,7 @@ describe(
         expect((await fleet.action(run.id, "publish-branch")).status).toBe(200);
       await expect
         .poll(async () => (await fleet.request(`/api/runs/${run.id}`)).body.run.state, {
-          timeout: 120_000,
+          timeout: PHASE_TIMEOUT_MS,
         })
         .toBe("completed");
       const store = new FleetStore(join(fleet.root, "host.db"));
@@ -443,26 +455,26 @@ describe(
             if (fleet.failures.length) throw fleet.failures[0];
             return fleet.entered.size;
           },
-          { timeout: 30_000 },
+          { timeout: PHASE_TIMEOUT_MS },
         )
         .toBe(2);
       expect(fleet.maximum()).toBe(2);
       fleet.release();
-      await expect.poll(() => fleet.reviewed.size, { timeout: 90_000 }).toBe(2);
+      await expect.poll(() => fleet.reviewed.size, { timeout: PHASE_TIMEOUT_MS }).toBe(2);
       for (const run of [a, b]) {
         await expect
           .poll(
             async () =>
               (await fleet.request(`/api/runs/${run.id}`)).body.run.workspaceBinding
                 .aggregationPhase,
-            { timeout: 60_000 },
+            { timeout: PHASE_TIMEOUT_MS },
           )
           .toBe("await_publish_approval");
         expect((await fleet.action(run.id, "publish-branch")).status).toBe(200);
       }
       await expect
         .poll(async () => (await fleet.request(`/api/runs/${a.id}`)).body.run.state, {
-          timeout: 60_000,
+          timeout: PHASE_TIMEOUT_MS,
         })
         .toBe("completed");
       const aState = await fleet.state(a.id),
@@ -522,11 +534,11 @@ describe(
       expect(
         (await fleet.request(`/api/runs/${run.id}/approve`, "POST", {})).status,
       ).toBe(200);
-      await expect.poll(() => fleet.entered.size, { timeout: 30_000 }).toBe(1);
+      await expect.poll(() => fleet.entered.size, { timeout: PHASE_TIMEOUT_MS }).toBe(1);
       await expect
         .poll(
           async () => (await fleet.request(`/api/runs/${run.id}`)).body.steps[0]?.state,
-          { timeout: 30_000 },
+          { timeout: PHASE_TIMEOUT_MS },
         )
         .toBe("failed");
       await expect
@@ -535,7 +547,7 @@ describe(
             const current = (await fleet.request(`/api/runs/${run.id}`)).body.run;
             return `${current.state}:${current.workspaceBinding.aggregationState}`;
           },
-          { timeout: 120_000 },
+          { timeout: PHASE_TIMEOUT_MS },
         )
         .toBe("failed:completed");
 

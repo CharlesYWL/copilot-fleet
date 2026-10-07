@@ -1791,6 +1791,9 @@ GitHub 托管的 Actions runner，因此这里已移除 GitHub Actions 工作流
 npm run test:watch -- --project=services apps/host/src/auth/public-signin.test.ts
 ```
 
+驱动真实 Git、PowerShell 或 Node 进程的测试套件属于 `services-process` 项目，它在其他
+项目之后运行，避免挤占它们的资源；选择方式相同。
+
 运行 **`npm run test:coverage`** 后打开 `coverage/index.html`，可在浏览器查看覆盖率。
 这些报告仅保存在本地，并被 Git 忽略。
 

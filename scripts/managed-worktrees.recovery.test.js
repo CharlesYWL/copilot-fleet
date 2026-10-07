@@ -13,15 +13,27 @@ import { GitRunner, parseWorktreeRegistry } from "../apps/node/src/git-runner.ts
 const execute = promisify(execFile);
 const cleanup = [];
 const git = new GitRunner();
+/*
+ * Every step is a chain of real Git processes plus a fresh tsx-compiled Node,
+ * and on Windows each launch costs hundreds of milliseconds, more under a
+ * parallel suite: a case that takes a minute alone must not fail for taking
+ * two under load. A healthy run pays nothing for the headroom.
+ */
+const CHILD_TIMEOUT_MS = 180_000;
+const TEST_TIMEOUT_MS = 600_000;
 afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
-});
+}, 120_000);
 
 async function fixture() {
   const root = resolve(".mwi-test-work", randomUUID());
   const source = join(root, "source");
   await mkdir(source, { recursive: true });
-  cleanup.push(() => rm(root, { recursive: true, force: true }));
+  // Windows holds a directory briefly after a Git child exits; retry rather
+  // than fail the next test on EBUSY.
+  cleanup.push(() =>
+    rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }),
+  );
   await git.run(source, ["init", "-b", "target"]);
   for (const [name, value] of [
     ["user.name", "Fleet Recovery"],
@@ -122,7 +134,12 @@ async function fixture() {
           script,
           JSON.stringify({ directory, operation, mutation, preparation }),
         ],
-        { cwd: process.cwd(), timeout: 60_000, windowsHide: true, maxBuffer: 32_000 },
+        {
+          cwd: process.cwd(),
+          timeout: CHILD_TIMEOUT_MS,
+          windowsHide: true,
+          maxBuffer: 32_000,
+        },
       );
     } catch (error) {
       code = error.code;
@@ -135,7 +152,7 @@ async function fixture() {
   return { source, tree: () => manager.get(treeId), request, crash, act };
 }
 
-describe("real Node process-death recovery", { timeout: 90_000 }, () => {
+describe("real Node process-death recovery", { timeout: TEST_TIMEOUT_MS }, () => {
   it("reconciles create/remove after process death between Git mutation and acknowledgement", async () => {
     const fleet = await fixture();
     await fleet.crash(fleet.request("create"));
