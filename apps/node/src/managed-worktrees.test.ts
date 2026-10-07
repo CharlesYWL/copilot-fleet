@@ -14,7 +14,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NodeCommandSchema,
@@ -118,9 +118,12 @@ async function operation(
   ].includes(kind);
   const normalizedExtra = { ...extra };
   if (integrationOperation) {
+    // Only a Fleet-created `integration-*` workspace may be named as the
+    // target; match its own directory name, since the checkout running the
+    // suite may itself have "integration-" anywhere in its path.
     if (
       typeof normalizedExtra.targetPath === "string" &&
-      !normalizedExtra.targetPath.includes("integration-")
+      !basename(normalizedExtra.targetPath).startsWith("integration-")
     )
       delete normalizedExtra.targetPath;
     normalizedExtra.integrationTargetRef ??= `refs/heads/dev/fleet-test/fleet-${tree.runId.slice(0, 20)}`;
