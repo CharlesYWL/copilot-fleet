@@ -280,9 +280,9 @@ describe("SecurityPanel", () => {
       expect(screen.getByText("client-1")).toBeTruthy();
       expect(
         (
-          screen.getByRole("button", {
+          (await screen.findByRole("button", {
             name: /^erase auth settings$/i,
-          }) as HTMLButtonElement
+          })) as HTMLButtonElement
         ).disabled,
       ).toBe(false);
     });
@@ -590,7 +590,7 @@ describe("SecurityPanel", () => {
         (screen.getByLabelText(/application \(client\) id/i) as HTMLInputElement).value,
       ).toBe(clientId);
       expect(
-        within(screen.getByRole("region", { name: /^this host$/i })).getByText(
+        within(await screen.findByRole("region", { name: /^this host$/i })).getByText(
           "client-1",
         ),
       ).toBeTruthy();
