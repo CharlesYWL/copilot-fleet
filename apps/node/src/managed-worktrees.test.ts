@@ -49,8 +49,11 @@ afterEach(async () => {
   for (const release of releases.splice(0)) release();
   for (const router of routers.splice(0)) await router.stopAll();
   for (const manager of managers.splice(0)) manager.close();
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
-});
+  // Windows holds a directory briefly after a Git child exits; retry rather
+  // than fail the next test on EBUSY.
+  for (const root of roots.splice(0))
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+}, 120_000);
 
 async function fixture(
   checkpoint?: ConstructorParameters<typeof ManagedWorktrees>[0]["checkpoint"],
@@ -342,10 +345,12 @@ async function liveAcpFixture(managed = true) {
   };
 }
 
-// The 120s cases execute 200–250 real Git commands (65–84s on Windows before
-// fixture reductions). Keep ordinary cases at 60s, without mocking policy or
-// revalidation probes or dropping publication safety checks.
-describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
+// The 300s cases execute 200–250 real Git commands (65–84s on Windows before
+// fixture reductions, over 100s on a throttled disk or under the parallel
+// suite); ordinary cases still take 45–60s there. Budget for process launches
+// without mocking policy or revalidation probes or dropping publication safety
+// checks: a healthy run pays nothing for the headroom.
+describe("real Git managed task worktrees", { timeout: 180_000 }, () => {
   it("finalizes an unchanged workspace with ignored output without uploading repository history", async () => {
     const uploadArtifact = vi.fn();
     const { source, manager } = await fixture(undefined, { uploadArtifact });
@@ -757,7 +762,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       state: "ready",
       resultSha: composed.worktree!.composition!.resultSha,
     });
-  }, 120_000);
+  }, 300_000);
 
   it("retains conflicting committed step results in a derived workspace without resetting or cleaning", async () => {
     const { source, manager } = await fixture();
@@ -828,7 +833,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       conflicts: ["same.txt"],
       error: expect.stringContaining("did not reset or clean"),
     });
-  }, 120_000);
+  }, 300_000);
 
   it("composes a clean primary checkout advanced by a read-only predecessor", async () => {
     const { source, manager } = await fixture();
@@ -2213,7 +2218,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect(
       (await git.run(source, ["rev-parse", "--verify", tree.branchRef])).stdout.trim(),
     ).toBe(preview.taskSha);
-  }, 120_000);
+  }, 300_000);
 
   it("refuses detached legacy integration targets outside the managed root", async () => {
     const { root, manager, source } = await fixture();
@@ -2277,7 +2282,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     } finally {
       database.close();
     }
-  }, 120_000);
+  }, 300_000);
 
   it("rejects stale reviewed SHA and target preview; merges only after explicit confirmation", async () => {
     const { manager, source } = await fixture();
@@ -2333,7 +2338,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     await expect(readFile(join(source, "task.txt"), "utf8")).rejects.toThrow();
     expect(await readFile(join(fresh.target.path, "task.txt"), "utf8")).toBe("task");
     expect((await operation(manager, tree, "cleanup")).ok).toBe(false);
-  }, 120_000);
+  }, 300_000);
 
   it("allows unrelated ignored target output but blocks ignored paths the merge would overwrite", async () => {
     const { manager, source } = await fixture();
@@ -2386,7 +2391,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     await expect(
       readFile(join(collisionFixture.source, "ignored.txt"), "utf8"),
     ).resolves.toBe("local generated output\n");
-  }, 120_000);
+  }, 300_000);
 
   it("disables explicitly allowed hooks during Fleet-controlled integration commits", async () => {
     const { manager, source } = await fixture();
@@ -2612,7 +2617,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
         ])
       ).stdout.trim(),
     ).toContain(published.integration!.resultSha);
-  }, 120_000);
+  }, 300_000);
 
   it("does not run post-commit hooks during controlled integration", async () => {
     const { manager, source } = await fixture();
@@ -2774,7 +2779,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       "target",
     );
     expect((await git.run(source, ["remote"])).stdout.trim()).toBe("");
-  }, 120_000);
+  }, 300_000);
 
   it("fails closed on wrong ownership/generation/path and never recreates a manually missing checkout", async () => {
     const { manager, source } = await fixture();
