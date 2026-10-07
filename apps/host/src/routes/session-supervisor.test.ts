@@ -6,6 +6,7 @@ import {
   NODE_ID_HEADER,
   NODE_SECRET_HEADER,
   ORCHESTRATOR_STOP_REASON,
+  SessionEventSchema,
   type NodeCommand,
   type SessionEvent,
 } from "@fleet/protocol";
@@ -255,6 +256,258 @@ async function setup(
 }
 
 describe("trusted supervisor session handoff", () => {
+  it.each(["terminal worker", "terminal worker cold ledger", "manual worker", "lead"])(
+    "streams authoritative permission holds for a %s without publishing stale attempt events",
+    async (path) => {
+      const f = await setup("password", true);
+      if (path === "manual worker")
+        expect((await f.command("prompt")).statusCode).toBe(202);
+      if (!path.endsWith("cold ledger")) f.service.snapshot();
+      const sessionId = path === "lead" ? f.leadId : f.worker.id;
+      const otherSessionId = path === "lead" ? f.worker.id : f.leadId;
+      const record = f.store.prMaintenance.get(f.record.id);
+      const step = f.store.getRunStep(f.step.id);
+      const worker = f.store.getSession(f.worker.id);
+      const sent = [...f.sent];
+      const broadcast = vi.spyOn(f.service, "broadcast");
+      const listener = vi.fn();
+      f.service.onSessionEvent(listener);
+      let sequence = 10;
+      const permissionEvent = (target: string, requestId: string, resolve = false) =>
+        SessionEventSchema.parse({
+          eventId: randomUUID(),
+          sessionId: target,
+          sequence: ++sequence,
+          createdAt: new Date().toISOString(),
+          type: resolve ? "permission_result" : "permission",
+          payload: resolve ? { requestId, outcome: "deny" } : { requestId, options: [] },
+        });
+      const deliver = (event: SessionEvent) => {
+        broadcast.mockClear();
+        listener.mockClear();
+        expect(f.service.handleEvent(event)).toBe(true);
+      };
+      const projected = () => {
+        const snapshots = broadcast.mock.calls
+          .map(([message]) => message)
+          .filter((message) => message.type === "snapshot");
+        expect(snapshots).toHaveLength(1);
+        return snapshots[0]!.data.prMaintenanceTasks?.find(
+          (status) => status.taskId === f.task.id,
+        )?.effective;
+      };
+      const held = async () => {
+        expect(projected()).toMatchObject({
+          status: "needs_decision",
+          reason: expect.stringMatching(/permission/i),
+          action: expect.stringMatching(/permission/i),
+        });
+        expect((await f.command("prompt")).statusCode).toBe(409);
+        expect(f.store.prMaintenance.get(f.record.id)).toEqual(record);
+        expect(f.store.getRunStep(f.step.id)).toEqual(step);
+        expect(f.sent).toEqual(sent);
+      };
+
+      const first = permissionEvent(sessionId, "first");
+      deliver(first);
+      await held();
+      if (path.startsWith("terminal worker")) {
+        expect(broadcast.mock.calls.map(([message]) => message.type)).toEqual([
+          "snapshot",
+        ]);
+        expect(listener).not.toHaveBeenCalled();
+        expect(f.store.getSession(f.worker.id)).toEqual({
+          ...worker,
+          lastActivityAt: expect.any(String),
+        });
+      } else {
+        expect(listener).toHaveBeenCalledWith(first);
+      }
+      deliver(first);
+      expect(broadcast).not.toHaveBeenCalled();
+      expect(listener).not.toHaveBeenCalled();
+      expect(f.sent).toEqual(sent);
+
+      deliver(permissionEvent(sessionId, "second"));
+      await held();
+      deliver(permissionEvent(sessionId, "wrong-request", true));
+      await held();
+      deliver(permissionEvent(otherSessionId, "first", true));
+      await held();
+      deliver(permissionEvent(sessionId, "first", true));
+      await held();
+      const last = permissionEvent(sessionId, "second", true);
+      deliver(last);
+      expect(projected()?.status).toBe(
+        path === "manual worker" ? "running_manually" : "checking",
+      );
+      expect(f.store.prMaintenance.get(f.record.id)).toEqual(record);
+      expect(f.store.getRunStep(f.step.id)).toEqual(step);
+      expect(f.sent).toEqual(sent);
+      deliver(last);
+      deliver(first);
+      expect(broadcast).not.toHaveBeenCalled();
+      expect(
+        f.service
+          .snapshot()
+          .permissionEvents?.filter((event) => event.type === "permission"),
+      ).toEqual([]);
+
+      // A different session's permission is not this registration's authority.
+      const unrelated = f.store.createSession(f.store.listPlacements()[0]!, "unrelated");
+      deliver(permissionEvent(unrelated.id, "first"));
+      expect(broadcast.mock.calls.some(([message]) => message.type === "snapshot")).toBe(
+        false,
+      );
+      expect(
+        f.service
+          .snapshot()
+          .prMaintenanceTasks?.find((status) => status.taskId === f.task.id)?.effective
+          ?.status,
+      ).toBe(path === "manual worker" ? "running_manually" : "checking");
+      if (path.startsWith("terminal worker")) {
+        deliver(
+          SessionEventSchema.parse({
+            eventId: randomUUID(),
+            sessionId,
+            sequence: ++sequence,
+            createdAt: new Date().toISOString(),
+            type: "state",
+            payload: { state: "running" },
+          }),
+        );
+        expect(broadcast).not.toHaveBeenCalled();
+        expect(listener).not.toHaveBeenCalled();
+        expect(f.store.getSession(f.worker.id)).toEqual({
+          ...worker,
+          lastActivityAt: expect.any(String),
+        });
+      }
+    },
+  );
+
+  function observeHandback(f: Awaited<ReturnType<typeof setup>>) {
+    const record = f.store.prMaintenance.get(f.record.id)!;
+    return f.store.prMaintenance.checkpoint(f.leadId, record.id, record.version, {
+      kind: "observation",
+      observation: {
+        attemptedAt: new Date().toISOString(),
+        complete: true,
+        identity: record.identity,
+        headSha,
+        baseSha: "b".repeat(40),
+        state: "open",
+        snapshotId: `manual-${Date.now()}`,
+        fingerprint: "manual-current",
+        evidence: "Fresh complete post-turn provider reconciliation",
+        sources: [source],
+      },
+    });
+  }
+
+  it("hands back only the selected completed turn after quiescence and fresh reconciliation, without renewing its grant", async () => {
+    const f = await setup("password", true);
+    const before = observeHandback(f);
+    const payload = {
+      prompt: "Repair the bounded defect then hand back.",
+      handback: "after_turn",
+      operationId: randomUUID(),
+    };
+    const response = await f.command("prompt", payload);
+    expect(response.statusCode, response.body).toBe(202);
+    const intent = f.store.prMaintenance.get(f.record.id)!.continuation!;
+    expect(intent).toMatchObject({
+      state: "handback",
+      operatorId: expect.any(String),
+      manualCommandId: expect.any(String),
+    });
+    expect((await f.command("prompt", payload)).statusCode).toBe(409);
+    expect(f.sent.filter((entry) => entry.type === "prompt")).toHaveLength(1);
+    const engine = new OrchestratorEngine(f.service);
+    f.event("state", { state: "idle" });
+    engine.tick();
+    expect(
+      f.store.prMaintenance.get(f.record.id)!.continuation?.completedAt,
+    ).toBeUndefined();
+    f.event("state", { state: "running" });
+    f.event("turn_complete", { reason: "end_turn" });
+    engine.tick();
+    expect(
+      f.store.prMaintenance.get(f.record.id)!.manualControl?.endedAt,
+    ).toBeUndefined();
+    f.event("state", { state: "idle" });
+    engine.tick();
+    expect(
+      f.store.prMaintenance.get(f.record.id)!.continuation?.completedAt,
+    ).toBeDefined();
+    expect(
+      f.store.prMaintenance.get(f.record.id)!.manualControl?.endedAt,
+    ).toBeUndefined();
+    observeHandback(f);
+    engine.tick();
+    const handedBack = f.store.prMaintenance.get(f.record.id)!;
+    expect(handedBack.lifecycle).toBe("active");
+    expect(handedBack.manualControl?.endedAt).toBeDefined();
+    expect(handedBack.continuation?.state).toBe("checking");
+    expect(handedBack.authorization).toEqual(before.authorization);
+    expect(handedBack.counters).toEqual(before.counters);
+    expect(handedBack.renewedAt).toBe(before.renewedAt);
+    engine.tick();
+    expect(f.sent.filter((entry) => entry.type === "prompt")).toHaveLength(1);
+  });
+
+  it.each(["stop", "pause", "task", "worker"] as const)(
+    "keeps a selected handback held after a later %s change",
+    async (change) => {
+      const f = await setup("password", true);
+      observeHandback(f);
+      expect(
+        (await f.command("prompt", { prompt: "One turn", handback: "after_turn" }))
+          .statusCode,
+      ).toBe(202);
+      if (change === "stop")
+        f.store.setSessionControls(f.worker.id, { stopRequested: true });
+      if (change === "pause") {
+        const record = f.store.prMaintenance.get(f.record.id)!;
+        f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          { action: "pause", reason: "Independent operator hold" },
+          "operator",
+        );
+      }
+      if (change === "task")
+        f.store.updateRun(f.task.id, { objective: "A different objective" });
+      if (change === "worker")
+        f.event("agent_session", { agentSessionId: "different-conversation" });
+      f.settle();
+      const engine = new OrchestratorEngine(f.service);
+      engine.tick();
+      expect(
+        f.store.prMaintenance.get(f.record.id)!.manualControl?.endedAt,
+      ).toBeUndefined();
+      expect(f.store.prMaintenance.get(f.record.id)!.continuation?.state).toBe(
+        "cancelled",
+      );
+    },
+  );
+
+  it("binds one-turn consent to its operation digest and rejects an unauthenticated handback", async () => {
+    const f = await setup("password", true);
+    observeHandback(f);
+    const payload = {
+      prompt: "One turn",
+      operationId: randomUUID(),
+      handback: "after_turn",
+    };
+    expect((await f.command("prompt", payload)).statusCode).toBe(202);
+    expect(
+      (await f.command("prompt", { ...payload, handback: "ongoing" })).statusCode,
+    ).toBe(409);
+    expect((await f.command("prompt", payload, {})).statusCode).toBe(401);
+    expect(f.sent.filter((entry) => entry.type === "prompt")).toHaveLength(1);
+  });
+
   it.each(["subscription", "restart", "failure"] as const)(
     "never settles a stopped repair with a later manual %s event",
     async (path) => {

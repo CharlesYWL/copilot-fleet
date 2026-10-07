@@ -800,6 +800,7 @@ export const PrMaintenanceOperatorActionSchema = z.discriminatedUnion("action", 
       decisionVersion: z.number().int().positive(),
       direction: text,
       resume: z.boolean().default(true),
+      continueEligible: z.boolean().default(false),
     })
     .strict(),
 ]);
@@ -816,6 +817,7 @@ export const PrMaintenanceManualCommandSchema = z
     eventSeqFrom: count,
     state: z.enum(["unknown", "accepted", "settled", "rejected"]),
     createdAt: time,
+    handback: z.enum(["ongoing", "after_turn"]).optional(),
   })
   .strict();
 export type PrMaintenanceManualCommand = z.infer<typeof PrMaintenanceManualCommandSchema>;
@@ -856,6 +858,42 @@ const pauseOriginSchema = z
   })
   .strict();
 
+const continuationSchema = z
+  .object({
+    id,
+    operatorId: id,
+    requestedAt: time,
+    expectedVersion: z.number().int().positive(),
+    authorityHash: id,
+    headSha: sha,
+    state: z.enum(["checking", "handback", "consumed", "cancelled"]),
+    manualCommandId: id.optional(),
+    completedAt: time.optional(),
+    wakeQueuedAt: time.optional(),
+    settledAt: time.optional(),
+    reason: text.optional(),
+    batchId: id.optional(),
+  })
+  .strict();
+
+export const PrMaintenanceEffectiveStateSchema = z
+  .object({
+    status: z.enum([
+      "checking",
+      "queued",
+      "running_manually",
+      "running",
+      "needs_decision",
+      "released",
+    ]),
+    reason: z.string(),
+    action: z.string(),
+  })
+  .strict();
+export type PrMaintenanceEffectiveState = z.infer<
+  typeof PrMaintenanceEffectiveStateSchema
+>;
+
 export const PrMaintenanceRegistrationSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -878,6 +916,8 @@ export const PrMaintenanceRegistrationSchema = z
     pausedNoticeAt: time.optional(),
     ownershipReleasedAt: time.optional(),
     retentionReleasedBy: id.optional(),
+    continuation: continuationSchema.optional(),
+    continuationHistory: z.array(continuationSchema).max(100).optional(),
     manualControl: z
       .object({
         operatorId: id,
@@ -1164,9 +1204,11 @@ export function currentPrMaintenance<
 export const PrMaintenanceTaskStatusSchema = z.object({
   taskId: id,
   recordId: id,
+  workerSessionId: id.optional(),
   stage: PrMaintenanceStageSchema,
   prUrl: z.string().min(1),
   manualControl: z.boolean(),
+  effective: PrMaintenanceEffectiveStateSchema.optional(),
   /** After this, a stage that relied on the last observation is only "checking". */
   freshUntil: time.optional(),
 });
@@ -1188,7 +1230,7 @@ export function prMaintenanceTaskStatuses(
     byTask.set(record.taskId, [...(byTask.get(record.taskId) ?? []), record]);
   return [...byTask.values()].flatMap((taskRecords) => {
     const record = currentPrMaintenance(taskRecords);
-    if (!record || record.ownershipReleasedAt) return [];
+    if (!record) return [];
     const { stage } = prMaintenanceProgress(record, nowMs);
     const currentUntil = prMaintenanceEvidenceCurrentUntil(record);
     const freshUntil =
@@ -1199,6 +1241,7 @@ export function prMaintenanceTaskStatuses(
       {
         taskId: record.taskId,
         recordId: record.id,
+        workerSessionId: record.workerSessionId,
         stage,
         prUrl: prMaintenanceUrl(record.identity),
         manualControl: Boolean(record.manualControl && !record.manualControl.endedAt),

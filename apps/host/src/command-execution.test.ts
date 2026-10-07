@@ -30,6 +30,8 @@ import {
   PromptSchema,
   type PrMaintenanceIdentity,
   type PrMaintenanceObservation,
+  type SessionEvent,
+  PrMaintenanceObservationSchema,
   CommandExecutionPageSchema,
 } from "@fleet/protocol";
 import type { AuthenticatedChannel } from "@fleet/protocol/node-auth";
@@ -2561,6 +2563,129 @@ describe("durable command output", () => {
 });
 
 describe("PR maintenance with durable commands", () => {
+  it("retains authenticated continuation offline, queues it once while busy, and recovers the same delivery after restart", () => {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-continuation-"));
+    directories.push(directory);
+    const path = join(directory, "host.sqlite");
+    const f = setup(path);
+    let record = enableMaintenance(f);
+    record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+      kind: "observation",
+      observation: PrMaintenanceObservationSchema.parse({
+        attemptedAt: new Date().toISOString(),
+        complete: true,
+        identity: record.identity,
+        snapshotId: "before-consent",
+        headSha: "a".repeat(40),
+        baseSha: "b".repeat(40),
+        state: "open",
+        fingerprint: "before-consent",
+        checksComplete: true,
+        reviewsComplete: true,
+        evidence: "Isolated provider fixture.",
+      }),
+    });
+    record = f.store.prMaintenance.holdForDecision(
+      f.lead.id,
+      record.id,
+      record.version,
+      {
+        id: "decision",
+        version: 1,
+        proposal: "Keep API?",
+        scope: "Existing contract",
+        headSha: "a".repeat(40),
+      },
+      () => f.store.updateRun(record.taskId, { state: "awaiting_human" }),
+    );
+    record = f.store.prMaintenance.operatorAction(
+      record.id,
+      record.version,
+      {
+        action: "direction",
+        decisionId: "decision",
+        decisionVersion: 1,
+        direction: "Keep the approved API; repair within the existing grant.",
+        resume: true,
+        continueEligible: true,
+      },
+      "operator",
+      () => f.store.updateRun(record.taskId, { state: "running" }),
+    );
+    const offline = vi.spyOn(f.service, "nodeSocket").mockReturnValue(undefined);
+    const engine = new OrchestratorEngine(f.service);
+    engine.tick();
+    expect(f.store.commands.prompts(f.lead.id)).toHaveLength(0);
+    expect(f.store.prMaintenance.get(record.id)!.continuation).toEqual(
+      record.continuation,
+    );
+    offline.mockRestore();
+    f.store.transitionSession(f.lead.id, "running");
+    const enqueue = vi
+      .spyOn(f.service.commands, "queueLeadPrompt")
+      .mockImplementationOnce(() => {
+        throw new Error("Fixture queue unavailable");
+      });
+    expect(() => engine.tick()).toThrow("Fixture queue unavailable");
+    expect(f.store.commands.prompts(f.lead.id)).toHaveLength(0);
+    expect(f.store.prMaintenance.get(record.id)!.continuation).toEqual(
+      record.continuation,
+    );
+    enqueue.mockRestore();
+    engine.tick();
+    engine.tick();
+    const queued = f.store.commands
+      .prompts(f.lead.id)
+      .filter((entry) => entry.delivery.prompt.includes(record.continuation!.id));
+    expect(queued).toHaveLength(1);
+    const delivery = queued[0]!.delivery;
+    expect(
+      f.frames.filter(
+        (frame) =>
+          frame.type === "deliver_lead_prompt" &&
+          frame.delivery.deliveryId === delivery.deliveryId,
+      ),
+    ).toHaveLength(0);
+    const restored = open(path);
+    expect(
+      restored.prMaintenance.get(record.id)!.continuation?.wakeQueuedAt,
+    ).toBeTruthy();
+    expect(restored.commands.prompt(delivery.deliveryId)!.delivery).toEqual(delivery);
+    const restarted = new FleetService(restored, log, "test");
+    restarted.attachNode(f.node.id, f.service.nodeSocket(f.node.id)!);
+    restarted.commands.nodeReady(f.node.id, {
+      capabilities,
+      commandExecution: readiness,
+    });
+    restored.transitionSession(f.lead.id, "idle");
+    const restartedEngine = new OrchestratorEngine(restarted);
+    restartedEngine.tick();
+    expect(
+      restarted.commands.handleNodeMessage(f.node.id, {
+        type: "lead_prompt_receipt",
+        receipt: nativeReceipt({
+          deliveryId: delivery.deliveryId,
+          sessionId: f.lead.id,
+          state: "accepted",
+          at: new Date().toISOString(),
+        }),
+      }),
+    ).toBe(true);
+    restartedEngine.tick();
+    restarted.commands.pumpLead(f.lead.id);
+    expect(
+      f.frames.filter(
+        (frame) =>
+          frame.type === "deliver_lead_prompt" &&
+          frame.delivery.deliveryId === delivery.deliveryId,
+      ),
+    ).toHaveLength(1);
+    expect(restored.prMaintenance.get(record.id)!.authorization).toEqual(
+      record.authorization,
+    );
+    expect(restored.prMaintenance.get(record.id)!.counters).toEqual(record.counters);
+  });
+
   function enableMaintenance(
     f: ReturnType<typeof setup>,
     identity?: PrMaintenanceIdentity,
@@ -2767,12 +2892,58 @@ describe("PR maintenance with durable commands", () => {
       outboundMs?: number;
       approvalDelay?: number;
       commandDelay?: number;
+      handback?: boolean;
+      deferPreparation?: boolean;
     } = {},
   ) {
     if (timing.preparationMs || timing.approvalDelay || timing.commandDelay)
       vi.spyOn(performance, "now").mockImplementation(() => Date.now());
     const f = setup(path);
-    const record = enableMaintenance(f, identity);
+    let record = enableMaintenance(f, identity);
+    if (timing.handback) {
+      record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "observation",
+        observation: {
+          attemptedAt: new Date().toISOString(),
+          complete: true,
+          identity,
+          headSha: "a".repeat(40),
+          baseSha: "b".repeat(40),
+          state: "open",
+          snapshotId: "before-manual",
+          fingerprint: "before-manual",
+          evidence: "Fresh synthetic evidence before selected manual control.",
+        },
+      });
+      expect(
+        f.service.promptSession(
+          record.workerSessionId,
+          {
+            prompt: "Inspect the existing invariant.",
+            attachments: [],
+            operationId: randomUUID(),
+            handback: "after_turn",
+          },
+          "operator",
+        ),
+      ).toEqual({ ok: true });
+      for (const event of [
+        { type: "state", payload: { state: "running" } },
+        { type: "turn_complete", payload: {} },
+        { type: "state", payload: { state: "idle" } },
+      ] as const)
+        f.service.handleEvent({
+          ...event,
+          eventId: randomUUID(),
+          sessionId: record.workerSessionId,
+          sequence: f.store.maxEventSequence(record.workerSessionId) + 1,
+          createdAt: new Date().toISOString(),
+        });
+      f.store.prMaintenance.reconcileContinuations();
+      record = f.store.prMaintenance.get(record.id)!;
+      expect(record.continuation?.completedAt).toBeDefined();
+      expect(record.manualControl?.endedAt).toBeUndefined();
+    }
     const helper = f.store.createPlacement(
       f.store.createWorkspace("Observation helper", "").id,
       f.node.id,
@@ -2857,7 +3028,7 @@ describe("PR maintenance with durable commands", () => {
       .update(commandDigestPayload(descriptor))
       .digest("hex");
     if (timing.preparationMs) vi.setSystemTime(Date.now() + timing.preparationMs);
-    const prepared = f.prepare(pending, descriptor);
+    const prepared = timing.deferPreparation ? pending : f.prepare(pending, descriptor);
     if (timing.approvalDelay) vi.setSystemTime(Date.now() + timing.approvalDelay);
     const execution = approve ? f.approve(prepared) : prepared;
     expect(leadReceipt(first.delivery.deliveryId, "settled")).toBe(true);
@@ -2920,6 +3091,7 @@ describe("PR maintenance with durable commands", () => {
       record,
       first,
       execution,
+      descriptor,
       claim: JSON.parse(claim.text),
       call,
       connect,
@@ -3458,6 +3630,141 @@ describe("PR maintenance with durable commands", () => {
       ).toBeUndefined();
     },
   );
+  it("reconciles selected handback through the real finite command and receipt path", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand(":memory:", true, githubIdentity, 0, {
+      handback: true,
+    });
+    const before = h.f.store.prMaintenance.get(h.record.id)!;
+    vi.setSystemTime(Date.now() + COMMAND_LIMITS.clockDriftMs + 1);
+    expect(before.lifecycle).toBe("paused");
+    expect(before.manualControl?.endedAt).toBeUndefined();
+    expect(
+      h.f.store.prMaintenance.admission({
+        action: "discover",
+        recordId: before.id,
+        leadSessionId: h.f.lead.id,
+      }).allowed,
+    ).toBe(false);
+    const { cli, result, stdout } = nativeGithubResult(
+      {
+        schemaVersion: 1,
+        generation: before.generation,
+        pr: before.identity,
+        budget: {
+          maxRequests: 39,
+          maxBytes: 1_048_576,
+          deadlineAt: h.claim.observationAllowance.deadlineAt,
+        },
+      },
+      0,
+      { started: Date.now(), nodeOffset: 0 },
+    );
+    expect(cli.status, cli.stdout).toBe(0);
+    h.finish(result, {}, stdout);
+    h.completionTurn();
+    const saved = await h.call(
+      "fleet_checkpoint_pr_maintenance",
+      h.checkpoint(result.observation),
+    );
+    expect(saved.ok, saved.text).toBe(true);
+    expect(
+      h.f.store.prMaintenance.get(before.id)?.manualControl?.endedAt,
+    ).toBeUndefined();
+    h.f.store.prMaintenance.reconcileContinuations();
+    expect(h.f.store.prMaintenance.get(before.id)).toMatchObject({
+      lifecycle: "active",
+      continuation: { state: "checking" },
+      authorization: before.authorization,
+      counters: before.counters,
+      renewedAt: before.renewedAt,
+    });
+    expect(h.f.store.prMaintenance.get(before.id)?.manualControl?.endedAt).toBeDefined();
+    const wake = h.f.store.prMaintenance.beginWake(
+      h.f.lead.id,
+      h.first.delivery.deliveryId,
+    );
+    expect(wake.requests).toBe(39);
+    expect(wake.observationClaims[0]).toMatchObject({
+      executionId: h.execution.id,
+      attemptId: h.execution.attemptId,
+      deadlineAt: h.claim.observationAllowance.deadlineAt,
+    });
+  });
+
+  it.each(
+    (["preparation", "approval"] as const).flatMap((stage) =>
+      (
+        [
+          "stop",
+          "native",
+          "lead-permission",
+          "worker-permission",
+          "busy",
+          "uncertain",
+        ] as const
+      ).map((hold) => ({ stage, hold })),
+    ),
+  )("rechecks selected handback at $stage after $hold", async ({ stage, hold }) => {
+    const h = await observationCommand(":memory:", false, githubIdentity, 0, {
+      handback: true,
+      deferPreparation: stage === "preparation",
+    });
+    const record = h.f.store.prMaintenance.get(h.record.id)!;
+    const workerId = record.workerSessionId;
+    const wakeBefore = h.f.store.prMaintenance.beginWake(
+      h.f.lead.id,
+      h.first.delivery.deliveryId,
+    );
+    const event = (
+      sessionId: string,
+      type: SessionEvent["type"],
+      payload: Record<string, unknown>,
+    ) =>
+      h.f.service.handleEvent({
+        eventId: randomUUID(),
+        sessionId,
+        type,
+        payload,
+        sequence: h.f.store.maxEventSequence(sessionId) + 1,
+        createdAt: new Date().toISOString(),
+      });
+    if (hold === "stop")
+      h.f.service.dispatch(h.f.node.id, { type: "stop", sessionId: workerId });
+    if (hold === "native")
+      event(workerId, "agent_session", { agentSessionId: "different-native" });
+    if (hold.endsWith("permission"))
+      event(hold === "lead-permission" ? h.f.lead.id : workerId, "permission", {
+        requestId: "independent-access",
+        options: [],
+      });
+    if (hold === "busy") event(workerId, "state", { state: "running" });
+    if (hold === "uncertain")
+      h.f.store.prMaintenance.checkpoint(h.f.lead.id, record.id, record.version, {
+        kind: "observation",
+        observation: {
+          attemptedAt: new Date().toISOString(),
+          complete: false,
+          failure: "incomplete",
+          helperState: { error: { code: "ambiguous_effect" } },
+          evidence: "A correlated external effect remains unconfirmed.",
+        },
+      });
+    const starts = () =>
+      h.f.frames.filter((frame) => frame.type === "start_command_execution");
+    expect(starts()).toHaveLength(0);
+    if (stage === "preparation")
+      expect(h.f.prepare(h.execution, h.descriptor).state).toBe("failed");
+    else expect(() => h.f.approve(h.execution)).toThrow();
+    expect(starts()).toHaveLength(0);
+    expect(
+      h.f.store.prMaintenance.get(record.id)?.manualControl?.endedAt,
+    ).toBeUndefined();
+    expect(
+      h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId),
+    ).toEqual(wakeBefore);
+  });
+
   async function checkpointNativeAfterRestart(
     h: Awaited<ReturnType<typeof observationCommand>>,
     path: string,

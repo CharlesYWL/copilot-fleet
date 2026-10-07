@@ -191,6 +191,7 @@ export class OrchestratorEngine {
   /** Advances every run that is not already finished. */
   tick(nowMs = Date.now()): void {
     this.service.commands.tick(nowMs);
+    if (this.store.prMaintenance.reconcileContinuations()) this.service.publishSnapshot();
     this.service.cancelPausedPrMaintenance(new Date(nowMs).toISOString());
     this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
@@ -212,6 +213,7 @@ export class OrchestratorEngine {
     // Requests of runs that just closed, and expiry, are settled on every sweep.
     this.resume.reconcile(nowMs);
     this.wakeMaintenanceRecovery(nowMs);
+    this.wakeMaintenanceContinuations(nowMs);
     this.remindIdleLeads(nowMs);
   }
 
@@ -839,6 +841,53 @@ export class OrchestratorEngine {
         this.promptedThisTick.add(lead.id);
         this.service.commands.pumpLead(lead.id);
       }
+    }
+  }
+
+  private wakeMaintenanceContinuations(nowMs: number): void {
+    for (const record of this.store.prMaintenance.pendingContinuationWakes()) {
+      const intent = record.continuation!;
+      const lead = this.store.getSession(record.leadSessionId);
+      if (
+        !lead ||
+        lead.stopRequested ||
+        lead.cleanupRequested ||
+        lead.dismissed ||
+        terminalSessionStates.has(lead.state) ||
+        this.store.getSessionTransitionIntent(lead.id) ||
+        !this.service.commands.durableLead(lead.id)
+      )
+        continue;
+      const prompt = [
+        `Authenticated bounded continuation ${intent.id} for maintenance record ${record.id}, task ${record.taskId}.`,
+        intent.state === "handback"
+          ? "Selected manual turn has completed. Reconcile its exact execution and effects read-only; the Host alone decides when quiescent handback is safe. Do not dispatch while manual control is active."
+          : "Read the retained record and claim the existing bounded maintenance visit. Refresh provider evidence before preparing or retrying the exact retained-worker batch.",
+        record.decision?.state === "directed"
+          ? `Operator direction: ${record.decision.direction}`
+          : "",
+        "Reuse the retained worker, immutable accepted prompt and existing grant. No replacement, new rights, budget reset, merge or autocomplete. Independent Stop, access, identity and unresolved-effect holds win.",
+      ]
+        .filter(Boolean)
+        .join("\n");
+      const queued = this.store.writeAtomically(() => {
+        if (
+          !this.store.prMaintenance.markContinuationWake(
+            record.id,
+            intent.id,
+            new Date(nowMs).toISOString(),
+          )
+        )
+          return false;
+        this.service.commands.queueLeadPrompt(
+          lead.id,
+          prompt,
+          `maintenance-continuation:${intent.id}:${intent.state}`,
+        );
+        return true;
+      });
+      if (queued && this.service.commands.durableLead(lead.id))
+        this.service.commands.pumpLead(lead.id);
     }
   }
 

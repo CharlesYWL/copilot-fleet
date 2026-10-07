@@ -81,6 +81,7 @@ const maintenanceVisualState: Record<PrMaintenanceStage, StatusState> = {
 };
 
 export function maintenanceStatusLabel(status: PrMaintenanceTaskStatus): string {
+  if (status.effective) return `PR · ${status.effective.status.replaceAll("_", " ")}`;
   return `PR · ${status.manualControl ? "Manual control" : maintenanceStageLabels[status.stage]}`;
 }
 
@@ -92,6 +93,21 @@ export function maintenanceStatusLabel(status: PrMaintenanceTaskStatus): string 
  * which one is blocking an agent right now.
  */
 export function runVisual(model: RunViewModel): StatusDescriptor {
+  if (model.maintenance?.effective) {
+    const effective = model.maintenance.effective.status;
+    return {
+      ...statusDescriptor(
+        effective === "needs_decision"
+          ? "waiting-for-permission"
+          : effective === "released"
+            ? "stopped"
+            : effective === "running" || effective === "running_manually"
+              ? "running"
+              : "idle",
+      ),
+      label: maintenanceStatusLabel(model.maintenance),
+    };
+  }
   if ((model.stoppingSteps ?? 0) > 0) {
     return {
       ...statusDescriptor("stopping"),

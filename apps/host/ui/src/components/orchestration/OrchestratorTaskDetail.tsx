@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Button,
+  Checkbox,
   Dialog,
   DialogActions,
   DialogBody,
@@ -329,6 +330,7 @@ export const OrchestratorTaskDetail = ({
   const [reviewContext, setReviewContext] = useState<ReviewContext>();
   const [reopenNote, setReopenNote] = useState("");
   const [note, setNote] = useState("");
+  const [continueEligible, setContinueEligible] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState("");
   const [freshnessRevision, setFreshnessRevision] = useState(0);
@@ -392,6 +394,7 @@ export const OrchestratorTaskDetail = ({
   const reviewUnavailable = !maintenance || Boolean(maintenance.statusError);
 
   const openReview = () => {
+    setContinueEligible(false);
     setReviewContext({
       taskId: run.id,
       reviewSeq: run.reviewSeq,
@@ -413,7 +416,10 @@ export const OrchestratorTaskDetail = ({
     setBusy(true);
     try {
       const ok = reviewContext.reference
-        ? await onReview(false, note.trim(), reviewContext.reference)
+        ? await onReview(false, note.trim(), {
+            ...reviewContext.reference,
+            ...(continueEligible ? { continueEligible } : {}),
+          })
         : await onReview(approved, note.trim());
       if (ok) {
         setReviewOpen(false);
@@ -648,6 +654,25 @@ export const OrchestratorTaskDetail = ({
                     applies only to this exact proposal; it does not resume a stopped
                     worker, resolve defects, or merge the PR.
                   </p>
+                  <Checkbox
+                    checked={continueEligible}
+                    disabled={busy || reviewChanged || !maintenance?.canAuthorize}
+                    onChange={(_, data) => setContinueEligible(data.checked === true)}
+                    label="Continue already-authorized work after recording this direction"
+                  />
+                  <p>
+                    This queues fresh checks using the same worker and grant, without
+                    resetting budgets. Independent Stop, access holds and ongoing manual
+                    takeover are not cleared. If a hold prevents continuation, neither
+                    direction nor continuation is saved.
+                  </p>
+                  {maintenanceHold &&
+                  maintenance?.effectiveStates?.[maintenanceHold.id] ? (
+                    <p role="status">
+                      Current hold:{" "}
+                      {maintenance.effectiveStates[maintenanceHold.id]!.reason}
+                    </p>
+                  ) : null}
                 </>
               ) : null}
               {reviewContext?.body ? (
@@ -705,7 +730,11 @@ export const OrchestratorTaskDetail = ({
                 }
                 onClick={() => void answer(false)}
               >
-                {reviewContext?.reference ? "Send back with instructions" : "Send back"}
+                {reviewContext?.reference
+                  ? continueEligible
+                    ? "Direct and continue"
+                    : "Send back with instructions"
+                  : "Send back"}
               </Button>
             </DialogActions>
           </DialogBody>

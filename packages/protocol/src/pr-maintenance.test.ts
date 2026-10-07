@@ -293,7 +293,7 @@ describe("PR maintenance wire schemas", () => {
       );
     });
 
-    it("summarizes each task's current retained maintenance for task lists", () => {
+    it("summarizes retained workers and Released history truthfully for task lists", () => {
       const now = Date.parse(at);
       const ready = base();
       ready.readyFingerprint = observation.fingerprint;
@@ -311,14 +311,24 @@ describe("PR maintenance wire schemas", () => {
         {
           taskId: "task",
           recordId: "job",
+          workerSessionId: "worker",
           stage: "ready",
           prUrl: "https://github.com/example/repo/pull/1",
           manualControl: false,
           freshUntil: "2026-09-18T00:30:00.000Z",
         },
         {
+          taskId: "released-task",
+          recordId: "released",
+          workerSessionId: "worker",
+          stage: "released",
+          prUrl: "https://github.com/example/repo/pull/1",
+          manualControl: false,
+        },
+        {
           taskId: "manual-task",
           recordId: "manual",
+          workerSessionId: "worker",
           stage: "paused",
           prUrl: "https://github.com/example/repo/pull/1",
           manualControl: true,

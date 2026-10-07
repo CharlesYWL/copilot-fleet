@@ -162,6 +162,24 @@ command evidence and already-saved attempts remain readable under existing reten
 Unbound historical commands cannot acquire this authority retroactively. Same-turn
 non-command observations retain the original claimed-visit checkpoint contract.
 
+An explicitly selected one-turn handback has a narrow Host-owned exception:
+after its correlated manual command completes and settles, read-only observations
+may reconcile that same pinned registration while manual control remains held.
+No repair dispatch is admitted until quiescence and effect settlement are proven.
+Ordinary ongoing takeover, later Stop, changed pins and released ownership do not
+receive this exception. Accepted pending batches may refresh evidence only when
+the Host proves the exact attempt was never dispatched and has no effects.
+Neither path resets a visit allowance, deadline, grant or accepted worker prompt.
+The selected-handback exception is checked at the exact observation claim's
+command binding, preparation and approval/dispatch rechecks; it never makes general
+paused-job discovery, repair or publication admissible. A pending permission on
+either the retained worker or its owning lead independently holds continuation,
+handback and observation. Review that request in its actual session. Accepted
+worker work remains unchanged across the hold and restart; resolution returns it
+to normal admission, not a new acceptance or allowance. A later Stop remains a
+durable hold after terminal acknowledgement, even when the historical manual-control
+record has no end timestamp.
+
 The proposal tool's `identity` is **not** the discovery `pr` object: pass a complete
 helper's `observation.identity` unchanged, or construct the same strict provider
 identity from fresh, independently authorized metadata. ADO uses

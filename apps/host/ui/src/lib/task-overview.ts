@@ -90,6 +90,22 @@ export function taskOverview(
       attention: true,
     };
   }
+  const effective = record && maintenance?.effectiveStates?.[record.id];
+  if (effective) {
+    return {
+      title: `PR: ${effective.status.replaceAll("_", " ")}`,
+      summary: `${effective.reason} ${effective.action}`,
+      attention: effective.status === "needs_decision",
+    };
+  }
+  if (record?.ownershipReleasedAt) {
+    return {
+      title: "PR: released",
+      summary:
+        "Maintenance ownership is released. Prior paused lifecycle data is historical, not an active hold.",
+      attention: false,
+    };
+  }
   if (record?.decision?.state === "pending" && !record.ownershipReleasedAt) {
     return {
       title: "Your design decision is needed",

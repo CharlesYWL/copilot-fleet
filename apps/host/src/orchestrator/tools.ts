@@ -1205,14 +1205,18 @@ export class FleetTools {
             "ownership",
             "That task does not belong to this lead.",
           );
+        const page = registry.list({
+          leadSessionId: this.leadSessionId,
+          taskId: parsed.taskId,
+          limit: parsed.limit,
+          ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
+        });
         return {
           serverTime: new Date().toISOString(),
-          ...registry.list({
-            leadSessionId: this.leadSessionId,
-            taskId: parsed.taskId,
-            limit: parsed.limit,
-            ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
-          }),
+          effectiveStates: Object.fromEntries(
+            page.records.map((record) => [record.id, registry.effectiveState(record)]),
+          ),
+          ...page,
           proposal: registry.getProposal(parsed.taskId, this.leadSessionId) ?? null,
         };
       }
@@ -1226,7 +1230,11 @@ export class FleetTools {
             "Claim oldest-due work without a record ID.",
           );
         }
-        return { ...record, serverTime: new Date().toISOString() };
+        return {
+          ...record,
+          effectiveState: registry.effectiveState(record),
+          serverTime: new Date().toISOString(),
+        };
       }
       // The caller cannot invent a wake ID to reset the per-turn allowance.
       const wakeId = this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId;
@@ -1263,7 +1271,7 @@ export class FleetTools {
           );
           return {
             serverTime: new Date().toISOString(),
-            record,
+            record: { ...record, effectiveState: registry.effectiveState(record) },
             observationAllowance: {
               requests,
               milliseconds: allowance.milliseconds,
@@ -1303,6 +1311,7 @@ export class FleetTools {
           ownershipReleasedAt: record.ownershipReleasedAt,
           counters: record.counters,
           progress: prMaintenanceProgress(record),
+          effectiveState: registry.effectiveState(record),
           recovery: record.incidents
             .filter((incident) => !incident.resolvedAt)
             .map((incident) => ({
@@ -2667,7 +2676,6 @@ export class FleetTools {
     const maintenance = this.store.prMaintenance.list({
       taskId: run.id,
       leadSessionId: this.leadSessionId,
-      retainedOnly: true,
     });
     return [
       `task: ${JSON.stringify(run.name)} - ${run.state} - ${this.phaseLine(run)}`,
@@ -2698,7 +2706,7 @@ export class FleetTools {
         : []),
       ...maintenance.records.map(
         (record) =>
-          `  Retained PR maintenance: ${prMaintenanceUrl(record.identity)} (${record.id}) - ${record.lifecycle}${record.pauseReason ? ` (${record.pauseReason})` : ""}; read fleet_get_pr_maintenance with taskId "${run.id}" for current facts and prior PR history before continuation.`,
+          `  PR maintenance: ${prMaintenanceUrl(record.identity)} (${record.id}) - ${JSON.stringify(this.store.prMaintenance.effectiveState(record))}; read fleet_get_pr_maintenance with taskId "${run.id}" for current facts and prior PR history before continuation.`,
       ),
       ...(steps.length
         ? steps.map((step) => {

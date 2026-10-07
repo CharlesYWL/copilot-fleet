@@ -325,7 +325,7 @@ export class FleetService {
       ...(this.hostUpdate ? { hostUpdate: this.hostUpdate.status() } : {}),
       commandExecutions: this.commands.list({ limit: 100 }),
       prMaintenanceApprovals: this.store.prMaintenance.listApprovals(),
-      prMaintenanceTasks: prMaintenanceTaskStatuses(this.retainedPrMaintenance()),
+      prMaintenanceTasks: this.maintenanceTaskStatuses(),
       workerResumeRequests: this.store.resumeRequests.list({ limit: 50 }),
       permissionEvents: this.permissionEvents(),
     };
@@ -355,7 +355,6 @@ export class FleetService {
     let cursor: string | undefined;
     do {
       const page = this.store.prMaintenance.list({
-        retainedOnly: true,
         limit: 100,
         ...(cursor ? { cursor } : {}),
       });
@@ -363,6 +362,16 @@ export class FleetService {
       cursor = page.nextCursor;
     } while (cursor);
     return records;
+  }
+
+  private maintenanceTaskStatuses() {
+    const records = this.retainedPrMaintenance();
+    return prMaintenanceTaskStatuses(records).map((status) => ({
+      ...status,
+      effective: this.store.prMaintenance.effectiveState(
+        records.find((record) => record.id === status.recordId)!,
+      ),
+    }));
   }
 
   listNodes(): FleetNode[] {
@@ -1193,7 +1202,11 @@ export class FleetService {
     sessionId: string,
     kind: SupervisorCommand["kind"],
     supervisor: { operatorId: string; operationId?: string | undefined },
-    input?: { prompt: string; attachments: PromptAttachment[] },
+    input?: {
+      prompt: string;
+      attachments: PromptAttachment[];
+      handback?: "ongoing" | "after_turn" | undefined;
+    },
   ): SupervisorCommand | undefined {
     if (
       !this.store.prMaintenance.manualRecord(sessionId) &&
@@ -1206,6 +1219,7 @@ export class FleetService {
           kind,
           prompt: input?.prompt,
           attachments: input?.attachments,
+          ...(input?.handback === "after_turn" ? { handback: input.handback } : {}),
         }),
       )
       .digest("hex");
@@ -1230,6 +1244,7 @@ export class FleetService {
       digest,
       kind,
       operatorId: supervisor.operatorId,
+      ...(input?.handback ? { handback: input.handback } : {}),
     };
   }
 
@@ -1260,11 +1275,18 @@ export class FleetService {
       prompt: string;
       attachments: PromptAttachment[];
       operationId?: string | undefined;
+      handback?: "ongoing" | "after_turn" | undefined;
     },
     operatorId?: string,
   ): { ok: true } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false, status: 404, error: "Session not found" };
+    if (input.handback === "after_turn" && !operatorId)
+      return {
+        ok: false,
+        status: 403,
+        error: "One-turn handback requires an authenticated browser operator.",
+      };
     const manual = operatorId
       ? this.supervisorCommand(
           sessionId,
@@ -1273,6 +1295,13 @@ export class FleetService {
           input,
         )
       : undefined;
+    if (input.handback === "after_turn" && !manual)
+      return {
+        ok: false,
+        status: 409,
+        error:
+          "One-turn handback requires an existing retained maintenance registration.",
+      };
     if (manual && this.isSupervisorRetry(sessionId, manual)) return { ok: true };
     if (session.stopRequested)
       return { ok: false, status: 409, error: "Session is stopping" };
@@ -1455,6 +1484,7 @@ export class FleetService {
         request.sessionId,
         "Session stop or cancellation requested",
       );
+      this.publishSnapshot();
     }
     if (
       request.type === "start_session" ||
@@ -1566,7 +1596,7 @@ export class FleetService {
           supervisor &&
           request.type === "prompt" &&
           this.store.prMaintenance.manualRecord(session.id)
-            ? `${request.prompt}\n\n<fleet-manual-control>\nThe human supervisor has taken manual control of this retained worker. Unattended PR maintenance is paused and must remain paused after this turn. Follow the human's direction; this handoff itself does not authorize unattended publication, certify PR readiness, or approve pending design decisions. Preserve retained scope and receipts; do not restart maintenance.\n</fleet-manual-control>`
+            ? `${request.prompt}\n\n<fleet-manual-control>\nThe human supervisor has taken manual control of this retained worker. ${supervisor.handback === "after_turn" ? "The operator selected one-turn handback. The Host alone may return control after this exact turn completes, the worker is quiescent and effects are reconciled." : "Unattended PR maintenance is paused and must remain paused after this turn."} Follow the human's direction; this handoff itself does not authorize unattended publication, certify PR readiness, or approve pending design decisions. Preserve retained scope and receipts; do not restart maintenance.\n</fleet-manual-control>`
             : undefined;
         const command = {
           ...request,
@@ -2450,7 +2480,6 @@ export class FleetService {
     };
 
     const afterCommit = (result: WriteResult): void => {
-      if (manualReceiptChanged) this.publishSnapshot();
       if (result.skipped > 0) {
         this.log.warn(
           { sessionId: event.sessionId, skipped: result.skipped },
@@ -2481,6 +2510,19 @@ export class FleetService {
           sessionId: result.session.id,
         });
       }
+      if (
+        manualReceiptChanged ||
+        // Stored permissions remain authoritative even when prior-attempt output is stale.
+        (((stored && ["permission", "permission_result"].includes(event.type)) ||
+          (result.publish && ["state", "agent_session"].includes(event.type))) &&
+          (this.store.prMaintenance.manualRecord(event.sessionId) ||
+            this.store.prMaintenance.list({
+              leadSessionId: event.sessionId,
+              retainedOnly: true,
+              limit: 1,
+            }).records.length > 0))
+      )
+        this.publishSnapshot();
     };
 
     try {

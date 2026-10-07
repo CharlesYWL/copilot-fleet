@@ -1639,61 +1639,78 @@ describe("PR maintenance task controls", () => {
     expect(actOnTaskMaintenance).not.toHaveBeenCalled();
   });
 
-  it("keeps the human hold off Approve and links bounded Send back to its version", async () => {
-    const record = registration();
-    record.decision = {
-      id: "decision",
-      version: 2,
-      proposal: "Change the public API?",
-      headSha: "a".repeat(40),
-      scope: "API compatibility",
-      state: "pending",
-    };
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [record],
-      canAuthorize: true,
-    });
-    const review = vi.fn().mockResolvedValue(true);
-    const model = buildRunViewModels({ runs: [task], stepsByRun: {}, sessions: [] })[0]!;
-    render(
-      <FluentProvider theme={fleetDarkTheme}>
-        <OrchestratorTaskDetail
-          model={model}
-          notes={[]}
-          sessions={[]}
-          onBack={vi.fn()}
-          onOpenLead={vi.fn()}
-          onOpenWorker={vi.fn()}
-          onReview={review}
-          onArchive={vi.fn()}
-          onReopen={vi.fn()}
-          onDelete={vi.fn()}
-        />
-      </FluentProvider>,
-    );
-    fireEvent.click(await screen.findByRole("button", { name: "Review decision" }));
-    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
-    fireEvent.change(screen.getByRole("textbox", { name: "What needs changing?" }), {
-      target: { value: "Keep the contract; restore validation only" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Send back with instructions" }));
-    await waitFor(() =>
-      expect(review).toHaveBeenCalledWith(
-        false,
-        "Keep the contract; restore validation only",
-        {
-          recordId: "maintenance",
-          expectedVersion: 4,
-          decisionId: "decision",
-          decisionVersion: 2,
-        },
-      ),
-    );
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    fireEvent.click(screen.getByText("Maintenance controls and evidence"));
-    expect(
-      (screen.getByRole("button", { name: "Resume maintenance" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
-  });
+  it.each([false, true])(
+    "links bounded direction and explicit continuation=%s to the exact decision",
+    async (continueEligible) => {
+      const record = registration();
+      record.decision = {
+        id: "decision",
+        version: 2,
+        proposal: "Change the public API?",
+        headSha: "a".repeat(40),
+        scope: "API compatibility",
+        state: "pending",
+      };
+      vi.mocked(getTaskMaintenance).mockResolvedValue({
+        records: [record],
+        canAuthorize: true,
+      });
+      const review = vi.fn().mockResolvedValue(true);
+      const model = buildRunViewModels({
+        runs: [task],
+        stepsByRun: {},
+        sessions: [],
+      })[0]!;
+      render(
+        <FluentProvider theme={fleetDarkTheme}>
+          <OrchestratorTaskDetail
+            model={model}
+            notes={[]}
+            sessions={[]}
+            onBack={vi.fn()}
+            onOpenLead={vi.fn()}
+            onOpenWorker={vi.fn()}
+            onReview={review}
+            onArchive={vi.fn()}
+            onReopen={vi.fn()}
+            onDelete={vi.fn()}
+          />
+        </FluentProvider>,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "Review decision" }));
+      expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+      fireEvent.change(screen.getByRole("textbox", { name: "What needs changing?" }), {
+        target: { value: "Keep the contract; restore validation only" },
+      });
+      const checkbox = within(screen.getByRole("dialog")).getByRole("checkbox", {
+        name: /continue/i,
+      });
+      expect((checkbox as HTMLInputElement).checked).toBe(false);
+      if (continueEligible) fireEvent.click(checkbox);
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: continueEligible ? "Direct and continue" : "Send back with instructions",
+        }),
+      );
+      await waitFor(() =>
+        expect(review).toHaveBeenCalledWith(
+          false,
+          "Keep the contract; restore validation only",
+          {
+            recordId: "maintenance",
+            expectedVersion: 4,
+            decisionId: "decision",
+            decisionVersion: 2,
+            ...(continueEligible ? { continueEligible: true } : {}),
+          },
+        ),
+      );
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      fireEvent.click(screen.getByText("Maintenance controls and evidence"));
+      expect(
+        (screen.getByRole("button", { name: "Resume maintenance" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true);
+    },
+  );
 });

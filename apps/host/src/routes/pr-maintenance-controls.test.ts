@@ -206,6 +206,7 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
   return {
     ...state,
     app,
+    engine,
     run,
     worker,
     step: step!,
@@ -219,9 +220,177 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
 }
 
 describe("authenticated PR maintenance controls", () => {
+  async function continuationFixture(dbPath?: string) {
+    const f = await setup("github", dbPath);
+    const held = f.hold();
+    const record = f.store.prMaintenance.checkpoint(f.leadId, held.id, held.version, {
+      kind: "observation",
+      observation: {
+        attemptedAt: new Date().toISOString(),
+        complete: true,
+        identity: held.identity,
+        headSha: "a".repeat(40),
+        baseSha: "b".repeat(40),
+        state: "open",
+        snapshotId: "current",
+        fingerprint: "current",
+        evidence: "Complete fixture provider observation",
+      },
+    });
+    const payload = {
+      approved: false,
+      note: "Keep the existing contract; repair and verify within the existing grant.",
+      maintenance: {
+        recordId: record.id,
+        expectedVersion: record.version,
+        decisionId: record.decision!.id,
+        decisionVersion: record.decision!.version,
+        continueEligible: true,
+      },
+    };
+    const review = (headers: Record<string, string> = { "fixture-browser": "yes" }) =>
+      f.app.inject({
+        method: "POST",
+        url: `/api/runs/${f.run.id}/review`,
+        headers,
+        payload,
+      });
+    return { ...f, record, payload, review };
+  }
+
+  it("atomically persists authenticated direction and bounded continuation across restart without renewing authority", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-continuation-"));
+    const path = join(directory, "fixture.sqlite");
+    const f = await continuationFixture(path);
+    try {
+      const response = await f.review();
+      expect(response.statusCode, response.body).toBe(202);
+      const saved = f.store.prMaintenance.get(f.record.id)!;
+      expect(saved).toMatchObject({
+        lifecycle: "active",
+        decision: { state: "directed", operatorId: "real-browser-principal" },
+        continuation: {
+          state: "checking",
+          operatorId: "real-browser-principal",
+          headSha: "a".repeat(40),
+          expectedVersion: f.record.version,
+        },
+        authorization: f.record.authorization,
+        counters: f.record.counters,
+        renewedAt: f.record.renewedAt,
+      });
+      expect(f.store.getRun(f.run.id)?.state).toBe("running");
+      expect((await f.review()).statusCode).toBe(409);
+      expect(f.store.prMaintenance.get(saved.id)).toEqual(saved);
+      await f.close();
+      const reopened = new FleetStore(path);
+      try {
+        expect(reopened.prMaintenance.get(saved.id)).toEqual(saved);
+        expect(reopened.prMaintenance.pendingContinuationWakes()).toHaveLength(1);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      await f.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns durable acceptance without depending on a synchronous scheduler wake", async () => {
+    const f = await continuationFixture();
+    vi.mocked(f.engine.tick).mockImplementation(() => {
+      throw new Error("Fixture scheduler unavailable");
+    });
+    const response = await f.review();
+    expect(response.statusCode, response.body).toBe(202);
+    expect(f.engine.tick).not.toHaveBeenCalled();
+    expect(
+      f.store.prMaintenance.pendingContinuationWakes().map((record) => record.id),
+    ).toEqual([f.record.id]);
+    expect(f.store.prMaintenance.get(f.record.id)?.continuation?.state).toBe("checking");
+  });
+
+  it.each(["lead", "worker"] as const)(
+    "rejects atomic continuation while the exact %s has an independent permission request",
+    async (owner) => {
+      const f = await continuationFixture();
+      const sessionId = owner === "lead" ? f.leadId : f.worker.id;
+      f.service.handleEvent({
+        eventId: `permission-${owner}`,
+        sessionId,
+        sequence: f.store.maxEventSequence(sessionId) + 1,
+        type: "permission",
+        payload: { requestId: "independent-access", options: [] },
+        createdAt: new Date().toISOString(),
+      });
+      const before = f.store.prMaintenance.get(f.record.id);
+      const task = f.store.getRun(f.run.id);
+      const notes = f.store.listRunNotes(f.run.id);
+      expect(f.store.prMaintenance.effectiveState(before!).status).toBe("needs_decision");
+      const denied = await f.review();
+      expect(denied.statusCode, denied.body).toBe(409);
+      expect(denied.body).toContain("permission");
+      expect(f.store.prMaintenance.get(f.record.id)).toEqual(before);
+      expect(f.store.getRun(f.run.id)).toEqual(task);
+      expect(f.store.listRunNotes(f.run.id)).toEqual(notes);
+      f.service.handleEvent({
+        eventId: `permission-result-${owner}`,
+        sessionId,
+        sequence: f.store.maxEventSequence(sessionId) + 1,
+        type: "permission_result",
+        payload: { requestId: "independent-access", outcome: "deny" },
+        createdAt: new Date().toISOString(),
+      });
+      expect((await f.review()).statusCode).toBe(202);
+    },
+  );
+
+  it.each(["stale", "unauthenticated", "expanded", "stop", "callback"] as const)(
+    "rolls back the whole direction transaction for %s",
+    async (failure) => {
+      const f = await continuationFixture();
+      if (failure === "stale") f.payload.maintenance.expectedVersion--;
+      if (failure === "stop")
+        f.store.setSessionControls(f.worker.id, { stopRequested: true });
+      if (failure === "callback")
+        vi.spyOn(f.store, "appendRunNote").mockImplementationOnce(() => {
+          throw new Error("fixture transaction failure");
+        });
+      const beforeTask = f.store.getRun(f.run.id);
+      const beforeNotes = f.store.listRunNotes(f.run.id);
+      const beforeRecord = f.store.prMaintenance.get(f.record.id);
+      if (failure === "stop")
+        f.payload.maintenance.expectedVersion = beforeRecord!.version;
+      const response =
+        failure === "expanded"
+          ? await f.app.inject({
+              method: "POST",
+              url: `/api/runs/${f.run.id}/review`,
+              headers: { "fixture-browser": "yes" },
+              payload: {
+                ...f.payload,
+                maintenance: { ...f.payload.maintenance, scope: { replies: true } },
+              },
+            })
+          : await f.review(failure === "unauthenticated" ? {} : undefined);
+      expect(response.statusCode, response.body).toBe(
+        failure === "callback"
+          ? 500
+          : failure === "expanded"
+            ? 400
+            : failure === "unauthenticated"
+              ? 403
+              : 409,
+      );
+      expect(f.store.prMaintenance.get(f.record.id)).toEqual(beforeRecord);
+      expect(f.store.getRun(f.run.id)).toEqual(beforeTask);
+      expect(f.store.listRunNotes(f.run.id)).toEqual(beforeNotes);
+    },
+  );
+
   it("preserves F1 old and newly approved prerequisite markers in portable evidence", async () => {
     const directory = mkdtempSync(join(tmpdir(), "fleet-authorization-evidence-"));
-    const { store, run, registration, authorize, mcp, app, worker, close } = await setup(
+    const { store, run, registration, authorize, mcp, app, close } = await setup(
       "azure-devops",
       join(directory, "host.sqlite"),
     );
@@ -236,7 +405,7 @@ describe("authenticated PR maintenance controls", () => {
     store.writeAtomically(() => store.prMaintenance.importBackup(backup));
     const prepared = await mcp("fleet_prepare_pr_maintenance", {
       taskId: run.id,
-      workerSessionId: worker.id,
+      workerSessionId: registration.workerSessionId,
       prUrl: prMaintenanceUrl(registration.identity),
       identity: registration.identity,
       headSha: registration.headSha,
@@ -1295,9 +1464,11 @@ describe("authenticated PR maintenance controls", () => {
         {
           taskId: run.id,
           recordId: accepted.json().id,
+          workerSessionId: registration.workerSessionId,
           stage: expect.any(String),
           prUrl: prMaintenanceUrl(registration.identity),
           manualControl: false,
+          effective: expect.objectContaining({ status: "checking" }),
         },
       ]);
       const archivedProposal = store
