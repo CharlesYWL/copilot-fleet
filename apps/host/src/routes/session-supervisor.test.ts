@@ -6,6 +6,7 @@ import {
   NODE_ID_HEADER,
   NODE_SECRET_HEADER,
   ORCHESTRATOR_STOP_REASON,
+  SessionEventSchema,
   type NodeCommand,
   type SessionEvent,
 } from "@fleet/protocol";
@@ -255,6 +256,136 @@ async function setup(
 }
 
 describe("trusted supervisor session handoff", () => {
+  it.each(["terminal worker", "terminal worker cold ledger", "manual worker", "lead"])(
+    "streams authoritative permission holds for a %s without publishing stale attempt events",
+    async (path) => {
+      const f = await setup("password", true);
+      if (path === "manual worker")
+        expect((await f.command("prompt")).statusCode).toBe(202);
+      if (!path.endsWith("cold ledger")) f.service.snapshot();
+      const sessionId = path === "lead" ? f.leadId : f.worker.id;
+      const otherSessionId = path === "lead" ? f.worker.id : f.leadId;
+      const record = f.store.prMaintenance.get(f.record.id);
+      const step = f.store.getRunStep(f.step.id);
+      const worker = f.store.getSession(f.worker.id);
+      const sent = [...f.sent];
+      const broadcast = vi.spyOn(f.service, "broadcast");
+      const listener = vi.fn();
+      f.service.onSessionEvent(listener);
+      let sequence = 10;
+      const permissionEvent = (target: string, requestId: string, resolve = false) =>
+        SessionEventSchema.parse({
+          eventId: randomUUID(),
+          sessionId: target,
+          sequence: ++sequence,
+          createdAt: new Date().toISOString(),
+          type: resolve ? "permission_result" : "permission",
+          payload: resolve ? { requestId, outcome: "deny" } : { requestId, options: [] },
+        });
+      const deliver = (event: SessionEvent) => {
+        broadcast.mockClear();
+        listener.mockClear();
+        expect(f.service.handleEvent(event)).toBe(true);
+      };
+      const projected = () => {
+        const snapshots = broadcast.mock.calls
+          .map(([message]) => message)
+          .filter((message) => message.type === "snapshot");
+        expect(snapshots).toHaveLength(1);
+        return snapshots[0]!.data.prMaintenanceTasks?.find(
+          (status) => status.taskId === f.task.id,
+        )?.effective;
+      };
+      const held = async () => {
+        expect(projected()).toMatchObject({
+          status: "needs_decision",
+          reason: expect.stringMatching(/permission/i),
+          action: expect.stringMatching(/permission/i),
+        });
+        expect((await f.command("prompt")).statusCode).toBe(409);
+        expect(f.store.prMaintenance.get(f.record.id)).toEqual(record);
+        expect(f.store.getRunStep(f.step.id)).toEqual(step);
+        expect(f.sent).toEqual(sent);
+      };
+
+      const first = permissionEvent(sessionId, "first");
+      deliver(first);
+      await held();
+      if (path.startsWith("terminal worker")) {
+        expect(broadcast.mock.calls.map(([message]) => message.type)).toEqual([
+          "snapshot",
+        ]);
+        expect(listener).not.toHaveBeenCalled();
+        expect(f.store.getSession(f.worker.id)).toEqual({
+          ...worker,
+          lastActivityAt: expect.any(String),
+        });
+      } else {
+        expect(listener).toHaveBeenCalledWith(first);
+      }
+      deliver(first);
+      expect(broadcast).not.toHaveBeenCalled();
+      expect(listener).not.toHaveBeenCalled();
+      expect(f.sent).toEqual(sent);
+
+      deliver(permissionEvent(sessionId, "second"));
+      await held();
+      deliver(permissionEvent(sessionId, "wrong-request", true));
+      await held();
+      deliver(permissionEvent(otherSessionId, "first", true));
+      await held();
+      deliver(permissionEvent(sessionId, "first", true));
+      await held();
+      const last = permissionEvent(sessionId, "second", true);
+      deliver(last);
+      expect(projected()?.status).toBe(
+        path === "manual worker" ? "running_manually" : "checking",
+      );
+      expect(f.store.prMaintenance.get(f.record.id)).toEqual(record);
+      expect(f.store.getRunStep(f.step.id)).toEqual(step);
+      expect(f.sent).toEqual(sent);
+      deliver(last);
+      deliver(first);
+      expect(broadcast).not.toHaveBeenCalled();
+      expect(
+        f.service
+          .snapshot()
+          .permissionEvents?.filter((event) => event.type === "permission"),
+      ).toEqual([]);
+
+      // A different session's permission is not this registration's authority.
+      const unrelated = f.store.createSession(f.store.listPlacements()[0]!, "unrelated");
+      deliver(permissionEvent(unrelated.id, "first"));
+      expect(broadcast.mock.calls.some(([message]) => message.type === "snapshot")).toBe(
+        false,
+      );
+      expect(
+        f.service
+          .snapshot()
+          .prMaintenanceTasks?.find((status) => status.taskId === f.task.id)?.effective
+          ?.status,
+      ).toBe(path === "manual worker" ? "running_manually" : "checking");
+      if (path.startsWith("terminal worker")) {
+        deliver(
+          SessionEventSchema.parse({
+            eventId: randomUUID(),
+            sessionId,
+            sequence: ++sequence,
+            createdAt: new Date().toISOString(),
+            type: "state",
+            payload: { state: "running" },
+          }),
+        );
+        expect(broadcast).not.toHaveBeenCalled();
+        expect(listener).not.toHaveBeenCalled();
+        expect(f.store.getSession(f.worker.id)).toEqual({
+          ...worker,
+          lastActivityAt: expect.any(String),
+        });
+      }
+    },
+  );
+
   function observeHandback(f: Awaited<ReturnType<typeof setup>>) {
     const record = f.store.prMaintenance.get(f.record.id)!;
     return f.store.prMaintenance.checkpoint(f.leadId, record.id, record.version, {

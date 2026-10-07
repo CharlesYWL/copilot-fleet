@@ -2512,10 +2512,9 @@ export class FleetService {
       }
       if (
         manualReceiptChanged ||
-        (result.publish &&
-          ["state", "permission", "permission_result", "agent_session"].includes(
-            event.type,
-          ) &&
+        // Stored permissions remain authoritative even when prior-attempt output is stale.
+        (((stored && ["permission", "permission_result"].includes(event.type)) ||
+          (result.publish && ["state", "agent_session"].includes(event.type))) &&
           (this.store.prMaintenance.manualRecord(event.sessionId) ||
             this.store.prMaintenance.list({
               leadSessionId: event.sessionId,

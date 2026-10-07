@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,7 +17,7 @@ import {
 } from "./harness.js";
 
 it.each(["after_turn", "ongoing"] as const)(
-  "renders continuation and an acknowledged Stop after %s manual control",
+  "streams permission holds, continuation and acknowledged Stop after %s manual control",
   async (mode) => {
     const directory = mkdtempSync(join(tmpdir(), "fleet-maintenance-e2e-"));
     const database = join(directory, "host.sqlite");
@@ -27,9 +27,13 @@ it.each(["after_turn", "ongoing"] as const)(
     let node: FakeNode | undefined;
     let browser: Browser | undefined;
     let token: string;
+    let csrf: string;
     let taskId: string;
+    let leadId: string;
     let workerId: string;
     let leadToken: string;
+    const artifacts = process.env.FLEET_E2E_ARTIFACTS;
+    const observations: unknown[] = [];
     try {
       store.setSetting(AUTH_MODE_SETTING, "microsoft-only");
       const administrator = store.claimFirstAdministrator({
@@ -44,14 +48,17 @@ it.each(["after_turn", "ongoing"] as const)(
         warn: () => {},
         externalScheme: { publicUrl: () => undefined, tunnels: () => [] },
       });
-      token = auth.sessions.issue({
+      const issued = auth.sessions.issue({
         administratorId: administrator.id,
         authMethod: "microsoft-code",
-      }).token;
+      });
+      token = issued.token;
+      csrf = auth.sessions.csrfToken(issued.tokenHash);
       const placement = store.listPlacements()[0]!;
       const lead = store.createSession(placement, "Fixture", false, "Continuation lead", {
         runRole: "lead",
       });
+      leadId = lead.id;
       const task = store.createRun({
         workspaceId: placement.workspaceId,
         name: "Continuation fixture",
@@ -172,7 +179,6 @@ it.each(["after_turn", "ongoing"] as const)(
         .getByRole("textbox", { name: "What needs changing?" })
         .fill("Keep the contract; repair only the existing invariant.");
       await continuation.check();
-      const artifacts = process.env.FLEET_E2E_ARTIFACTS;
       if (artifacts) {
         mkdirSync(artifacts, { recursive: true });
         await page.screenshot({
@@ -194,6 +200,146 @@ it.each(["after_turn", "ongoing"] as const)(
       const state = await view.json();
       expect(state.records[0].continuation.state).toBe("checking");
       expect(state.effectiveStates[state.records[0].id].status).toBe("checking");
+      const recordId = state.records[0].id;
+      const maintenance = async () => {
+        const reply = await context.request.get(
+          `${host!.url}/api/runs/${taskId}/pr-maintenance`,
+        );
+        expect(reply.status()).toBe(200);
+        return reply.json();
+      };
+      const taskRegion = page.getByRole("region", {
+        name: "Task Continuation fixture",
+        exact: true,
+      });
+      const assertProjection = async (status: string, reason: RegExp, phase: string) => {
+        await expect
+          .poll(async () => (await maintenance()).effectiveStates[recordId])
+          .toMatchObject({ status, reason: expect.stringMatching(reason) });
+        const current = await maintenance();
+        const effective = current.effectiveStates[recordId];
+        const mcp = await context.request.post(`${host!.url}/mcp`, {
+          headers: {
+            authorization: `Bearer ${leadToken}`,
+            accept: "application/json, text/event-stream",
+          },
+          data: {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "fleet_get_pr_maintenance", arguments: { recordId } },
+          },
+        });
+        expect(mcp.status()).toBe(200);
+        const result = await mcp.json();
+        expect(result.error).toBeUndefined();
+        expect(result.result.isError).not.toBe(true);
+        const mcpState = JSON.parse(result.result.content[0].text).effectiveState;
+        expect(mcpState).toEqual(effective);
+        try {
+          const label = status.replaceAll("_", " ");
+          await expect
+            .poll(() =>
+              page
+                .getByRole("heading", {
+                  name: "Continuation fixture",
+                  exact: true,
+                })
+                .locator("..")
+                .innerText(),
+            )
+            .toContain(label);
+          await expect.poll(() => taskRegion.innerText()).toContain(`PR: ${label}`);
+          await expect.poll(() => taskRegion.innerText()).toContain(effective.reason);
+          await expect.poll(() => taskRegion.innerText()).toContain(effective.action);
+          await expect
+            .poll(() =>
+              taskRegion
+                .getByRole("region", { name: "PR maintenance", exact: true })
+                .getByRole("status")
+                .innerText(),
+            )
+            .toContain(`${effective.reason} ${effective.action}`);
+          if (phase === "late-worker-permission")
+            await expect
+              .poll(() =>
+                taskRegion
+                  .getByRole("button", {
+                    name: "Review permission",
+                    exact: true,
+                  })
+                  .isVisible(),
+              )
+              .toBe(true);
+        } finally {
+          observations.push({
+            phase,
+            view: current,
+            mcpState,
+            text: await taskRegion.innerText(),
+          });
+          if (artifacts)
+            await page.screenshot({ path: join(artifacts, `${phase}-${mode}.png`) });
+        }
+        return current;
+      };
+      node.send(workerId, [
+        {
+          type: "permission",
+          payload: { requestId: "late-worker", options: [] },
+        },
+      ]);
+      await expect
+        .poll(async () => (await maintenance()).effectiveStates[recordId].status)
+        .toBe("needs_decision");
+      const denied = await context.request.post(
+        `${host.url}/api/sessions/${workerId}/prompt`,
+        {
+          headers: { origin: host.url, "x-csrf-token": csrf },
+          data: {
+            prompt: "Blocked while an independent permission is pending.",
+            handback: mode,
+          },
+        },
+      );
+      const deniedBody = await denied.json();
+      observations.push({
+        phase: "permission-admission",
+        status: denied.status(),
+        body: deniedBody,
+      });
+      expect(denied.status()).toBe(409);
+      expect(deniedBody.code).toBe("permission_pending");
+      await assertProjection("needs_decision", /permission/i, "late-worker-permission");
+      node.send(workerId, [
+        {
+          type: "permission_result",
+          payload: { requestId: "late-worker", outcome: "deny" },
+        },
+      ]);
+      await assertProjection(
+        "checking",
+        /continuation|checking|reconcil/i,
+        "late-worker-resolved",
+      );
+      node.send(leadId, [
+        {
+          type: "permission",
+          payload: { requestId: "lead-permission", options: [] },
+        },
+      ]);
+      await assertProjection("needs_decision", /permission/i, "lead-permission");
+      node.send(leadId, [
+        {
+          type: "permission_result",
+          payload: { requestId: "lead-permission", outcome: "deny" },
+        },
+      ]);
+      await assertProjection(
+        "checking",
+        /continuation|checking|reconcil/i,
+        "lead-resolved",
+      );
       await page.getByText("Retained worker", { exact: true }).first().click();
       const handback = page.getByRole("checkbox", { name: /One-turn handback/ });
       await handback.waitFor({ state: "visible" });
@@ -213,13 +359,29 @@ it.each(["after_turn", "ongoing"] as const)(
       expect(sent.request().postDataJSON().handback).toBe(
         mode === "after_turn" ? "after_turn" : undefined,
       );
-      const maintenance = async () => {
-        const reply = await context.request.get(
-          `${host!.url}/api/runs/${taskId}/pr-maintenance`,
-        );
-        expect(reply.status()).toBe(200);
-        return reply.json();
-      };
+      await expect.poll(() => handback.isChecked()).toBe(false);
+      node.send(workerId, [{ type: "state", payload: { state: "running" } }]);
+      await page.locator('button[title="Continuation lead"]').first().click();
+      await page.getByText("Continuation fixture", { exact: true }).first().click();
+      await assertProjection("running_manually", /manual|handback/i, "manual-running");
+      node.send(workerId, [
+        {
+          type: "permission",
+          payload: { requestId: "active-worker", options: [] },
+        },
+      ]);
+      await assertProjection("needs_decision", /permission/i, "active-worker-permission");
+      node.send(workerId, [
+        {
+          type: "permission_result",
+          payload: { requestId: "active-worker", outcome: "deny" },
+        },
+      ]);
+      await assertProjection(
+        "running_manually",
+        /manual|handback/i,
+        "active-worker-resolved",
+      );
       node.send(workerId, [
         { type: "state", payload: { state: "running" } },
         { type: "turn_complete", payload: {} },
@@ -229,6 +391,7 @@ it.each(["after_turn", "ongoing"] as const)(
         await expect
           .poll(async () => (await maintenance()).records[0].continuation.completedAt)
           .toBeTruthy();
+      await page.getByText("Retained worker", { exact: true }).first().click();
       const stopping = page.waitForResponse(
         (reply) =>
           reply.url().endsWith(`/api/sessions/${workerId}/stop`) &&
@@ -236,6 +399,9 @@ it.each(["after_turn", "ongoing"] as const)(
       );
       await page.getByRole("button", { name: "Stop session", exact: true }).click();
       expect((await stopping).status()).toBe(202);
+      await page.locator('button[title="Continuation lead"]').first().click();
+      await page.getByText("Continuation fixture", { exact: true }).first().click();
+      await assertProjection("needs_decision", /stop/i, "stop-requested");
       node.send(workerId, [{ type: "state", payload: { state: "stopped" } }]);
       await expect
         .poll(async () => {
@@ -244,8 +410,35 @@ it.each(["after_turn", "ongoing"] as const)(
           return sessions.find((session: { id: string }) => session.id === workerId);
         })
         .toMatchObject({ state: "stopped", stopRequested: false });
-      await page.locator('button[title="Continuation lead"]').first().click();
-      await page.getByText("Continuation fixture", { exact: true }).first().click();
+      await assertProjection("needs_decision", /stop/i, "stop-acknowledged-no-refresh");
+      node.send(workerId, [
+        {
+          type: "permission",
+          payload: { requestId: "stopped-worker", options: [] },
+        },
+      ]);
+      await expect
+        .poll(async () => {
+          const reply = await context.request.get(`${host!.url}/api/snapshot`);
+          expect(reply.status()).toBe(200);
+          return (await reply.json()).permissionEvents.some(
+            (event: { type: string; payload: { requestId: string } }) =>
+              event.type === "permission" && event.payload.requestId === "stopped-worker",
+          );
+        })
+        .toBe(true);
+      await assertProjection("needs_decision", /permission/i, "stop-with-permission");
+      node.send(workerId, [
+        {
+          type: "permission_result",
+          payload: { requestId: "stopped-worker", outcome: "deny" },
+        },
+      ]);
+      await assertProjection(
+        "needs_decision",
+        /stop/i,
+        "stop-after-permission-resolution",
+      );
       const refreshing = page.waitForResponse(
         (reply) =>
           reply.url().endsWith(`/api/runs/${taskId}/pr-maintenance`) &&
@@ -265,25 +458,7 @@ it.each(["after_turn", "ongoing"] as const)(
       expect(effective).toMatchObject({ status: "needs_decision" });
       expect(effective.reason).toMatch(/stop/i);
       expect(effective.action).toMatch(/operator|review/i);
-      const mcp = await context.request.post(`${host.url}/mcp`, {
-        headers: {
-          authorization: `Bearer ${leadToken}`,
-          accept: "application/json, text/event-stream",
-        },
-        data: {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "tools/call",
-          params: {
-            name: "fleet_get_pr_maintenance",
-            arguments: { recordId: record.id },
-          },
-        },
-      });
-      const result = await mcp.json();
-      expect(result.error).toBeUndefined();
-      expect(result.result.isError).not.toBe(true);
-      expect(JSON.parse(result.result.content[0].text).effectiveState).toEqual(effective);
+      await assertProjection("needs_decision", /stop/i, "stop-after-refresh");
       await page.getByText("PR: needs decision", { exact: true }).first().waitFor();
       expect(
         await page
@@ -304,6 +479,13 @@ it.each(["after_turn", "ongoing"] as const)(
       if (artifacts)
         await page.screenshot({ path: join(artifacts, `acknowledged-stop-${mode}.png`) });
     } finally {
+      if (artifacts) {
+        mkdirSync(artifacts, { recursive: true });
+        writeFileSync(
+          join(artifacts, `observations-${mode}.json`),
+          JSON.stringify(observations, null, 2),
+        );
+      }
       node?.close();
       await browser?.close();
       if (host) await stopHost(host.child);
