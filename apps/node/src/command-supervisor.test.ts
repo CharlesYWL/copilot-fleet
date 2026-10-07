@@ -136,7 +136,11 @@ async function killParent(child: ChildProcess): Promise<void> {
   await closed;
 }
 
-async function workload(root: string, mode: "silent" | "orphan", exitCode = 7) {
+async function workload(
+  root: string,
+  mode: "silent" | "orphan" | "outlive",
+  exitCode = 7,
+) {
   const path = join(root, "workload.cjs");
   await writeFile(
     path,
@@ -147,6 +151,22 @@ const path = require("node:path");
 const mode = process.argv[2];
 if (mode === "grandchild") {
   setInterval(() => {}, 1000);
+} else if (mode === "lingering") {
+  // Outlive the job root (the shell), then leave on its own shortly after.
+  const shell = Number(process.argv[3]);
+  const poll = setInterval(() => {
+    try {
+      process.kill(shell, 0);
+    } catch {
+      clearInterval(poll);
+      fs.writeFileSync(path.join(__dirname, "outlived.json"), "{}");
+      setTimeout(() => process.exit(0), 100);
+    }
+  }, 10);
+} else if (mode === "outlive") {
+  const lingering = spawn(process.execPath, [__filename, "lingering", String(process.ppid)], { stdio: "ignore", windowsHide: true, detached: true });
+  fs.writeFileSync(path.join(__dirname, "grandchild.json"), JSON.stringify({ pid: lingering.pid }));
+  lingering.unref();
 } else if (mode === "middle") {
   const grandchild = spawn(process.execPath, [__filename, "grandchild"], { stdio: "ignore", windowsHide: true, detached: true });
   fs.writeFileSync(path.join(__dirname, "grandchild.json"), JSON.stringify({ pid: grandchild.pid }));
@@ -736,6 +756,24 @@ windows("Windows command supervisor: real disposable processes", () => {
     },
     40_000,
   );
+
+  it("does not count a descendant that leaves on its own just after the root as forced", async () => {
+    // The root's own console host is such a descendant: it exits only after the
+    // root disconnects, so under load it can still be in the job at root exit.
+    const { root, cwd } = await fixture();
+    const prepared = await start(input(root, cwd, await workload(root, "outlive")));
+    await prepared.release();
+    const result = await prepared.result;
+    expect(result).toMatchObject({
+      exitCode: 0,
+      reason: "exited",
+      descendantCleanupForced: false,
+      interrupted: false,
+      ownership: "quiescent",
+    });
+    // It really did outlive the root, rather than racing ahead of it.
+    expect(await readJson(join(root, "outlived.json"))).not.toBeNull();
+  }, 40_000);
 
   it.each(["timeout", "cancel"])(
     "enforces %s for a silent job with surviving grandchildren",

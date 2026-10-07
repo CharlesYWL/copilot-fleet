@@ -88,6 +88,10 @@ public static class FleetCommandSupervisor {
   static readonly object OutputLock = new object();
   static long Retained;
   const long OutputLimit = 10 * 1024 * 1024;
+  // A job member still leaving on its own at root exit was not forced. The root's
+  // console host is one: it exits only after the root disconnects, so under load
+  // it can still be counted when the root is first observed to have exited.
+  const long RootExitDrainMs = 1000;
   const int ErrorLimit = ${COMMAND_SUPERVISOR_ERROR_LIMIT};
   static string Bound(string message, int limit = ErrorLimit) {
     const string suffix = "...[truncated]";
@@ -154,12 +158,12 @@ public static class FleetCommandSupervisor {
     Check(QueryInformationJobObject(job, 1, out accounting, (uint)Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero));
     return accounting.Active;
   }
-  static bool Empty(IntPtr job) {
+  static bool Empty(IntPtr job, long limitMs) {
     var wait = Stopwatch.StartNew();
     do {
       if (Active(job) == 0) return true;
       Thread.Sleep(10);
-    } while (wait.ElapsedMilliseconds < 10000);
+    } while (wait.ElapsedMilliseconds < limitMs);
     return false;
   }
   static string Quote(string argument) {
@@ -297,7 +301,7 @@ public static class FleetCommandSupervisor {
           Phase = "read_root_exit";
           uint code; Check(GetExitCodeProcess(info.Process, out code));
           exitCode = (long)code;
-          forced = Active(job) > 0;
+          forced = !Empty(job, RootExitDrainMs);
           reason = forced ? "descendant_cleanup" : "exited";
           break;
         }
@@ -341,7 +345,7 @@ public static class FleetCommandSupervisor {
         if (job != IntPtr.Zero) {
           Phase = "terminate_job";
           Check(TerminateJobObject(job, 1));
-          quiescent = Empty(job);
+          quiescent = Empty(job, 10000);
         }
         if (!assigned && info.Process != IntPtr.Zero) {
           Phase = "terminate_unassigned_root";
