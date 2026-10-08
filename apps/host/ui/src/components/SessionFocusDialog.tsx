@@ -54,6 +54,7 @@ type SessionFocusDialogProps = {
   ) => void;
   onConfigChange: (configId: string, value: string) => void;
   notificationPreferenceControl?: ReactNode;
+  messageQueue?: ReactNode;
   draft: SessionDraft;
   onDraftChange: (update: (current: SessionDraft) => SessionDraft) => void;
 };
@@ -78,6 +79,7 @@ export const SessionFocusDialog = ({
   onPermission,
   onConfigChange,
   notificationPreferenceControl,
+  messageQueue,
   draft,
   onDraftChange,
 }: SessionFocusDialogProps) => {
@@ -109,6 +111,7 @@ export const SessionFocusDialog = ({
           onPermission={onPermission}
           onConfigChange={onConfigChange}
           notificationPreferenceControl={notificationPreferenceControl}
+          messageQueue={messageQueue}
           onClose={handleClose}
           draft={draft}
           onDraftChange={onDraftChange}

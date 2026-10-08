@@ -139,6 +139,10 @@ export class CommandExecutionStore {
       )
       .run(randomUUID());
     const columns = this.db.prepare("PRAGMA table_info(lead_prompt_deliveries)").all();
+    if (!columns.some((column) => column.name === "priority"))
+      this.db.exec(
+        "ALTER TABLE lead_prompt_deliveries ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+      );
     if (!columns.some((column) => column.name === "payload_bytes")) {
       this.db.exec(
         "ALTER TABLE lead_prompt_deliveries ADD COLUMN payload_bytes INTEGER NOT NULL DEFAULT 0",
@@ -1208,11 +1212,26 @@ export class CommandExecutionStore {
     return row ? this.parsePrompt(String(row.data)) : undefined;
   }
 
+  promptByKey(leadId: string, key: string): PromptRecord | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT data FROM lead_prompt_deliveries WHERE lead_id=? AND logical_key=?",
+      )
+      .get(leadId, key);
+    return row ? this.parsePrompt(String(row.data)) : undefined;
+  }
+
+  prioritizePrompt(id: string): void {
+    this.db
+      .prepare("UPDATE lead_prompt_deliveries SET priority=? WHERE id=?")
+      .run(Date.now(), id);
+  }
+
   prompts(leadId?: string): PromptRecord[] {
     return this.db
       .prepare(
         `SELECT data FROM lead_prompt_deliveries WHERE state NOT IN ('settled','rejected','orphaned')
-       AND (? IS NULL OR lead_id=?) ORDER BY rowid`,
+       AND (? IS NULL OR lead_id=?) ORDER BY priority DESC,rowid`,
       )
       .all(leadId ?? null, leadId ?? null)
       .map((row) => this.parsePrompt(String(row.data)));

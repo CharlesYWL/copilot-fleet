@@ -108,6 +108,31 @@ const streamEvent = (
 });
 
 describe("TerminalView composer", () => {
+  it.each(["running", "starting", "cancelling"] as const)(
+    "accepts and queues a follow-up while %s, without clearing newer edits",
+    async (state) => {
+      const onPrompt = vi.fn().mockResolvedValue(true);
+      let current: SessionDraft = { prompt: "Do this next", attachments: [] };
+      show(
+        { state },
+        current,
+        [],
+        vi.fn(),
+        (update) => {
+          current = update(current);
+        },
+        onPrompt,
+      );
+      expect(
+        (screen.getByLabelText("Follow-up prompt") as HTMLTextAreaElement).disabled,
+      ).toBe(false);
+      fireEvent.click(screen.getByRole("button", { name: "Queue message" }));
+      fireEvent.click(screen.getByRole("button", { name: "Queue message" }));
+      await waitFor(() => expect(current).toBe(EMPTY_DRAFT));
+      expect(onPrompt).toHaveBeenCalledTimes(1);
+      expect(onPrompt).toHaveBeenCalledWith("Do this next", []);
+    },
+  );
   it.each([false, true])(
     "sends one-turn handback only with explicit selection=%s",
     async (selected) => {
@@ -738,6 +763,22 @@ describe("TerminalView transcript", () => {
   });
 
   it.each([
+    {
+      header: '<fleet-task-transfer task="Moved task" state="awaiting_human">',
+      body: "This task was transferred to you from another conversation.",
+      closing: "</fleet-task-transfer>",
+      guidance: "Read the task before continuing.",
+      title: "Fleet task transfer",
+      detail: "Moved task",
+    },
+    {
+      header: '<fleet-future-command task="New internal command">',
+      body: "New instructions with an envelope not known to the UI.",
+      closing: "</fleet-future-command>",
+      guidance: "Keep this guidance when expanded.",
+      title: "Fleet future command",
+      detail: "New internal command",
+    },
     {
       header:
         '<fleet-command-result executionId="d00c5b6e-1c21-4b5d-8f2e-c2dc1ebdbf65" node="Windows builder" state="succeeded">',

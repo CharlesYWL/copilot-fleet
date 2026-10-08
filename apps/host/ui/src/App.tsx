@@ -76,6 +76,7 @@ import type {
 } from "./components/navigation/ContextModeToggle";
 import { Sidebar } from "./components/Sidebar";
 import { TerminalView } from "./components/TerminalView";
+import { SessionMessageQueue } from "./components/SessionMessageQueue";
 import { TopBar } from "./components/TopBar";
 import { LifecycleNotificationControl } from "./components/LifecycleNotificationControl";
 import { OnboardingTour } from "./components/OnboardingTour";
@@ -1566,6 +1567,12 @@ export function App() {
                       )}
                       <TerminalView
                         session={activeSession}
+                        messageQueue={
+                          <SessionMessageQueue
+                            key={activeSession.id}
+                            session={activeSession}
+                          />
+                        }
                         node={snapshot.nodes.find(
                           (node) => node.id === activeSession.nodeId,
                         )}
@@ -1682,6 +1689,11 @@ export function App() {
         {view === "overview" && activeSession && (
           <SessionFocusDialog
             session={activeSession}
+            messageQueue={
+              focusOpen ? (
+                <SessionMessageQueue key={activeSession.id} session={activeSession} />
+              ) : undefined
+            }
             node={snapshot.nodes.find((node) => node.id === activeSession.nodeId)}
             placement={snapshot.placements.find(
               (placement) => placement.id === activeSession.placementId,

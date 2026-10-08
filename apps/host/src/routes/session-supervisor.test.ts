@@ -1231,7 +1231,7 @@ describe("trusted supervisor session handoff", () => {
   });
 
   it.each(["busy", "stopping", "offline", "checkout"] as const)(
-    "preserves %s refusal without creating a manual grant",
+    "queues busy input and preserves %s safety without creating a manual grant",
     async (condition) => {
       const f = await setup();
       if (condition === "busy") f.store.transitionSession(f.worker.id, "running");
@@ -1244,10 +1244,19 @@ describe("trusted supervisor session handoff", () => {
         });
       const reply = await f.command("prompt");
       expect(reply.statusCode).toBe(
-        condition === "offline" ? 503 : condition === "checkout" ? 500 : 409,
+        condition === "busy"
+          ? 202
+          : condition === "offline"
+            ? 503
+            : condition === "checkout"
+              ? 500
+              : 409,
       );
       expect(f.sent).toHaveLength(0);
       expect(f.store.prMaintenance.get(f.record.id)?.manualControl).toBeUndefined();
+      expect(f.store.queuedMessages(f.worker.id)).toHaveLength(
+        condition === "busy" ? 1 : 0,
+      );
     },
   );
 

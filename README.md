@@ -1072,10 +1072,21 @@ conversations quick to open and to type in while they stream, but it also means
 the browser's own find (Ctrl+F) only searches what is on screen. Measurements and
 how to rerun them are in [chat-history-benchmarks.md](docs/chat-history-benchmarks.md).
 
-Fleet-generated control messages, including worker wake summaries and task
-reviews, appear as compact expandable steps rather than user chat bubbles.
+Fleet-generated control messages, including task transfers, worker wake summaries and
+task reviews, appear as compact expandable steps rather than user chat bubbles.
+New complete `fleet-*` envelopes receive the same treatment without a UI allowlist;
+ordinary prose mentioning a tag and workspace hints appended to human prompts do not.
 Expand a step to read its full original message. These messages do not add
 marks to the user-prompt rail.
+
+Keep typing while a session works: **Queue message** saves the follow-up on the Host
+until the session is idle. A compact **N queued messages** pill above the composer
+expands into a scrollable list, including pending Fleet workflow messages.
+**Cancel** withdraws an unsent message. **Send now** prioritizes it and interrupts
+the current turn, waiting for the agent to become idle before delivery. Attachments
+stay with their queued message. Workflow-owned requests and messages already being
+delivered cannot be recalled. Delivery errors remain visible; uncertain delivery
+is not automatically replayed. Queued messages survive a browser reload or Host restart.
 
 Consecutive diagnostic messages, including Agency startup output, share one
 **Output** label while keeping every line visible. Errors, prompts, and other

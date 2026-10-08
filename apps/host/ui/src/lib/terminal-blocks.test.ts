@@ -340,11 +340,8 @@ describe("toTerminalBlocks", () => {
     'Explain <fleet-review task="Fix" verdict="reopened"> and <fleet-wake>.',
     'Inspect this:\n<fleet-review task="Fix" verdict="reopened">\nnote\n</fleet-review>',
     '```xml\n<fleet-review task="Fix" verdict="reopened">\nnote\n</fleet-review>\n```',
-    "<fleet-review>\nWhat does this tag do?\n</fleet-review>",
     '<fleet-review task="Fix" verdict="reopened">\nWhat does this header mean?',
     '<fleet-review task="Fix" verdict="reopened">\nnote\n</fleet-task>',
-    '<fleet-task name="Fix">\nAn example, not a task brief.\n</fleet-task>',
-    "<fleet-status-check>\nWhat is this?\n</fleet-status-check>",
     "Fix the banner.\n\n<fleet-workspace>\nUse the bound checkout.\n</fleet-workspace>",
   ])(
     "keeps literal tag mentions and incomplete frames as human prompts: %s",
@@ -365,6 +362,18 @@ describe("toTerminalBlocks", () => {
       ]);
     },
   );
+
+  it.each([
+    '<fleet-task-transfer task="Move it">Transferred</fleet-task-transfer>',
+    "<fleet-future-control>New control</fleet-future-control>",
+    "<fleet-review>Changed envelope</fleet-review>",
+    '<fleet-task name="Fix">Changed brief</fleet-task>',
+    "<fleet-status-check>Changed status</fleet-status-check>",
+  ])("folds complete namespace envelopes without matching attributes: %s", (prompt) => {
+    expect(
+      toTerminalBlocks([event("system", { text: `User: ${prompt}` })])[0],
+    ).toMatchObject({ kind: "wake", body: prompt });
+  });
 
   it("only folds the prompt channel, preserving streaming merges and tool responses", () => {
     const prompt = reopenPrompt("Fix the banner", "The regression is back.");

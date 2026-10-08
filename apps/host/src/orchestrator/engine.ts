@@ -190,6 +190,7 @@ export class OrchestratorEngine {
 
   /** Advances every run that is not already finished. */
   tick(nowMs = Date.now()): void {
+    this.service.messages.tick(true);
     this.service.commands.tick(nowMs);
     if (this.store.prMaintenance.reconcileContinuations()) this.service.publishSnapshot();
     this.service.cancelPausedPrMaintenance(new Date(nowMs).toISOString());
@@ -210,6 +211,8 @@ export class OrchestratorEngine {
       }
       this.tickRun(run.id, nowMs);
     }
+    // A worker's finished step must settle before a queued prompt replaces its receipt.
+    this.service.messages.tick();
     // Requests of runs that just closed, and expiry, are settled on every sweep.
     this.resume.reconcile(nowMs);
     this.wakeMaintenanceRecovery(nowMs);

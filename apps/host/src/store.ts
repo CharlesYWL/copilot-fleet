@@ -40,6 +40,7 @@ import {
   type SessionEvent,
   type SessionActivity,
   type SessionState,
+  type PromptAttachment,
   type TunnelProvider,
   type Workspace,
   HOST_BACKUP_KIND,
@@ -472,6 +473,22 @@ const NO_MANUAL_CHECKOUTS =
 /** How the Host locks its own data down, injectable so tests can watch it. */
 export type SecureFiles = (databasePath: string) => void;
 
+export type QueuedSessionMessage = {
+  id: string;
+  sessionId: string;
+  prompt: string;
+  attachments: PromptAttachment[];
+  operatorId?: string | undefined;
+  handback?: "ongoing" | "after_turn" | undefined;
+  createdAt: string;
+  state: "pending" | "sending" | "failed" | "delivered" | "cancelled";
+  priority: number;
+  afterSequence: number;
+  deliveryKey: string;
+  error: string;
+  digest: string;
+};
+
 export class FleetStore {
   private readonly db: DatabaseSync;
   /**
@@ -715,6 +732,15 @@ export class FleetStore {
         updated_at TEXT NOT NULL,
         PRIMARY KEY(session_id, agent_id)
       );
+      CREATE TABLE IF NOT EXISTS session_message_queue (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        state TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 0,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_session_message_queue
+        ON session_message_queue(session_id,state);
       CREATE TABLE IF NOT EXISTS session_transition_intents (
         session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
         intent TEXT NOT NULL,
@@ -4208,6 +4234,48 @@ export class FleetStore {
          ORDER BY CASE WHEN w.kind='chats' THEN 0 ELSE 1 END,w.name,p.position,n.name`,
       ).all() as Row[]
     ).map(placementFromRow);
+  }
+
+  queuedMessageSessionIds(): string[] {
+    return this.statement(
+      "SELECT DISTINCT session_id FROM session_message_queue WHERE state NOT IN ('delivered','cancelled')",
+    )
+      .all()
+      .map((row) => String(row.session_id));
+  }
+
+  queuedMessages(
+    sessionId?: string,
+    state?: QueuedSessionMessage["state"],
+  ): QueuedSessionMessage[] {
+    return this.statement(
+      `SELECT data FROM session_message_queue
+       WHERE state NOT IN ('delivered','cancelled') AND (? IS NULL OR session_id=?)
+       AND (? IS NULL OR state=?)
+       ORDER BY priority DESC,rowid`,
+    )
+      .all(sessionId ?? null, sessionId ?? null, state ?? null, state ?? null)
+      .map((row) => JSON.parse(String(row.data)) as QueuedSessionMessage);
+  }
+
+  queuedMessage(id: string): QueuedSessionMessage | undefined {
+    const row = this.statement("SELECT data FROM session_message_queue WHERE id=?").get(
+      id,
+    );
+    return row ? (JSON.parse(String(row.data)) as QueuedSessionMessage) : undefined;
+  }
+
+  saveQueuedMessage(message: QueuedSessionMessage): void {
+    this.statement(
+      `INSERT INTO session_message_queue(id,session_id,state,priority,data) VALUES(?,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET state=excluded.state,priority=excluded.priority,data=excluded.data`,
+    ).run(
+      message.id,
+      message.sessionId,
+      message.state,
+      message.priority,
+      JSON.stringify(message),
+    );
   }
 
   createSession(

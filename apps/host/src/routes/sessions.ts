@@ -210,7 +210,9 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       }
       const session = store.getSession(id);
       if (!session) return reply.code(404).send({ error: "Session not found" });
-      const dispatched = service.promptSession(id, input, request.fleetHumanActor);
+      if (request.fleetNodeId && request.fleetNodeId !== session.nodeId)
+        return reply.code(403).send({ error: "A node may only prompt its own sessions" });
+      const dispatched = service.messages.submit(id, input, request.fleetHumanActor);
       if (!dispatched.ok)
         return reply.code(dispatched.status).send({ error: dispatched.error });
       /*
@@ -239,6 +241,33 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       return reply.code(202).send({ ok: true });
     },
   );
+
+  app.get("/api/sessions/:id/messages", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = store.getSession(id);
+    if (!session) return reply.code(404).send({ error: "Session not found" });
+    if (request.fleetNodeId && request.fleetNodeId !== session.nodeId)
+      return reply.code(403).send({ error: "A node may only read its own sessions" });
+    return service.messages.list(id);
+  });
+
+  app.post("/api/sessions/:id/messages/:messageId/:action", async (request, reply) => {
+    const { id, messageId, action } = z
+      .object({
+        id: z.string(),
+        messageId: z.string(),
+        action: z.enum(["cancel", "send-now"]),
+      })
+      .parse(request.params);
+    const session = store.getSession(id);
+    if (!session) return reply.code(404).send({ error: "Session not found" });
+    if (request.fleetNodeId)
+      return reply
+        .code(403)
+        .send({ error: "Message queue controls require a browser operator" });
+    service.messages.act(id, messageId, action);
+    return reply.code(202).send({ ok: true });
+  });
 
   app.post("/api/sessions/:id/resume", async (request, reply) => {
     const { id } = request.params as { id: string };
