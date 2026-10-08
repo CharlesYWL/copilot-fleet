@@ -419,6 +419,12 @@ export type AuthTransaction = {
         sessionTokenHash: string;
       }
     | undefined;
+  /**
+   * The page asked for this sign-in to confirm a change it is still holding,
+   * from a tab of its own. It decides only where the callback lands; what the
+   * sign-in is worth is decided exactly as for any other.
+   */
+  reauth?: true | undefined;
   expiresAt: number;
 };
 
@@ -431,6 +437,7 @@ export type StartTransactionInput = {
   configurationKey?: string | undefined;
   migration?: AuthTransaction["migration"];
   administratorAddition?: AuthTransaction["administratorAddition"];
+  reauth?: AuthTransaction["reauth"];
 };
 
 /**
@@ -472,6 +479,7 @@ export class EntraTransactions {
       configurationKey: input.configurationKey ?? "",
       migration: input.migration,
       administratorAddition: input.administratorAddition,
+      ...(input.reauth ? { reauth: true as const } : {}),
       expiresAt: this.now() + AUTH_TRANSACTION_TTL_MS,
     };
     this.byState.set(transaction.state, transaction);

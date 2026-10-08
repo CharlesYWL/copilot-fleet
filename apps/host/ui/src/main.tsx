@@ -4,12 +4,13 @@ import { FluentProvider } from "@fluentui/react-components";
 import { App } from "./App";
 import { AuthGate } from "./components/AuthGate";
 import { AdministratorAdded } from "./components/AdministratorAdded";
+import { IdentityConfirmed } from "./components/IdentityConfirmed";
 import { fleetDarkTheme } from "./theme";
 import "./styles.css";
 
-const addedAdministratorId = new URLSearchParams(window.location.search).get(
-  "administrator_added",
-);
+const landing = new URLSearchParams(window.location.search);
+const addedAdministratorId = landing.get("administrator_added");
+const identityConfirmed = landing.get("reauthenticated") === "1";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
@@ -21,6 +22,8 @@ createRoot(document.getElementById("root")!).render(
         <AuthGate>
           {addedAdministratorId ? (
             <AdministratorAdded administratorId={addedAdministratorId} />
+          ) : identityConfirmed ? (
+            <IdentityConfirmed />
           ) : (
             <App />
           )}

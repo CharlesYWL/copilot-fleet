@@ -128,13 +128,13 @@ describe("Microsoft identity routes", () => {
       }),
     );
 
-  const signIn = async () => {
+  const signIn = async (payload: Record<string, unknown> = {}) => {
     const started = remember(
       await app.inject({
         method: "POST",
         url: "/api/auth/code/start",
         headers: { cookie: cookieHeader() },
-        payload: {},
+        payload,
       }),
     );
     if (started.statusCode !== 200) return started;
@@ -578,6 +578,44 @@ describe("Microsoft identity routes", () => {
     expect(signedIn.statusCode).toBe(302);
     expect(signedIn.headers.location).toBe("/");
     expect(await status()).toMatchObject({ authenticated: true });
+  });
+
+  it("returns a confirming sign-in to a page that hands back to the waiting tab", async () => {
+    // Settings opens this sign-in in a tab of its own while it holds the
+    // change; landing on a second full console there would strand the person.
+    await bootstrap();
+    await configure();
+    await signIn();
+    const before = jar.get("fleet_operator");
+
+    const confirmed = await signIn({ reauth: true });
+    expect(confirmed.statusCode).toBe(302);
+    expect(confirmed.headers.location).toBe("/?reauthenticated=1");
+    // The marker changes where it lands, not what it is worth: it is a new,
+    // freshly authenticated session like any other code sign-in.
+    expect(jar.get("fleet_operator")).toBeTruthy();
+    expect(jar.get("fleet_operator")).not.toBe(before);
+    expect(await status()).toMatchObject({ authenticated: true });
+
+    // A claim still lands on the setup tour, and a denial is still a denial.
+    jar.clear();
+    nextIdentity = bob;
+    const denied = await signIn({ reauth: true });
+    expect(deniedAs(denied)).toBe("not-authorized");
+    expect(jar.get("fleet_operator")).toBeUndefined();
+  });
+
+  it("will not take anything but a plain marker on a sign-in start", async () => {
+    await bootstrap();
+    await configure();
+    await signIn();
+    const refused = await app.inject({
+      method: "POST",
+      url: "/api/auth/code/start",
+      headers: { cookie: cookieHeader() },
+      payload: { reauth: "/elsewhere" },
+    });
+    expect(refused.statusCode).toBe(400);
   });
 
   it("consumes the bootstrap grant, so a second claim cannot ride on it", async () => {

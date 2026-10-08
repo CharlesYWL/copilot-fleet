@@ -114,6 +114,11 @@ export type LoginSuccess = {
   administrator?: Administrator;
   /** Only the successful first claim starts the browser's setup walkthrough. */
   claimedHost?: true;
+  /**
+   * The sign-in confirmed a change another tab is holding, so the callback
+   * lands on a page that hands back to it rather than on a second console.
+   */
+  reauthenticated?: true;
 };
 export type AdministratorAddedSuccess = {
   ok: true;
@@ -862,6 +867,7 @@ export class FleetAuth {
   async startCodeLogin(
     input: MicrosoftLoginInput & {
       redirectUri: string;
+      reauth?: boolean | undefined;
     },
   ): Promise<{ ok: true; authorizationUrl: string } | AuthFailure> {
     const prepared = this.prepareMicrosoftLogin(input);
@@ -873,6 +879,7 @@ export class FleetAuth {
       invitation: input.invitation,
       redirectUri: input.redirectUri,
       configurationKey: this.configurationKey(prepared.config),
+      reauth: input.reauth ? true : undefined,
     });
     try {
       const authorizationUrl = await this.provider(prepared.config).authorizationUrl({
@@ -995,12 +1002,15 @@ export class FleetAuth {
         input.host,
       );
     }
-    return this.authorize(identity, "microsoft-code", {
+    const outcome = this.authorize(identity, "microsoft-code", {
       bootstrap: transaction.bootstrap,
       grantToken: transaction.grantToken,
       invitation: transaction.invitation,
       host: input.host,
     });
+    return outcome.ok && transaction.reauth
+      ? { ...outcome, reauthenticated: true }
+      : outcome;
   }
 
   cancelCodeLogin(state: string | undefined, binding: string): void {

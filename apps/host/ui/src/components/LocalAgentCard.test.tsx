@@ -55,9 +55,11 @@ const host = (
 
 const show = () => {
   const failures: unknown[] = [];
+  const options: unknown[] = [];
   const notify = vi.fn();
   // Stands in for SecurityPanel's `run`: it owns turning a refusal into feedback.
-  const run = async (work: () => Promise<unknown>) => {
+  const run = async (work: () => Promise<unknown>, option?: unknown) => {
+    options.push(option);
     try {
       await work();
     } catch (reason) {
@@ -71,7 +73,7 @@ const show = () => {
       </NotificationContext.Provider>
     </FluentProvider>,
   );
-  return { failures, notify };
+  return { failures, notify, options };
 };
 
 const sent = (fetchMock: ReturnType<typeof host>, method: string, url: string) => {
@@ -155,6 +157,56 @@ describe("LocalAgentCard", () => {
       ),
     ).toBeTruthy();
     expect(screen.getByText(/"url": "http:\/\/127\.0\.0\.1:8786\/v1\/mcp"/)).toBeTruthy();
+  });
+
+  it("asks the panel to finish a save after a fresh sign-in, but never an abandon", async () => {
+    // A save names the revision it was made from, so replaying it once the
+    // administrator has confirmed elsewhere cannot overwrite a newer one. An
+    // abandon withdraws work, so it waits for the administrator to ask again.
+    const owed = {
+      operationId: "op-1",
+      kind: "create_task",
+      state: "waiting_for_brief",
+      leadSessionId: lead.id,
+      taskId: "task-1",
+      clientLabel: "hermes",
+      createdAt: "2026-09-01T10:00:00.000Z",
+      updatedAt: "2026-09-01T10:00:00.000Z",
+      version: 2,
+      dispatchEverReserved: false,
+      briefDigest: "digest-1",
+      workspaceId: workspace.id,
+      taskName: "Fix flaky test",
+      targetDeleted: false,
+      owedPreview: "<fleet-task-brief>Fix the flaky test</fleet-task-brief>",
+    };
+    host(
+      { requests: [owed] },
+      {
+        "PUT /api/local-agent/config": () => answer(view({ enabled: true, revision: 4 })),
+        "POST /api/local-agent/requests/op-1/disposition": () =>
+          answer({ request: { ...owed, state: "abandoned" } }),
+      },
+    );
+    const { options } = show();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Turn on…" }));
+    const warning = await screen.findByRole("dialog", {
+      name: /turn on the local agent api/i,
+    });
+    fireEvent.click(within(warning).getByRole("button", { name: "Turn on" }));
+    await waitFor(() => expect(options).toHaveLength(1));
+    expect(options[0]).toEqual({ refresh: false, resumeAfterReauth: true });
+
+    const table = await screen.findByRole("table", { name: "Local agent requests" });
+    fireEvent.click(within(table).getByRole("button", { name: "Abandon…" }));
+    const dialog = await screen.findByRole("dialog", { name: /abandon this request/i });
+    fireEvent.change(within(dialog).getByRole("textbox"), {
+      target: { value: "Agent crashed" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Abandon" }));
+    await waitFor(() => expect(options).toHaveLength(2));
+    expect(options[1]).toEqual({ refresh: false });
   });
 
   it("will not offer the Host's own port", async () => {
