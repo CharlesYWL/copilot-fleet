@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
-import { render, screen, fireEvent, within } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
 import { Sidebar } from "./Sidebar";
@@ -98,6 +98,7 @@ const tree = (
         waitingPermissions={[]}
         onSelectSession={vi.fn()}
         onSelectLeadSession={vi.fn()}
+        onDeleteLeadSession={vi.fn(async () => true)}
         onNewConversation={vi.fn()}
         onNewSession={vi.fn()}
         onSelectView={vi.fn()}
@@ -128,16 +129,19 @@ describe("Sidebar drag handles", () => {
   });
 
   describe("dismissed orchestrators", () => {
+    const lead: FleetSession = {
+      ...session("lead", "w1", "n1", "stopped"),
+      runRole: "lead",
+      dismissed: true,
+    };
+
     it("collapses hidden conversations by default and restores them after expansion", () => {
       const restore = vi.fn();
-      const lead: FleetSession = {
-        ...session("lead", "w1", "n1", "stopped"),
-        runRole: "lead",
-        dismissed: true,
-      };
+      const remove = vi.fn(async () => true);
       show([placement], [], {
         dismissedLeadSessions: [lead],
         onRestoreLeadSession: restore,
+        onDeleteLeadSession: remove,
       });
 
       const disclosure = screen.getByRole("button", {
@@ -154,6 +158,92 @@ describe("Sidebar drag handles", () => {
       ).toBe("true");
       fireEvent.click(screen.getByTitle("Restore lead"));
       expect(restore).toHaveBeenCalledWith("lead");
+      expect(remove).not.toHaveBeenCalled();
+    });
+
+    it("requires confirmation and lets the operator cancel deletion", async () => {
+      const remove = vi.fn(async () => true);
+      const restore = vi.fn();
+      show([placement], [], {
+        dismissedLeadSessions: [lead],
+        onRestoreLeadSession: restore,
+        onDeleteLeadSession: remove,
+      });
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Show dismissed orchestrators" }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Delete lead" }));
+
+      const dialog = screen.getByRole("dialog", {
+        name: "Delete dismissed orchestrator?",
+      });
+      expect(within(dialog).getByText(/cannot be restored/)).toBeTruthy();
+      expect(within(dialog).getByText(/Task history.*are not deleted/)).toBeTruthy();
+      expect(remove).not.toHaveBeenCalled();
+      expect(restore).not.toHaveBeenCalled();
+
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(await screen.findByRole("button", { name: "Delete lead" })).toBeTruthy();
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(remove).not.toHaveBeenCalled();
+    });
+
+    it("deletes only the confirmed conversation and removes it after refresh", async () => {
+      const remove = vi.fn(async () => true);
+      const restore = vi.fn();
+      const other = { ...lead, id: "other-lead", name: "Other lead" };
+      const overrides = {
+        dismissedLeadSessions: [lead, other],
+        onRestoreLeadSession: restore,
+        onDeleteLeadSession: remove,
+      };
+      const { rerender } = show([placement], [], overrides);
+      fireEvent.click(
+        screen.getByRole("button", { name: "Show dismissed orchestrators" }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Delete lead" }));
+      const confirm = screen.getByRole("button", { name: "Delete orchestrator" });
+      fireEvent.click(confirm);
+      expect(confirm.hasAttribute("disabled")).toBe(true);
+      expect(
+        screen.getByRole("button", { name: "Cancel" }).hasAttribute("disabled"),
+      ).toBe(true);
+      fireEvent.click(confirm);
+      expect(remove).toHaveBeenCalledExactlyOnceWith("lead");
+      expect(restore).not.toHaveBeenCalled();
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+      rerender(tree([placement], [], { ...overrides, dismissedLeadSessions: [other] }));
+      expect(screen.queryByTitle("Restore lead")).toBeNull();
+      expect(
+        await screen.findByRole("button", { name: "Delete Other lead" }),
+      ).toBeTruthy();
+      rerender(tree([placement], [], { ...overrides, dismissedLeadSessions: [] }));
+      expect(screen.queryByText("Dismissed orchestrators")).toBeNull();
+    });
+
+    it("keeps a refused deletion open for retry", async () => {
+      const remove = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      show([placement], [], {
+        dismissedLeadSessions: [lead],
+        onDeleteLeadSession: remove,
+      });
+      fireEvent.click(
+        screen.getByRole("button", { name: "Show dismissed orchestrators" }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Delete lead" }));
+      const confirm = screen.getByRole("button", { name: "Delete orchestrator" });
+      fireEvent.click(confirm);
+      await waitFor(() => expect(confirm.hasAttribute("disabled")).toBe(false));
+      expect(screen.getByRole("dialog")).toBeTruthy();
+      expect(screen.getByTitle("Restore lead")).toBeTruthy();
+      expect(remove).toHaveBeenCalledExactlyOnceWith("lead");
+
+      fireEvent.click(confirm);
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(remove).toHaveBeenCalledTimes(2);
+      expect(remove).toHaveBeenLastCalledWith("lead");
     });
   });
 

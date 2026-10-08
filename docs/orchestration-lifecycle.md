@@ -32,6 +32,14 @@ is driven by lead wakes.
 Dismiss and restore never change run, step, or worker state. A dismissed lead and
 its tasks remain in persistence and continue accepting late terminal events.
 
+Each conversation under **Dismissed orchestrators** in the sidebar also has a
+**Delete** action. After confirmation, it uses `DELETE /api/sessions/:id` to
+permanently remove the conversation and its transcript from Fleet, including the
+dismissed list; it can no longer be restored. Task history, worker sessions and
+files on nodes are not deleted. Existing session-cleanup, command and PR
+maintenance retention guards still apply; a refused deletion leaves the
+conversation available to restore or retry.
+
 An unexpected lead failure, including failure to restore MCP tools, and an
 explicit Stop are handled the same way: Resume reattaches the existing lead
 conversation while workers in ongoing tasks keep their sessions and progress.

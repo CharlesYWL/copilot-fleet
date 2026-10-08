@@ -1378,6 +1378,7 @@ export function App() {
                   onRestoreLeadSession={(sessionId) => {
                     void handleRestoreOrchestrator(sessionId);
                   }}
+                  onDeleteLeadSession={handleDismissSession}
                   onNewConversation={() => {
                     void handleStartOrchestrator();
                     setNavOpen(false);
