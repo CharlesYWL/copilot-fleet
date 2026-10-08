@@ -9,6 +9,9 @@ import { isDeepStrictEqual } from "node:util";
 import {
   AgentKindSchema,
   AgentParamsSchema,
+  LOCAL_AGENT_DEFAULT_PORT,
+  LocalAgentConfigSchema,
+  type LocalAgentConfig,
   type AgentKind,
   type AgentParams,
   type OrchestratorModels,
@@ -114,6 +117,7 @@ import {
 } from "@fleet/protocol";
 import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
 import { CommandConflict, CommandExecutionStore } from "./command-execution-store.js";
+import { LocalAgentStore, briefOwedBy, withoutBrief } from "./local-agent-store.js";
 import { assertHostArchiveSize } from "./backup-limits.js";
 import {
   PrMaintenanceStore,
@@ -419,6 +423,8 @@ export const PRESERVED_SETTING_KEYS = [
   "node.mutualAuthentication.required",
 ] as const;
 
+/** Deliberately not preserved: see `getLocalAgentConfig`. */
+export const LOCAL_AGENT_CONFIG_SETTING = "localAgent.config";
 const terminalStateList = [...terminalSessionStates];
 /** Terminal plus offline: settled enough that a cascade delete is safe. */
 const settledStateList = [...terminalStateList, "offline"];
@@ -481,6 +487,7 @@ export class FleetStore {
    */
   private readonly heartbeats = new Map<string, string>();
   readonly commands: CommandExecutionStore;
+  readonly localAgent: LocalAgentStore;
   readonly prMaintenance: PrMaintenanceStore;
   readonly resumeRequests: WorkerResumeStore;
   readonly artifactDirectory: string;
@@ -973,6 +980,11 @@ export class FleetStore {
       this.writeAtomically(work),
     );
     this.commands.quarantine();
+    this.localAgent = new LocalAgentStore(this.db, (work) => this.writeAtomically(work), {
+      prompt: (deliveryId) => this.commands.prompt(deliveryId),
+      prompts: (leadId) => this.commands.prompts(leadId),
+      run: (runId) => this.getRun(runId),
+    });
     this.prMaintenance = new PrMaintenanceStore(this, this.db);
     this.resumeRequests = new WorkerResumeStore(this.db, (work) =>
       this.transactionIfNeeded(work),
@@ -1180,6 +1192,50 @@ export class FleetStore {
     ).run(key, value);
   }
 
+  /**
+   * Who the local agent API may reach, and whether it listens at all.
+   *
+   * Off until an administrator turns it on. Not a preserved setting, so a
+   * restore — which brings back a different set of orchestrators and
+   * workspaces — switches it off rather than exposing whatever IDs the archive
+   * happens to reuse; so does an authentication reset, which removes the
+   * administrators who consented to it.
+   */
+  getLocalAgentConfig(): LocalAgentConfig {
+    const stored = this.getSetting(LOCAL_AGENT_CONFIG_SETTING);
+    if (stored) {
+      try {
+        return LocalAgentConfigSchema.parse(JSON.parse(stored));
+      } catch {
+        // A config this build cannot read exposes nothing.
+      }
+    }
+    return {
+      enabled: false,
+      port: LOCAL_AGENT_DEFAULT_PORT,
+      allowedLeadSessionIds: [],
+      allowedWorkspaceIds: [],
+      revision: 0,
+    };
+  }
+
+  /** Writes the config if it is still at `expectedRevision`; otherwise returns undefined. */
+  setLocalAgentConfig(
+    next: Omit<LocalAgentConfig, "revision">,
+    expectedRevision: number,
+  ): LocalAgentConfig | undefined {
+    return this.writeAtomically(() => {
+      const current = this.getLocalAgentConfig();
+      if (current.revision !== expectedRevision) return undefined;
+      const saved = LocalAgentConfigSchema.parse({
+        ...next,
+        revision: current.revision + 1,
+      });
+      this.setSetting(LOCAL_AGENT_CONFIG_SETTING, JSON.stringify(saved));
+      return saved;
+    });
+  }
+
   /** Console-only fresh start; Node credentials and working data are not browser auth. */
   resetOperatorAuthentication(): void {
     if (this.statement("PRAGMA locking_mode").get()?.locking_mode !== "exclusive") {
@@ -1224,6 +1280,8 @@ export class FleetStore {
       this.statement(`DELETE FROM settings WHERE key IN (${placeholders(keys)})`).run(
         ...keys,
       );
+      // The administrators who consented to the local agent API are gone with this.
+      this.statement("DELETE FROM settings WHERE key=?").run(LOCAL_AGENT_CONFIG_SETTING);
       if (options.csrfKey) {
         this.setSetting("auth.csrfKey", options.csrfKey);
         this.setSetting("auth.passwordEnabled", "0");
@@ -2665,6 +2723,32 @@ export class FleetStore {
     // backup with the one workspace nothing is written to work without.
     this.seedChatsWorkspace();
     this.commands.importBackup(parsed.commandExecutionData);
+    this.retireReplayedLocalBriefs();
+  }
+
+  /**
+   * A restored run can owe a local agent's brief that this Host has already
+   * handed to its orchestrator — the archive predates the delivery — or that
+   * an administrator abandoned. The local ledger is not part of the archive,
+   * so it still holds the proof, and sending those exact words again would
+   * start the same work twice. Only the bytes the ledger vouches for are
+   * removed; anything appended to them stays owed.
+   */
+  private retireReplayedLocalBriefs(): void {
+    for (const row of this.localAgent.retiredBriefs()) {
+      const run = this.getRun(row.taskId);
+      if (!run || !briefOwedBy(row, run.pendingPrompt)) continue;
+      this.updateRun(run.id, {
+        pendingPrompt: withoutBrief(run.pendingPrompt, row.briefLength!),
+      });
+      this.recordSecurityAudit({
+        eventType: "local_agent_brief_retired",
+        actorKind: "host",
+        outcome: "allowed",
+        targetId: row.operationId,
+        detail: `Restore brought back task ${run.id}'s brief, which this Host had already ${row.phase === "abandoned" ? "abandoned" : "delivered"}; it was not sent again.`,
+      });
+    }
   }
 
   /**

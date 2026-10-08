@@ -46,6 +46,7 @@ export * from "./session-files.js";
 export * from "./pr-maintenance.js";
 export * from "./heartbeat-schedule.js";
 export * from "./worker-resume.js";
+export * from "./local-agent.js";
 import {
   HEARTBEAT_SCHEDULE_MAX_LENGTH,
   HeartbeatScheduleSchema,

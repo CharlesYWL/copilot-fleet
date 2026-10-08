@@ -273,7 +273,13 @@ export const PlanTaskSchema = z.object({
   accessIntent: AccessIntentSchema.optional().describe(
     "Use no-checkout only for nonrepository work in Chats. Shell-capable repository work always requires a checkout lease.",
   ),
-  task: z.string().min(1).max(80).describe("A short name for this piece of work."),
+  task: z
+    .string()
+    .min(1)
+    .max(80)
+    .describe(
+      "A short name for new work, or the exact task ID a <fleet-task id=...> brief gave you. Prefer the ID: names need not be unique.",
+    ),
   objective: z
     .string()
     .min(1)

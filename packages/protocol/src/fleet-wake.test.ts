@@ -45,6 +45,41 @@ describe("command result controls", () => {
   });
 });
 
+describe("task and local-agent controls", () => {
+  it("reads task briefs with and without the exact task ID", () => {
+    for (const header of [
+      '<fleet-task id="task-1" name="Fix it" workspace="repo">',
+      '<fleet-task name="Fix it" workspace="repo">',
+    ]) {
+      expect(parseFleetControl([header, "Do it.", "</fleet-task>"].join("\n"))).toEqual({
+        title: "Task received",
+        detail: "Fix it · repo",
+      });
+    }
+  });
+
+  it("summarizes a complete local-agent request and nothing that merely resembles one", () => {
+    const header =
+      '<fleet-local-agent-request id="op-1" taskId="task-1" task="Fix \\"it\\"" intent="question" source="local-agent" client="Hermes">';
+    const text = [header, "Body", "</fleet-local-agent-request>"].join("\n");
+    expect(parseFleetControl(text)).toEqual({
+      title: "Local agent question",
+      detail: 'Hermes · Fix "it"',
+    });
+    expect(
+      parseFleetControl(
+        text
+          .replace(' client="Hermes"', "")
+          .replace('intent="question"', 'intent="guidance"'),
+      ),
+    ).toEqual({ title: "Local agent guidance", detail: 'Unlabelled client · Fix "it"' });
+    expect(parseFleetControl(`${header}\nBody`)).toBeUndefined();
+    expect(
+      parseFleetControl(`Explain ${header}\n</fleet-local-agent-request>`),
+    ).toBeUndefined();
+  });
+});
+
 /** Written exactly as `wakeEnvelope` in apps/host/src/orchestrator/briefing.ts does. */
 const envelope = [
   `<fleet-wake task="PR for bug 2129276 empty-state fix" phase="Open PR" (1/1) wakes=2/12>`,

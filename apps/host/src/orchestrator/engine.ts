@@ -725,16 +725,26 @@ export class OrchestratorEngine {
           )
         )
           return false;
-        this.service.commands.queueLeadPrompt(
+        const record = this.service.commands.queueLeadPrompt(
           lead.id,
           prompt,
           `run-prompt:${run.id}:${run.updatedAt}`,
+        );
+        // In the same commit, so a local agent's receipt can never lose track
+        // of the brief between "no longer owed" and "queued".
+        this.store.localAgent.linkWaitingBriefs(
+          run.id,
+          record.delivery.deliveryId,
+          prompt,
         );
         return true;
       });
       if (queued) this.service.commands.pumpLead(lead.id);
       return queued;
     }
+    // A local agent was promised a receipt for this brief, and only the
+    // durable queue can give one. It stays owed, visibly, until it can.
+    if (this.store.localAgent.waitingBriefOwed(run.id)) return false;
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
     if (

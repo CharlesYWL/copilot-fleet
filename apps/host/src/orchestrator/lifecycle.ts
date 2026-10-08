@@ -357,6 +357,20 @@ export function transferRun(
             ", ",
           )}). Their results go to the orchestrator that requested them, so let them settle or cancel them, then transfer the task.`,
       );
+    // A local agent named this owner when it sent these, and its receipt
+    // follows the delivery on that owner's queue; moving the task would answer
+    // on one conversation while the work continues on another.
+    const local = store.localAgent.unresolvedForTask(run.id);
+    if (local.length)
+      throw new TaskTransferError(
+        409,
+        "task_message_pending",
+        `This task has ${local.length} unresolved local agent request(s) (${local
+          .map((request) => `${request.operationId}: ${request.state}`)
+          .join(
+            ", ",
+          )}). Let the orchestrator take them, or have an administrator abandon them under Settings → Security → Local agent API, then transfer the task.`,
+      );
 
     const from = run.leadSessionId;
     const previous = from ? store.getSession(from) : undefined;

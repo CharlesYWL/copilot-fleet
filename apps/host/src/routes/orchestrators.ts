@@ -8,7 +8,6 @@ import {
   terminalRunStates,
   terminalSessionStates,
   WorkspaceModeSchema,
-  isChatsWorkspace,
   PrMaintenanceEnableSchema,
   PrMaintenanceOperatorActionSchema,
   parsePrMaintenanceUrl,
@@ -24,6 +23,12 @@ import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetTools } from "../orchestrator/tools.js";
 import { orchestratorBriefing, owedPrompt } from "../orchestrator/briefing.js";
 import { maintenanceDirectionPrompt, reviewOutcome } from "../orchestrator/review.js";
+import {
+  assertTaskAdmissible,
+  createTaskOnLead,
+  findTaskLead,
+  TaskApplicationError,
+} from "../orchestrator/task-application.js";
 import { PrMaintenanceError, prMaintenanceUnsettled } from "../pr-maintenance-store.js";
 import {
   reopenOrchestratorStoppedRun,
@@ -153,24 +158,6 @@ const CreateRunSchema = z.object({
     })
     .optional(),
 });
-
-/**
- * The turn a new task arrives as.
- *
- * Shaped like the wake envelopes, because that is the form the orchestrator has
- * been treating as "a fact to act on" since its first turn. A bare sentence
- * from a person reads as something to reply to instead.
- */
-function taskBrief(name: string, objective: string, workspace: string): string {
-  return [
-    `<fleet-task name=${JSON.stringify(name)} workspace=${JSON.stringify(workspace)}>`,
-    objective,
-    "</fleet-task>",
-    "",
-    `Plan this with fleet_plan_task using the task name "${name}", then dispatch the`,
-    "work for its first phase and end your turn.",
-  ].join("\n");
-}
 
 export type OrchestratorRouteOptions = {
   service: FleetService;
@@ -753,10 +740,8 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
   app.post("/api/orchestrators/:id/runs", async (request, reply) => {
     const { id } = request.params as { id: string };
     const input = CreateRunSchema.parse(request.body);
-    const lead = store.getSession(id);
-    if (!lead || lead.runRole !== "lead" || terminalSessionStates.has(lead.state)) {
-      return reply.code(404).send({ error: "Orchestrator not found" });
-    }
+    const lead = findTaskLead(store, id);
+    if (!lead) return reply.code(404).send({ error: "Orchestrator not found" });
     if (lead.stopRequested) {
       return reply.code(409).send({ error: "The orchestrator is stopping" });
     }
@@ -770,89 +755,45 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       ) as { runId: string } | undefined;
       if (replay) return reply.code(201).send({ run: store.getRun(replay.runId) });
     }
-    if (
-      input.sourcePlacementId &&
-      store.getPlacement(input.sourcePlacementId)?.workspaceId !== input.workspaceId
-    )
-      return reply.code(409).send({
-        code: "source_mismatch",
-        error: "Select a source placement in this workspace.",
+    let run;
+    try {
+      assertTaskAdmissible(store, {
+        lead,
+        workspace,
+        workspaceMode: input.workspaceMode,
+        sourcePlacementId: input.sourcePlacementId,
+        hasOperationId: Boolean(input.operationId),
       });
-    if (
-      !isChatsWorkspace(input.workspaceId) &&
-      (input.workspaceMode === "managed" ||
-        (input.workspaceMode === "auto" && store.getManagedWorktreesEnabled())) &&
-      !input.sourcePlacementId
-    ) {
-      return reply.code(409).send({
-        code: "source_required",
-        error: "Select the repository copy that should define this task’s baseline.",
-      });
-    }
-    if (
-      !isChatsWorkspace(input.workspaceId) &&
-      (input.workspaceMode === "managed" ||
-        (input.workspaceMode === "auto" && store.getManagedWorktreesEnabled())) &&
-      !input.operationId
-    ) {
-      return reply.code(409).send({
-        code: "idempotency_required",
-        error: "Managed task creation requires an operationId.",
-      });
-    }
-    const reachable = store
-      .listPlacements()
-      .some(
-        (placement) =>
-          placement.workspaceId === workspace.id &&
-          store.getNode(placement.nodeId)?.online,
-      );
-    if (!reachable) {
-      return reply
-        .code(409)
-        .send({ error: "No online node holds that workspace, so a task cannot run" });
-    }
-
-    const template = store.listRuns().find((entry) => entry.leadSessionId === lead.id);
-    const administrator = request.fleetSession?.administratorId
-      ? store.getAdministrator(request.fleetSession.administratorId)
-      : undefined;
-    const created = store.writeAtomically(() => {
-      const created = store.createRun({
+      const administrator = request.fleetSession?.administratorId
+        ? store.getAdministrator(request.fleetSession.administratorId)
+        : undefined;
+      run = createTaskOnLead(store, {
+        lead,
+        workspace,
+        name: input.name,
+        objective: input.objective,
         workspaceMode: input.workspaceMode,
         sourcePlacementId: input.sourcePlacementId,
         integrationBaseRef: input.integrationBaseRef,
         integrationBranchRef: input.integrationBranchRef,
         integrationUsername: administrator?.username,
-        accessIntent: isChatsWorkspace(workspace.id) ? "no-checkout" : "checkout",
-        workspaceId: workspace.id,
-        name: input.name,
-        objective: input.objective,
-        policy: {
-          ...(template ? template.policy : {}),
-          ...(input.policy ?? {}),
-          wakePolicy: "on_any_settle",
-          onStepFailure: "wake",
+        policy: input.policy,
+        record: (created) => {
+          if (input.operationId)
+            store.recordManagedApiRequest(`create-task:${id}`, input.operationId, input, {
+              runId: created.id,
+            });
         },
       });
-      if (input.operationId)
-        store.recordManagedApiRequest(`create-task:${id}`, input.operationId, input, {
-          runId: created.id,
+    } catch (error) {
+      if (error instanceof TaskApplicationError) {
+        return reply.code(error.statusCode).send({
+          ...(error.code === "workspace_unreachable" ? {} : { code: error.code }),
+          error: error.message,
         });
-      return created;
-    });
-    const run = store.updateRun(created.id, {
-      leadSessionId: lead.id,
-      state: "running",
-      /*
-       * The brief is owed rather than sent. It goes out on the first tick where
-       * the orchestrator is free; an orchestrator running another task is the
-       * ordinary case, and a prompt pushed at it mid-turn is refused by the
-       * Node and reported only as a transcript notice — so a direct send here
-       * would create a task nothing had been told about, and return 201.
-       */
-      pendingPrompt: taskBrief(created.name, created.objective, workspace.name),
-    })!;
+      }
+      throw error;
+    }
 
     await service.worktrees.prepare(run.id);
     service.publishRun(store.getRun(run.id)!);
