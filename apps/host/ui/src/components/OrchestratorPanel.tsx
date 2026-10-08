@@ -220,7 +220,7 @@ export function OrchestratorPanel({
                   ? (profile.error.issues[0]?.message ?? null)
                   : null
               }
-              hint="One active Hermes orchestrator per profile per Node. Memory and skills stay with that profile on that Node."
+              hint="Orchestrators can share a profile with separate conversations. Memory and skills are shared on that Node."
             >
               <Input
                 aria-label="Hermes profile"
@@ -242,8 +242,8 @@ export function OrchestratorPanel({
                 <Text className={styles.caption}>
                   Skip creation if the profile already exists. Setup is interactive; the
                   check verifies ACP dependencies, not a model request. Fleet does not
-                  create profiles, copy credentials, or synchronize memory. Do not use
-                  this profile in another Hermes process while Fleet runs it.
+                  create profiles, copy credentials, or synchronize memory. Use different
+                  profiles when learning should stay separate.
                 </Text>
               </div>
             )}

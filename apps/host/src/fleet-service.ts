@@ -871,23 +871,6 @@ export class FleetService {
     if (!supportsAgentKind(node, params.kind)) {
       return `${agentKindLabels[params.kind]} is unavailable on ${node.name}. Install the agent and reconnect or upgrade this Node; existing sessions never change backend.`;
     }
-    if (
-      params.kind === "hermes" &&
-      this.store
-        .listSessions()
-        .some(
-          (session) =>
-            session.id !== sessionId &&
-            session.nodeId === node.id &&
-            session.agentParams?.kind === "hermes" &&
-            session.agentParams.profile === params.profile &&
-            (liveSessionStates.has(session.state) ||
-              session.state === "offline" ||
-              session.stopRequested),
-        )
-    ) {
-      return `Hermes profile "${params.profile}" already belongs to an active orchestrator on ${node.name}. Stop it before starting another, or select a different profile. If its Node is unavailable, verify the old process has stopped, then use Mark stopped on that conversation. Dismissal alone does not stop a process.`;
-    }
     return undefined;
   }
 

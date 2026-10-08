@@ -762,21 +762,6 @@ export class CommandRouter {
       );
     }
     const kind: SessionKind = command.readOnly ? "read-only" : "writing";
-    const params = command.agentParams;
-    if (
-      params?.kind === "hermes" &&
-      [...this.slots.values(), ...this.reconciliation.values()].some(
-        (slot) =>
-          slot.launch?.agentParams?.kind === "hermes" &&
-          slot.launch.agentParams.profile === params.profile,
-      )
-    ) {
-      return Promise.reject(
-        new CommandRefused(
-          `Hermes profile "${params.profile}" is already in use on this Node. Stop its orchestrator and wait for cleanup before reusing it.`,
-        ),
-      );
-    }
     const held = [...new Map([...this.reconciliation, ...this.slots]).values()].filter(
       (slot) => slot.kind === kind,
     ).length;

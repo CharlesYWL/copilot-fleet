@@ -296,6 +296,12 @@ describe("OrchestratorPanel", () => {
     fireEvent.click(dropdown);
     fireEvent.click(screen.getByRole("option", { name: "Hermes" }));
     expect(screen.getByText(/Detected on online Nodes: Hermes box/)).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Orchestrators can share a profile with separate conversations. Memory and skills are shared on that Node.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/One active Hermes orchestrator/)).toBeNull();
     const input = screen.getByRole<HTMLInputElement>("textbox", {
       name: "Hermes profile",
     });

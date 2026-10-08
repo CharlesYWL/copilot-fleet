@@ -2048,9 +2048,12 @@ hermes -p fleet-orchestrator acp --check
 Skip creation if the profile exists. Setup is interactive; `--check` verifies
 ACP dependencies, not a successful model request. Fleet never creates profiles
 or copies credentials. Memory, skills, identity and native history belong to
-the selected profile and are not synchronized across Nodes. Only one active
-Hermes orchestrator may use a given profile on a Node; do not use that profile
-in a separate Hermes process at the same time.
+the selected profile and are not synchronized across Nodes. Multiple Hermes
+orchestrators may share a profile on the same Node. Each has its own ACP process
+and native conversation ID; stop and resume retain that conversation's history.
+Profile memory, skills, identity and configuration remain shared even when the
+orchestrators work in different areas. Use different profiles for independent
+learning.
 
 The Hermes model dropdown applies its backend-native ID via `session/set_model`
 after startup or resume and before prompting. It does not rewrite the profile.
@@ -2076,17 +2079,17 @@ still produce those diagnostics without starting another turn. Replies, tool
 failures and fatal session errors remain visible in the conversation. Existing
 saved log entries are left intact.
 
-An offline orchestrator or pending Stop still reserves its profile. If its Node
+An offline orchestrator or pending Stop does not prevent a different conversation
+from using the same profile. Its own process still requires cleanup: if its Node
 will not reconnect, request **Stop**, verify independently that the old process
-has exited, then select **Mark stopped** on the conversation to release it.
-**Dismiss** only hides a stopped conversation; it never stops a process or
-bypasses the profile reservation. The same profile name on another Node is
-independent.
+has exited, then select **Mark stopped** on that conversation. **Dismiss** only
+hides a stopped conversation; it never stops a process. The same profile name on
+another Node has independent state.
 
 Fleet prefers an online placement with the chosen agent. If no online Node
 holding the workspace has Hermes installed, a **new** lead falls back to Copilot
-with a transcript notice. An occupied profile, missing profile, authentication
-failure or other startup error is reported instead. An existing Hermes session
+with a transcript notice. A missing profile, authentication failure or other
+startup error is reported instead. An existing Hermes session
 never falls back on resume. Automatic native-session retention remains
 Copilot-only; manage Hermes history in its profile.
 

@@ -185,13 +185,20 @@ describe("orchestrator lifecycle routes", () => {
     expect(start).not.toHaveProperty("contextTier");
     expect(start).toMatchObject({ mcpServers: [{ name: "fleet" }] });
 
-    const duplicate = await app.inject({
+    const another = await app.inject({
       method: "POST",
       url: "/api/orchestrators",
       payload: { workspaceId: session.workspaceId },
     });
-    expect(duplicate.statusCode).toBe(409);
-    expect(duplicate.json().error).toMatch(/profile.*already belongs/);
+    expect(another.statusCode).toBe(201);
+    const second = another.json<{ session: FleetSession }>().session;
+    expect(second.id).not.toBe(session.id);
+    expect(second).toMatchObject({ nodeId: node.id, agentParams: params });
+    expect(
+      commands()
+        .filter((command) => command.type === "start_session")
+        .map((command) => command.sessionId),
+    ).toEqual([session.id, second.id]);
 
     store.transitionSession(session.id, "starting");
     store.transitionSession(session.id, "idle");
@@ -208,6 +215,7 @@ describe("orchestrator lifecycle routes", () => {
     expect(service.resumeSession(session.id).ok).toBe(true);
     expect(commands().at(-1)).toMatchObject({
       type: "resume_session",
+      sessionId: session.id,
       agentParams: params,
       agentSessionId: "hermes-saved",
       agent: "",
@@ -332,7 +340,7 @@ describe("orchestrator lifecycle routes", () => {
     }
   });
 
-  it("releases an offline Hermes profile through confirmed Stop, not by hiding a possibly live process", async () => {
+  it("preserves offline Hermes Stop confirmation without reserving the shared profile", async () => {
     const { app, store, service, leadId, addNode } = await setup();
     const placement = store.getPlacement(store.getSession(leadId)!.placementId)!;
     store.setNodeIdentity(placement.nodeId, {
@@ -356,13 +364,13 @@ describe("orchestrator lifecycle routes", () => {
       (await app.inject({ method: "POST", url: `/api/orchestrators/${lead.id}/stop` }))
         .statusCode,
     ).toBe(202);
-    expect(service.agentLaunchProblem(node, params)).toContain("already belongs");
+    expect(service.agentLaunchProblem(node, params)).toBeUndefined();
     service.disconnectNode(node.id, "Node unavailable");
     expect(store.getSession(lead.id)).toMatchObject({
       state: "offline",
       stopRequested: true,
     });
-    expect(service.agentLaunchProblem(node, params)).toContain("Mark stopped");
+    expect(service.agentLaunchProblem(node, params)).toBeUndefined();
     expect(
       (await app.inject({ method: "DELETE", url: `/api/orchestrators/${lead.id}` }))
         .statusCode,

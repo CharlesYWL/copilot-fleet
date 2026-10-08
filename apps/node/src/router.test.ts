@@ -77,22 +77,26 @@ describe("CommandRouter", () => {
     expect(deleteInactiveSession).not.toHaveBeenCalled();
   });
 
-  it("reserves a Hermes profile before startup awaits and releases it only after stopping", async () => {
+  it("shares a Hermes profile across independent starts, stops and resumes within capacity", async () => {
     let finish!: () => void;
     const pending = new Promise<void>((resolve) => {
       finish = resolve;
     });
+    const sessionAgents = new Map<string, SessionAgent>();
     const start = vi.fn<AgentFactory["start"]>(async (id, _cwd, sink) => {
       await pending;
-      return inertAgent(id, sink);
+      const agent = { ...inertAgent(id, sink), stop: vi.fn(async () => {}) };
+      sessionAgents.set(id, agent);
+      return agent;
     });
     const router = new CommandRouter(
       { start },
-      3,
+      2,
       () => {},
       async (path) => path,
     );
-    const command = NodeCommandSchema.parse({
+    const command: Extract<NodeCommand, { type: "start_session" }> = {
+      ...START_DEFAULTS,
       type: "start_session",
       commandId: "h1",
       sessionId: "h1",
@@ -101,45 +105,83 @@ describe("CommandRouter", () => {
       agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
       yolo: true,
       readOnly: true,
-    });
+    };
     const first = router.route(command);
+    const second = router.route({
+      ...command,
+      commandId: "h2",
+      sessionId: "h2",
+      localPath: "C:\\other",
+    });
+    const overCapacity = router.route({
+      ...command,
+      commandId: "h3",
+      sessionId: "h3",
+    });
+    finish();
     try {
+      expect((await first).ok).toBe(true);
+      expect((await second).ok).toBe(true);
+      expect(start.mock.calls.map(([id, cwd]) => [id, cwd])).toEqual([
+        ["h1", "C:\\repo"],
+        ["h2", "C:\\other"],
+      ]);
+      expect(await overCapacity).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("at capacity"),
+      });
+      for (const call of start.mock.calls) {
+        expect(call[3]).toMatchObject({
+          agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+        });
+        expect(call[3]).not.toHaveProperty("resumeAgentSessionId");
+      }
+      expect(router.activeSessionIds).toEqual(["h1", "h2"]);
       expect(
-        await router.route({ ...command, commandId: "h2", sessionId: "h2" }),
+        await router.route(
+          NodeCommandSchema.parse({
+            type: "resume_session",
+            commandId: "change",
+            sessionId: "h1",
+            localPath: "C:\\repo",
+            agentSessionId: "saved",
+            agentParams: { kind: "hermes", profile: "different" },
+          }),
+        ),
       ).toMatchObject({
         ok: false,
         fatal: false,
-        error: expect.stringContaining("already in use"),
+        error: expect.stringContaining("cannot change"),
       });
+      const original = sessionAgents.get("h1")!;
+      expect(
+        await router.route({ type: "stop", commandId: "stop", sessionId: "h1" }),
+      ).toMatchObject({ ok: true });
+      expect(original.stop).toHaveBeenCalledOnce();
+      expect(sessionAgents.get("h2")!.stop).not.toHaveBeenCalled();
+      expect(router.activeSessionIds).toEqual(["h2"]);
+      expect(
+        await router.route(
+          NodeCommandSchema.parse({
+            type: "resume_session",
+            commandId: "resume",
+            sessionId: "h1",
+            localPath: "C:\\repo",
+            agentSessionId: "saved-h1",
+            agentParams: command.agentParams,
+            readOnly: true,
+          }),
+        ),
+      ).toMatchObject({ ok: true });
+      expect(start.mock.calls.at(-1)?.[3]).toMatchObject({
+        agentParams: command.agentParams,
+        resumeAgentSessionId: "saved-h1",
+      });
+      expect(sessionAgents.get("h2")!.stop).not.toHaveBeenCalled();
+      expect(router.activeSessionIds).toEqual(["h2", "h1"]);
     } finally {
-      finish();
+      await router.stopAll();
     }
-    expect((await first).ok).toBe(true);
-    expect(start).toHaveBeenCalledTimes(1);
-    expect(start.mock.calls[0]?.[3]).toMatchObject({
-      agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
-    });
-    expect(
-      await router.route(
-        NodeCommandSchema.parse({
-          type: "resume_session",
-          commandId: "change",
-          sessionId: "h1",
-          localPath: "C:\\repo",
-          agentSessionId: "saved",
-          agentParams: { kind: "hermes", profile: "different" },
-        }),
-      ),
-    ).toMatchObject({
-      ok: false,
-      fatal: false,
-      error: expect.stringContaining("cannot change"),
-    });
-    await router.route({ type: "stop", commandId: "stop", sessionId: "h1" });
-    expect(
-      (await router.route({ ...command, commandId: "h3", sessionId: "h3" })).ok,
-    ).toBe(true);
-    await router.stopAll();
   });
 
   it("stops idle and busy sessions through the existing shutdown path", async () => {
