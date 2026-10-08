@@ -39,6 +39,7 @@ export function acceptAttachment(
   file: { name: string; type: string; size: number },
   data: string,
   existing: readonly DraftAttachment[],
+  source: "file" | "clipboard" = "file",
 ): AttachResult {
   if (existing.length >= MAX_ATTACHMENTS_PER_PROMPT) {
     return {
@@ -53,6 +54,35 @@ export function acceptAttachment(
       error: `"${file.name}" is larger than the ${megabytes(MAX_ATTACHMENT_BYTES)} limit`,
     };
   }
+  let name = file.name || "pasted-image.png";
+  if (source === "clipboard" && file.type.startsWith("image/")) {
+    const extension =
+      file.name.match(/\.[^.]+$/)?.[0] ??
+      `.${file.type.slice("image/".length).replace("jpeg", "jpg").replace("+xml", "")}`;
+    let next = 1n;
+    for (const attachment of existing) {
+      const match = /^image(\d+)(?:\.[^.]+)?$/i.exec(attachment.name);
+      if (match) {
+        const after = BigInt(match[1]!) + 1n;
+        if (after > next) next = after;
+      }
+    }
+    name = `image${next}${extension}`;
+  }
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const extension = dot > 0 ? name.slice(dot) : "";
+  const names = new Set(existing.map((attachment) => attachment.name.toLowerCase()));
+  for (let number = 2; names.has(name.toLowerCase()); number++) {
+    const suffix = ` (${number})`;
+    name = `${stem.slice(0, Math.max(0, 255 - suffix.length - extension.length))}${suffix}${extension}`;
+  }
+  if (name.length > 255) {
+    return {
+      ok: false,
+      error: `"${file.name}" has an attachment name longer than 255 characters`,
+    };
+  }
   return {
     ok: true,
     attachment: {
@@ -60,7 +90,7 @@ export function acceptAttachment(
       // the identity: two screenshots would collide and removing one would take
       // both.
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      name: file.name || "pasted-image.png",
+      name,
       mimeType: file.type || "application/octet-stream",
       data,
     },

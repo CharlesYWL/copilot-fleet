@@ -1103,6 +1103,13 @@ Draft text and attachments stay in the composer until the Host accepts the send.
 A failed request keeps them available for retry; edits made while sending are
 not cleared by the earlier request.
 
+Pasted images are numbered within the current draft (`image1.png`, `image2.png`,
+and so on), preserving their image extension. File-picker uploads keep their names;
+duplicates get a suffix before the extension, such as `report.pdf` and
+`report (2).pdf`. Both files keep their own contents, and removing one does not
+remove or rename the other. These names travel with the prompt and remain on the
+sent attachment chips; nothing is overwritten on disk.
+
 How a file reaches the agent depends on what it is. Images go over as ACP image
 blocks; everything else is embedded as text, so the agent reads the contents
 without needing the file to exist on its own disk — which matters because the
