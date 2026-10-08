@@ -10,6 +10,12 @@ import {
 import {
   shorthands,
   Button,
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
   Text,
   Tree,
   TreeItem,
@@ -383,6 +389,7 @@ type SidebarProps = {
   onSelectSession: (sessionId: string) => void;
   onSelectLeadSession: (sessionId: string) => void;
   onRestoreLeadSession?: (sessionId: string) => void;
+  onDeleteLeadSession: (sessionId: string) => Promise<boolean>;
   /** Starts another conversation with the orchestrator. */
   onNewConversation: () => void;
   onNewSession: () => void;
@@ -412,6 +419,7 @@ export const Sidebar = ({
   onSelectSession,
   onSelectLeadSession,
   onRestoreLeadSession,
+  onDeleteLeadSession,
   onNewConversation,
   onNewSession,
   onSelectView,
@@ -431,6 +439,8 @@ export const Sidebar = ({
   const [conversationsClosed, setConversationsClosed] = useState(false);
   const [favoritesClosed, setFavoritesClosed] = useState(false);
   const [dismissedClosed, setDismissedClosed] = useState(true);
+  const [deleteLead, setDeleteLead] = useState<FleetSession>();
+  const [deletingLead, setDeletingLead] = useState(false);
   const [dropTarget, setDropTarget] = useState<{ key: string; edge: DropEdge }>();
   const { updatePlacement, reorderPlacements, reorderWorkspaces, reorderSessions } =
     useCatalog();
@@ -694,17 +704,28 @@ export const Sidebar = ({
             </button>
             {!dismissedClosed &&
               dismissedLeadSessions.map((lead) => (
-                <button
-                  key={lead.id}
-                  type="button"
-                  className={styles.leadRow}
-                  title={`Restore ${sessionLabel(lead)}`}
-                  onClick={() => onRestoreLeadSession?.(lead.id)}
-                >
-                  <Chat20Regular aria-hidden="true" />
-                  <span className={styles.orchestrationLabel}>{sessionLabel(lead)}</span>
-                  <span>Restore</span>
-                </button>
+                <div className={styles.favoriteEntry} key={lead.id}>
+                  <button
+                    type="button"
+                    className={styles.favoriteLink}
+                    title={`Restore ${sessionLabel(lead)}`}
+                    onClick={() => onRestoreLeadSession?.(lead.id)}
+                  >
+                    <Chat20Regular aria-hidden="true" />
+                    <span className={styles.orchestrationLabel}>
+                      {sessionLabel(lead)}
+                    </span>
+                    <span>Restore</span>
+                  </button>
+                  <Button
+                    appearance="subtle"
+                    size="small"
+                    icon={<Delete20Regular />}
+                    aria-label={`Delete ${sessionLabel(lead)}`}
+                    title={`Delete ${sessionLabel(lead)}`}
+                    onClick={() => setDeleteLead(lead)}
+                  />
+                </div>
               ))}
           </>
         )}
@@ -1081,6 +1102,48 @@ export const Sidebar = ({
           Settings
         </Button>
       </div>
+      <Dialog
+        open={!!deleteLead}
+        onOpenChange={(_, data) => {
+          if (!data.open && !deletingLead) setDeleteLead(undefined);
+        }}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Delete dismissed orchestrator?</DialogTitle>
+            <DialogContent>
+              <p>
+                Permanently delete {deleteLead && sessionLabel(deleteLead)} and its
+                conversation transcript from Fleet? It will be removed from this list and
+                cannot be restored.
+              </p>
+              <p>
+                Task history, worker sessions and files on your nodes are not deleted.
+              </p>
+            </DialogContent>
+            <DialogActions>
+              <Button disabled={deletingLead} onClick={() => setDeleteLead(undefined)}>
+                Cancel
+              </Button>
+              <Button
+                appearance="primary"
+                disabled={deletingLead}
+                onClick={() => {
+                  if (!deleteLead) return;
+                  setDeletingLead(true);
+                  void onDeleteLeadSession(deleteLead.id)
+                    .then((ok) => {
+                      if (ok) setDeleteLead(undefined);
+                    })
+                    .finally(() => setDeletingLead(false));
+                }}
+              >
+                Delete orchestrator
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
     </nav>
   );
 };

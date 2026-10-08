@@ -970,6 +970,50 @@ describe("orchestrator lifecycle routes", () => {
     expect(store.getRun(run.id)?.state).toBe("cancelled");
   });
 
+  it("deletes a dismissed conversation and transcript without deleting its tasks or workers", async () => {
+    const { app, store, service, leadId, run, worker } = await setup();
+    store.transitionSession(leadId, "stopped");
+    store.transitionSession(worker.id, "stopped");
+    archiveRun(service, run.id, "Archived by an operator");
+    const dismissed = await app.inject({
+      method: "DELETE",
+      url: `/api/orchestrators/${leadId}`,
+    });
+    expect(dismissed.statusCode).toBe(200);
+    expect(store.getSession(leadId)?.dismissed).toBe(true);
+    expect(store.listEvents(leadId).length).toBeGreaterThan(0);
+    const task = store.getRun(run.id);
+    const steps = store.listRunSteps(run.id);
+    const retainedWorker = store.getSession(worker.id);
+    const workerEvents = store.listEvents(worker.id);
+    const placement = store.getPlacement(worker.placementId);
+    const dispatch = vi.spyOn(service, "dispatch");
+
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: `/api/sessions/${leadId}`,
+    });
+
+    expect(deleted.statusCode).toBe(204);
+    expect(store.getSession(leadId)).toBeUndefined();
+    expect(store.listSessions().some((session) => session.id === leadId)).toBe(false);
+    expect(store.listEvents(leadId)).toEqual([]);
+    expect(store.getRun(run.id)).toEqual(task);
+    expect(store.listRunSteps(run.id)).toEqual(steps);
+    expect(store.getSession(worker.id)).toEqual(retainedWorker);
+    expect(store.listEvents(worker.id)).toEqual(workerEvents);
+    expect(store.getPlacement(worker.placementId)).toEqual(placement);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/orchestrators/${leadId}/restore`,
+        })
+      ).statusCode,
+    ).toBe(404);
+  });
+
   it("bulk cleans up selected stopped orchestrators without deleting history", async () => {
     const { app, store, service, leadId, run, worker } = await setup();
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
