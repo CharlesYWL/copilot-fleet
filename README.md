@@ -718,8 +718,9 @@ variables alone does not switch a claimed Host or broaden its account audience.
    open **Settings → Security → Change Microsoft sign-in configuration**.
    Choose the supported accounts and approved client ID, then **Verify new
    configuration with Microsoft**. This requires an authorization-code sign-in
-   from the last ten minutes. If prompted, confirm with Microsoft under the
-   current configuration, return to Security, and retry.
+   from the last ten minutes. If prompted, **Confirm with Microsoft** opens the
+   sign-in under the current configuration in a new tab; finish it there, return
+   to Security, and retry.
 4. Sign in through the proposed registration as that same administrator. The
    new configuration is saved **only after successful identity verification**.
    Failure, cancellation, or a different identity leaves the old configuration
@@ -2533,7 +2534,10 @@ exposes only what you pick.
 1. **Settings → Security → Local agent API**: tick the orchestrators and the
    workspaces to expose, keep the port (default `8786`) or change it, then
    **Turn on…** and accept the warning. With Microsoft sign-in on, any change
-   that leaves it on needs a recent sign-in; turning it off never does.
+   that leaves it on needs a recent sign-in; turning it off never does. If it
+   asks, **Confirm with Microsoft** opens the sign-in in a new tab and Settings
+   stays where it was: once you finish signing in, the change completes on its
+   own, with no second click.
 2. Call it at `http://127.0.0.1:8786` exactly, with the header
    `x-fleet-local-agent: 1` on every request:
 
@@ -2597,7 +2601,12 @@ tunnel this port.
   changing Microsoft sign-in configuration, exporting a portable backup —
   additionally require an **authorization-code** sign-in from the last ten minutes. A device
   sign-in does not satisfy it, because an attacker can start a device flow and
-  have an administrator finish it.
+  have an administrator finish it. Settings opens that sign-in in a new tab, so
+  the page and anything typed into it survive; it falls back to the same tab only
+  when the browser blocks the new one. Turning the local agent API on or changing
+  its scope is then finished automatically, because that request is repeated
+  exactly and still checks the revision it was made from. Every other change
+  waits for the administrator to retry it.
 - In Microsoft mode, generating a connect command requires a live Microsoft administrator session
   and CSRF protection, but no recent reauthentication. Authorization-code and
   device sign-ins both work for this operation. In no-auth mode, a reachable

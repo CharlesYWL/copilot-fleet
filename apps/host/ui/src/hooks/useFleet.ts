@@ -1036,10 +1036,26 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
    * whole session and a sign-out is what invalidates it.
    */
   const method = (init?.method ?? "GET").toUpperCase();
-  if (method !== "GET" && method !== "HEAD" && !headers.has("x-csrf-token")) {
+  const proves = method !== "GET" && method !== "HEAD" && !headers.has("x-csrf-token");
+  if (proves) headers.set("x-csrf-token", await csrfToken());
+  let response = await fetch(path, { ...init, headers });
+  /*
+   * A sign-in finished in another tab — confirming a change with Microsoft
+   * does that — replaces the session under this page, and the proof cached
+   * for the old one no longer matches. The Host refuses that before the route
+   * runs, so asking once more with the new session's proof repeats nothing.
+   * Only a body that can be sent twice is resent.
+   */
+  if (
+    proves &&
+    response.status === 403 &&
+    (init?.body === undefined || typeof init.body === "string") &&
+    (await staleCsrfRefusal(response))
+  ) {
+    forgetCsrfToken();
     headers.set("x-csrf-token", await csrfToken());
+    response = await fetch(path, { ...init, headers });
   }
-  const response = await fetch(path, { ...init, headers });
   if (response.status === 401) {
     // The session ended under us — expired, or the Host restarted and forgot
     // it. Saying so once puts the sign-in screen back up rather than leaving
@@ -1061,6 +1077,17 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
   const text = await response.text();
   if (!text) return undefined as T;
   return JSON.parse(text) as T;
+}
+
+const STALE_CSRF_ERROR = "Missing or invalid CSRF token";
+
+async function staleCsrfRefusal(response: Response): Promise<boolean> {
+  try {
+    const body = (await response.clone().json()) as { error?: unknown } | undefined;
+    return body?.error === STALE_CSRF_ERROR;
+  } catch {
+    return false;
+  }
 }
 
 /**

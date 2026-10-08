@@ -169,12 +169,17 @@ const sameSet = (a: string[], b: string[]) =>
  * Every call goes to this Host's own origin; the page never talks to the local
  * port itself. Nothing is pre-selected: an administrator names each
  * orchestrator and workspace, and turning the API on asks for a fresh
- * Microsoft sign-in, which the panel's `run` turns into a prompt.
+ * Microsoft sign-in, which the panel's `run` turns into a prompt. The sign-in
+ * opens in another tab and the held save finishes here once it is done, so
+ * nobody has to come back and press Turn on twice.
  */
 export const LocalAgentCard = ({
   run,
 }: {
-  run: (work: () => Promise<unknown>, refresh?: boolean) => Promise<void>;
+  run: (
+    work: () => Promise<unknown>,
+    options?: { refresh?: boolean; resumeAfterReauth?: boolean },
+  ) => Promise<void>;
 }) => {
   const styles = useStyles();
   const active = useSettingsActive();
@@ -260,63 +265,71 @@ export const LocalAgentCard = ({
   );
 
   const save = (enabled: boolean, scope: Draft) =>
-    run(async () => {
-      setBusy(true);
-      try {
-        const next = await api<LocalAgentView>("/api/local-agent/config", {
-          method: "PUT",
-          body: JSON.stringify({
-            enabled,
-            port: Number(scope.port),
-            allowedLeadSessionIds: scope.leads,
-            allowedWorkspaceIds: scope.workspaces,
-            expectedRevision: config.revision,
-          }),
-        });
-        adopt(next);
-        notify(
-          enabled
-            ? next.status.state === "listening"
-              ? "Local agent API saved."
-              : "Saved, but the local agent API is not listening. See its status."
-            : "Local agent API turned off.",
-          enabled && next.status.state !== "listening" ? "warning" : "success",
-        );
-      } catch (reason) {
-        // Someone else saved first: show what is there now rather than overwrite it.
-        if (reason instanceof ApiError && reason.status === 409) await load();
-        throw reason;
-      } finally {
-        setBusy(false);
-      }
-    }, false);
+    run(
+      async () => {
+        setBusy(true);
+        try {
+          const next = await api<LocalAgentView>("/api/local-agent/config", {
+            method: "PUT",
+            body: JSON.stringify({
+              enabled,
+              port: Number(scope.port),
+              allowedLeadSessionIds: scope.leads,
+              allowedWorkspaceIds: scope.workspaces,
+              expectedRevision: config.revision,
+            }),
+          });
+          adopt(next);
+          notify(
+            enabled
+              ? next.status.state === "listening"
+                ? "Local agent API saved."
+                : "Saved, but the local agent API is not listening. See its status."
+              : "Local agent API turned off.",
+            enabled && next.status.state !== "listening" ? "warning" : "success",
+          );
+        } catch (reason) {
+          // Someone else saved first: show what is there now rather than overwrite it.
+          if (reason instanceof ApiError && reason.status === 409) await load();
+          throw reason;
+        } finally {
+          setBusy(false);
+        }
+        // The same request again is safe: it still names the revision it was
+        // made from, so a save that lost a race is refused, not replayed over it.
+      },
+      { refresh: false, resumeAfterReauth: true },
+    );
 
   const abandon = (request: LocalAgentAdminRequest) =>
-    run(async () => {
-      setBusy(true);
-      try {
-        await api(
-          `/api/local-agent/requests/${encodeURIComponent(request.operationId)}/disposition`,
-          {
-            method: "POST",
-            body: JSON.stringify({
-              action: "abandon",
-              reason: reason.trim(),
-              expectedRequestVersion: request.version,
-              ...(request.briefDigest
-                ? { expectedBriefDigest: request.briefDigest }
-                : {}),
-            }),
-          },
-        );
-        setAbandoning(undefined);
-        setReason("");
-        notify("Request abandoned.", "success");
-      } finally {
-        setBusy(false);
-        await load();
-      }
-    }, false);
+    run(
+      async () => {
+        setBusy(true);
+        try {
+          await api(
+            `/api/local-agent/requests/${encodeURIComponent(request.operationId)}/disposition`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                action: "abandon",
+                reason: reason.trim(),
+                expectedRequestVersion: request.version,
+                ...(request.briefDigest
+                  ? { expectedBriefDigest: request.briefDigest }
+                  : {}),
+              }),
+            },
+          );
+          setAbandoning(undefined);
+          setReason("");
+          notify("Request abandoned.", "success");
+        } finally {
+          setBusy(false);
+          await load();
+        }
+      },
+      { refresh: false },
+    );
 
   const url = status.url ?? `http://127.0.0.1:${config.port}`;
   const curl = `curl -H "${LOCAL_AGENT_HEADER}: 1" ${url}/v1/orchestrators`;
@@ -499,9 +512,11 @@ export const LocalAgentCard = ({
       </div>
       <Text className={styles.caption}>
         With Microsoft sign-in on, turning it on or widening it needs a sign-in from the
-        last few minutes. Turning it off stops new requests at once; anything already
-        accepted still reaches its orchestrator through the normal delivery path, and Stop
-        remains how to halt it. Restoring a backup or resetting sign-in turns it off.
+        last few minutes; Fleet opens that sign-in in a new tab and finishes the change
+        here once you are done. Turning it off stops new requests at once; anything
+        already accepted still reaches its orchestrator through the normal delivery path,
+        and Stop remains how to halt it. Restoring a backup or resetting sign-in turns it
+        off.
       </Text>
 
       {config.enabled && (

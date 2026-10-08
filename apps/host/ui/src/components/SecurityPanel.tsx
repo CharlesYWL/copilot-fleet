@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Badge,
   Button,
@@ -37,7 +37,13 @@ import {
 import { useMessageNotification, useNotify } from "../hooks/useAppNotifications";
 import { api, ApiError } from "../hooks/useFleet";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
-import { browserNavigation, csrfToken, startCodeLogin } from "../lib/auth";
+import {
+  browserNavigation,
+  confirmIdentityInNewTab,
+  csrfToken,
+  forgetCsrfToken,
+  onIdentityConfirmed,
+} from "../lib/auth";
 import { pollUntilSignedIn, type DeviceFlow } from "../lib/device-login";
 import { DeviceCodePanel } from "./auth/DeviceCodePanel";
 import { MicrosoftSignInForm } from "./auth/MicrosoftSignInForm";
@@ -167,6 +173,19 @@ type Security = {
   enrollment: Enrollment;
 };
 
+/** How the panel's `run` treats a change; see `run` for when to resume. */
+type RunOptions = {
+  /** Re-read the page once the change succeeds (default true). */
+  refresh?: boolean;
+  /** Hold the change and finish it here after a sign-in in another tab. */
+  resumeAfterReauth?: boolean;
+};
+
+const needsReauth = (reason: unknown): reason is ApiError =>
+  reason instanceof ApiError &&
+  reason.status === 403 &&
+  reason.body.reauthRequired === true;
+
 const AUTH_MODE_COPY: Record<AuthStatus["state"], string> = {
   "no-auth":
     "Microsoft sign-in is off. Access is controlled by the local listener or private Dev Tunnel.",
@@ -195,6 +214,13 @@ export const SecurityPanel = () => {
   const [error, setError] = useState<string>();
   const [reauth, setReauth] = useState<string>();
   const [signingIn, setSigningIn] = useState(false);
+  // The sign-in is open in another tab; `resumable` says whether the change
+  // that asked for it is being held here to finish once it is done.
+  const [awaitingIdentity, setAwaitingIdentity] = useState(false);
+  const [resumable, setResumable] = useState(false);
+  const held = useRef<{ work: () => Promise<unknown>; refresh: boolean }>(undefined);
+  const resuming = useRef(false);
+  const notify = useNotify();
   useMessageNotification(error);
   useMessageNotification(reauth, "warning");
 
@@ -249,20 +275,28 @@ export const SecurityPanel = () => {
    * finished by a phished administrator. A bare 403 leaves the operator with
    * nothing but a guess; naming it lets the page offer the sign-in that fixes
    * it.
+   *
+   * That sign-in opens in another tab. A change that can be repeated exactly
+   * — the same request, still checked against the revision it was made from —
+   * may ask to be held and finished here once it is done
+   * (`resumeAfterReauth`). Others are left for the person to retry: one that
+   * navigates, needs a click of its own to open a tab, or cannot be undone
+   * should not run at a moment they did not choose.
    */
   const run = useCallback(
-    async (work: () => Promise<unknown>, refresh = true) => {
+    async (work: () => Promise<unknown>, options: RunOptions = {}) => {
+      const refresh = options.refresh ?? true;
       setError(undefined);
       setReauth(undefined);
+      setAwaitingIdentity(false);
+      held.current = undefined;
       try {
         await work();
         if (refresh) await load();
       } catch (reason) {
-        if (
-          reason instanceof ApiError &&
-          reason.status === 403 &&
-          reason.body.reauthRequired === true
-        ) {
+        if (needsReauth(reason)) {
+          held.current = options.resumeAfterReauth ? { work, refresh } : undefined;
+          setResumable(Boolean(options.resumeAfterReauth));
           setReauth(reason.message);
           return;
         }
@@ -272,11 +306,67 @@ export const SecurityPanel = () => {
     [load],
   );
 
+  const resume = useCallback(async () => {
+    const change = held.current;
+    if (!change || resuming.current) return;
+    resuming.current = true;
+    // The other tab replaced this page's session; its CSRF proof went with it.
+    forgetCsrfToken();
+    try {
+      await change.work();
+      held.current = undefined;
+      setAwaitingIdentity(false);
+      setReauth(undefined);
+      if (change.refresh) await load();
+    } catch (reason) {
+      // Back before the sign-in finished: keep holding it for the next look.
+      if (needsReauth(reason)) return;
+      held.current = undefined;
+      setAwaitingIdentity(false);
+      setReauth(undefined);
+      setError(errorMessage(reason, "That change was refused"));
+    } finally {
+      resuming.current = false;
+    }
+  }, [load]);
+
+  // A layout effect, so the listeners are in place by the time "waiting" is on
+  // screen; a passive one can lag the paint and miss a quick hand-back.
+  useLayoutEffect(() => {
+    if (!awaitingIdentity) return;
+    // Coming back to this tab is the cue; the other tab saying it finished is
+    // a faster one where the browser carries it.
+    const look = () => {
+      if (resumable) void resume();
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") look();
+    };
+    window.addEventListener("focus", look);
+    document.addEventListener("visibilitychange", onVisible);
+    const stop = onIdentityConfirmed(() => {
+      if (resumable) {
+        void resume();
+        return true;
+      }
+      forgetCsrfToken();
+      setAwaitingIdentity(false);
+      setReauth(undefined);
+      notify("Identity confirmed. Try the change again.", "success");
+      return true;
+    });
+    return () => {
+      window.removeEventListener("focus", look);
+      document.removeEventListener("visibilitychange", onVisible);
+      stop();
+    };
+  }, [awaitingIdentity, resumable, resume, notify]);
+
   const confirmIdentity = async () => {
     setSigningIn(true);
     setError(undefined);
     try {
-      await startCodeLogin();
+      if ((await confirmIdentityInNewTab()) === "tab") setAwaitingIdentity(true);
     } catch (reason) {
       setError(errorMessage(reason, "Could not start Microsoft sign-in"));
     } finally {
@@ -285,6 +375,8 @@ export const SecurityPanel = () => {
   };
 
   const dismissFeedback = () => {
+    held.current = undefined;
+    setAwaitingIdentity(false);
     setError(undefined);
     setReauth(undefined);
   };
@@ -376,12 +468,28 @@ export const SecurityPanel = () => {
                 : "Could not complete the change"}
             </DialogTitle>
             <DialogContent>
-              {reauth && (
-                <Text>
-                  {reauth} Use your current administrator account, then return to Settings
-                  → Security and retry the action.
-                </Text>
-              )}
+              {reauth &&
+                (awaitingIdentity ? (
+                  resumable ? (
+                    <Spinner
+                      size="small"
+                      labelPosition="after"
+                      label="Waiting for the Microsoft sign-in in the other tab. This change finishes here on its own once you are done."
+                    />
+                  ) : (
+                    <Text>
+                      Finish signing in with Microsoft in the other tab, then retry the
+                      action here.
+                    </Text>
+                  )
+                ) : (
+                  <Text>
+                    {reauth} Sign in with your current administrator account in a new tab;{" "}
+                    {resumable
+                      ? "this change finishes here on its own once you are done."
+                      : "then retry the action here."}
+                  </Text>
+                ))}
               {error && (
                 <MessageBar intent="error" layout="multiline">
                   <MessageBarBody>{error}</MessageBarBody>
@@ -394,7 +502,7 @@ export const SecurityPanel = () => {
                 disabled={signingIn}
                 onClick={dismissFeedback}
               >
-                {reauth ? "Cancel" : "Close"}
+                {reauth && (resumable || !awaitingIdentity) ? "Cancel" : "Close"}
               </Button>
               {reauth && (
                 <Button
@@ -402,7 +510,11 @@ export const SecurityPanel = () => {
                   disabled={signingIn}
                   onClick={() => void confirmIdentity()}
                 >
-                  {signingIn ? "Opening Microsoft…" : "Confirm with Microsoft"}
+                  {signingIn
+                    ? "Opening Microsoft…"
+                    : awaitingIdentity
+                      ? "Open sign-in again"
+                      : "Confirm with Microsoft"}
                 </Button>
               )}
             </DialogActions>
@@ -689,7 +801,7 @@ function PasswordCard({
 function EraseAuthCard({
   run,
 }: {
-  run: (work: () => Promise<unknown>, refresh?: boolean) => Promise<void>;
+  run: (work: () => Promise<unknown>, options?: RunOptions) => Promise<void>;
 }) {
   const styles = useStyles();
   const active = useSettingsActive();
@@ -706,14 +818,17 @@ function EraseAuthCard({
     setBusy(true);
     let navigating = false;
     try {
-      await run(async () => {
-        await api("/api/auth/erase", {
-          method: "POST",
-          body: JSON.stringify({ confirmation: ERASE_AUTH_CONFIRMATION }),
-        });
-        browserNavigation.assign("/");
-        navigating = true;
-      }, false);
+      await run(
+        async () => {
+          await api("/api/auth/erase", {
+            method: "POST",
+            body: JSON.stringify({ confirmation: ERASE_AUTH_CONFIRMATION }),
+          });
+          browserNavigation.assign("/");
+          navigating = true;
+        },
+        { refresh: false },
+      );
     } finally {
       if (!navigating) setBusy(false);
     }

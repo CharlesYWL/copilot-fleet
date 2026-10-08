@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { SecurityPanel } from "./SecurityPanel";
-import { browserNavigation, forgetCsrfToken } from "../lib/auth";
+import {
+  announceIdentityConfirmed,
+  browserNavigation,
+  forgetCsrfToken,
+} from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
 import { NotificationContext } from "../hooks/useAppNotifications";
 import { ERASE_AUTH_CONFIRMATION } from "@fleet/protocol";
@@ -634,6 +638,8 @@ describe("SecurityPanel", () => {
     });
 
     it("uses the existing recent-authentication prompt before retrying a change", async () => {
+      const tab = { closed: false, assign: vi.fn(), close: vi.fn() };
+      vi.spyOn(browserNavigation, "openTab").mockReturnValue(tab);
       const fetchMock = host({
         "POST /api/auth/configuration/start": () =>
           answer(
@@ -655,22 +661,34 @@ describe("SecurityPanel", () => {
         "Confirm your current administrator account.",
         "warning",
       );
-      expect(
-        within(dialog).getByText(/return to settings.*retry the action/i),
-      ).toBeTruthy();
+      // This change navigates the page itself, so it is not replayed behind
+      // the administrator's back once they have signed in.
+      expect(within(dialog).getByText(/new tab.*retry the action here/i)).toBeTruthy();
       expect(browserNavigation.assign).not.toHaveBeenCalled();
       fireEvent.click(
         await screen.findByRole("button", { name: /confirm with microsoft/i }),
       );
       await waitFor(() =>
-        expect(browserNavigation.assign).toHaveBeenCalledWith(
+        expect(tab.assign).toHaveBeenCalledWith(
           "https://login.microsoftonline.com/current",
         ),
       );
+      expect(browserNavigation.assign).not.toHaveBeenCalled();
       const reauth = fetchMock.mock.calls.find(
         ([url]) => String(url) === "/api/auth/code/start",
       );
-      expect(JSON.parse(String(reauth?.[1]?.body))).toEqual({});
+      expect(JSON.parse(String(reauth?.[1]?.body))).toEqual({ reauth: true });
+      expect(
+        await within(dialog).findByText(/finish signing in.*other tab.*retry/i),
+      ).toBeTruthy();
+      expect(within(dialog).getByRole("button", { name: /^close$/i })).toBeTruthy();
+      expect(
+        fetchMock.mock.calls.filter(
+          ([url, init]) =>
+            String(url).includes("/api/auth/configuration/start") &&
+            init?.method === "POST",
+        ),
+      ).toHaveLength(1);
     });
   });
 
@@ -1037,6 +1055,8 @@ describe("SecurityPanel", () => {
   it("asks for a fresh Microsoft sign-in when the Host wants recent proof", async () => {
     // A ten-minute-old code login is the price of a high-impact change; a 403
     // that only says "forbidden" leaves the operator with nothing to do.
+    const tab = { closed: false, assign: vi.fn(), close: vi.fn() };
+    vi.spyOn(browserNavigation, "openTab").mockReturnValue(tab);
     const fetchMock = host({
       "POST /api/auth/administrator-invitations": () =>
         answer(
@@ -1067,12 +1087,197 @@ describe("SecurityPanel", () => {
     );
     fireEvent.click(prompt);
 
+    // The settings page stays where it was; only the new tab goes to Microsoft.
     await waitFor(() =>
-      expect(browserNavigation.assign).toHaveBeenCalledWith("https://login/authorize"),
+      expect(tab.assign).toHaveBeenCalledWith("https://login/authorize"),
     );
+    expect(browserNavigation.assign).not.toHaveBeenCalled();
     expect(
       fetchMock.mock.calls.some(([url]) => String(url).includes("/api/auth/code/start")),
     ).toBe(true);
+  });
+
+  it("signs in on this page when the browser blocks the new tab", async () => {
+    vi.spyOn(browserNavigation, "openTab").mockReturnValue(undefined);
+    const fetchMock = host({
+      "POST /api/auth/administrator-invitations": () =>
+        answer({ error: "Confirm your identity.", reauthRequired: true }, 403),
+      "POST /api/auth/code/start": () =>
+        answer({ authorizationUrl: "https://login/authorize" }),
+    });
+    show();
+
+    fireEvent.click(await screen.findByRole("button", { name: /invite someone else/i }));
+    const dialog = await screen.findByRole("dialog", { name: /confirm.*microsoft/i });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /confirm with microsoft/i }),
+    );
+
+    await waitFor(() =>
+      expect(browserNavigation.assign).toHaveBeenCalledWith("https://login/authorize"),
+    );
+    const start = fetchMock.mock.calls.find(
+      ([url]) => String(url) === "/api/auth/code/start",
+    );
+    expect(JSON.parse(String(start?.[1]?.body))).toEqual({});
+  });
+
+  describe("finishing a held change after confirming in another tab", () => {
+    const refused = () =>
+      answer(
+        {
+          error: "Sign in with Microsoft again to confirm this change.",
+          reauthRequired: true,
+        },
+        403,
+      );
+    const turnedOn = {
+      ...(defaults["/api/local-agent/config"] as Record<string, unknown>),
+      config: {
+        enabled: true,
+        port: 8786,
+        allowedLeadSessionIds: [],
+        allowedWorkspaceIds: [],
+        revision: 1,
+      },
+      status: { state: "listening", url: "http://127.0.0.1:8786" },
+    };
+    const puts = (fetchMock: ReturnType<typeof host>) =>
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url) === "/api/local-agent/config" && init?.method === "PUT",
+      );
+
+    /** Turns the local agent API on, is refused, and opens the sign-in tab. */
+    const turnOnAndConfirm = async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Turn on…" }));
+      const warning = await screen.findByRole("dialog", {
+        name: /turn on the local agent api/i,
+      });
+      fireEvent.click(within(warning).getByRole("button", { name: "Turn on" }));
+      const dialog = await screen.findByRole("dialog", { name: /confirm.*microsoft/i });
+      expect(within(dialog).getByText(/new tab.*finishes here on its own/i)).toBeTruthy();
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: /confirm with microsoft/i }),
+      );
+      expect(
+        await within(dialog).findByText(/waiting for the microsoft sign-in/i),
+      ).toBeTruthy();
+      return dialog;
+    };
+
+    it("turns the setting on by itself once the administrator comes back", async () => {
+      const tab = { closed: false, assign: vi.fn(), close: vi.fn() };
+      vi.spyOn(browserNavigation, "openTab").mockReturnValue(tab);
+      let signedIn = false;
+      let session = "old-proof";
+      const fetchMock = host({
+        "GET /api/auth/csrf": () => answer({ csrfToken: session }),
+        "PUT /api/local-agent/config": () => (signedIn ? answer(turnedOn) : refused()),
+        "POST /api/auth/code/start": () =>
+          answer({ authorizationUrl: "https://login/authorize" }),
+      });
+      show();
+      await turnOnAndConfirm();
+      expect(tab.assign).toHaveBeenCalledWith("https://login/authorize");
+      expect(browserNavigation.assign).not.toHaveBeenCalled();
+      expect(puts(fetchMock)).toHaveLength(1);
+
+      // Signing in in the other tab replaced this page's session, and with it
+      // the CSRF proof the page had cached.
+      signedIn = true;
+      session = "new-proof";
+      fireEvent(window, new Event("focus"));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(await screen.findByText("Listening")).toBeTruthy();
+      const [, retried] = puts(fetchMock);
+      expect(new Headers(retried?.[1]?.headers).get("x-csrf-token")).toBe("new-proof");
+      expect(JSON.parse(String(retried?.[1]?.body))).toMatchObject({
+        enabled: true,
+        expectedRevision: 0,
+      });
+      expect(puts(fetchMock)).toHaveLength(2);
+    });
+
+    it("keeps waiting when the administrator looks back before signing in", async () => {
+      vi.spyOn(browserNavigation, "openTab").mockReturnValue({
+        closed: false,
+        assign: vi.fn(),
+        close: vi.fn(),
+      });
+      const fetchMock = host({
+        "PUT /api/local-agent/config": refused,
+        "POST /api/auth/code/start": () =>
+          answer({ authorizationUrl: "https://login/authorize" }),
+      });
+      show();
+      const dialog = await turnOnAndConfirm();
+
+      fireEvent(window, new Event("focus"));
+      await waitFor(() => expect(puts(fetchMock)).toHaveLength(2));
+      expect(within(dialog).getByText(/waiting for the microsoft sign-in/i)).toBeTruthy();
+      expect(
+        within(dialog).getByRole("button", { name: /open sign-in again/i }),
+      ).toBeTruthy();
+
+      fireEvent.click(within(dialog).getByRole("button", { name: /^cancel$/i }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      fireEvent(window, new Event("focus"));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(puts(fetchMock)).toHaveLength(2);
+    });
+
+    it("finishes as soon as the sign-in tab says it is done", async () => {
+      vi.spyOn(browserNavigation, "openTab").mockReturnValue({
+        closed: false,
+        assign: vi.fn(),
+        close: vi.fn(),
+      });
+      let signedIn = false;
+      const fetchMock = host({
+        "PUT /api/local-agent/config": () => (signedIn ? answer(turnedOn) : refused()),
+        "POST /api/auth/code/start": () =>
+          answer({ authorizationUrl: "https://login/authorize" }),
+      });
+      show();
+      await turnOnAndConfirm();
+
+      signedIn = true;
+      await expect(announceIdentityConfirmed(2_000)).resolves.toBe(true);
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(await screen.findByText("Listening")).toBeTruthy();
+      expect(puts(fetchMock)).toHaveLength(2);
+    });
+
+    it("reports a held change refused for another reason instead of retrying it", async () => {
+      vi.spyOn(browserNavigation, "openTab").mockReturnValue({
+        closed: false,
+        assign: vi.fn(),
+        close: vi.fn(),
+      });
+      let signedIn = false;
+      const fetchMock = host({
+        "PUT /api/local-agent/config": () =>
+          signedIn
+            ? answer({ error: "These settings changed since you opened them." }, 409)
+            : refused(),
+        "POST /api/auth/code/start": () =>
+          answer({ authorizationUrl: "https://login/authorize" }),
+      });
+      show();
+      await turnOnAndConfirm();
+
+      signedIn = true;
+      fireEvent(window, new Event("focus"));
+      const dialog = await screen.findByRole("dialog", {
+        name: /could not complete the change/i,
+      });
+      expect(within(dialog).getByText(/changed since you opened them/i)).toBeTruthy();
+      fireEvent(window, new Event("focus"));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(puts(fetchMock)).toHaveLength(2);
+    });
   });
 
   it("shows invitation failures in a dismissible dialog instead of above the viewport", async () => {
@@ -1095,6 +1300,16 @@ describe("SecurityPanel", () => {
   });
 
   it("keeps sign-in failures visible and lets the administrator retry", async () => {
+    const tabs: {
+      closed: boolean;
+      assign: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    }[] = [];
+    vi.spyOn(browserNavigation, "openTab").mockImplementation(() => {
+      const tab = { closed: false, assign: vi.fn(), close: vi.fn() };
+      tabs.push(tab);
+      return tab;
+    });
     let failed = true;
     host({
       "POST /api/auth/administrator-invitations": () =>
@@ -1118,13 +1333,18 @@ describe("SecurityPanel", () => {
       await within(dialog).findByText(/microsoft sign-in is unavailable/i),
     ).toBeTruthy();
     expect(browserNavigation.assign).not.toHaveBeenCalled();
+    // The blank tab opened for the refused start is not left behind.
+    expect(tabs).toHaveLength(1);
+    expect(tabs[0]?.close).toHaveBeenCalledOnce();
+    expect(tabs[0]?.assign).not.toHaveBeenCalled();
     expect((confirm as HTMLButtonElement).disabled).toBe(false);
     failed = false;
     fireEvent.click(confirm);
 
     await waitFor(() =>
-      expect(browserNavigation.assign).toHaveBeenCalledWith("https://login/authorize"),
+      expect(tabs[1]?.assign).toHaveBeenCalledWith("https://login/authorize"),
     );
+    expect(browserNavigation.assign).not.toHaveBeenCalled();
   });
 
   it("lets the administrator cancel re-confirmation without starting sign-in", async () => {

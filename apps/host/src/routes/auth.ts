@@ -40,6 +40,8 @@ const ConfigureSchema = z.object({
 });
 const CodeStartSchema = z.object({
   invitation: z.string().min(1).max(256).optional(),
+  /** Only where the callback lands; the sign-in itself is the same. */
+  reauth: z.literal(true).optional(),
 });
 const AdministratorAddStartSchema = z.strictObject({});
 const EnablePasswordSchema = z.object({
@@ -329,6 +331,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
       host: request.headers.host,
       redirectUri: callbackUri(request, auth.entraConfig(), loopbackCallbackOrigin),
       invitation: input.invitation,
+      reauth: input.reauth,
     });
     if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
     return reply.send({ authorizationUrl: outcome.authorizationUrl });
@@ -410,7 +413,16 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
       "set-cookie",
       sessionCookie(outcome.session.token, secure, OPERATOR_SESSION_ABSOLUTE_MS),
     );
-    return reply.redirect(appLocation(outcome.claimedHost ? "/?welcome=1" : "/"), 302);
+    return reply.redirect(
+      appLocation(
+        outcome.claimedHost
+          ? "/?welcome=1"
+          : outcome.reauthenticated
+            ? "/?reauthenticated=1"
+            : "/",
+      ),
+      302,
+    );
   };
 
   app.get(ENTRA_CALLBACK_PATH, completeCallback);
