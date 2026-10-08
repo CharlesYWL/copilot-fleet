@@ -186,6 +186,22 @@ const terminal = (events: SessionEvent[]) =>
   );
 
 describe("downloads from a session view", () => {
+  it("preserves download controls inside expanded tool groups", () => {
+    terminal([
+      tool({ title: "Read notes", status: "completed", kind: "read" }),
+      tool({
+        title: "Write report",
+        kind: "edit",
+        status: "completed",
+        detail: "C:\\work\\report.md",
+      }),
+    ]);
+    expect(screen.queryByRole("button", { name: "Download report.md" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "2 tool calls 2 completed" }));
+    fireEvent.click(screen.getByRole("button", { name: "Download report.md" }));
+    expect(downloadSessionFile).toHaveBeenCalledWith("s1", "C:\\work\\report.md");
+  });
+
   it("offers the file a finished edit wrote, and nothing for other steps", () => {
     terminal([
       tool({

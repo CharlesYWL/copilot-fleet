@@ -45,6 +45,14 @@ Raw events remain authoritative. Existing full-history APIs, agent context,
 orchestration semantics, and retention policy are unchanged. The projection is
 disposable: a restore clears it, and a restart rebuilds it.
 
+The shared transcript now folds consecutive completed/failed tool calls into a
+collapsed disclosure showing the call count and completion/failure counts.
+Running, pending, and unknown-status calls remain individual lines; messages,
+reasoning, permissions, and final answers carried by completion tools stay
+outside the disclosures. Expanding a group restores its original tool details
+and file-download controls. Tool runs share a virtual row so status changes do
+not renumber later rows; prompt navigation still uses absolute block positions.
+
 ### What the browser tests and the 10x run found
 
 | Found by | Problem | Fix |

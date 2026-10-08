@@ -376,4 +376,105 @@ describe("long transcripts in a real browser", () => {
     expect(await occurrences(endMarker(0))).toBe(0);
     expect(await occurrences(endMarker(1))).toBe(0);
   });
+
+  it("compacts finished tools while keeping live calls visible and disclosures keyboard accessible", async () => {
+    await open(0);
+    node!.send(lead, [
+      { type: "agent_text", payload: { text: "\nCOMPACT-TOOLS-PROGRESS" } },
+      ...Array.from({ length: 80 }, (_, index) => ({
+        type: "tool" as const,
+        payload: {
+          toolCallId: `compact-${index}`,
+          title: `COMPACT-FINISHED-${index}`,
+          status: index === 3 ? "failed" : "completed",
+          detail: `command-${index}`,
+          ...(index === 3 ? { error: "COMPACT-FAILURE-DETAIL" } : {}),
+        },
+      })),
+      {
+        type: "tool",
+        payload: {
+          toolCallId: "compact-live",
+          title: "COMPACT-LIVE-CALL",
+          status: "in_progress",
+          kind: "execute",
+        },
+      },
+      {
+        type: "tool",
+        payload: {
+          toolCallId: "compact-pending",
+          title: "COMPACT-PENDING-CALL",
+          status: "pending",
+          kind: "execute",
+        },
+      },
+    ]);
+    const group = page.getByRole("button", {
+      name: "80 tool calls 79 completed, 1 failed",
+      exact: true,
+    });
+    await group.waitFor();
+    await eventually(() => onScreen("COMPACT-LIVE-CALL")).toBe(true);
+    await eventually(() => onScreen("COMPACT-PENDING-CALL")).toBe(true);
+    expect(await occurrences("COMPACT-FINISHED-")).toBe(0);
+    expect((await group.boundingBox())!.height).toBeLessThan(30);
+    expect(await group.getAttribute("aria-expanded")).toBe("false");
+
+    await group.focus();
+    await page.keyboard.press("Enter");
+    await eventually(() => group.getAttribute("aria-expanded")).toBe("true");
+    expect(await occurrences("COMPACT-FINISHED-")).toBe(80);
+    expect(await occurrences("COMPACT-FAILURE-DETAIL")).toBe(1);
+    await page.keyboard.press("Space");
+    await eventually(() => group.getAttribute("aria-expanded")).toBe("false");
+    expect(await occurrences("COMPACT-FINISHED-")).toBe(0);
+
+    node!.send(lead, [
+      { type: "tool", payload: { toolCallId: "compact-live", status: "completed" } },
+    ]);
+    await page
+      .getByRole("button", { name: "81 tool calls 80 completed, 1 failed", exact: true })
+      .waitFor();
+    expect(await occurrences("COMPACT-LIVE-CALL")).toBe(0);
+    await eventually(() => onScreen("COMPACT-PENDING-CALL")).toBe(true);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await scrollTo(Number.MAX_SAFE_INTEGER);
+    await eventually(() => onScreen("COMPACT-PENDING-CALL")).toBe(true);
+    expect(
+      await page
+        .locator(REGION)
+        .evaluate((element) => element.scrollWidth <= element.clientWidth),
+    ).toBe(true);
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const updatedGroup = page.getByRole("button", {
+      name: "81 tool calls 80 completed, 1 failed",
+      exact: true,
+    });
+    await updatedGroup.click();
+    await settle();
+    await scrollTo(0);
+    await eventually(() => updatedGroup.count()).toBe(0);
+    await page.getByRole("button", { name: "Jump to latest" }).click();
+    await eventually(() => updatedGroup.getAttribute("aria-expanded")).toBe("true");
+    await updatedGroup.click();
+    await settle();
+    await scrollTo(Number.MAX_SAFE_INTEGER);
+    await settle();
+    await eventually(async () => atBottom(await scroll())).toBe(true);
+
+    node!.send(lead, [
+      { type: "system", payload: { text: "User: COMPACT-PROMPT-AFTER-TOOLS" } },
+      { type: "agent_text", payload: { text: "COMPACT-ANSWER-AFTER-TOOLS" } },
+    ]);
+    await eventually(() => onScreen("COMPACT-ANSWER-AFTER-TOOLS")).toBe(true);
+    for (const prompt of [FIRST_PROMPT, "COMPACT-PROMPT-AFTER-TOOLS"]) {
+      await page
+        .getByRole("button", { name: `Jump to prompt: ${prompt}`, exact: true })
+        .click();
+      await eventually(() => onScreen(prompt)).toBe(true);
+    }
+  });
 });
