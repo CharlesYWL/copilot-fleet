@@ -109,6 +109,20 @@ export function parseFleetControl(
   if (status && lines.some((line) => line.trim() === "</fleet-status-check>")) {
     return { title: "Status check", detail: `${unquote(status[1] ?? "")} interval` };
   }
+  // The fleet-* namespace is the contract; new envelopes need no UI allowlist.
+  // Anchor at the start so quoted examples and appended workspace hints stay prose.
+  const envelope =
+    /^\s*<(fleet-[a-z][a-z0-9-]*)(?=[\s>])((?:[^>"']|"(?:[^"\\]|\\.)*"|'[^']*')*)>/i.exec(
+      text,
+    );
+  if (envelope && text.includes(`</${envelope[1]}>`)) {
+    const name = envelope[1]!.slice("fleet-".length).replaceAll("-", " ");
+    const detail = /\b(?:task|name)="((?:[^"\\]|\\.)*)"/.exec(envelope[2] ?? "");
+    return {
+      title: `Fleet ${name}`,
+      detail: detail ? unquote(detail[1]!) : "Internal message",
+    };
+  }
   return undefined;
 }
 

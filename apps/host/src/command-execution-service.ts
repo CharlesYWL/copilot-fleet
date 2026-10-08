@@ -603,7 +603,7 @@ export class CommandExecutionService {
     return execution;
   }
 
-  revokeLead(leadId: string): void {
+  revokeLead(leadId: string, preservePendingPrompts = false): void {
     this.records.revokeSessionGrants(leadId);
     for (const [nodeId, peer] of this.peers) {
       for (const target of this.records.sessionGrantRevocations(nodeId))
@@ -615,8 +615,11 @@ export class CommandExecutionService {
       .unsettled()
       .filter((entry) => entry.leadSessionId === leadId && !entry.cancelRequested))
       this.cancel(execution.id);
-    for (const record of this.records.prompts(leadId))
+    for (const record of this.records.prompts(leadId)) {
+      if (preservePendingPrompts && ["pending", "rejected_busy"].includes(record.state))
+        continue;
       this.records.updatePrompt({ ...record, state: "orphaned" });
+    }
   }
 
   revokeAllSessionGrants(): void {

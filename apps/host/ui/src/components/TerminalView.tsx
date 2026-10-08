@@ -604,6 +604,7 @@ type TerminalViewProps = {
   onClose?: () => void;
   onConfigChange?: (configId: string, value: string) => void;
   notificationPreferenceControl?: ReactNode;
+  messageQueue?: ReactNode;
   draft: SessionDraft;
   onDraftChange: (update: (current: SessionDraft) => SessionDraft) => void;
 };
@@ -627,6 +628,7 @@ export const TerminalView = ({
   onClose,
   onConfigChange,
   notificationPreferenceControl,
+  messageQueue,
   draft,
   onDraftChange,
 }: TerminalViewProps) => {
@@ -638,6 +640,8 @@ export const TerminalView = ({
   const [menuDismissed, setMenuDismissed] = useState(false);
   const [highlight, setHighlight] = useState(0);
   const [attachError, setAttachError] = useState<string>();
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   useMessageNotification(attachError);
   /** The list's own scroll element: what the reader scrolls, and what is measured. */
   const streamRef = useRef<HTMLElement | null>(null);
@@ -937,7 +941,11 @@ export const TerminalView = ({
     setAttachError(undefined);
   }, [session.id]);
 
-  const canPrompt = session.state === "idle" && !session.stopRequested;
+  const canPrompt =
+    ["idle", "running", "starting", "cancelling"].includes(session.state) &&
+    !session.stopRequested &&
+    !session.cleanupRequested;
+  const willQueue = session.state !== "idle";
   const isEnded = terminalSessionStates.has(session.state);
   // Offline and terminal sessions can be re-attached via Copilot's session/load.
   const canResume =
@@ -967,20 +975,27 @@ export const TerminalView = ({
   ) => {
     // A file with no words is still a message: "look at this" is implied, and
     // refusing to send it would strand the attachment the operator just added.
-    if ((!text && files.length === 0) || !canPrompt) return;
-    const accepted =
-      maintenanceWorker && handbackSession === session.id
-        ? onPrompt(text || "(see attachment)", files, "after_turn")
-        : onPrompt(text || "(see attachment)", files);
-    setAttachError(undefined);
-    setMenuDismissed(false);
-    // Sending is a request to watch what happens next, so it re-pins the
-    // transcript. Scrolling back to read something older otherwise left the
-    // operator staring at old output while the answer arrived below the fold.
-    jumpToLatest();
-    if (await accepted) {
-      setHandbackSession("");
-      onDraftChange((current) => (current === draft ? EMPTY_DRAFT : current));
+    if ((!text && files.length === 0) || !canPrompt || submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    try {
+      const accepted =
+        maintenanceWorker && handbackSession === session.id
+          ? onPrompt(text || "(see attachment)", files, "after_turn")
+          : onPrompt(text || "(see attachment)", files);
+      setAttachError(undefined);
+      setMenuDismissed(false);
+      // Sending is a request to watch what happens next, so it re-pins the
+      // transcript. Scrolling back to read something older otherwise left the
+      // operator staring at old output while the answer arrived below the fold.
+      jumpToLatest();
+      if (await accepted) {
+        setHandbackSession("");
+        onDraftChange((current) => (current === draft ? EMPTY_DRAFT : current));
+      }
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
     }
   };
 
@@ -1358,6 +1373,7 @@ export const TerminalView = ({
         )}
       </div>
 
+      {messageQueue}
       <form className={styles.composer} onSubmit={handleSubmit}>
         {menuOpen ? (
           <SlashMenu
@@ -1403,7 +1419,9 @@ export const TerminalView = ({
             session.stopRequested
               ? "Stopping this session"
               : canPrompt
-                ? "Send a follow-up prompt. Type / for commands, paste or attach files · Enter sends"
+                ? willQueue
+                  ? "Queue a follow-up while the agent works · Enter queues"
+                  : "Send a follow-up prompt. Type / for commands, paste or attach files · Enter sends"
                 : "Available when the session is idle"
           }
         />
@@ -1451,7 +1469,7 @@ export const TerminalView = ({
           <SessionUsageBar
             agentKind={session.agentParams?.kind ?? "copilot"}
             usage={session.usage}
-            canCompact={canPrompt}
+            canCompact={canPrompt && !willQueue && !submitting}
             compactAvailable={session.commands.some(
               (command) => command.name === "compact",
             )}
@@ -1465,11 +1483,13 @@ export const TerminalView = ({
             appearance="primary"
             shape="circular"
             type="submit"
-            title="Send"
-            aria-label="Send"
+            title={willQueue ? "Queue message" : "Send"}
+            aria-label={willQueue ? "Queue message" : "Send"}
             icon={<Send20Regular />}
             disabled={
-              !canPrompt || (prompt.trim().length === 0 && attachments.length === 0)
+              !canPrompt ||
+              submitting ||
+              (prompt.trim().length === 0 && attachments.length === 0)
             }
           />
         </div>

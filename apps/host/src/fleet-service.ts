@@ -62,6 +62,7 @@ import { ManagedWorktreeService } from "./managed-worktree-service.js";
 import { CommandExecutionService } from "./command-execution-service.js";
 import { SessionFileService } from "./session-files.js";
 import { TranscriptProjections } from "./transcript-projections.js";
+import { SessionMessages } from "./session-messages.js";
 import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
 import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
@@ -137,6 +138,7 @@ export type EventHandlingResult =
 
 type HostTransitionCause =
   | "resume_requested"
+  | "queued_prompt_dispatched"
   | "dispatch_fallback"
   | "operator_cancel_requested"
   | "operator_settlement"
@@ -246,6 +248,7 @@ export class FleetService {
   readonly sessionRetention: SessionRetention;
   readonly worktrees: ManagedWorktreeService;
   readonly commands: CommandExecutionService;
+  readonly messages: SessionMessages;
   readonly files: SessionFileService;
   readonly transcripts: TranscriptProjections;
   /** Built by the first snapshot; see `permissionEvents`. */
@@ -305,6 +308,7 @@ export class FleetService {
     this.sessionRetention = new SessionRetention(this, log, sessionRetentionDays);
     this.worktrees = new ManagedWorktreeService(this);
     this.commands = new CommandExecutionService(this);
+    this.messages = new SessionMessages(this);
     this.files = new SessionFileService(this);
     this.transcripts = new TranscriptProjections(store, (sessionId) =>
       this.broadcast({ type: "transcript_reset", sessionId }),
@@ -1298,6 +1302,7 @@ export class FleetService {
       handback?: "ongoing" | "after_turn" | undefined;
     },
     operatorId?: string,
+    deliveryKey?: string,
   ): { ok: true } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false, status: 404, error: "Session not found" };
@@ -1329,6 +1334,24 @@ export class FleetService {
       return { ok: false, status: 409, error: "Session must be idle" };
     if (!manual)
       this.store.prMaintenance.assertAdmission({ sessionId, action: "prompt" });
+    if (
+      deliveryKey &&
+      session.runRole === "lead" &&
+      this.commands.durableLead(sessionId)
+    ) {
+      const record = this.commands.queueLeadPrompt(
+        sessionId,
+        input.prompt,
+        deliveryKey,
+        [],
+        session.executionBinding,
+        input.attachments,
+      );
+      if (this.store.queuedMessage(input.operationId ?? "")?.priority)
+        this.store.commands.prioritizePrompt(record.delivery.deliveryId);
+      this.commands.pumpLead(sessionId);
+      return { ok: true };
+    }
     const provenance: [undefined?, SupervisorCommand?] = manual
       ? [undefined, manual]
       : [];
@@ -1454,13 +1477,14 @@ export class FleetService {
     fallback?: DispatchFallback,
     attemptOverride?: string,
     supervisor?: SupervisorCommand,
+    options: { preservePendingPrompts?: boolean } = {},
   ): DispatchResult {
     const commandSession = this.store.getSession(request.sessionId);
     if (
       ["stop", "cancel", "delete_session"].includes(request.type) &&
       commandSession?.runRole === "lead"
     )
-      this.commands.revokeLead(commandSession.id);
+      this.commands.revokeLead(commandSession.id, options.preservePendingPrompts);
     if (
       ["start_session", "resume_session", "prompt"].includes(request.type) &&
       commandSession?.runId &&
@@ -1746,6 +1770,13 @@ export class FleetService {
     return this.transitionSession(sessionId, "cancelling", "Cancelling active turn", {
       type: "host",
       cause: "operator_cancel_requested",
+    });
+  }
+
+  beginQueuedPrompt(sessionId: string): FleetSession {
+    return this.transitionSession(sessionId, "running", "Delivering queued message", {
+      type: "host",
+      cause: "queued_prompt_dispatched",
     });
   }
 
@@ -2516,6 +2547,7 @@ export class FleetService {
       if (result.publish && result.session) {
         this.broadcast({ type: "event", event, ...(transcript ? { transcript } : {}) });
         this.publishSession(result.session);
+        this.messages.handleEvent(event);
         if (result.notifyListeners) this.notifySessionEventListeners(event);
       } else if (transcript) {
         this.broadcast({

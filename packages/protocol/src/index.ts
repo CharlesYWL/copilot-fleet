@@ -2695,6 +2695,20 @@ export const PromptSchema = z.object({
     .default([]),
 });
 
+/** Queue previews never include attachment bytes or operator identity. */
+export const PendingSessionMessageSchema = z.object({
+  id: z.string(),
+  prompt: z.string(),
+  createdAt: z.string(),
+  source: z.enum(["operator", "fleet"]),
+  state: z.string(),
+  attachments: z.array(z.object({ name: z.string() })),
+  canCancel: z.boolean(),
+  canSendNow: z.boolean(),
+  detail: z.string(),
+});
+export type PendingSessionMessage = z.infer<typeof PendingSessionMessageSchema>;
+
 export const PermissionResponseSchema = z.object({
   requestId: z.string().min(1),
   outcome: z.enum(["allow_once", "deny"]),

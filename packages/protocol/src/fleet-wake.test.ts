@@ -2,6 +2,28 @@ import { describe, expect, it } from "vitest";
 import { parseFleetControl, parseWake, wakeDetail, wakeTitle } from "./fleet-wake.js";
 
 const executionId = "d00c5b6e-1c21-4b5d-8f2e-c2dc1ebdbf65";
+describe("Fleet envelope namespace", () => {
+  it.each(["task-transfer", "future-control", "another-new-command"])(
+    "folds %s without a type allowlist, including inline envelopes",
+    (name) => {
+      expect(
+        parseFleetControl(
+          ` <fleet-${name} task="Ship it">Body</fleet-${name}>\nTrailing guidance`,
+        ),
+      ).toEqual({ title: `Fleet ${name.replaceAll("-", " ")}`, detail: "Ship it" });
+    },
+  );
+  it.each([
+    "Explain <fleet-future>example</fleet-future>",
+    "My request\n\n<fleet-workspace>Context</fleet-workspace>",
+    "```xml\n<fleet-future>example</fleet-future>\n```",
+    "<fleet-future>Unfinished",
+    "<fleet-future>Wrong end</fleet-other>",
+  ])("leaves human prose and incomplete envelopes alone: %s", (text) => {
+    expect(parseFleetControl(text)).toBeUndefined();
+  });
+});
+
 const legacyCommandResult = [
   `Fleet command ${executionId} settled: succeeded.`,
   'Target: {"placementId":"p1"} on Windows builder; cwd: C:\\repo.',
