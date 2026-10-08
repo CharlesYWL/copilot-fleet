@@ -84,6 +84,11 @@ import {
 import type { PromptMark } from "../lib/prompt-marks";
 import type { TranscriptView } from "../lib/transcript-cache";
 import {
+  isCompactTool,
+  transcriptRows,
+  type TranscriptRow,
+} from "../lib/transcript-rows";
+import {
   applyCommand,
   matchCommands,
   moveHighlight,
@@ -414,6 +419,11 @@ const useStyles = makeStyles({
     margin: "2px 0 8px 25px",
     color: terminal.thought,
   },
+  toolGroupBody: {
+    marginLeft: "7px",
+    paddingLeft: "17px",
+    borderLeft: `1px solid ${tokens.colorNeutralStroke3}`,
+  },
   note: {
     margin: "0 0 0 25px",
     fontFamily: terminal.font,
@@ -668,6 +678,27 @@ export const TerminalView = ({
 
   const blocks = transcript?.blocks ?? noBlocks;
   const start = transcript?.start ?? 0;
+  const rowEpoch = `${session.id}:${transcript?.epoch ?? 0}`;
+  const [rowState, setRowState] = useState(() => ({
+    epoch: rowEpoch,
+    blocks,
+    start,
+    view: transcriptRows(blocks, start),
+  }));
+  let rowView = rowState.view;
+  if (
+    rowState.epoch !== rowEpoch ||
+    rowState.blocks !== blocks ||
+    rowState.start !== start
+  ) {
+    rowView = transcriptRows(
+      blocks,
+      start,
+      rowState.epoch === rowEpoch ? rowState.view : undefined,
+    );
+    setRowState({ epoch: rowEpoch, blocks, start, view: rowView });
+  }
+  const { rows, firstItemIndex } = rowView;
   const promptMarks = transcript?.prompts ?? noPrompts;
   const permission = knownPermission ?? undefined;
   const status = sessionStatusDescriptor(session, Boolean(permission));
@@ -734,7 +765,11 @@ export const TerminalView = ({
       const element = streamRef.current;
       const smooth = !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
       if (!node || !element) {
-        virtuosoRef.current?.scrollToIndex({ index: index - start, align: "start" });
+        const rowIndex = rows.findIndex(
+          (row) => row.index <= index && index < row.index + row.blocks.length,
+        );
+        if (rowIndex >= 0)
+          virtuosoRef.current?.scrollToIndex({ index: rowIndex, align: "start" });
         return;
       }
       const offset =
@@ -748,7 +783,7 @@ export const TerminalView = ({
         element.scrollTop = top;
       }
     },
-    [promptNodes, start],
+    [promptNodes, rows],
   );
 
   const scrollToPrompt = useCallback(
@@ -888,10 +923,10 @@ export const TerminalView = ({
   }, [onLoadOlder, start]);
   const trackRange = useCallback(
     (range: ListRange) => {
-      renderedStart.current = range.startIndex;
+      renderedStart.current = rows[range.startIndex - firstItemIndex]?.index ?? start;
       updateActivePrompt();
     },
-    [updateActivePrompt],
+    [rows, firstItemIndex, start, updateActivePrompt],
   );
 
   // A clock, only while it could change the answer: a silent running session.
@@ -1316,9 +1351,9 @@ export const TerminalView = ({
               key={`${session.id}:${transcript.epoch}`}
               ref={virtuosoRef}
               className={styles.list}
-              data={blocks}
-              firstItemIndex={start}
-              initialTopMostItemIndex={{ index: blocks.length - 1, align: "end" }}
+              data={rows}
+              firstItemIndex={firstItemIndex}
+              initialTopMostItemIndex={{ index: rows.length - 1, align: "end" }}
               computeItemKey={transcriptItemKey}
               itemContent={renderTranscriptItem}
               context={listContext}
@@ -1510,10 +1545,8 @@ export const TerminalView = ({
  * when the event it describes does.
  *
  * What is said splits from what was done: the agent's words and the operator's
- * prompts get prose treatment, and everything between them — tool calls,
- * reasoning, state changes — gets one dim line each. The middle steps used to
- * be bordered cards with a timestamp column, which meant a turn that ran ten
- * tools pushed its own answer off the screen.
+ * prompts get prose treatment. Finished tool runs fold together; active calls,
+ * reasoning and state changes keep their individual lines.
  */
 type TerminalLineProps = {
   block: TerminalBlock;
@@ -1532,30 +1565,66 @@ type TranscriptListContext = {
   working: boolean;
 };
 
-const TranscriptRow = memo(function TranscriptRow(props: TerminalLineProps) {
+const TranscriptItem = memo(function TranscriptItem({
+  row,
+  context,
+}: {
+  row: TranscriptRow;
+  context: TranscriptListContext;
+}) {
   const styles = useStyles();
-  return (
-    <div className={styles.row}>
-      <TerminalLine {...props} />
-    </div>
-  );
+  const content: ReactNode[] = [];
+  for (let offset = 0; offset < row.blocks.length;) {
+    const first = offset++;
+    const block = row.blocks[first]!;
+    if (isCompactTool(block)) {
+      while (row.blocks[offset] && isCompactTool(row.blocks[offset]!)) offset++;
+    }
+    const tools = row.blocks.slice(first, offset);
+    const key = `tools:${first === 0 ? row.key : block.key}`;
+    const open = context.expanded.has(key);
+    const lines = () =>
+      tools.map((tool, index) => (
+        <TerminalLine
+          key={tool.key}
+          block={tool}
+          index={row.index + first + index}
+          sessionState={context.sessionState}
+          expanded={context.expanded.has(tool.key)}
+          onToggle={context.onToggle}
+        />
+      ));
+    if (tools.length < 2) {
+      content.push(...lines());
+      continue;
+    }
+    const failed = tools.filter((tool) => tool.status === "failed").length;
+    content.push(
+      <div key={key}>
+        <StepRow
+          icon={open ? <ChevronDown16Regular /> : <ChevronRight16Regular />}
+          title={`${tools.length} tool calls`}
+          detail={`${tools.length - failed} completed${failed ? `, ${failed} failed` : ""}`}
+          proseDetail
+          time={formatTime(block.createdAt)}
+          color={failed ? terminal.error : undefined}
+          onClick={() => context.onToggle(key)}
+          expanded={open}
+        />
+        {open ? <div className={styles.toolGroupBody}>{lines()}</div> : null}
+      </div>,
+    );
+  }
+  return <div className={styles.row}>{content}</div>;
 });
 
 const renderTranscriptItem = (
-  index: number,
-  block: TerminalBlock,
+  _index: number,
+  row: TranscriptRow,
   context: TranscriptListContext,
-) => (
-  <TranscriptRow
-    block={block}
-    index={index}
-    sessionState={context.sessionState}
-    expanded={context.expanded.has(block.key)}
-    onToggle={context.onToggle}
-  />
-);
+) => <TranscriptItem row={row} context={context} />;
 
-const transcriptItemKey = (_index: number, block: TerminalBlock) => block.key;
+const transcriptItemKey = (_index: number, row: TranscriptRow) => row.key;
 
 /** The list's scroll element, which is also the transcript's landmark. */
 const TranscriptScroller = forwardRef<HTMLDivElement, ScrollerProps>(
@@ -1863,6 +1932,7 @@ const StepRow = ({
       title={time}
       onClick={onClick}
       aria-expanded={expanded}
+      aria-label={detail ? `${title} ${detail}` : title}
     >
       {content}
     </button>

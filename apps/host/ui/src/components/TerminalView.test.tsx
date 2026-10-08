@@ -638,6 +638,179 @@ describe("TerminalView transcript", () => {
     expect(screen.queryByText("completed")).toBeNull();
   });
 
+  it("packs finished calls but keeps working and pending calls individually visible", () => {
+    const finished = Array.from({ length: 80 }, (_, index) =>
+      streamEvent("tool", {
+        toolCallId: `finished-${index}`,
+        title: `Finished call ${index}`,
+        status: index === 3 ? "failed" : "completed",
+        detail: `command-${index}`,
+        ...(index === 3 ? { error: "A command failed." } : {}),
+      }),
+    );
+    show({ state: "running" }, EMPTY_DRAFT, [
+      streamEvent("agent_text", { text: "Checking the source." }),
+      ...finished,
+      streamEvent("tool", {
+        toolCallId: "working",
+        title: "Working call",
+        status: "in_progress",
+      }),
+      streamEvent("tool", {
+        toolCallId: "waiting",
+        title: "Pending call",
+        status: "pending",
+      }),
+    ]);
+
+    const summary = screen.getByRole("button", {
+      name: "80 tool calls 79 completed, 1 failed",
+    });
+    expect(summary.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("Finished call 0")).toBeNull();
+    expect(screen.queryByText("command-0")).toBeNull();
+    expect(screen.queryByText("A command failed.")).toBeNull();
+    expect(screen.getByText("Checking the source.")).toBeTruthy();
+    expect(screen.getByText("Working call")).toBeTruthy();
+    expect(screen.getByText("Pending call")).toBeTruthy();
+    expect(screen.getAllByLabelText("Tool running")).toHaveLength(2);
+
+    fireEvent.click(summary);
+    expect(summary.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getAllByText(/^Finished call /)).toHaveLength(80);
+    expect(screen.getByText("command-0")).toBeTruthy();
+    expect(screen.getByText("A command failed.")).toBeTruthy();
+    fireEvent.click(summary);
+    expect(screen.queryByText("Finished call 0")).toBeNull();
+    expect(screen.getByText("Working call")).toBeTruthy();
+  });
+
+  it("keeps activity groups on either side of working calls, reasoning, messages, and permissions", () => {
+    const pair = (prefix: string) =>
+      [1, 2].map((index) =>
+        streamEvent("tool", {
+          toolCallId: `${prefix}-${index}`,
+          title: `${prefix} ${index}`,
+          status: "completed",
+        }),
+      );
+    const { container } = show({ state: "running" }, EMPTY_DRAFT, [
+      ...pair("First"),
+      streamEvent("tool", {
+        toolCallId: "active",
+        title: "Still working",
+        status: "in_progress",
+      }),
+      ...pair("Second"),
+      streamEvent("agent_thought", { text: "Thinking about the result" }),
+      ...pair("Third"),
+      streamEvent("agent_text", { text: "Here is the progress." }),
+      streamEvent("system", { text: "User: continue" }),
+      ...pair("Fourth"),
+      streamEvent("permission", { requestId: "approval", title: "Approve this command" }),
+      streamEvent("error", { message: "Visible session error" }),
+    ]);
+    expect(
+      screen.getAllByRole("button", { name: "2 tool calls 2 completed" }),
+    ).toHaveLength(4);
+    expect(screen.getByText("Still working")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Thinking/ })).toBeTruthy();
+    expect(screen.getByText("Here is the progress.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeTruthy();
+    expect(screen.getByText("Visible session error")).toBeTruthy();
+    expect(
+      container.querySelector("[data-prompt-key]")?.getAttribute("data-prompt-index"),
+    ).toBe("9");
+  });
+
+  it("compacts a live call when it finishes without closing an expanded group", () => {
+    const events = [
+      streamEvent("tool", {
+        toolCallId: "one",
+        title: "First call",
+        status: "completed",
+      }),
+      streamEvent("tool", {
+        toolCallId: "two",
+        title: "Second call",
+        status: "completed",
+      }),
+      streamEvent("tool", {
+        toolCallId: "three",
+        title: "Live call",
+        status: "in_progress",
+      }),
+    ];
+    const tree = (next: SessionEvent[]) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationContext.Provider value={vi.fn()}>
+          <TerminalView
+            session={session({ state: "running" })}
+            {...live(next)}
+            onPrompt={vi.fn()}
+            onCancel={vi.fn()}
+            onStop={vi.fn()}
+            onPermission={vi.fn()}
+            draft={EMPTY_DRAFT}
+            onDraftChange={vi.fn()}
+          />
+        </NotificationContext.Provider>
+      </FluentProvider>
+    );
+    const view = render(tree(events));
+    fireEvent.click(screen.getByRole("button", { name: "2 tool calls 2 completed" }));
+    const region = screen.getByRole("region", { name: "Chat transcript" });
+    Object.defineProperties(region, {
+      scrollHeight: { configurable: true, value: 1200 },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    region.scrollTop = 100;
+    fireEvent.scroll(region);
+    view.rerender(
+      tree([
+        ...events,
+        streamEvent("tool", {
+          toolCallId: "three",
+          status: "failed",
+          error: "Live failure",
+        }),
+      ]),
+    );
+    const summary = screen.getByRole("button", {
+      name: "3 tool calls 2 completed, 1 failed",
+    });
+    expect(summary.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("Live failure")).toBeTruthy();
+    expect(screen.queryByLabelText("Tool running")).toBeNull();
+    expect(region.scrollTop).toBe(100);
+    fireEvent.click(summary);
+    expect(screen.queryByText("Live call")).toBeNull();
+  });
+
+  it("never folds a completion tool's final answer into the preceding tools", () => {
+    show({}, EMPTY_DRAFT, [
+      streamEvent("tool", {
+        toolCallId: "one",
+        title: "First call",
+        status: "completed",
+      }),
+      streamEvent("tool", {
+        toolCallId: "two",
+        title: "Second call",
+        status: "completed",
+      }),
+      streamEvent("tool", {
+        toolCallId: "done",
+        title: "task_complete",
+        status: "completed",
+        response: "The final answer is **visible**.",
+      }),
+    ]);
+    expect(screen.getByRole("button", { name: "2 tool calls 2 completed" })).toBeTruthy();
+    expect(screen.getByText("visible", { selector: "strong" })).toBeTruthy();
+    expect(screen.getByText("task_complete")).toBeTruthy();
+  });
+
   it("says a failed tool failed rather than leaving it to colour alone", () => {
     show({}, EMPTY_DRAFT, [
       streamEvent("tool", {
