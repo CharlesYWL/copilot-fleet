@@ -451,6 +451,52 @@ describe("Hermes ACP startup", () => {
       (process) => process.args.includes("acp") && !process.args.includes("--check"),
     )!;
 
+  it("creates separate native Hermes sessions and processes for a shared profile", async () => {
+    const factory = new AcpAgentFactory(60_000, "copilot");
+    const events: SessionEvent[][] = [[], []];
+    const started = await Promise.all(
+      events.map((sink, index) =>
+        factory.start(
+          `hermes-${index}`,
+          `C:\\repo-${index}`,
+          (event) => sink.push(event),
+          { agentParams: params },
+        ),
+      ),
+    );
+    agents.push(...started);
+    const children = processes.filter(
+      (process) => process.args.includes("acp") && !process.args.includes("--check"),
+    );
+    expect(children).toHaveLength(2);
+    expect(children[0]!.child).not.toBe(children[1]!.child);
+    for (const child of children) {
+      expect(child.args).toEqual(["-p", "fleet-orchestrator", "acp"]);
+    }
+    const nativeIds = events.map(
+      (sink) =>
+        sink.find((event) => event.type === "agent_session")?.payload.agentSessionId,
+    );
+    expect(new Set(nativeIds)).toEqual(new Set(["acp-created", "acp-created-2"]));
+    await Promise.all(started.map((agent, index) => agent.prompt(`Plan area ${index}`)));
+    expect(
+      requests
+        .filter((request) => request.method === "session/prompt")
+        .map((request) => request.params.sessionId),
+    ).toEqual(nativeIds);
+    await started[0]!.stop();
+    expect(children[0]!.child.kill).toHaveBeenCalledOnce();
+    expect(children[1]!.child.kill).not.toHaveBeenCalled();
+    await started[1]!.prompt("Continue area 1");
+    expect(requests.at(-1)).toMatchObject({
+      method: "session/prompt",
+      params: { sessionId: nativeIds[1] },
+    });
+    for (const [index, sink] of events.entries()) {
+      expect(sink.every((event) => event.sessionId === `hermes-${index}`)).toBe(true);
+    }
+  });
+
   it.each([false, true])(
     "keeps Hermes stderr in diagnostics after a turn, not chat history (resumed=%s)",
     async (resumed) => {

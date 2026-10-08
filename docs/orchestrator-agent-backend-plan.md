@@ -21,14 +21,16 @@ and adopted Copilot conversations continue using Copilot ACP.
 - Hermes uses an explicitly selected, manually configured profile, initially
   `fleet-orchestrator`. Fleet does not create profiles, clone personal state,
   configure providers, or copy credentials.
-- **Only one active Hermes orchestrator per profile per Node.** Stop and resume
-  reuse that profile's memory. Different profiles or Nodes may run concurrently.
-  Do not also run a non-Fleet Hermes process against an occupied profile.
+- **Multiple Hermes orchestrators may share a profile per Node.** Each owns a
+  separate ACP process and native conversation ID. Stop and resume reuse only
+  that conversation's history; profile memory, skills, identity and configuration
+  remain intentionally shared. Different work areas do not isolate that state.
+  Use different profiles when learning should stay independent.
 - Prefer an online workspace placement that advertises the requested backend
   and has capacity. If no online placement has Hermes installed, a **new**
   orchestrator uses Copilot and records a sequenced system event in its
   transcript. No extra Host notification is introduced.
-- Profile conflicts, missing profiles, broken ACP dependencies, authentication
+- Missing profiles, broken ACP dependencies, authentication
   failures, and other startup errors are explicit errors, not reasons to switch
   to Copilot. A stopped Hermes session never falls back on resume.
 - Unknown usage stays unknown (`?`). Copilot credits and context reporting
@@ -43,7 +45,7 @@ and adopted Copilot conversations continue using Copilot ACP.
 | `agent`, `agentKind`, and `agentParams` overlapped | One discriminated `agentParams`; existing `agent` remains the Copilot custom-agent name |
 | Assumed all agents offered `configOptions` | Hermes uses ACP `models`/`modes` and `session/set_model` / `session/set_mode` |
 | Copilot fleet model, effort, Agency and context settings could leak | Apply them only to Copilot; Hermes uses its independent model default or profile choice |
-| Profile sharing did not address concurrent memory writers | Host admission and Node slot reservation guard each profile |
+| Profile sharing did not address concurrent memory writers | Separate conversations share profile learning intentionally; guidance distinguishes conversation isolation from independent profiles |
 | Fallback could change a saved conversation's identity | Resolve fallback only before creating a new session; persist the actual selection |
 | Resume, MCP reconnect and archives could lose parameters | Preserve the full selection in SQLite, launch commands, replacements and Host backups |
 | Usage reporting assumed Copilot's meaning of ACP token counts | Hermes context is labeled as an agent-reported estimate, separately from Copilot `/context` |
@@ -152,15 +154,17 @@ If a custom-agent catalog read rejects, it logs a warning and retains the last
 successful catalog (empty before the first successful read). A successful empty
 read replaces it, so removed agents do not persist indefinitely.
 
-The router reserves a Hermes profile before awaiting startup. It also counts
-slots awaiting process reconciliation, refuses identity/profile changes on a
-live slot, and preserves parameters when replacing a process to restore MCP.
+The router reserves each session's capacity before awaiting startup, without
+reserving its Hermes profile. It also counts slots awaiting process
+reconciliation, refuses identity/profile changes on a live slot, and preserves
+parameters when replacing a process to restore MCP.
 
 ## Host scheduling and lifecycle
 
 The orchestrator route selects the preferred backend and placement before
 creating a session. Only installation unavailability permits the new-session
-Copilot fallback. Lack of capacity or an occupied profile is a refusal.
+Copilot fallback. Lack of capacity is a refusal; another conversation using the
+same profile is not.
 
 Hermes always receives the full orchestrator briefing; it does not select
 Fleet's packaged Copilot custom-agent persona. The Host remains authoritative
@@ -171,14 +175,14 @@ current default. A missing backend blocks resume with an actionable message.
 Host backup/restore retains both the preference and the independent actual
 selection for every session.
 
-An offline session or pending Stop still holds its Hermes profile because loss
-of connectivity is not proof that its process exited. Request **Stop** first;
-if the Node cannot return, independently verify that the old process has stopped
-and then select **Mark stopped** on that conversation. This existing confirmation
-clears the pending Stop and releases the profile. Dismissal is visibility-only
-and is allowed only after the conversation stops; it must not bypass ownership
-of a possibly running process. The reservation is Node-local, so it does not
-block the same profile name on another Node.
+An offline session or pending Stop does not reserve its Hermes profile against
+other conversations. Loss of connectivity is still not proof that its own
+process exited. Request **Stop** first; if the Node cannot return, independently
+verify that the old process has stopped and then select **Mark stopped** on that
+conversation. This existing confirmation clears its pending Stop. Dismissal is
+visibility-only and is allowed only after the conversation stops; it must not
+bypass ownership of a possibly running process. The same profile name on another
+Node has independent state.
 
 Workers still use the existing Copilot path, including Agency, model/effort
 defaults, context settings and permission behavior.
@@ -198,7 +202,8 @@ Agent and profile save together after validation; a failed save retains the
 draft and displays the error. Visited settings tabs retain unsaved input.
 
 The page explains installation versus readiness, Node-local memory, the
-one-active-profile constraint, new-session-only fallback and profile setup.
+separate conversations with shared profile state, new-session-only fallback and
+profile setup.
 Each model dropdown reads only that backend's reported catalog and retains the
 raw model ID, even when different backends use the same display name. A saved
 unavailable model remains visible and can be cleared without a live catalog.
@@ -250,7 +255,8 @@ still applies only to Copilot.
 
 Coverage includes typed/legacy protocol parsing, discovered installations,
 new-session fallback, preference versus actual identity, backup round-tripping,
-sticky resume, profile reservation races, workers remaining on Copilot, both
+sticky resume, concurrent shared-profile startup and independent native sessions,
+workers remaining on Copilot, both
 Hermes picker methods, YOLO choices, truthful usage and settings retention.
 Existing Copilot/Agency startup, cancellation, rollover and usage cases remain
 regression coverage.
@@ -340,8 +346,9 @@ a one-time Host setup step.
 ### Isolation and remaining trade-offs
 
 - One shared identity per Node retains learning; one per orchestrator separates
-  it. Hermes currently reuses a named profile serially, with only one active
-  orchestrator per profile per Node. This research does not authorize concurrent
-  Hermes writers; other backends' sharing behavior must be verified separately.
+  it. Hermes may reuse a named profile concurrently with separate native
+  conversations and processes, intentionally sharing profile learning. This does
+  not provide profile-state isolation; other backends' sharing behavior must be
+  verified separately.
 - Learned memory is per Node; an orchestrator placed on another Node does
   not carry it. Cross-Node memory sync is a separate, later problem.
