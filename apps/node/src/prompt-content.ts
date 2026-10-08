@@ -45,6 +45,7 @@ export function toPromptBlocks(
         type: "image",
         data: attachment.data,
         mimeType: attachment.mimeType,
+        uri: attachmentUri(attachment.name),
       });
       continue;
     }

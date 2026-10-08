@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
-import type { ComponentProps } from "react";
+import { useState, type ComponentProps } from "react";
 import type { FleetSession, SessionEvent } from "@fleet/protocol";
 import { TerminalView } from "./TerminalView";
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
@@ -375,6 +375,64 @@ describe("TerminalView composer", () => {
     );
     expect(screen.getByRole("alert").textContent).toBe('Could not read "empty.txt"');
   });
+
+  it.each(["paste", "picker"] as const)(
+    "distinguishes same-name %s attachments in the composer and submitted prompt",
+    async (source) => {
+      const onPrompt = vi.fn().mockResolvedValue(true);
+      function Composer() {
+        const [draft, setDraft] = useState(EMPTY_DRAFT);
+        return (
+          <FluentProvider theme={fleetDarkTheme}>
+            <TerminalView
+              session={session()}
+              onPrompt={onPrompt}
+              onCancel={vi.fn()}
+              onStop={vi.fn()}
+              onPermission={vi.fn()}
+              draft={draft}
+              onDraftChange={setDraft}
+            />
+          </FluentProvider>
+        );
+      }
+      const { container } = render(<Composer />);
+      const add = (contents: string[]) => {
+        const files = contents.map(
+          (content) => new File([content], "image.png", { type: "image/png" }),
+        );
+        if (source === "paste") {
+          fireEvent.paste(screen.getByLabelText("Follow-up prompt"), {
+            clipboardData: { files },
+          });
+        } else {
+          fireEvent.change(container.querySelector('input[type="file"]')!, {
+            target: { files },
+          });
+        }
+      };
+      const names =
+        source === "paste"
+          ? ["image1.png", "image2.png", "image3.png"]
+          : ["image.png", "image (2).png", "image (3).png"];
+      add(["first", "second"]);
+      await screen.findByRole("button", { name: `Remove ${names[1]}` });
+      add(["third"]);
+      await screen.findByRole("button", { name: `Remove ${names[2]}` });
+      fireEvent.click(screen.getByRole("button", { name: `Remove ${names[0]}` }));
+      expect(screen.queryByText(names[0]!)).toBeNull();
+      expect(screen.getByText(names[1]!)).toBeTruthy();
+      expect(screen.getByText(names[2]!)).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() =>
+        expect(onPrompt).toHaveBeenCalledExactlyOnceWith("(see attachment)", [
+          { name: names[1], mimeType: "image/png", data: btoa("second") },
+          { name: names[2], mimeType: "image/png", data: btoa("third") },
+        ]),
+      );
+      await waitFor(() => expect(screen.queryByText(names[1]!)).toBeNull());
+    },
+  );
 
   it("keeps the pickers inside the composer, under the text box", () => {
     // They used to sit in a band above it; the point of the move is that the

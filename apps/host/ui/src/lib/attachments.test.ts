@@ -34,19 +34,93 @@ describe("acceptAttachment", () => {
     expect(result.attachment.id).toBeTruthy();
   });
 
-  it("gives two pasted screenshots different handles", () => {
-    // Both arrive named "image.png"; keying on the name would make removing one
-    // remove the other.
-    const first = acceptAttachment(file("image.png", "image/png"), "AAAA", []);
-    const second = acceptAttachment(file("image.png", "image/png"), "AAAA", []);
-    expect(first.ok && second.ok).toBe(true);
-    if (!first.ok || !second.ok) return;
+  it("numbers pasted screenshots and keeps their identities and bytes separate", () => {
+    const first = acceptAttachment(
+      file("image.png", "image/png"),
+      "AAAA",
+      [],
+      "clipboard",
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const second = acceptAttachment(
+      file("image.png", "image/png"),
+      "BBBB",
+      [first.attachment],
+      "clipboard",
+    );
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
     expect(first.attachment.id).not.toBe(second.attachment.id);
+    expect(toWireAttachments([first.attachment, second.attachment])).toEqual([
+      { name: "image1.png", mimeType: "image/png", data: "AAAA" },
+      { name: "image2.png", mimeType: "image/png", data: "BBBB" },
+    ]);
   });
 
-  it("names a clipboard image that arrives without one", () => {
-    const result = acceptAttachment(file("", "image/png"), "AAAA", []);
-    expect(result.ok && result.attachment.name).toBe("pasted-image.png");
+  it.each([
+    ["", "image/png", "image1.png"],
+    ["", "image/jpeg", "image1.jpg"],
+    ["", "image/svg+xml", "image1.svg"],
+    ["screenshot.webp", "image/webp", "image1.webp"],
+  ])("names a pasted %s (%s) with its image extension", (name, type, expected) => {
+    const result = acceptAttachment(file(name, type), "AAAA", [], "clipboard");
+    expect(result.ok && result.attachment.name).toBe(expected);
+  });
+
+  it("continues image numbering across formats, existing uploads and removal", () => {
+    const existing: DraftAttachment[] = [
+      { id: "kept", name: "IMAGE2.PNG", mimeType: "image/png", data: "AAAA" },
+    ];
+    const result = acceptAttachment(
+      file("image.webp", "image/webp"),
+      "BBBB",
+      existing,
+      "clipboard",
+    );
+    expect(result.ok && result.attachment.name).toBe("image3.webp");
+    expect(existing[0]?.name).toBe("IMAGE2.PNG");
+  });
+
+  it.each([
+    ["report.pdf", "application/pdf", "report (2).pdf"],
+    ["image.png", "image/png", "image (2).png"],
+    ["notes", "text/plain", "notes (2)"],
+    [".env", "text/plain", ".env (2)"],
+    ["a".repeat(251) + ".txt", "text/plain", "a".repeat(247) + " (2).txt"],
+  ])(
+    "disambiguates uploaded %s without changing its contents",
+    (name, type, expected) => {
+      const first = acceptAttachment(file(name, type), "AAAA", []);
+      expect(first.ok).toBe(true);
+      if (!first.ok) return;
+      const second = acceptAttachment(file(name, type), "BBBB", [first.attachment]);
+      expect(second.ok).toBe(true);
+      if (!second.ok) return;
+      expect(first.attachment.name).toBe(name);
+      expect(second.attachment).toMatchObject({
+        name: expected,
+        mimeType: type,
+        data: "BBBB",
+      });
+      expect(second.attachment.name.length).toBeLessThanOrEqual(255);
+    },
+  );
+
+  it("skips occupied suffixes case-insensitively, including pasted non-image files", () => {
+    const existing = ["NOTES.TXT", "notes (2).txt"].map((name) => ({
+      id: name,
+      name,
+      mimeType: "text/plain",
+      data: "AAAA",
+    }));
+    const result = acceptAttachment(
+      file("notes.txt", "text/plain"),
+      "BBBB",
+      existing,
+      "clipboard",
+    );
+    expect(result.ok && result.attachment.name).toBe("notes (3).txt");
   });
 
   it("refuses once the prompt is full, and says so", () => {

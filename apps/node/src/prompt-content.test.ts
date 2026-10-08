@@ -27,6 +27,7 @@ describe("toPromptBlocks", () => {
       type: "image",
       data: image.data,
       mimeType: "image/png",
+      uri: "attachment:///shot.png",
     });
   });
 
@@ -74,6 +75,34 @@ describe("toPromptBlocks", () => {
       attach("b.png", "image/png", "second"),
     ]);
     expect(blocks.map((block) => block.type)).toEqual(["text", "resource", "image"]);
+  });
+
+  it("preserves numbered image names and their corresponding bytes", () => {
+    const images = [
+      attach("image1.png", "image/png", "first"),
+      attach("image2.png", "image/png", "second"),
+    ];
+    expect(toPromptBlocks("compare image1 and image2", images).slice(1)).toEqual(
+      images.map((image) => ({
+        type: "image",
+        uri: `attachment:///${image.name}`,
+        mimeType: image.mimeType,
+        data: image.data,
+      })),
+    );
+  });
+
+  it("keeps both contents even when a caller supplies identical file names", () => {
+    const blocks = toPromptBlocks("compare", [
+      attach("notes.txt", "text/plain", "first"),
+      attach("notes.txt", "text/plain", "second"),
+    ]);
+    expect(blocks.slice(1)).toEqual(
+      ["first", "second"].map((text) => ({
+        type: "resource",
+        resource: { uri: "attachment:///notes.txt", mimeType: "text/plain", text },
+      })),
+    );
   });
 
   it("sends a plain prompt as one text block when nothing is attached", () => {

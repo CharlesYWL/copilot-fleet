@@ -999,7 +999,10 @@ export const TerminalView = ({
     }
   };
 
-  const addFiles = async (files: readonly File[]) => {
+  const addFiles = async (
+    files: readonly File[],
+    source: "file" | "clipboard" = "file",
+  ) => {
     if (files.length === 0) return;
     setAttachError(undefined);
     for (const file of files) {
@@ -1014,7 +1017,12 @@ export const TerminalView = ({
       // files one by one.
       let rejected: string | undefined;
       setAttachments((current) => {
-        const result = acceptAttachment(file, base64FromDataUrl(dataUrl), current);
+        const result = acceptAttachment(
+          file,
+          base64FromDataUrl(dataUrl),
+          current,
+          source,
+        );
         if (!result.ok) {
           rejected = result.error;
           return current;
@@ -1031,7 +1039,7 @@ export const TerminalView = ({
     // Pasted text keeps its normal behaviour; only files are intercepted, or
     // copying an image out of a document would stop pasting its caption too.
     event.preventDefault();
-    void addFiles(files);
+    void addFiles(files, "clipboard");
   };
 
   const handleSubmit = (event: FormEvent) => {
@@ -1605,8 +1613,8 @@ const TerminalLine = memo(function TerminalLine({
         <MarkdownBody text={block.text} copyable />
         {block.attachments?.length ? (
           <div className={styles.blockAttachments}>
-            {block.attachments.map((attachment) => (
-              <span className={styles.blockAttachment} key={attachment.name}>
+            {block.attachments.map((attachment, attachmentIndex) => (
+              <span className={styles.blockAttachment} key={attachmentIndex}>
                 <Attach20Regular className={styles.blockAttachmentIcon} />
                 {attachment.name}
               </span>
