@@ -451,7 +451,26 @@ export class FleetService {
     this.transcripts.clear();
     this.permissionLedger = undefined;
     this.commands.reconcileNotifications();
+    this.notifyRestored();
     this.broadcast({ type: "snapshot", data: this.snapshot() });
+  }
+
+  private readonly restoredListeners = new Set<() => void>();
+
+  /** Subscribes to catalog replacement by either restore path; returns an unsubscribe. */
+  onRestored(listener: () => void): () => void {
+    this.restoredListeners.add(listener);
+    return () => this.restoredListeners.delete(listener);
+  }
+
+  private notifyRestored(): void {
+    for (const listener of this.restoredListeners) {
+      try {
+        listener();
+      } catch (error) {
+        this.log.error({ error }, "A restore listener threw");
+      }
+    }
   }
 
   /**
@@ -475,6 +494,7 @@ export class FleetService {
     this.transcripts.clear();
     this.permissionLedger = undefined;
     this.commands.reconcileNotifications();
+    this.notifyRestored();
     return result;
   }
 

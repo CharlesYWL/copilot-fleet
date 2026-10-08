@@ -872,6 +872,13 @@ Five separate facts: a tunnel decides who can **reach** the Host, optional Entra
 - Node HTTP credentials reach only the catalog routes the config page relays, and a node can only place its own paths.
 - Copilot credentials stay on the Node.
 
+### The local agent API
+
+- An opt-in third principal for programs on the Host machine: a separate Fastify instance (`apps/host/src/local-agent-server.ts`) bound only to literal `127.0.0.1` on its own port (default 8786), unauthenticated by design. It shares the service and store, but has none of the main routes, guard, cookies or tunnel targets, and nothing on the main port reaches it.
+- Admission runs before any body is read: a loopback socket peer, a `Host` of exactly `127.0.0.1:<port>`, an origin-form target, the non-secret `x-fleet-local-agent: 1` marker, GET or JSON POST only, and no `Origin`, `Cookie`, `Authorization`, `Forwarded`/`X-Forwarded-*`, `Via`, `Upgrade`, `Sec-Fetch-Site`/`-Dest`/`-User`, CSRF or Node headers. That keeps browser pages and Fleet's own relays out; it cannot authenticate another local process, which the enable warning says.
+- Scope is two explicit allowlists (orchestrator IDs and workspace IDs), empty by default, managed on the primary Security settings by a Microsoft administrator — recent reauthentication for any change that leaves it on, none to turn it off or abandon a request — or, on a no-auth Host, by the reachable operator. A local caller is never a person: it cannot approve, publish, stop, resume or transfer, and its messages reach a lead in a `<fleet-local-agent-request>` envelope through the existing durable queue.
+- Writes are idempotent on a caller-supplied UUID, recorded in a host-local ledger (`local_agent_requests`) in the same commit as the task or queued delivery. Receipts are projected from the delivery record, so there is one authority for whether it was handed over. The ledger stays out of backups; a restore keeps it and uses it to retire briefs this Host already delivered. Restore and auth reset turn the API off.
+
 ### Everything else
 
 - Session creation references a Placement ID, never an arbitrary browser-supplied path.

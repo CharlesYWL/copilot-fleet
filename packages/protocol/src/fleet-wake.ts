@@ -32,8 +32,12 @@ const HEADER =
 /** Headers emitted by review.ts, routes/orchestrators.ts and briefing.ts. */
 const REVIEW_HEADER =
   /^<fleet-review\s+task="((?:[^"\\]|\\.)*)"\s+verdict="(changes requested|reopened)">$/;
+/** `id` is optional: briefs written before exact-ID briefing carried only the name. */
 const TASK_HEADER =
-  /^<fleet-task\s+name="((?:[^"\\]|\\.)*)"\s+workspace="((?:[^"\\]|\\.)*)">$/;
+  /^<fleet-task(?:\s+id="(?:[^"\\]|\\.)*")?\s+name="((?:[^"\\]|\\.)*)"\s+workspace="((?:[^"\\]|\\.)*)">$/;
+/** Header written by `localAgentEnvelope` in apps/host/src/local-agent-service.ts. */
+const LOCAL_AGENT_HEADER =
+  /^<fleet-local-agent-request\s+id="[^"\\]*"\s+taskId="(?:[^"\\]|\\.)*"\s+task="((?:[^"\\]|\\.)*)"\s+intent="(question|guidance)"\s+source="local-agent"(?:\s+client="((?:[^"\\]|\\.)*)")?>$/;
 const STATUS_HEADER = /^<fleet-status-check\s+interval="((?:[^"\\]|\\.)*)">$/;
 const COMMAND_HEADER =
   /^<fleet-command-result executionId="([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})" node="((?:[^"\\]|\\.)*)" state="([a-z_]+)">$/i;
@@ -89,6 +93,16 @@ export function parseFleetControl(
     return {
       title: "Task received",
       detail: [unquote(task[1] ?? ""), unquote(task[2] ?? "")].join(" · "),
+    };
+  }
+  const local = LOCAL_AGENT_HEADER.exec(header);
+  if (local && lines.at(-1)?.trim() === "</fleet-local-agent-request>") {
+    return {
+      title: local[2] === "question" ? "Local agent question" : "Local agent guidance",
+      detail: [
+        unquote(local[3] ?? "") || "Unlabelled client",
+        unquote(local[1] ?? ""),
+      ].join(" · "),
     };
   }
   const status = STATUS_HEADER.exec(header);

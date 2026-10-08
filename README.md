@@ -111,7 +111,8 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [Orchestrator quick guide](#orchestrator-quick-guide),
   [approved remote commands](#approved-remote-commands),
   [Runs: several sessions toward one objective](#runs-several-sessions-toward-one-objective),
-  and [Chats as a destination](#chats-as-a-destination).
+  [Chats as a destination](#chats-as-a-destination), and
+  [local agents](#local-agents-handing-work-to-an-orchestrator-from-this-machine).
 - **Recover, move, back up, or troubleshoot:**
   [Moving a Host or Node](#moving-a-host-or-a-node-to-another-machine),
   [recovering sessions](#recovering-sessions-after-a-restart),
@@ -2508,6 +2509,49 @@ Approving is deliberately the only gate. A human authorises the objective and
 its budget; individual dispatches are not re-approved, and the budget is what
 stops a run rather than a prompt each time.
 
+### Local agents: handing work to an orchestrator from this machine
+
+A program on the Host machine — Hermes, a script, any MCP client — can create
+tasks on an existing orchestrator, ask about old ones, and read the answers,
+without a browser session or a Microsoft identity. It is off by default and
+exposes only what you pick.
+
+1. **Settings → Security → Local agent API**: tick the orchestrators and the
+   workspaces to expose, keep the port (default `8786`) or change it, then
+   **Turn on…** and accept the warning. With Microsoft sign-in on, any change
+   that leaves it on needs a recent sign-in; turning it off never does.
+2. Call it at `http://127.0.0.1:8786` exactly, with the header
+   `x-fleet-local-agent: 1` on every request:
+
+   ```bash
+   curl -H "x-fleet-local-agent: 1" http://127.0.0.1:8786/v1/orchestrators
+   ```
+
+   The REST surface is `/v1/capabilities`, `/v1/orchestrators`,
+   `/v1/workspaces`, `/v1/tasks`, `/v1/tasks/<id>`,
+   `POST /v1/orchestrators/<id>/tasks`,
+   `POST /v1/tasks/<id>/messages`, `/v1/requests/<operationId>` and
+   `/v1/orchestrators/<id>/transcript`. MCP clients use `POST /v1/mcp`; the card
+   copies a ready client configuration.
+
+3. Every write takes a fresh UUID `operationId`; retrying with the same one
+   replays the original receipt instead of creating work twice. Replies are
+   asynchronous: poll the request and task, then read the orchestrator's answer
+   in its transcript.
+
+A local agent is never a person. A _question_ works on any exposed task,
+including finished ones, and does not reopen it; _guidance_ is held while a task
+is closed or waiting for review. Nothing here approves, publishes, stops,
+transfers or resumes anything — use the normal controls for that. The card lists
+recent local requests and lets whoever manages it abandon one that is stuck. See
+[the design and implementation record](docs/local-agent-api-plan.md).
+
+**Trust model.** Any process that can reach the loopback port — potentially
+including other users on this machine — can read the exposed orchestrators'
+whole conversations and ask them to act with their existing permissions. The
+header keeps browser pages out; it is not authentication. Never forward or
+tunnel this port.
+
 ## Security notes
 
 - In explicit no-auth mode, local access or a private Dev Tunnel replaces Fleet
@@ -2547,6 +2591,12 @@ stops a run rather than a prompt each time.
 - Removing an administrator revokes their sessions and closes their live browser
   sockets in the same operation; a 60-second sweep re-checks every open socket
   against the live session and administrator rows.
+- The opt-in [local agent API](#local-agents-handing-work-to-an-orchestrator-from-this-machine)
+  is a separate listener on literal `127.0.0.1`, unauthenticated by design. It
+  reaches only the orchestrators and workspaces an operator exposed, never the
+  main `/api`, `/ws` or lead `/mcp`, and refuses browser, proxy and credential
+  headers. Fleet's own tunnel refuses to forward its port. Restore and Host
+  sign-in reset turn it off.
 - Legacy password sign-in is opt-in, off on a fresh Host, and retired
   automatically by the first Microsoft claim. Disabling it
   deletes the verifier and records the choice, so a stale

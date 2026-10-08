@@ -43,6 +43,7 @@ import { DeviceCodePanel } from "./auth/DeviceCodePanel";
 import { MicrosoftSignInForm } from "./auth/MicrosoftSignInForm";
 import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
+import { LocalAgentCard } from "./LocalAgentCard";
 import { MicrosoftSignInSetup } from "./AuthGate";
 import { terminal } from "../theme";
 
@@ -316,6 +317,7 @@ export const SecurityPanel = () => {
         </MessageBar>
         <IdentityCard status={data.status} enrollment={data.enrollment} />
         <NodeMigrationCard enrollment={data.enrollment} run={run} />
+        <LocalAgentCard run={run} />
         {error && (
           <MessageBar intent="error">
             <MessageBarBody>{error}</MessageBarBody>
@@ -357,6 +359,7 @@ export const SecurityPanel = () => {
         claimed={!data.status.claimCodeRequired}
         onImported={() => window.location.reload()}
       />
+      <LocalAgentCard run={run} />
       <AuditCard events={data.audit} />
       <EraseAuthCard run={run} />
       <Dialog

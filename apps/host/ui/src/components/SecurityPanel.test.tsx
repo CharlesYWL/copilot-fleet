@@ -77,6 +77,20 @@ const defaults: Record<string, unknown> = {
     mutualAuthenticationRequired: false,
   },
   "/api/auth/csrf": { csrfToken: "proof" },
+  "/api/local-agent/config": {
+    config: {
+      enabled: false,
+      port: 8786,
+      allowedLeadSessionIds: [],
+      allowedWorkspaceIds: [],
+      revision: 0,
+    },
+    status: { state: "disabled" },
+    hostPort: 8787,
+    defaultPort: 8786,
+    choices: { orchestrators: [], workspaces: [] },
+  },
+  "/api/local-agent/requests": { requests: [] },
 };
 
 /** Serves the panel's reads, with per-test overrides for the writes. */

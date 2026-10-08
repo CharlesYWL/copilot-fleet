@@ -38,6 +38,8 @@ import {
   type LegacyEnrollment,
 } from "./config.js";
 import { FleetService } from "./fleet-service.js";
+import { LocalAgentListener } from "./local-agent-server.js";
+import { LocalAgentService } from "./local-agent-service.js";
 import { registerBrowserGateway } from "./gateway/browser-socket.js";
 import { registerNodeGateway } from "./gateway/node-socket.js";
 import { startHostUrlMonitor } from "./host-url.js";
@@ -64,6 +66,7 @@ import { managedWorktreeRoutes } from "./routes/managed-worktrees.js";
 import { orchestratorRoutes } from "./routes/orchestrators.js";
 import { systemRoutes } from "./routes/system.js";
 import { hostUpdateRoutes } from "./routes/host-update.js";
+import { localAgentSettingsRoutes } from "./routes/local-agent-settings.js";
 import {
   HostSelfUpdate,
   checkoutBusy,
@@ -179,6 +182,8 @@ export async function buildServer(
   if (enrollment.token) store.setSetting("enrollment.token", enrollment.token);
   const heartbeatTimeoutMs = Number(process.env.HEARTBEAT_TIMEOUT_MS ?? 15_000);
   const listenPort = process.env.PORT ?? "8787";
+  /** Bound once the local agent listener exists; auth resets can fire before then. */
+  let reconcileLocalAgent: () => Promise<unknown> = async () => undefined;
 
   const tunnel: TunnelSupervisor = new TunnelSupervisor({
     policy: () =>
@@ -259,7 +264,11 @@ export async function buildServer(
       browsers.revokeSessions(revoked.map((row) => row.tokenHash)),
     onAdministratorRemoved: (administratorId) =>
       browsers.revokeAdministrator(administratorId),
-    onAuthenticationReset: () => browsers.closeAll(),
+    onAuthenticationReset: () => {
+      browsers.closeAll();
+      // A reset erased the local agent consent along with every credential.
+      void reconcileLocalAgent();
+    },
   });
   const service = new FleetService(
     store,
@@ -476,6 +485,39 @@ export async function buildServer(
   await app.register(orchestratorRoutes, { service, engine });
   await app.register(hostUpdateRoutes, { hostUpdate });
 
+  /*
+   * The local agent API: a second, loopback-only listener for programs on this
+   * machine. Opened only once the main Host is listening — an in-memory fixture
+   * never binds it — and closed before the service and store it reads from.
+   */
+  const localAgent = new LocalAgentService(service, engine, app.log);
+  const localAgentListener = new LocalAgentListener({
+    agent: localAgent,
+    log: app.log,
+    mainPort: Number(listenPort),
+    ...(databasePath === ":memory:" ? { markerPath: null } : {}),
+  });
+  reconcileLocalAgent = () =>
+    localAgentListener
+      .reconcile()
+      .catch((error) =>
+        app.log.error({ err: error }, "Could not reconcile the local agent API"),
+      );
+  service.onRestored(() => void reconcileLocalAgent());
+  app.addHook("onListen", async () => {
+    void localAgentListener
+      .activate()
+      .catch((error) =>
+        app.log.error({ err: error }, "Could not start the local agent API"),
+      );
+  });
+  await app.register(localAgentSettingsRoutes, {
+    auth,
+    agent: localAgent,
+    listener: localAgentListener,
+    mainPort: Number(listenPort),
+  });
+
   registerBrowserGateway(app, { service, auth, registry: browsers });
   registerNodeGateway(app, service, { identity: hostIdentity });
   const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs, (stalledMs) =>
@@ -544,6 +586,7 @@ export async function buildServer(
   });
 
   app.addHook("onClose", async () => {
+    await localAgentListener.close();
     clearInterval(presenceTimer);
     clearInterval(notificationRetentionTimer);
     clearInterval(sessionRetentionTimer);

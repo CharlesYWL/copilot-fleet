@@ -1538,14 +1538,16 @@ export class CommandExecutionService {
       .prompts(leadId)
       .find(
         (entry) =>
-          entry.state === "pending" ||
-          (entry.state === "rejected_busy" &&
-            entry.retryAfterSeq !== undefined &&
-            this.store.maxEventSequence(leadId) > entry.retryAfterSeq),
+          (entry.state === "pending" ||
+            (entry.state === "rejected_busy" &&
+              entry.retryAfterSeq !== undefined &&
+              this.store.maxEventSequence(leadId) > entry.retryAfterSeq)) &&
+          this.store.localAgent.admits(entry),
       );
     if (!record) return;
     this.store.writeAtomically(() => {
       this.records.updatePrompt({ ...record, state: "reserved" });
+      this.store.localAgent.markReserved(record.delivery.deliveryId);
       this.store.recordOrchestratorPrompt(leadId);
     });
     if (

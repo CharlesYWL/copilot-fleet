@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { TunnelProviderSchema } from "@fleet/protocol";
 import { externalTunnelPath, adoptOrKillStale } from "./external-tunnel.js";
+import { localAgentTunnelConflict } from "./local-agent-marker.js";
 import { parseLocalTarget, providerSpecs } from "./tunnel-providers.js";
 
 /**
@@ -20,6 +21,12 @@ const statePath = externalTunnelPath();
 
 const log = (message: string) =>
   console.log(`${new Date().toISOString()} [tunnel] ${message}`);
+
+const refused = localAgentTunnelConflict(target.port, Number(process.env.PORT ?? "8787"));
+if (refused) {
+  log(refused);
+  process.exit(1);
+}
 
 const writeState = (
   pid: number,
