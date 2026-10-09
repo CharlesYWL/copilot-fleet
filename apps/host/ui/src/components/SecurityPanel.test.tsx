@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { FluentProvider } from "@fluentui/react-components";
+import { FluentProvider, tokens } from "@fluentui/react-components";
 import { SecurityPanel } from "./SecurityPanel";
 import {
   announceIdentityConfirmed,
@@ -1559,6 +1559,19 @@ describe("SecurityPanel", () => {
     }
     expect(within(rows[1]!).getByText("command_execution_decision")).toBeTruthy();
     expect(within(rows[1]!).getByText("success")).toBeTruthy();
+    for (const [index, outcome] of [
+      "success",
+      "allowed",
+      "denied",
+      "failure",
+    ].entries()) {
+      const badge = within(rows[index + 1]!).getByText(outcome);
+      expect(getComputedStyle(badge).color).toBe(
+        index < 2
+          ? tokens.colorPaletteGreenForeground3
+          : tokens.colorPaletteRedForeground3,
+      );
+    }
     expect(cells[4]!.textContent).toBe(detail);
     expect(getComputedStyle(cells[4]!).whiteSpace).toBe("normal");
     expect(getComputedStyle(cells[4]!).minWidth).toBe("240px");
