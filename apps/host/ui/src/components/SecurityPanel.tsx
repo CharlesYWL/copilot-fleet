@@ -1467,7 +1467,11 @@ function AuditCard({ events }: { events: AuditEvent[] }) {
                   <TableCell>
                     <Badge
                       appearance="outline"
-                      color={event.outcome === "allowed" ? "success" : "danger"}
+                      color={
+                        event.outcome === "allowed" || event.outcome === "success"
+                          ? "success"
+                          : "danger"
+                      }
                     >
                       {event.outcome}
                     </Badge>
