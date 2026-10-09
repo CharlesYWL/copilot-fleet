@@ -417,6 +417,7 @@ export const PRESERVED_SETTING_KEYS = [
   "auth.csrfKey",
   "auth.sessionKey",
   "orchestrator.tokenKey",
+  "hostMcp.tokenKey",
   "host.identity.id",
   "host.identity.privateKey",
   "host.identity.publicKey",

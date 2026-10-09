@@ -38,6 +38,10 @@ describe("requiredPrincipal", () => {
     expect(requiredPrincipal("GET", "/ws/node")).toBe("node-protocol");
     expect(requiredPrincipal("POST", "/api/nodes/register")).toBe("enrollment");
     expect(requiredPrincipal("POST", "/mcp")).toBe("lead");
+    expect(requiredPrincipal("POST", "/mcp/host/figma")).toBe("session-mcp");
+    expect(requiredPrincipal("POST", "/mcp/host/%66igma")).toBe("session-mcp");
+    expect(requiredPrincipal("GET", "/mcp/host/figma")).toBe("operator");
+    expect(requiredPrincipal("POST", "/mcp/host/figma/extra")).toBe("operator");
   });
 
   it("requires an operator for everything else under /api and /ws", () => {
@@ -51,6 +55,8 @@ describe("requiredPrincipal", () => {
       ["POST", "/api/auth/configuration/start"],
       ["POST", "/api/auth/erase"],
       ["GET", "/api/security/audit"],
+      ["GET", "/api/host-mcp/settings"],
+      ["PUT", "/api/host-mcp/settings"],
       ["GET", "/ws/browser"],
       ["GET", "/api/enrollment"],
     ] as const) {

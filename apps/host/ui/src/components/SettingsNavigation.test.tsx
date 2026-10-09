@@ -59,6 +59,7 @@ const responses: Record<string, unknown> = {
     tunnels: [],
   },
   "/api/logs": { entries: [] },
+  "/api/host-mcp/settings": { revision: "a".repeat(64), suspended: false, servers: [] },
 };
 
 const show = () =>

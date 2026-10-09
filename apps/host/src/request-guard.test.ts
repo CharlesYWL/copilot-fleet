@@ -527,54 +527,57 @@ describe("guarded server", () => {
    * every principal except this one is how an endpoint reachable from the
    * internet ends up with one check instead of three.
    */
-  describe("the lead control plane", () => {
-    const mcp = (headers: Record<string, string>) =>
-      app.inject({
-        method: "POST",
-        url: "/mcp",
-        headers: {
-          accept: "application/json, text/event-stream",
-          "content-type": "application/json",
-          ...headers,
-        },
-        payload: { jsonrpc: "2.0", id: 1, method: "tools/list" },
+  describe.each(["/mcp", "/mcp/host/figma", "/mcp/host/%66igma"])(
+    "MCP control plane at %s",
+    (url) => {
+      const mcp = (headers: Record<string, string>) =>
+        app.inject({
+          method: "POST",
+          url,
+          headers: {
+            accept: "application/json, text/event-stream",
+            "content-type": "application/json",
+            ...headers,
+          },
+          payload: { jsonrpc: "2.0", id: 1, method: "tools/list" },
+        });
+
+      it("refuses a name this Host does not answer to before looking at the token", async () => {
+        const response = await mcp({
+          host: "fleet.attacker.example",
+          authorization: "Bearer flt_whatever.whatever",
+        });
+
+        expect(response.statusCode).toBe(403);
       });
 
-    it("refuses a name this Host does not answer to before looking at the token", async () => {
-      const response = await mcp({
-        host: "fleet.attacker.example",
-        authorization: "Bearer flt_whatever.whatever",
+      it("refuses anything a browser sent, however it names this Host", async () => {
+        const response = await mcp({
+          host: "localhost:8787",
+          origin: "http://localhost:8787",
+          authorization: "Bearer flt_whatever.whatever",
+        });
+
+        expect(response.statusCode).toBe(403);
       });
 
-      expect(response.statusCode).toBe(403);
-    });
+      it("lets a name it does answer to through to the token check", async () => {
+        const response = await mcp({
+          host: "127.0.0.1:8787",
+          authorization: "Bearer flt_whatever.whatever",
+        });
 
-    it("refuses anything a browser sent, however it names this Host", async () => {
-      const response = await mcp({
-        host: "localhost:8787",
-        origin: "http://localhost:8787",
-        authorization: "Bearer flt_whatever.whatever",
+        // 401 rather than 403: the guard was satisfied and the route was not.
+        expect(response.statusCode).toBe(401);
       });
 
-      expect(response.statusCode).toBe(403);
-    });
+      it("does not accept an operator session in place of a lead token", async () => {
+        const response = await mcp({ host: "localhost:8787", cookie });
 
-    it("lets a name it does answer to through to the token check", async () => {
-      const response = await mcp({
-        host: "127.0.0.1:8787",
-        authorization: "Bearer flt_whatever.whatever",
+        expect(response.statusCode).toBe(401);
       });
-
-      // 401 rather than 403: the guard was satisfied and the route was not.
-      expect(response.statusCode).toBe(401);
-    });
-
-    it("does not accept an operator session in place of a lead token", async () => {
-      const response = await mcp({ host: "localhost:8787", cookie });
-
-      expect(response.statusCode).toBe(401);
-    });
-  });
+    },
+  );
 });
 
 /**
@@ -609,25 +612,28 @@ describe("credentials over a plain-HTTP address this Host published", () => {
     else process.env.FLEET_PUBLIC_URL = previousPublicUrl;
   });
 
-  it("refuses a lead token presented over it", async () => {
-    const refused = await app.inject({
-      method: "POST",
-      url: "/mcp",
-      headers: {
-        accept: "application/json, text/event-stream",
-        "content-type": "application/json",
-        host: "fleet.lan:8787",
-        authorization: "Bearer whatever",
-      },
-      payload: { jsonrpc: "2.0", id: 1, method: "tools/list" },
-    });
+  it.each(["/mcp", "/mcp/host/figma", "/mcp/host/%66igma"])(
+    "refuses an MCP token over plain HTTP at %s",
+    async (url) => {
+      const refused = await app.inject({
+        method: "POST",
+        url,
+        headers: {
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+          host: "fleet.lan:8787",
+          authorization: "Bearer whatever",
+        },
+        payload: { jsonrpc: "2.0", id: 1, method: "tools/list" },
+      });
 
-    // 403 rather than 401: the address is the refusal, not the token.
-    expect(refused.statusCode).toBe(403);
-    expect(String((refused.json() as { error: string }).error)).toMatch(
-      /plain HTTP|not encrypted|HTTPS/i,
-    );
-  });
+      // 403 rather than 401: the address is the refusal, not the token.
+      expect(refused.statusCode).toBe(403);
+      expect(String((refused.json() as { error: string }).error)).toMatch(
+        /plain HTTP|not encrypted|HTTPS/i,
+      );
+    },
+  );
 
   it("still serves the same endpoint on loopback", async () => {
     const reached = await app.inject({

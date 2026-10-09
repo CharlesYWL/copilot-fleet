@@ -50,6 +50,7 @@ import { MicrosoftSignInForm } from "./auth/MicrosoftSignInForm";
 import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
 import { LocalAgentCard } from "./LocalAgentCard";
+import { HostMcpCard } from "./HostMcpCard";
 import { MicrosoftSignInSetup } from "./AuthGate";
 import { terminal } from "../theme";
 
@@ -410,6 +411,7 @@ export const SecurityPanel = () => {
         <IdentityCard status={data.status} enrollment={data.enrollment} />
         <NodeMigrationCard enrollment={data.enrollment} run={run} />
         <LocalAgentCard run={run} />
+        <HostMcpCard run={run} />
         {error && (
           <MessageBar intent="error">
             <MessageBarBody>{error}</MessageBarBody>
@@ -452,6 +454,7 @@ export const SecurityPanel = () => {
         onImported={() => window.location.reload()}
       />
       <LocalAgentCard run={run} />
+      <HostMcpCard run={run} />
       <AuditCard events={data.audit} />
       <EraseAuthCard run={run} />
       <Dialog

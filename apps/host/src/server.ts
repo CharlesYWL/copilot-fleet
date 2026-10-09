@@ -48,6 +48,11 @@ import { startPresenceMonitor } from "./presence.js";
 import { OrchestratorEngine } from "./orchestrator/engine.js";
 import { LeadTokens } from "./orchestrator/lead-tokens.js";
 import { MCP_PATH, mcpRoutes } from "./orchestrator/mcp-routes.js";
+import { HostMcpRelay, hostMcpRoutes, readHostMcpConfig } from "./host-mcp.js";
+import {
+  HostMcpSettingsService,
+  hostMcpSettingsRoutes,
+} from "./routes/host-mcp-settings.js";
 import { startRunDeadlineMonitor } from "./orchestrator/deadlines.js";
 import { registerRequestGuard } from "./request-guard.js";
 import { authRoutes } from "./routes/auth.js";
@@ -155,6 +160,12 @@ export async function buildServer(
   const app = Fastify({ logger: { stream: recordingLogStream(logs) } });
   const databasePath =
     options.databasePath ?? resolveDatabasePath(process.env.DATABASE_PATH);
+  const hostMcpConfigPath =
+    process.env.FLEET_HOST_MCP_CONFIG || join(dirname(databasePath), "host-mcp.json");
+  const hostMcpConfig =
+    databasePath === ":memory:"
+      ? { servers: [] }
+      : await readHostMcpConfig(hostMcpConfigPath);
   const store = new FleetStore(databasePath, {
     warn: (message) => app.log.warn(message),
     exclusive: options.resetOperatorAuth === true,
@@ -479,6 +490,24 @@ export async function buildServer(
     // something an administrator has to be able to see.
     audit: (entry) => auth.audit(entry),
   });
+  const hostMcp = new HostMcpRelay(service, hostMcpConfig, enrollmentHostUrl);
+  service.attachHostMcp((session) => hostMcp.serversFor(session));
+  await app.register(hostMcpRoutes, { relay: hostMcp });
+  await app.register(hostMcpSettingsRoutes, {
+    auth,
+    settings: new HostMcpSettingsService(
+      hostMcp,
+      databasePath === ":memory:" ? undefined : hostMcpConfigPath,
+      app.log,
+    ),
+  });
+  service.onRestored(() => {
+    void hostMcp
+      .close()
+      .catch((error) =>
+        app.log.error({ err: error }, "Could not close Host MCP after restore"),
+      );
+  });
   await app.register(runRoutes, { service, engine });
   await app.register(workerResumeRoutes, { engine });
   await app.register(managedWorktreeRoutes, { service });
@@ -594,6 +623,7 @@ export async function buildServer(
     clearInterval(hostUrlMonitor);
     clearInterval(sessionTimer);
     hostUpdate.close();
+    await hostMcp.close();
     await tunnel.stop();
     service.shutdown();
     store.close();
