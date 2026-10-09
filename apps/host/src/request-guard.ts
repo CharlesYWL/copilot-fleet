@@ -325,7 +325,8 @@ export function registerRequestGuard(
   app.addHook("onRequest", async (request, reply) => {
     const { pathname, isApi, isSocket } = classify(request.url);
     const principal = requiredPrincipal(request.method, pathname);
-    if (!isApi && !isSocket && principal !== "lead") return;
+    const machineMcp = principal === "lead" || principal === "session-mcp";
+    if (!isApi && !isSocket && !machineMcp) return;
 
     // The node gateway carries its own credential in the first frame, and a
     // node dials whatever address it was enrolled with — a LAN IP, a forwarded
@@ -344,7 +345,7 @@ export function registerRequestGuard(
      * the request claims to have arrived under must be one this Host answers
      * to, and a browser must not be able to reach it however good its token is.
      */
-    if (principal === "lead") {
+    if (machineMcp) {
       if (!nameAllowed(request.headers.host, allowedHostnames(allowlist))) {
         auth.audit({
           eventType: "mcp_request_host_rejected",

@@ -14,7 +14,8 @@ export type GuardPrincipal =
   | "operator"
   | "node-protocol"
   | "enrollment"
-  | "lead";
+  | "lead"
+  | "session-mcp";
 
 export type GuardRule = {
   method: string | "*";
@@ -67,6 +68,11 @@ export const GUARD_RULES: readonly GuardRule[] = [
   },
   { method: "POST", pattern: /^\/api\/nodes\/register$/, principal: "enrollment" },
   { method: "POST", pattern: /^\/mcp$/, principal: "lead" },
+  {
+    method: "POST",
+    pattern: /^\/mcp\/host\/[^/]+$/,
+    principal: "session-mcp",
+  },
 ];
 
 /**

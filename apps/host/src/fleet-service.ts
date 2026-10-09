@@ -234,6 +234,9 @@ export class FleetService {
     | { mint: (subject: { sessionId: string; runId: string; nodeId: string }) => string }
     | undefined;
   private mcpUrl: (() => string) | undefined;
+  private hostMcpServers:
+    | ((session: Pick<FleetSession, "id" | "runId" | "nodeId">) => McpHttpServer[])
+    | undefined;
   private runTicker: ((runId: string) => void) | undefined;
   /**
    * "Resume now" and step admission, owned by the orchestration engine.
@@ -269,6 +272,13 @@ export class FleetService {
     this.mcpUrl = input.mcpUrl;
     this.runTicker = input.tickRun;
     this.workerResume = input.resume;
+  }
+
+  /** Optional Host-owned MCP grants, shared by ordinary starts and every resume path. */
+  attachHostMcp(
+    servers: (session: Pick<FleetSession, "id" | "runId" | "nodeId">) => McpHttpServer[],
+  ): void {
+    this.hostMcpServers = servers;
   }
 
   /** Advances one run now, used by the tools so a dispatch is not left waiting. */
@@ -1364,13 +1374,16 @@ export class FleetService {
   mcpServersFor(
     session: Pick<FleetSession, "id" | "runRole" | "runId" | "nodeId">,
   ): McpHttpServer[] {
-    if (session.runRole !== "lead" || !this.leadTokens || !this.mcpUrl) return [];
+    const hostServers = this.hostMcpServers?.(session) ?? [];
+    if (session.runRole !== "lead" || !this.leadTokens || !this.mcpUrl)
+      return hostServers;
     const token = this.leadTokens.mint({
       sessionId: session.id,
       runId: session.runId,
       nodeId: session.nodeId,
     });
     return [
+      ...hostServers,
       {
         name: "fleet",
         url: this.mcpUrl(),

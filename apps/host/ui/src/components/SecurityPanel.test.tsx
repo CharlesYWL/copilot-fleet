@@ -95,6 +95,7 @@ const defaults: Record<string, unknown> = {
     choices: { orchestrators: [], workspaces: [] },
   },
   "/api/local-agent/requests": { requests: [] },
+  "/api/host-mcp/settings": { revision: "a".repeat(64), suspended: false, servers: [] },
 };
 
 /** Serves the panel's reads, with per-test overrides for the writes. */
