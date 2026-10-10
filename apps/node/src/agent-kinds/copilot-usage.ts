@@ -38,13 +38,15 @@ export class CopilotUsageReporter implements UsageReporter {
 
   flush(): Promise<void> {
     if (this.reading) return this.reading;
-    if (!this.reader) return Promise.resolve();
-    const read = this.reader
+    const reader = this.reader;
+    if (!reader) return Promise.resolve();
+    const read = reader
       .read()
       .then((aiCredits) => {
         if (this.context.aborted()) return;
         this.creditError = undefined;
         if (aiCredits !== undefined) this.context.report({ aiCredits });
+        this.context.agentLoop?.(reader.loop);
       })
       .catch((error: unknown) => {
         if (this.context.aborted()) return;

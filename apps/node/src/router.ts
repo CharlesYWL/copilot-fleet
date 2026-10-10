@@ -52,6 +52,20 @@ export type CommandResult = {
  */
 export class CommandRefused extends Error {}
 
+/**
+ * Whether replacing this agent's process would cut work short: a turn in
+ * flight, or background work a finished turn left running inside it.
+ */
+function mustKeepProcess(agent: SessionAgent | undefined): boolean {
+  return !!agent && (agent.busy || agent.holdsBackgroundWork === true);
+}
+
+function contextChangeRefusal(agent: SessionAgent, label: string): string {
+  return agent.busy
+    ? "Wait for the current turn before changing context"
+    : `${label} is still running background work it started, and changing context would stop it. Wait for that work to finish`;
+}
+
 export type CommandRouterOptions = {
   worktrees?: ManagedWorktrees;
   admission?: NodeAdmission;
@@ -260,7 +274,7 @@ export class CommandRouter {
           !slot.launch?.mcpServers.length
         )
           return;
-        if (slot.agent.busy) {
+        if (mustKeepProcess(slot.agent)) {
           slot.refreshMcpPending = true;
           return;
         }
@@ -396,10 +410,13 @@ export class CommandRouter {
               if (!slot.config.has(CONTEXT_TIER_CONFIG_ID)) {
                 throw new CommandRefused("This agent does not support context switching");
               }
-              if (agent.busy) {
+              if (mustKeepProcess(agent)) {
                 agent.resync();
                 throw new CommandRefused(
-                  "Wait for the current turn before changing context",
+                  contextChangeRefusal(
+                    agent,
+                    agentKindLabels[slot.launch?.agentParams?.kind ?? "copilot"],
+                  ),
                 );
               }
               if (slot.config.get(CONTEXT_TIER_CONFIG_ID) !== tier) {
@@ -1292,6 +1309,7 @@ export class CommandRouter {
     if (
       state === "idle" &&
       slot.refreshMcpPending &&
+      !slot.agent?.holdsBackgroundWork &&
       !this.deleting.has(sessionId) &&
       !slot.stopping &&
       !this.options.admission?.reason &&
@@ -1353,9 +1371,14 @@ export class CommandRouter {
           "Session cannot be restarted without its saved conversation",
         );
       }
-      if (current.busy) {
+      if (mustKeepProcess(current)) {
         current.resync();
-        throw new CommandRefused("Wait for the current turn before changing context");
+        throw new CommandRefused(
+          contextChangeRefusal(
+            current,
+            agentKindLabels[launch.agentParams?.kind ?? "copilot"],
+          ),
+        );
       }
       await this.replaceAgent(sessionId, slot, contextTier);
     });
@@ -1448,7 +1471,7 @@ export class CommandRouter {
         signal.aborted
       )
         return;
-      if (slot.agent?.busy) {
+      if (mustKeepProcess(slot.agent)) {
         slot.refreshMcpPending = true;
         return;
       }
@@ -1468,7 +1491,7 @@ export class CommandRouter {
           await this.mcpConnection.wait(signal);
           signal.throwIfAborted();
           if (this.slots.get(sessionId) !== slot) return;
-          if (attempt === 0 && slot.agent?.busy) {
+          if (attempt === 0 && mustKeepProcess(slot.agent)) {
             slot.refreshMcpPending = true;
             return;
           }

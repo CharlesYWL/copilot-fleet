@@ -355,3 +355,104 @@ describe("SessionCreditReader", () => {
     },
   );
 });
+
+describe("SessionCreditReader agent loop", () => {
+  let home: string;
+  let events: string;
+  let reader: SessionCreditReader;
+  const line = (type: string, data: unknown = {}) =>
+    `${JSON.stringify({ type, data, id: randomUUID() })}\n`;
+  const append = async (...types: string[]) => {
+    await fs.appendFile(events, types.map((type) => line(type)).join(""));
+    await reader.read();
+    return reader.loop;
+  };
+
+  beforeEach(async () => {
+    home = join(process.cwd(), `.session-credits-fixture-${randomUUID()}`);
+    events = join(home, "session-state", sessionId, "events.jsonl");
+    await fs.mkdir(dirname(events), { recursive: true });
+    await fs.writeFile(events, "");
+    reader = new SessionCreditReader(sessionId, home);
+  });
+
+  afterEach(async () => {
+    await fs.rm(home, { recursive: true, force: true });
+  });
+
+  // The order Copilot CLI 1.0.96 wrote for a reply that started a background
+  // shell, before it held the prompt open waiting on that shell.
+  it("rests once a finished turn is followed by its usage checkpoint", async () => {
+    expect(
+      (await append("session.start", "user.message", "assistant.turn_start")).idle,
+    ).toBe(false);
+    expect(
+      (
+        await append(
+          "session.usage_record",
+          "assistant.message",
+          "tool.execution_start",
+          "tool.execution_complete",
+          "assistant.turn_end",
+          "assistant.turn_start",
+          "assistant.message",
+          "assistant.turn_end",
+        )
+      ).idle,
+    ).toBe(false);
+    const rest = await append("session.usage_checkpoint");
+    expect(rest.idle).toBe(true);
+    // Hooks and compaction run around a finished loop and do not end its rest.
+    expect(await append("hook.start", "hook.end", "session.compaction_complete")).toEqual(
+      rest,
+    );
+  });
+
+  it.each(["system.notification", "user.message", "assistant.turn_start", "abort"])(
+    "is running again after %s",
+    async (type) => {
+      await append("user.message", "assistant.turn_end", "session.usage_checkpoint");
+      expect((await append(type)).idle).toBe(false);
+    },
+  );
+
+  it("does not count a checkpoint written while a tool was still running", async () => {
+    expect(
+      (
+        await append(
+          "assistant.turn_start",
+          "tool.execution_start",
+          "session.usage_checkpoint",
+        )
+      ).idle,
+    ).toBe(false);
+  });
+
+  it("moves its generation on with every loop event, and only then", async () => {
+    const first = await append(
+      "user.message",
+      "assistant.turn_end",
+      "session.usage_checkpoint",
+    );
+    await reader.read();
+    expect(reader.loop).toEqual(first);
+    const second = await append(
+      "system.notification",
+      "assistant.turn_start",
+      "assistant.turn_end",
+      "session.usage_checkpoint",
+    );
+    expect(second.idle).toBe(true);
+    expect(second.generation).not.toBe(first.generation);
+  });
+
+  it("follows the loop through a checkpoint it cannot parse", async () => {
+    await fs.appendFile(
+      events,
+      line("assistant.turn_end") +
+        '{"type":"session.usage_checkpoint","data":{"totalNanoAiu":"bad"}}\n',
+    );
+    await expect(reader.read()).rejects.toThrow(/totalNanoAiu/);
+    expect(reader.loop.idle).toBe(true);
+  });
+});
