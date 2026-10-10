@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SessionActorSchema } from "./session-actor.js";
 
 const id = z.string().trim().min(1).max(512);
 const text = z.string().min(1).max(8_192);
@@ -813,13 +814,18 @@ export const PrMaintenanceManualCommandSchema = z
     id,
     digest: id,
     kind: z.enum(["prompt", "resume_session"]),
-    operatorId: id,
-    eventSeqFrom: count,
+    operatorId: id.optional(),
+    actor: SessionActorSchema.optional(),
+    eventSeqFrom: z.number().int().nonnegative(),
     state: z.enum(["unknown", "accepted", "settled", "rejected"]),
     createdAt: time,
     handback: z.enum(["ongoing", "after_turn"]).optional(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (value) => Boolean(value.actor || value.operatorId),
+    "A control actor is required",
+  );
 export type PrMaintenanceManualCommand = z.infer<typeof PrMaintenanceManualCommandSchema>;
 
 export const PrMaintenanceManualOwnerSchema = z
@@ -852,7 +858,7 @@ const authorizationSchema = z
 
 const pauseOriginSchema = z
   .object({
-    actor: z.enum(["lead", "operator", "system"]),
+    actor: z.enum(["lead", "operator", "node_console", "system"]),
     actorId: id,
     at: time,
   })
@@ -920,12 +926,17 @@ export const PrMaintenanceRegistrationSchema = z
     continuationHistory: z.array(continuationSchema).max(100).optional(),
     manualControl: z
       .object({
-        operatorId: id,
+        operatorId: id.optional(),
+        actor: SessionActorSchema.optional(),
         takenAt: time,
         endedAt: time.optional(),
         commands: z.array(PrMaintenanceManualCommandSchema).max(1_000),
       })
       .strict()
+      .refine(
+        (value) => Boolean(value.actor || value.operatorId),
+        "A control actor is required",
+      )
       .optional(),
     authorization: authorizationSchema,
     authorizationHistory: z.array(authorizationSchema).max(100).default([]),

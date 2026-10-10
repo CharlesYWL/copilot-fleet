@@ -59,6 +59,14 @@ export function createSessionRouteHandler(
   fleet: FleetApi,
   discovery: SessionDiscoveryApi,
 ): (method: string, url: string, body: string) => Promise<ConfigReply | undefined> {
+  const discoveryPages = new Map<string, string | undefined>();
+  const refreshDiscovered = async (id: string) => {
+    const cached = discovery.get(id);
+    if (cached) return cached;
+    if (!discoveryPages.has(id)) return undefined;
+    const result = await discovery.list(discoveryPages.get(id));
+    return result.sessions.find((session) => session.id === id);
+  };
   return async (method, url, body) => {
     const pathname = url.split("?")[0] ?? url;
     if (method === "POST" && pathname === "/api/sessions/new") {
@@ -104,6 +112,10 @@ export function createSessionRouteHandler(
             .filter((status) => status.agentSessionId)
             .map((status) => [status.agentSessionId, status]),
         );
+        for (const session of page.sessions)
+          discoveryPages.set(session.id, queryValue(url, "cursor"));
+        while (discoveryPages.size > 10_000)
+          discoveryPages.delete(discoveryPages.keys().next().value!);
         return ok({
           sessions: page.sessions.map((session) => {
             const placement = placementByPath.get(comparablePath(session.cwd));
@@ -118,6 +130,7 @@ export function createSessionRouteHandler(
                   : undefined;
             return {
               id: session.id,
+              fleetSessionId: status?.id ?? null,
               title: session.title ?? null,
               updatedAt: session.updatedAt ?? null,
               createdAt: null,
@@ -140,6 +153,7 @@ export function createSessionRouteHandler(
     if (method === "GET" && previewMatch?.[1]) {
       try {
         const id = decodeURIComponent(previewMatch[1]);
+        await refreshDiscovered(id);
         return ok({ id, ...(await discovery.preview(id)) });
       } catch (error) {
         return discoveryFailure(error);
@@ -149,7 +163,7 @@ export function createSessionRouteHandler(
     const resumeMatch = /^\/api\/sessions\/([^/]+)\/resume$/.exec(pathname);
     if (method !== "POST" || !resumeMatch?.[1]) return undefined;
     const sessionId = decodeURIComponent(resumeMatch[1]);
-    const session = discovery.get(sessionId);
+    const session = await refreshDiscovered(sessionId);
     if (!session) {
       return {
         status: 404,

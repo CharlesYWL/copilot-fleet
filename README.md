@@ -1608,6 +1608,49 @@ Use the config page to retarget the node when a tunnel
 hands out a new URL — the node reconnects in place, so no restart is needed and
 running sessions survive.
 
+**Sessions** opens Fleet conversations on this Node using the same chat components
+as Host. Selecting a live conversation attaches a view to its existing worker;
+it never starts a second Copilot process. Lists are paginated, transcript pages
+and live subscriptions load only for the selected chat, and **Local Copilot
+history** does not start discovery until expanded. A native conversation already
+owned by Fleet offers **Open chat** instead of another resume.
+
+On a compatible, mutually authenticated Host/Node connection, existing non-lead
+workers receive a local-continuation grant at startup or their first reconnect
+after upgrade. If Host becomes unreachable, open the Node console and continue
+chatting with those running workers. Their prompts, output and queue operations
+are journaled locally and reconciled to Host before queued Host work resumes.
+The VM still needs access to the model provider; Host-backed tools and offline
+lead prompts are unavailable. A Node restart preserves the journal, not a running
+process: Host can reattach eligible sessions after synchronization without
+re-executing completed or uncertain prompts.
+
+**Permission approvals remain Host-only**, including when the Node is connected.
+The local console shows permission requests and outcomes but cannot approve them
+or enable a more permissive execution mode. A worker requiring new approval during
+an outage waits or follows its existing timeout/cancellation behavior. Local
+access intentionally also permits local programs to use chat: Origin/Fetch
+Metadata checks prevent unwanted browser requests, not impersonation by a
+shell-capable process. These controls are not an OS sandbox.
+
+Local transcripts and attachment payloads are sensitive. They live in the private
+`session-history` subdirectory of the Node's configuration directory, not in
+worktrees or identity exports. Unacknowledged data is not silently evicted.
+Moving the Node requires synchronization with the original Host first; service
+uninstall continues to preserve files. An explicit same-origin
+`POST /api/fleet-sessions/purge` with
+`{"confirmation":"Delete local session history","discardUnsynchronized":false}`
+removes this Host's local journal only when workers are stopped and pending
+history is acknowledged. Setting `discardUnsynchronized` to `true` explicitly
+discards pending evidence; it is not a secure-erasure guarantee. Older history
+from before local journaling is available from Host on demand, not preloaded for
+every session.
+
+The Node UI is included in `npm run build:node` and the Node development startup.
+Self-updates validate its generated asset manifest and revision before clearing
+update quarantine. An older Host or legacy shared-secret enrollment must be
+updated/re-enrolled before session-console synchronization is enabled.
+
 It also edits the node name, session capacity, Copilot executable path, and
 permission timeout. Values are stored in `settings.json` beside the credentials
 and take precedence over the environment variables, so an edit here is not

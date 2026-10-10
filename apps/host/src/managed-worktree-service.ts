@@ -2235,6 +2235,8 @@ export class ManagedWorktreeService {
   }
 
   private send(operation: WorktreeOperation, waitMs: number): Promise<WorktreeOperation> {
+    if (this.service.console?.blocked(operation.request.nodeId))
+      return Promise.resolve(operation);
     this.assertMaintenanceWorkspaceOperation(
       operation.request.runId,
       operation.request.kind,

@@ -2,7 +2,7 @@
 
 ## Core ownership rules
 
-1. **Host owns desired state and history.** It stores Nodes, Workspaces, Placements, Sessions, and ordered Session Events.
+1. **Host owns fleet desired state and integrated history.** It stores Nodes, Workspaces, Placements, Sessions, and ordered Session Events. Compatible Nodes durably journal their own granted non-lead sessions so local activity survives a Host outage and can be reconciled.
 2. **Node owns execution.** Agent login, profiles, child processes, local paths, and ACP connections never leave the Node.
 3. **Workspace is logical; Placement is physical.** A Workspace can be available on several Nodes, each with a different absolute local path. A Session is assigned to one Placement and therefore one Node.
 4. **One Fleet Session owns one ACP agent process.** Copilot remains the worker backend; orchestrators may also use Hermes. This makes cancellation, permissions, isolation, and concurrent capacity predictable.
@@ -545,6 +545,45 @@ ever re-announce it, and the `starting` the Host recorded would stand forever â€
 shown as running, with Cancel disabled. When the refused command is the launch
 the Session is still waiting on, the Host settles it `failed` with the Node's
 reason, which keeps it resumable.
+
+### Local Node session console
+
+The local console is a scoped client on the sealed outbound Node connection,
+not an administrator REST proxy. Host-derived Node identity scopes every
+catalog read, session subscription, action and replay. Browser requests stay
+same-origin on the loopback listener. Permission decisions and permission-policy
+expansion have no console action; console provenance is a typed `node_console`
+actor, never an invented `operatorId`. Retained-worker local intervention pauses
+maintenance without authorizing publication or human-only handback.
+
+The Node bundles the existing Host chat components in a separate local entry.
+Only an opened conversation loads a transcript and subscribes to changes.
+Native Copilot history is a distinct, explicitly expanded discovery surface.
+No live-session preview opens another ACP connection.
+
+`SessionJournal` uses the existing private SQLite directory conventions. It
+records every event of continuation-enabled non-lead sessions online and offline,
+independently of browser activity; output is group-committed before publication.
+Command identities are committed before invocation. A separate sequence high-water
+mark survives body trimming, and every resumed process continues above both Host
+and local sequence offsets. Accepted handoffs without proven completion become
+uncertain after restart and are never automatically re-prompted.
+
+Reconnect has an explicit console synchronization barrier spanning all bounded
+event batches and local-operation receipts. Command reconnect, prompt pumps,
+worktree mutations, retention and auto-resume are gated at their producers and
+dispatch boundaries. The Host acknowledges the final synchronization boundary
+before emitting new work; Node clears its admission barrier on that acknowledgment.
+Only then can current process inventory drive automatic reattachment. Historical
+idle events alone never prove a process survived a Node restart. Safety stop and
+permission resolution can proceed without deleting outstanding history.
+
+Local queued prompts remain Node-owned until dispatched or cancelled, with
+durable priority and shared queue controls. Host prompts predating local
+intervention require confirmation rather than silently running afterward.
+Conflicting Host identity, grants or workspace bindings retain local evidence and
+block further work. The Node configuration-directory journal is not added to
+identity exports; moving identities must first settle it with the original Host.
 
 ### Turns Copilot starts on its own
 

@@ -43,6 +43,9 @@ import {
   type PrMaintenanceRegistration,
   type PrMaintenanceEffectiveState,
   type CommandExecution,
+  type SessionActor,
+  sessionActor,
+  sessionActorId,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
 import { notificationAttemptKey } from "./notifications/service.js";
@@ -109,7 +112,8 @@ export type SupervisorCommand = {
   id: string;
   digest: string;
   kind: "prompt" | "resume_session";
-  operatorId: string;
+  operatorId?: string | undefined;
+  actor?: SessionActor | undefined;
   handback?: "ongoing" | "after_turn" | undefined;
 };
 
@@ -998,7 +1002,7 @@ export class PrMaintenanceStore {
     reason: string,
     at = nowIso(),
     origin: {
-      actor: "lead" | "operator" | "system";
+      actor: "lead" | "operator" | "node_console" | "system";
       actorId: string;
     } = { actor: "system", actorId: "host" },
   ): void {
@@ -1289,6 +1293,10 @@ export class PrMaintenanceStore {
       (!previous ||
         (previous.digest === command.digest &&
           previous.operatorId === command.operatorId &&
+          isDeepStrictEqual(
+            sessionActor(previous.actor, previous.operatorId),
+            sessionActor(command.actor, command.operatorId),
+          ) &&
           previous.kind === command.kind))
     ) {
       this.saveManualCommand(sessionId, command);
@@ -1333,6 +1341,10 @@ export class PrMaintenanceStore {
       if (
         previous.digest !== command.digest ||
         previous.operatorId !== command.operatorId ||
+        !isDeepStrictEqual(
+          sessionActor(previous.actor, previous.operatorId),
+          sessionActor(command.actor, command.operatorId),
+        ) ||
         previous.kind !== command.kind
       )
         refuse(
@@ -1473,6 +1485,11 @@ export class PrMaintenanceStore {
     eventSeqFrom: number,
   ): void {
     this.store.writeAtomically(() => {
+      const actor = sessionActor(command.actor, command.operatorId);
+      if (!actor)
+        refuse("manual_actor_missing", "Manual control requires a known actor.");
+      if (command.handback === "after_turn" && actor.kind !== "operator")
+        refuse("handback_unavailable", "One-turn handback requires a Host operator.");
       this.assertManualAvailable(sessionId);
       this.assertManualOperationUnambiguous(sessionId, command.id);
       const record = this.manualRecord(sessionId);
@@ -1516,18 +1533,21 @@ export class PrMaintenanceStore {
         this.refund(record, batch, 0, false);
       }
       this.pause(record, "manual_control", now, {
-        actor: "operator",
-        actorId: command.operatorId,
+        actor: actor.kind,
+        actorId: sessionActorId(actor),
       });
       record.manualControl ??= {
-        operatorId: command.operatorId,
+        ...(actor.kind === "operator" ? { operatorId: actor.operatorId } : {}),
+        actor,
         takenAt: now,
         commands: [],
       };
       delete record.manualControl.endedAt;
       record.manualControl.commands.push(receipt);
       if (command.handback === "after_turn") {
-        this.requestContinuation(record, command.operatorId, now, command.id);
+        if (actor.kind !== "operator")
+          refuse("handback_unavailable", "Host operator required");
+        this.requestContinuation(record, actor.operatorId, now, command.id);
       }
       this.save(record);
     });

@@ -603,16 +603,16 @@ type TerminalViewProps = {
   maintenanceWorker?: boolean | undefined;
   onCancel: () => void;
   onStop: () => void;
-  onPermission: (
-    requestId: string,
-    outcome: "allow_once" | "deny",
-    optionId?: string,
-  ) => void;
+  onPermission?:
+    | ((requestId: string, outcome: "allow_once" | "deny", optionId?: string) => void)
+    | undefined;
+  /** A disconnected Node may still allow a granted worker, but never a lead. */
+  controlsDisabled?: boolean;
   onRename?: (name: string) => void;
   onDismiss?: () => void;
-  onResume?: () => void;
+  onResume?: (() => void) | undefined;
   onClose?: () => void;
-  onConfigChange?: (configId: string, value: string) => void;
+  onConfigChange?: ((configId: string, value: string) => void) | undefined;
   notificationPreferenceControl?: ReactNode;
   messageQueue?: ReactNode;
   draft: SessionDraft;
@@ -632,6 +632,7 @@ export const TerminalView = ({
   onCancel,
   onStop,
   onPermission,
+  controlsDisabled = false,
   onRename,
   onDismiss,
   onResume,
@@ -977,6 +978,7 @@ export const TerminalView = ({
   }, [session.id]);
 
   const canPrompt =
+    !controlsDisabled &&
     ["idle", "running", "starting", "cancelling"].includes(session.state) &&
     !session.stopRequested &&
     !session.cleanupRequested;
@@ -984,7 +986,10 @@ export const TerminalView = ({
   const isEnded = terminalSessionStates.has(session.state);
   // Offline and terminal sessions can be re-attached via Copilot's session/load.
   const canResume =
-    Boolean(onResume) && !session.stopRequested && isResumableSession(session);
+    !controlsDisabled &&
+    Boolean(onResume) &&
+    !session.stopRequested &&
+    isResumableSession(session);
   const canConfirmStopped = session.stopRequested && session.state === "offline";
   useMessageNotification(
     canConfirmStopped
@@ -1131,7 +1136,7 @@ export const TerminalView = ({
   const handleDecide = (outcome: "allow_once" | "deny", optionId?: string) => {
     const requestId = permission && permissionRequestId(permission);
     if (!requestId) return;
-    onPermission(requestId, outcome, optionId);
+    onPermission?.(requestId, outcome, optionId);
   };
 
   const isEditingName = draftName !== undefined;
@@ -1242,7 +1247,7 @@ export const TerminalView = ({
           appearance="subtle"
           size="small"
           icon={<RecordStop20Regular />}
-          disabled={session.state !== "running"}
+          disabled={controlsDisabled || session.state !== "running"}
           onClick={onCancel}
           aria-label="Cancel turn"
           title="Cancel turn"
@@ -1282,7 +1287,9 @@ export const TerminalView = ({
             size="small"
             icon={<Stop20Regular />}
             onClick={onStop}
-            disabled={Boolean(session.stopRequested && !canConfirmStopped)}
+            disabled={
+              controlsDisabled || Boolean(session.stopRequested && !canConfirmStopped)
+            }
             aria-label={canConfirmStopped ? "Mark stopped" : "Stop session"}
             {...(canConfirmStopped
               ? {
@@ -1326,7 +1333,7 @@ export const TerminalView = ({
         <PermissionBanner
           title={permissionTitle(permission)}
           allowOptionId={allowOnceOptionId(permission)}
-          onDecide={handleDecide}
+          onDecide={onPermission ? handleDecide : undefined}
         />
       )}
 

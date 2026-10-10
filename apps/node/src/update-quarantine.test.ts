@@ -109,4 +109,24 @@ describe("update admission quarantine", () => {
     f.quarantine.restoreBlock();
     expect(f.admission.reason).toBe("Unknown process ownership");
   });
+
+  it("keeps admission quarantined when the UI bundle failed or has the wrong revision", () => {
+    const f = fixture();
+    f.quarantine.beforeMutation();
+    const failed = new UpdateQuarantine(
+      f.admission,
+      f.directory,
+      f.root,
+      "a".repeat(12),
+      () => "Missing session-console manifest",
+    );
+    expect(() => failed.built("a".repeat(12))).toThrow(/UI build is incomplete/);
+    expect(f.admission.reason).toBe(UPDATE_QUARANTINE_REASON);
+    f.quarantine.built("a".repeat(12));
+    const restarted = new NodeAdmission();
+    const validate = vi.fn(() => "UI revision does not match");
+    new UpdateQuarantine(restarted, f.directory, f.root, "a".repeat(12), validate);
+    expect(validate).toHaveBeenCalledWith("a".repeat(12));
+    expect(restarted.reason).toBe(UPDATE_QUARANTINE_REASON);
+  });
 });

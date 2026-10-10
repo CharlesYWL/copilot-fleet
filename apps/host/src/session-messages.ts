@@ -6,6 +6,7 @@ import {
   type PendingSessionMessage,
   type PromptAttachment,
   type SessionEvent,
+  type SessionActor,
 } from "@fleet/protocol";
 import type { FleetService } from "./fleet-service.js";
 import type { QueuedSessionMessage } from "./store.js";
@@ -39,9 +40,23 @@ export class SessionMessages {
     return this.service.store;
   }
 
-  submit(sessionId: string, input: PromptInput, operatorId?: string) {
+  submit(
+    sessionId: string,
+    input: PromptInput,
+    operatorId?: string,
+    actor?: SessionActor,
+  ) {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false as const, status: 404, error: "Session not found" };
+    if (this.service.console?.blocked(session.nodeId))
+      return { ok: false as const, status: 409, error: "Node history is synchronizing" };
+    if (
+      session.state === "idle" &&
+      this.store.queuedMessages(sessionId).length === 0 &&
+      (this.store.prMaintenance.manualRecord(sessionId) ||
+        this.store.prMaintenance.hasManualHistory(sessionId))
+    )
+      return this.service.promptSession(sessionId, input, operatorId, undefined, actor);
     const id = input.operationId ?? randomUUID();
     const digest = createHash("sha256")
       .update(
@@ -51,6 +66,7 @@ export class SessionMessages {
           input.attachments,
           input.handback,
           operatorId,
+          ...(actor ? [actor] : []),
         ]),
       )
       .digest("hex");
@@ -63,8 +79,9 @@ export class SessionMessages {
         );
       return { ok: true as const };
     }
-    if (session.state === "idle" && this.store.queuedMessages(sessionId).length === 0)
-      return this.service.promptSession(sessionId, input, operatorId);
+    const link = this.service.nodeSocket(session.nodeId);
+    if (!link || link.readyState !== link.OPEN)
+      return { ok: false as const, status: 503, error: "Node is offline" };
     if (
       session.stopRequested ||
       session.cleanupRequested ||
@@ -77,7 +94,9 @@ export class SessionMessages {
       };
     if (
       input.handback === "after_turn" &&
-      (!operatorId || !this.store.prMaintenance.manualRecord(sessionId))
+      (!operatorId ||
+        actor?.kind === "node_console" ||
+        !this.store.prMaintenance.manualRecord(sessionId))
     )
       return {
         ok: false as const,
@@ -100,6 +119,7 @@ export class SessionMessages {
       prompt: input.prompt,
       attachments: input.attachments,
       operatorId,
+      actor,
       handback: input.handback,
       digest,
       createdAt: new Date().toISOString(),
@@ -110,6 +130,9 @@ export class SessionMessages {
       deliveryKey: `operator-queue:${id}`,
     });
     this.pump(sessionId);
+    const failed = this.store.queuedMessage(id);
+    if (failed?.state === "failed")
+      return { ok: false as const, status: 409, error: failed.error };
     return { ok: true as const };
   }
 
@@ -140,6 +163,39 @@ export class SessionMessages {
         },
       ];
     });
+    for (const operation of this.store.sessionConsole.localOperations(sessionId)) {
+      if (!["queued", "accepted", "uncertain"].includes(operation.state)) continue;
+      const payload = operation.payload;
+      result.push({
+        id: `node:${operation.id}`,
+        prompt:
+          payload &&
+          typeof payload === "object" &&
+          "prompt" in payload &&
+          typeof payload.prompt === "string"
+            ? payload.prompt
+            : operation.action,
+        createdAt: operation.createdAt,
+        source: "operator",
+        state:
+          operation.state === "queued"
+            ? "pending"
+            : operation.state === "uncertain"
+              ? "failed"
+              : "sending",
+        attachments: [],
+        canCancel:
+          operation.state === "queued" &&
+          this.service.console.enabled(session!.nodeId) &&
+          !this.service.console.blocked(session!.nodeId),
+        canSendNow:
+          operation.state === "queued" &&
+          canSend &&
+          this.service.console.enabled(session!.nodeId) &&
+          !this.service.console.blocked(session!.nodeId),
+        detail: operation.error || "Queued on Node",
+      });
+    }
     const ownedKeys = new Set(operators.map((message) => message.deliveryKey));
     for (const record of this.store.commands.prompts(sessionId)) {
       if (ownedKeys.has(record.key) || record.state === "accepted") continue;
@@ -193,6 +249,10 @@ export class SessionMessages {
         "message_locked",
         "This message is already being delivered or is managed by its workflow.",
       );
+    if (id.startsWith("node:")) {
+      this.service.console.controlQueue(sessionId, id.slice("node:".length), action);
+      return;
+    }
     const session = this.store.getSession(sessionId)!;
     if (action === "send-now" && !this.service.nodeSocket(session.nodeId))
       throw new CommandConflict(
@@ -356,7 +416,9 @@ export class SessionMessages {
       session.state !== "idle" ||
       session.stopRequested ||
       session.cleanupRequested ||
-      !this.service.nodeSocket(session.nodeId)
+      !this.service.nodeSocket(session.nodeId) ||
+      this.service.console?.blocked(session.nodeId) ||
+      this.service.console?.reserved(sessionId)
     )
       return;
     if (session.runRole === "lead" && this.store.commands.reserved(sessionId)) return;
@@ -376,6 +438,7 @@ export class SessionMessages {
         },
         message.operatorId,
         message.deliveryKey,
+        message.actor,
       );
       if (!result.ok) throw new Error(result.error);
       if (!this.store.commands.promptByKey(sessionId, message.deliveryKey))

@@ -38,6 +38,7 @@ import {
   type RunStepState,
   type SecurityBackupPayload,
   type SessionEvent,
+  type SessionActor,
   type SessionActivity,
   type SessionState,
   type PromptAttachment,
@@ -119,6 +120,7 @@ import {
 import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
 import { CommandConflict, CommandExecutionStore } from "./command-execution-store.js";
 import { LocalAgentStore, briefOwedBy, withoutBrief } from "./local-agent-store.js";
+import { SessionConsoleStore } from "./session-console-store.js";
 import { assertHostArchiveSize } from "./backup-limits.js";
 import {
   PrMaintenanceStore,
@@ -480,6 +482,7 @@ export type QueuedSessionMessage = {
   prompt: string;
   attachments: PromptAttachment[];
   operatorId?: string | undefined;
+  actor?: SessionActor | undefined;
   handback?: "ongoing" | "after_turn" | undefined;
   createdAt: string;
   state: "pending" | "sending" | "failed" | "delivered" | "cancelled";
@@ -505,6 +508,7 @@ export class FleetStore {
    */
   private readonly heartbeats = new Map<string, string>();
   readonly commands: CommandExecutionStore;
+  readonly sessionConsole: SessionConsoleStore;
   readonly localAgent: LocalAgentStore;
   readonly prMaintenance: PrMaintenanceStore;
   readonly resumeRequests: WorkerResumeStore;
@@ -1003,6 +1007,7 @@ export class FleetStore {
         ('orchestrator.model.copilot',COALESCE((SELECT value FROM settings WHERE key='defaults.model'),'')),
         ('orchestrator.reasoningEffort',COALESCE((SELECT value FROM settings WHERE key='defaults.reasoningEffort'),''));
     `);
+    this.sessionConsole = new SessionConsoleStore(this.db);
     this.commands = new CommandExecutionStore(this.db, (work) =>
       this.writeAtomically(work),
     );
@@ -6227,14 +6232,18 @@ export class FleetStore {
       : undefined;
   }
 
-  listPermissionEvents(): SessionEvent[] {
+  listPermissionEvents(sessionId?: string): SessionEvent[] {
     const index = new SessionPermissions();
     index.apply(
       (
-        this.statement(
-          `SELECT * FROM events WHERE type IN ('permission','permission_result')
+        (sessionId
+          ? this.statement(
+              `SELECT * FROM events WHERE session_id=? AND type IN ('permission','permission_result') ORDER BY sequence`,
+            ).all(sessionId)
+          : this.statement(
+              `SELECT * FROM events WHERE type IN ('permission','permission_result')
          ORDER BY session_id,sequence`,
-        ).all() as Row[]
+            ).all()) as Row[]
       ).map(eventFromRow),
     );
     return index.latestEvents();

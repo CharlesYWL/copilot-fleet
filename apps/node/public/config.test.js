@@ -62,6 +62,7 @@ const respond = (path, init) => {
   if (path === "/api/logs") return reply({ entries: [] });
   if (path === "/api/fleet") return reply({ workspaces: [], placements: [] });
   if (path === "/api/sessions") return reply({ sessions: [] });
+  if (String(path).startsWith("/api/fleet-sessions?")) return reply({ sessions: [] });
   throw new Error(`unexpected request: ${path}`);
 };
 
@@ -92,6 +93,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  window.dispatchEvent(new Event("pagehide"));
   vi.useRealTimers();
   vi.unstubAllGlobals();
   document.body.innerHTML = "";
@@ -433,6 +435,10 @@ describe("node settings form", () => {
 });
 
 describe("Copilot session history", () => {
+  const expandNative = () => {
+    $("nativeSessions").open = true;
+    $("nativeSessions").dispatchEvent(new Event("toggle"));
+  };
   it("sorts, searches, and selects by stable session id", async () => {
     vi.mocked(fetch).mockImplementation((path, init) => {
       if (path === "/api/sessions") {
@@ -466,6 +472,7 @@ describe("Copilot session history", () => {
       return respond(path, init);
     });
     await startPage();
+    expandNative();
     await vi.waitFor(() =>
       expect(document.querySelectorAll("[data-session-id]")).toHaveLength(2),
     );
@@ -514,6 +521,7 @@ describe("Copilot session history", () => {
       return respond(path, init);
     });
     await startPage();
+    expandNative();
     await vi.waitFor(() => expect($("sessionList").textContent).toContain("Resume me"));
     document.querySelector("[data-session-id]")?.click();
 
@@ -529,8 +537,68 @@ describe("Copilot session history", () => {
       ok: true,
       json: async () => ({ sessionId: "fleet-session", state: "starting" }),
     });
-    await vi.waitFor(() => expect($("resumeSession").textContent).toBe("Resumed"));
-    expect($("resumeSession").disabled).toBe(true);
+    await vi.waitFor(() => expect($("resumeSession").textContent).toBe("Open chat"));
+    expect($("resumeSession").disabled).toBe(false);
+    expect($("fleetChat").querySelector("iframe")).toBeTruthy();
+    $("resumeSession").click();
+    expect(
+      vi.mocked(fetch).mock.calls.filter(([path]) => String(path).endsWith("/resume")),
+    ).toHaveLength(1);
+  });
+
+  it("opens a native session's existing Fleet chat without adopting it again", async () => {
+    vi.mocked(fetch).mockImplementation((path, init) => {
+      if (path === "/api/sessions")
+        return reply({
+          sessions: [
+            {
+              id: "native-live",
+              fleetSessionId: "fleet-live",
+              title: "Existing conversation",
+              workspaceName: "Fleet",
+              resumable: false,
+              resumeReason: "Already running",
+            },
+          ],
+        });
+      return respond(path, init);
+    });
+    await startPage();
+    expandNative();
+    await vi.waitFor(() =>
+      expect($("sessionList").textContent).toContain("Existing conversation"),
+    );
+    document.querySelector('[data-session-id="native-live"]').click();
+    expect($("resumeSession").textContent).toBe("Open chat");
+    expect($("resumeSession").disabled).toBe(false);
+    const opened = vi.fn();
+    document.addEventListener("node-fleet-session", opened, { once: true });
+    $("resumeSession").click();
+    expect(opened.mock.calls[0][0].detail).toBe("fleet-live");
+    expect($("fleetChat").querySelector("iframe")).toBeTruthy();
+    expect(
+      vi.mocked(fetch).mock.calls.some(([path]) => String(path).endsWith("/resume")),
+    ).toBe(false);
+  });
+
+  it("opens the returned Fleet ID after creating a new conversation", async () => {
+    vi.mocked(fetch).mockImplementation((path, init) => {
+      if (path === "/api/sessions/new")
+        return reply({ sessionId: "fleet-new", state: "starting" });
+      return respond(path, init);
+    });
+    await startPage();
+    $("newSessionDialog").close = vi.fn();
+    $("newSessionPlacement").append(new Option("Project", "placement"));
+    $("newSessionPlacement").value = "placement";
+    $("newSessionPrompt").value = "Start a new conversation";
+    const opened = vi.fn();
+    document.addEventListener("node-fleet-session", opened, { once: true });
+    $("newSessionForm").dispatchEvent(new Event("submit", { cancelable: true }));
+    await vi.waitFor(() => expect(opened).toHaveBeenCalledOnce());
+    expect(opened.mock.calls[0][0].detail).toBe("fleet-new");
+    expect($("fleetChat").querySelector("iframe")).toBeTruthy();
+    expect($("newSessionPrompt").value).toBe("");
   });
 
   it("paginates large histories without losing the selected session", async () => {
@@ -579,6 +647,7 @@ describe("Copilot session history", () => {
       return respond(path, init);
     });
     await startPage();
+    expandNative();
     await vi.waitFor(() => expect($("sessionList").textContent).toContain("First page"));
     document.querySelector('[data-session-id="page-one"]')?.click();
     $("loadPreview").click();
@@ -703,6 +772,7 @@ describe("Copilot session history", () => {
       return respond(path, init);
     });
     await startPage();
+    expandNative();
     await vi.waitFor(() =>
       expect(document.querySelectorAll("[data-session-id]")).toHaveLength(2),
     );

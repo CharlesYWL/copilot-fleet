@@ -256,6 +256,45 @@ async function setup(
 }
 
 describe("trusted supervisor session handoff", () => {
+  it("records a local console as a non-human controller without granting human handback authority", async () => {
+    const f = await setup();
+    const actor = { kind: "node_console" as const, nodeId: f.worker.nodeId };
+    const result = f.service.messages.submit(
+      f.worker.id,
+      {
+        prompt: "Local console follow-up",
+        attachments: [],
+        operationId: randomUUID(),
+      },
+      undefined,
+      actor,
+    );
+    expect(result).toEqual({ ok: true });
+    const record = f.store.prMaintenance.get(f.record.id)!;
+    expect(record.manualControl?.actor).toEqual(actor);
+    expect(record.manualControl?.operatorId).toBeUndefined();
+    expect(record.pauseOrigin).toMatchObject({
+      actor: "node_console",
+      actorId: f.worker.nodeId,
+    });
+    expect(record.manualControl?.commands[0]?.actor).toEqual(actor);
+    expect(f.sent[0]?.type === "prompt" && f.sent[0].prompt).toContain(
+      "local Node console",
+    );
+    expect(
+      f.service.promptSession(
+        f.worker.id,
+        {
+          prompt: "Cannot authorize handback",
+          attachments: [],
+          handback: "after_turn",
+        },
+        undefined,
+        undefined,
+        actor,
+      ),
+    ).toMatchObject({ ok: false, status: 403 });
+  });
   it.each(["terminal worker", "terminal worker cold ledger", "manual worker", "lead"])(
     "streams authoritative permission holds for a %s without publishing stale attempt events",
     async (path) => {

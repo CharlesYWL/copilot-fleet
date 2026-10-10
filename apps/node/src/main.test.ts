@@ -221,6 +221,20 @@ vi.mock("./command-journal.js", () => ({
     all = vi.fn(() => journalRecords);
   },
 }));
+vi.mock("./session-journal.js", () => ({
+  ReplayBudgetError: class extends Error {},
+  SessionJournal: class {
+    has = vi.fn(() => false);
+    get = vi.fn(() => undefined);
+    list = vi.fn(() => []);
+    operations = vi.fn(() => []);
+    flush = vi.fn();
+    close = vi.fn();
+  },
+}));
+vi.mock("./config-assets.js", () => ({
+  validateSessionConsoleAssets: vi.fn(() => ({ ok: true })),
+}));
 vi.mock("./lead-prompt-delivery.js", () => ({
   LeadPromptJournal: class {
     replay = leadReplay;

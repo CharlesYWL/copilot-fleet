@@ -52,7 +52,7 @@ type PermissionBannerProps = {
   title: string;
   allowOptionId?: string | undefined;
   compact?: boolean;
-  onDecide: (outcome: "allow_once" | "deny", optionId?: string) => void;
+  onDecide?: ((outcome: "allow_once" | "deny", optionId?: string) => void) | undefined;
 };
 
 export const PermissionBanner = ({
@@ -64,8 +64,8 @@ export const PermissionBanner = ({
   const styles = useStyles();
   const size = compact ? "small" : "medium";
 
-  const handleAllow = () => onDecide("allow_once", allowOptionId);
-  const handleDeny = () => onDecide("deny");
+  const handleAllow = () => onDecide?.("allow_once", allowOptionId);
+  const handleDeny = () => onDecide?.("deny");
 
   return (
     <div className={mergeClasses(styles.banner, compact && styles.compact)} role="alert">
@@ -76,12 +76,18 @@ export const PermissionBanner = ({
           {title}
         </Text>
       </div>
-      <Button className={styles.allow} size={size} onClick={handleAllow}>
-        Allow once
-      </Button>
-      <Button appearance="secondary" size={size} onClick={handleDeny}>
-        Deny
-      </Button>
+      {onDecide ? (
+        <>
+          <Button className={styles.allow} size={size} onClick={handleAllow}>
+            Allow once
+          </Button>
+          <Button appearance="secondary" size={size} onClick={handleDeny}>
+            Deny
+          </Button>
+        </>
+      ) : (
+        <Text>Approve this request in the Fleet Host. Node approvals are disabled.</Text>
+      )}
     </div>
   );
 };

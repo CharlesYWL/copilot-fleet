@@ -226,14 +226,28 @@ export class OrchestratorEngine {
       this.holdsByRun.delete(runId);
       return;
     }
+    const syncing = this.store
+      .listSessions()
+      .find(
+        (session) =>
+          (session.runId === runId || session.id === run.leadSessionId) &&
+          this.service.console.blocked(session.nodeId),
+      );
+    if (syncing) {
+      this.holdEveryPending(run.id, {
+        code: "node_offline",
+        nodeId: syncing.nodeId,
+        detail:
+          "Node history and local control are synchronizing; scheduling waits for reconciliation.",
+      });
+    }
     const manual = this.store.prMaintenance
       .list({ taskId: runId, retainedOnly: true })
       .records.find((record) => record.manualControl && !record.manualControl.endedAt);
     if (manual) {
       this.holdEveryPending(run.id, {
         code: "maintenance_hold",
-        detail:
-          "A person has taken manual control of this task's PR-maintenance worker; scheduling waits until that control ends.",
+        detail: `${manual.manualControl?.actor?.kind === "node_console" ? "The local Node console" : "A person"} has taken manual control of this task's PR-maintenance worker; scheduling waits until that control ends.`,
       });
       return;
     }
@@ -250,6 +264,7 @@ export class OrchestratorEngine {
       return;
     }
     if (run.state === "aggregating") {
+      if (syncing) return;
       if (
         !this.store.prMaintenance.admission({ action: "aggregate", taskId: run.id })
           .allowed
@@ -310,7 +325,9 @@ export class OrchestratorEngine {
     });
     const mayContinue = maintenance.allowed;
     const workspaceReady =
-      mayContinue && (steps.length ? this.service.worktrees.ensureReady(run) : true);
+      !syncing &&
+      mayContinue &&
+      (steps.length ? this.service.worktrees.ensureReady(run) : true);
     if (workspaceReady && run.workspaceBinding?.effectiveMode === "managed") {
       for (const step of steps)
         if (step.state === "pending") this.service.worktrees.ensureStepReady(run, step);
@@ -321,7 +338,13 @@ export class OrchestratorEngine {
       run,
       steps,
       sessions,
-      nodes: this.store.listNodes(),
+      nodes: this.store
+        .listNodes()
+        .map((node) =>
+          !syncing && this.service.console.blocked(node.id)
+            ? { ...node, online: false }
+            : node,
+        ),
       placements: this.store.listPlacements(),
       repositoryCapabilities: this.store.listPlacementRepositoryCapabilities(),
       turnCompleteSessionIds: completedTurns,
@@ -349,9 +372,23 @@ export class OrchestratorEngine {
     }
 
     let touched = false;
-    for (const action of actions)
+    for (const action of actions) {
+      if (syncing) {
+        const step =
+          "stepId" in action
+            ? steps.find((item) => item.id === action.stepId)
+            : undefined;
+        const session = step && sessions.find((item) => item.id === step.sessionId);
+        const recordedSettlement =
+          action.type === "settle_step" &&
+          session &&
+          (terminalSessionStates.has(session.state) ||
+            (session.state === "idle" && completedTurns.has(session.id)));
+        if (action.type !== "advance_step" && !recordedSettlement) continue;
+      }
       touched = this.execute(run, action, nowMs, holds) || touched;
-    this.resume.reconcile(nowMs, run.id);
+    }
+    if (!syncing) this.resume.reconcile(nowMs, run.id);
     const holdsChanged = this.recordHolds(run.id, holds);
     if (touched) this.publish(runId);
     else if (holdsChanged)

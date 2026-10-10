@@ -97,6 +97,9 @@ import {
 import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { ManagedWorktrees } from "./managed-worktrees.js";
 import { SessionFileReader } from "./session-files.js";
+import { SessionJournal } from "./session-journal.js";
+import { NodeSessionConsole } from "./session-console.js";
+import { validateSessionConsoleAssets } from "./config-assets.js";
 import { NodeAdmission } from "./node-admission.js";
 import { UpdateQuarantine } from "./update-quarantine.js";
 import { RepositoryParticipation } from "./repository-participation.js";
@@ -426,12 +429,28 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let updating = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
+  const consoleSlot: { current?: NodeSessionConsole } = {};
+  let sessionConsoleSupported = false;
   const admission = new NodeAdmission();
+  const sessionJournal = new SessionJournal(join(configDirectory(), "session-history"), {
+    onEvents: (events) => consoleSlot.current?.committed(events),
+    onFailure: (error) => {
+      admission.quarantine(`Session journal cannot persist history: ${String(error)}`);
+      warn(`Session history storage failed: ${String(error)}`);
+      consoleSlot.current?.unavailable(
+        "Local history storage failed; new session work is blocked until repaired",
+      );
+    },
+  });
   const updateQuarantine = new UpdateQuarantine(
     admission,
     configDirectory(),
     repoRoot(),
     REVISION,
+    (revision) => {
+      const assets = validateSessionConsoleAssets(undefined, revision);
+      return assets.ok ? undefined : assets.error;
+    },
   );
   const repositories = new RepositoryParticipation();
   const journal = new CommandJournal(join(configDirectory(), "remote-commands"));
@@ -646,6 +665,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     factory,
     settings.maxSessions,
     (event) => {
+      if (consoleSlot.current?.capture(event)) return;
       // Held rather than dropped when the Host is unreachable: the agent keeps
       // working through a Host restart, and these are the only record of it.
       if (!sendEvent(event)) {
@@ -683,6 +703,23 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     coordinatorDirectory: (sessionId) => worktrees.coordinatorDirectory(sessionId),
     protectedRoots: [configDirectory()],
   });
+  const sessionConsole = new NodeSessionConsole({
+    journal: sessionJournal,
+    router,
+    files: sessionFiles,
+    hostId: () =>
+      credentials.authProtocol === MUTUAL_AUTH_PROTOCOL ? credentials.host.hostId : "",
+    nodeId: () => credentials.nodeId,
+    send,
+    onError: warn,
+  });
+  consoleSlot.current = sessionConsole;
+  const finishSessionReconnect = async () => {
+    await sessionConsole.connected(sessionConsoleSupported);
+    if (sessionConsoleSupported && !sessionConsole.readyForHostWork) return;
+    router.setMcpAvailable(true);
+    await router.refreshMcpSessions();
+  };
 
   const commands = new CommandExecutionManager({
     journal,
@@ -820,6 +857,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         errors.push(error);
       }
     }
+    try {
+      await sessionConsole?.prepareIdentityMove();
+    } catch (error) {
+      errors.push(error);
+    }
     if (errors.length) {
       admission.quarantine(
         "Backup restore could not prove all process ownership quiescent.",
@@ -861,6 +903,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
   /** Drops the current socket so the next connect uses the latest credentials. */
   function reconnect(): void {
+    consoleSlot.current?.disconnected();
     if (reconnectTimer) clearTimeout(reconnectTimer);
     dialUrl = firstDialUrl(settings, credentials.hostUrl, tunnelMode);
     const current = socket;
@@ -949,7 +992,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     const root = repoRoot();
     log(`Self-update requested; using checkout ${root}`);
     try {
-      const forceRebuild = updateQuarantine.prepareRetry();
+      const forceRebuild =
+        updateQuarantine.prepareRetry() ||
+        !validateSessionConsoleAssets(undefined, REVISION).ok;
       admission.assertIdle();
       if (
         router.activeSessionIds.length ||
@@ -1112,6 +1157,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     ),
   });
   const configServer = startConfigServer({
+    sessionConsole,
     ...(sessionDiscovery ? { sessionDiscovery } : {}),
     getSettings: () => settings,
     getStatus: () => ({
@@ -1385,6 +1431,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           !!session && !!channel && frame.value.durableLeadDelivery;
         commandPermissionsNegotiated =
           commandExecutionsNegotiated && frame.value.commandPermissions;
+        sessionConsoleSupported = !!channel && frame.value.sessionConsole === true;
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
         if (socket !== active || active.readyState !== WebSocket.OPEN) return;
@@ -1401,8 +1448,49 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           }
           flushOutbox(active, frame.value.reconcileAfterOutbox, acknowledgeOutbox);
         } else {
-          router.setMcpAvailable(true);
-          void router.refreshMcpSessions();
+          void finishSessionReconnect().catch((error: unknown) =>
+            warn(`Session recovery failed: ${errorMessage(error)}`),
+          );
+        }
+        return;
+      }
+      if (frame.value.type === "session_console_response") {
+        sessionConsole?.response(frame.value.response);
+        return;
+      }
+      if (frame.value.type === "session_console_grant") {
+        if (sessionConsoleSupported) sessionConsole?.grant(frame.value.grant);
+        return;
+      }
+      if (frame.value.type === "session_console_update") {
+        if (sessionConsoleSupported) sessionConsole?.update(frame.value.message);
+        return;
+      }
+      if (frame.value.type === "session_console_queue") {
+        if (!sessionConsoleSupported) return;
+        const request = frame.value;
+        try {
+          await sessionConsole.queueAction(
+            request.sessionId,
+            request.messageId,
+            request.action,
+          );
+          send({
+            type: "command_result",
+            sessionId: request.sessionId,
+            commandId: request.operationId,
+            ok: true,
+            fatal: false,
+          });
+        } catch (error) {
+          send({
+            type: "command_result",
+            sessionId: request.sessionId,
+            commandId: request.operationId,
+            ok: false,
+            fatal: false,
+            error: errorMessage(error),
+          });
         }
         return;
       }
@@ -1466,8 +1554,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         }
         outboxReconciliationPending = false;
         holdEventsForReconnectFlush = false;
-        router.setMcpAvailable(true);
-        void router.refreshMcpSessions();
+        void finishSessionReconnect().catch((error: unknown) =>
+          warn(`Session recovery failed: ${errorMessage(error)}`),
+        );
         return;
       }
       if (frame.value.type === "request_node_key") {
@@ -1493,6 +1582,30 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         return;
       }
       if (frame.value.type === "managed_worktree") {
+        if (
+          sessionConsoleSupported &&
+          !sessionConsole.readyForHostWork &&
+          !["inspect", "quiesce"].includes(frame.value.request.kind)
+        ) {
+          const request = frame.value.request;
+          send({
+            type: "managed_worktree_result",
+            result: {
+              operationId: request.operationId,
+              worktreeId: request.worktreeId,
+              generation: request.generation,
+              nodeId: request.nodeId,
+              hostInstallationId: request.hostInstallationId,
+              ok: false,
+              retryable: true,
+              code: "session_sync_pending",
+              error:
+                "Session history and local control must synchronize before workspace mutation.",
+              acknowledgedAt: new Date().toISOString(),
+            },
+          });
+          return;
+        }
         try {
           const result = await worktrees.execute(frame.value.request);
           send({ type: "managed_worktree_result", result });
@@ -1547,7 +1660,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       if (frame.value.type !== "command") return;
       const { command } = frame.value;
       log(`< ${command.type} session=${command.sessionId.slice(0, 8)}`);
-      const result = await router.route(command);
+      const result = sessionConsoleSupported
+        ? await sessionConsole!.hostCommand(command, frame.value.consoleEpoch)
+        : await router.route(command);
       log(
         result.ok
           ? `> ${command.type} ok session=${command.sessionId.slice(0, 8)}`
@@ -1579,7 +1694,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // A settings change swaps the socket out; the stale one must not tear down
       // agents or schedule a retry against the URL we just left.
       if (socket !== active || shuttingDown) return;
+      sessionConsole?.disconnected();
       if (code === AUTH_FAILED_CLOSE_CODE) {
+        sessionConsole?.unavailable(
+          "Host revoked this Node's credentials; reconnect with valid enrollment before controlling sessions",
+        );
         /*
          * The credential this node holds will never be accepted again, so
          * retrying it is an infinite loop. Re-enrolling reclaims this node by
@@ -1828,6 +1947,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         () => health.stop(),
         () => releaseLiveness(),
         () => configServer.close(),
+        () => sessionConsole?.close(),
         () => recovery,
         () => commands.cancelAll("Node shutdown requested."),
         () => socket?.close(),
@@ -1849,6 +1969,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     if (!errors.length && !journalsClosed) {
       journal.close();
       leadDeliveries.close();
+      sessionJournal.close();
       journalsClosed = true;
     }
     if (errors.length === 1) throw errors[0];

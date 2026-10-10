@@ -49,6 +49,8 @@ import {
   type Snapshot,
   type ExecutionBinding,
   SessionPermissions,
+  sessionActor,
+  type SessionActor,
 } from "@fleet/protocol";
 import type {
   FleetStore,
@@ -63,6 +65,8 @@ import { CommandExecutionService } from "./command-execution-service.js";
 import { SessionFileService } from "./session-files.js";
 import { TranscriptProjections } from "./transcript-projections.js";
 import { SessionMessages } from "./session-messages.js";
+import { checkoutOccupants } from "./orchestrator/schedule.js";
+import { SessionConsoleService } from "./session-console-service.js";
 import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
 import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
@@ -194,6 +198,7 @@ export class FleetService {
    * is what keeps the legacy protocol working unchanged.
    */
   private readonly nodeSockets = new Map<string, NodeLink>();
+  private readonly linkNodes = new WeakMap<NodeLink, string>();
   private readonly browserSockets = new Set<WebSocket>();
   /** Latest observations only: no history, database writes, or backup telemetry. */
   private readonly nodeHealth = new Map<string, NodeHealth>();
@@ -252,6 +257,7 @@ export class FleetService {
   readonly worktrees: ManagedWorktreeService;
   readonly commands: CommandExecutionService;
   readonly messages: SessionMessages;
+  readonly console: SessionConsoleService;
   readonly files: SessionFileService;
   readonly transcripts: TranscriptProjections;
   /** Built by the first snapshot; see `permissionEvents`. */
@@ -288,7 +294,9 @@ export class FleetService {
 
   /** Why nothing new may start on this Node right now, if something prevents it. */
   nodeWorkBlocked(nodeId: string): string | undefined {
-    return this.hostUpdate?.blocksNodeWork(nodeId);
+    return this.console.blocked(nodeId)
+      ? "Node history is synchronizing"
+      : this.hostUpdate?.blocksNodeWork(nodeId);
   }
 
   logManagedPlacementScheduling(details: Record<string, unknown>, message: string): void {
@@ -323,6 +331,7 @@ export class FleetService {
     this.transcripts = new TranscriptProjections(store, (sessionId) =>
       this.broadcast({ type: "transcript_reset", sessionId }),
     );
+    this.console = new SessionConsoleService(this);
     this.commands.reconcileNotifications();
   }
 
@@ -416,9 +425,11 @@ export class FleetService {
   }
 
   attachNode(nodeId: string, socket: NodeLink): void {
+    this.console.detach(nodeId);
     this.sessionRetention.nodeDisconnected(nodeId);
     this.nodeHealth.delete(nodeId);
     this.nodeSockets.set(nodeId, socket);
+    this.linkNodes.set(socket, nodeId);
   }
 
   /** Hangs up on a Node the operator deleted; no session bookkeeping follows. */
@@ -518,11 +529,39 @@ export class FleetService {
   }
 
   send(socket: NodeLink, message: unknown): void {
+    const nodeId = this.linkNodes.get(socket);
+    if (
+      nodeId &&
+      this.console?.blocked(nodeId) &&
+      message &&
+      typeof message === "object" &&
+      "type" in message
+    ) {
+      let blocked = [
+        "deliver_lead_prompt",
+        "prepare_command_execution",
+        "start_command_execution",
+        "managed_worktree",
+        "session_console_queue",
+      ].includes(String(message.type));
+      if (
+        message.type === "command" &&
+        "command" in message &&
+        message.command &&
+        typeof message.command === "object" &&
+        "type" in message.command
+      )
+        blocked = !["stop", "cancel", "permission_response"].includes(
+          String(message.command.type),
+        );
+      if (blocked) throw new Error("Node history synchronization blocks new work");
+    }
     if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message));
   }
 
   broadcast(message: BrowserMessage): void {
     BrowserMessageSchema.parse(message);
+    this.console?.publish(message);
     for (const socket of this.browserSockets) {
       // Slow consumers recover command bytes by durable cursor; lifecycle is not dropped.
       if (
@@ -543,6 +582,7 @@ export class FleetService {
   }
 
   publishSession(session: FleetSession): void {
+    this.console?.observe(session);
     if (
       session.runRole === "lead" &&
       (terminalSessionStates.has(session.state) ||
@@ -907,6 +947,12 @@ export class FleetService {
   }):
     | { ok: true; session: FleetSession }
     | { ok: false; status: number; error: string; session?: FleetSession } {
+    if (this.console.blocked(input.placement.nodeId))
+      return {
+        ok: false,
+        status: 409,
+        error: "Node history is synchronizing; no new worker was started",
+      };
     if (input.runRole !== "lead") {
       const maintenance = this.store.prMaintenance.admission({
         action: "dispatch",
@@ -1086,13 +1132,36 @@ export class FleetService {
    * and assemble the same launch context. The caller may send a prompt
    * immediately afterwards: the Node queues it behind session initialization.
    */
+  resumeCheckoutProblem(sessionId: string): { code: string; error: string } | undefined {
+    const target = this.store.getSession(sessionId);
+    if (!target || !["worker", "reviewer"].includes(target.runRole)) return undefined;
+    const occupants = checkoutOccupants(
+      target,
+      this.store.listSessions(),
+      this.store.listNodes(),
+    );
+    if (!occupants.length) return undefined;
+    const where =
+      this.store.getPlacement(target.placementId)?.localPath ?? "its checkout";
+    return {
+      code: "checkout_busy",
+      error: `${where} on ${target.nodeName} is in use by ${occupants.map((occupant) => `"${occupant.name || occupant.id}" (${occupant.state})`).join(", ")}. Two sessions cannot write to one checkout; use Resume now on the task, which waits for it.`,
+    };
+  }
+
   resumeSession(
     sessionId: string,
     activity?: string,
-    supervisor?: { operatorId: string; operationId?: string | undefined },
+    supervisor?: {
+      operatorId?: string | undefined;
+      actor?: SessionActor | undefined;
+      operationId?: string | undefined;
+    },
   ): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false, status: 404, error: "Session not found" };
+    if (this.console.blocked(session.nodeId))
+      return { ok: false, status: 409, error: "Node history is synchronizing" };
     const manual =
       supervisor && this.supervisorCommand(sessionId, "resume_session", supervisor);
     if (manual && this.isSupervisorRetry(sessionId, manual)) return { ok: true, session };
@@ -1218,7 +1287,11 @@ export class FleetService {
   private supervisorCommand(
     sessionId: string,
     kind: SupervisorCommand["kind"],
-    supervisor: { operatorId: string; operationId?: string | undefined },
+    supervisor: {
+      operatorId?: string | undefined;
+      actor?: SessionActor | undefined;
+      operationId?: string | undefined;
+    },
     input?: {
       prompt: string;
       attachments: PromptAttachment[];
@@ -1249,6 +1322,8 @@ export class FleetService {
             (command) =>
               command.digest === digest &&
               command.operatorId === supervisor.operatorId &&
+              JSON.stringify(sessionActor(command.actor, command.operatorId)) ===
+                JSON.stringify(sessionActor(supervisor.actor, supervisor.operatorId)) &&
               command.kind === kind,
           )
       : undefined;
@@ -1261,6 +1336,7 @@ export class FleetService {
       digest,
       kind,
       operatorId: supervisor.operatorId,
+      ...(supervisor.actor ? { actor: supervisor.actor } : {}),
       ...(input?.handback ? { handback: input.handback } : {}),
     };
   }
@@ -1272,6 +1348,8 @@ export class FleetService {
     if (
       previous.digest !== command.digest ||
       previous.operatorId !== command.operatorId ||
+      JSON.stringify(sessionActor(previous.actor, previous.operatorId)) !==
+        JSON.stringify(sessionActor(command.actor, command.operatorId)) ||
       previous.kind !== command.kind
     )
       throw new PrMaintenanceError(
@@ -1296,23 +1374,28 @@ export class FleetService {
     },
     operatorId?: string,
     deliveryKey?: string,
+    actor?: SessionActor,
   ): { ok: true } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false, status: 404, error: "Session not found" };
-    if (input.handback === "after_turn" && !operatorId)
+    if (
+      input.handback === "after_turn" &&
+      (!operatorId || actor?.kind === "node_console")
+    )
       return {
         ok: false,
         status: 403,
         error: "One-turn handback requires an authenticated browser operator.",
       };
-    const manual = operatorId
-      ? this.supervisorCommand(
-          sessionId,
-          "prompt",
-          { operatorId, operationId: input.operationId },
-          input,
-        )
-      : undefined;
+    const manual =
+      operatorId || actor
+        ? this.supervisorCommand(
+            sessionId,
+            "prompt",
+            { operatorId, actor, operationId: input.operationId },
+            input,
+          )
+        : undefined;
     if (input.handback === "after_turn" && !manual)
       return {
         ok: false,
@@ -1475,6 +1558,13 @@ export class FleetService {
     supervisor?: SupervisorCommand,
     options: { preservePendingPrompts?: boolean } = {},
   ): DispatchResult {
+    if (
+      this.console.blocked(nodeId) &&
+      !["stop", "cancel", "permission_response"].includes(request.type)
+    )
+      return { sent: false };
+    if (request.type === "prompt" && this.console.reserved(request.sessionId))
+      return { sent: false };
     const commandSession = this.store.getSession(request.sessionId);
     if (
       ["stop", "cancel", "delete_session"].includes(request.type) &&
@@ -1636,7 +1726,7 @@ export class FleetService {
           supervisor &&
           request.type === "prompt" &&
           this.store.prMaintenance.manualRecord(session.id)
-            ? `${request.prompt}\n\n<fleet-manual-control>\nThe human supervisor has taken manual control of this retained worker. ${supervisor.handback === "after_turn" ? "The operator selected one-turn handback. The Host alone may return control after this exact turn completes, the worker is quiescent and effects are reconciled." : "Unattended PR maintenance is paused and must remain paused after this turn."} Follow the human's direction; this handoff itself does not authorize unattended publication, certify PR readiness, or approve pending design decisions. Preserve retained scope and receipts; do not restart maintenance.\n</fleet-manual-control>`
+            ? `${request.prompt}\n\n<fleet-manual-control>\n${supervisor.actor?.kind === "node_console" ? "The local Node console" : "The human supervisor"} has taken manual control of this retained worker. ${supervisor.handback === "after_turn" ? "The operator selected one-turn handback. The Host alone may return control after this exact turn completes, the worker is quiescent and effects are reconciled." : "Unattended PR maintenance is paused and must remain paused after this turn."} This handoff does not authorize unattended publication, certify PR readiness, or approve pending design decisions. Preserve retained scope and receipts; do not restart maintenance.\n</fleet-manual-control>`
             : undefined;
         const command = {
           ...request,
@@ -1683,7 +1773,15 @@ export class FleetService {
             : {}),
           commandId,
         } as NodeCommand;
-        this.send(socket, HostToNodeMessageSchema.parse({ type: "command", command }));
+        this.console.observe(this.store.getSession(session.id)!);
+        this.send(
+          socket,
+          HostToNodeMessageSchema.parse({
+            type: "command",
+            command,
+            consoleEpoch: this.store.sessionConsole.get(session.id)?.controlEpoch,
+          }),
+        );
         if (supervisor && session.runId) {
           this.publishSnapshot();
           this.publishRunSteps(session.runId, this.store.listRunSteps(session.runId));
@@ -1694,7 +1792,14 @@ export class FleetService {
         this.store.touchSessionActivity(request.sessionId);
       }
       const command = { ...request, commandId: randomUUID() } as NodeCommand;
-      this.send(socket, HostToNodeMessageSchema.parse({ type: "command", command }));
+      this.send(
+        socket,
+        HostToNodeMessageSchema.parse({
+          type: "command",
+          command,
+          consoleEpoch: this.store.sessionConsole.get(request.sessionId)?.controlEpoch,
+        }),
+      );
       return { sent: true };
     }
     if (!fallback) return { sent: false };
@@ -2042,6 +2147,7 @@ export class FleetService {
     activeSessionIds: readonly string[],
     busySessionIds: readonly string[] = [],
   ): FleetSession[] {
+    if (this.console.blocked(nodeId)) return [];
     const settled = this.notifications.commitAtomically(
       () => {
         const candidates = new Map(
@@ -2099,6 +2205,7 @@ export class FleetService {
       },
       (reconciled) => this.publishSessions(reconciled),
     );
+    if (this.console.blocked(nodeId)) return settled;
     for (const session of settled) {
       if (!session.stopRequested || terminalSessionStates.has(session.state)) continue;
       this.dispatch(nodeId, { type: "stop", sessionId: session.id });
@@ -2166,6 +2273,7 @@ export class FleetService {
         // prompt or consume a queued maintenance attempt.
         const result = this.resumeSession(session.id, "Reconnecting manual session", {
           operatorId: retained.manualControl.operatorId,
+          actor: retained.manualControl.actor,
           operationId: randomUUID(),
         });
         if (result.ok) {
@@ -2250,6 +2358,7 @@ export class FleetService {
   }
 
   disconnectNode(nodeId: string, activity: string): void {
+    this.console.detach(nodeId);
     this.commands.nodeDisconnected(nodeId);
     this.files.nodeDisconnected(nodeId);
     this.worktrees.nodeLost(nodeId);
