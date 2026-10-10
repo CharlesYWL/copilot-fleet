@@ -8,6 +8,17 @@ import {
   type FleetSession,
 } from "@fleet/protocol";
 
+function bindingKey(hostId: string, session: FleetSession): string {
+  return JSON.stringify([
+    hostId,
+    session.nodeId,
+    session.placementId,
+    session.executionBinding?.worktreeId,
+    session.executionBinding?.generation,
+    session.executionBinding?.cwd,
+  ]);
+}
+
 export class SessionConsoleStore {
   constructor(private readonly db: DatabaseSync) {
     db.exec(`
@@ -25,14 +36,7 @@ export class SessionConsoleStore {
   }
 
   grant(hostId: string, session: FleetSession, sequenceOffset: number): ConsoleGrant {
-    const binding = JSON.stringify([
-      hostId,
-      session.nodeId,
-      session.placementId,
-      session.executionBinding?.worktreeId,
-      session.executionBinding?.generation,
-      session.executionBinding?.cwd,
-    ]);
+    const binding = bindingKey(hostId, session);
     const previous = this.db
       .prepare("SELECT binding,data FROM session_console_grants WHERE session_id=?")
       .get(session.id);
@@ -60,6 +64,13 @@ export class SessionConsoleStore {
       .prepare("SELECT data FROM session_console_grants WHERE session_id=?")
       .get(sessionId);
     return row ? ConsoleGrantSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+
+  matches(grant: ConsoleGrant, session: FleetSession): boolean {
+    const row = this.db
+      .prepare("SELECT binding FROM session_console_grants WHERE session_id=?")
+      .get(session.id);
+    return row?.binding === bindingKey(grant.hostId, session);
   }
 
   epoch(sessionId: string, epoch: number): void {

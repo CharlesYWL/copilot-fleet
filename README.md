@@ -2867,6 +2867,17 @@ sizes, before/after comparisons, and measurement limitations. The
 [chat-history performance plan](docs/chat-history-performance-plan.md) records
 what was implemented, the measured results, and the remaining limits.
 
+`npm run benchmark:session-stream -- --rtt 50 --max-regression-ms 15` compares
+direct event forwarding with durable Node forwarding for 1, 4 and 8 concurrent
+streams at 50 chunks/second each. It uses separate Host/Node processes, real
+WebSockets and SQLite stores, and a simulated round-trip delay. The optional
+budget fails the command if journaled P95 exceeds the direct baseline by more
+than that many milliseconds. `--rtt`, `--sessions`, `--duration` (milliseconds)
+and `--output` customize the run. This measures event creation to Host
+publication, not model latency or browser painting, and never contacts running
+Fleet installations. Healthy delivery does not wait for per-session ACKs;
+offline recovery still uses the explicit synchronization barrier.
+
 ### Local verification and test monitoring
 
 The primary repository is

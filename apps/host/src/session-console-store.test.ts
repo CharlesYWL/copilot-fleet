@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { ConsoleOperationSchema } from "@fleet/protocol";
+import { ConsoleOperationSchema, SessionSchema } from "@fleet/protocol";
 import { SessionConsoleStore } from "./session-console-store.js";
 
 const databases: DatabaseSync[] = [];
@@ -28,6 +28,32 @@ const operation = () =>
   });
 
 describe("Host console receipts", () => {
+  it("validates a live binding without rewriting its grant on every batch", () => {
+    const db = new DatabaseSync(":memory:");
+    databases.push(db);
+    const store = new SessionConsoleStore(db);
+    const session = SessionSchema.parse({
+      id: "session",
+      workspaceId: "workspace",
+      workspaceName: "Workspace",
+      placementId: "placement",
+      nodeId: "node",
+      nodeName: "Node",
+      state: "idle",
+      initialPrompt: "Work",
+      currentActivity: "",
+      lastText: "",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      agentSessionId: "native",
+    });
+    const grant = store.grant("host", session, 0);
+    const changes = db.prepare("SELECT total_changes() count").get()!.count;
+    for (let index = 0; index < 10; index++)
+      expect(store.matches(grant, session)).toBe(true);
+    expect(store.matches(grant, { ...session, nodeId: "other-node" })).toBe(false);
+    expect(db.prepare("SELECT total_changes() count").get()!.count).toBe(changes);
+  });
   it("does not let another session overwrite a local-operation identity", () => {
     const store = fixture();
     const original = operation();

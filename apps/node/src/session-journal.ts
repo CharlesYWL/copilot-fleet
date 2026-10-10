@@ -172,7 +172,7 @@ export class SessionJournal {
       else mkdirSync(directory, { recursive: true });
       this.db = database = new DatabaseSync(join(directory, "sessions.db"));
       this.db.exec(`
-        PRAGMA journal_mode=DELETE;
+        PRAGMA journal_mode=WAL;
         PRAGMA synchronous=FULL;
         PRAGMA foreign_keys=ON;
         PRAGMA secure_delete=ON;
@@ -530,6 +530,48 @@ export class SessionJournal {
     );
   }
 
+  /** Coalesced live receipts share one durable commit; unacknowledged bodies remain replayable. */
+  acknowledgeBatch(
+    acknowledgements: readonly {
+      sessionId: string;
+      sequence: number;
+      controlEpoch: number;
+    }[],
+  ): void {
+    this.writable();
+    const changed = new Map<string, StoredSession>();
+    for (const acknowledgement of acknowledgements) {
+      integer(acknowledgement.sequence);
+      integer(acknowledgement.controlEpoch);
+      const record =
+        changed.get(acknowledgement.sessionId) ??
+        this.required(acknowledgement.sessionId);
+      if (
+        acknowledgement.sequence > record.highWater ||
+        acknowledgement.controlEpoch > record.controlEpoch
+      )
+        throw new Error("Acknowledgement exceeds committed session evidence.");
+      const sequence = Math.max(record.acknowledgedSequence, acknowledgement.sequence);
+      const epoch = Math.max(
+        record.acknowledgedControlEpoch,
+        acknowledgement.controlEpoch,
+      );
+      if (
+        sequence !== record.acknowledgedSequence ||
+        epoch !== record.acknowledgedControlEpoch
+      )
+        changed.set(acknowledgement.sessionId, {
+          ...record,
+          acknowledgedSequence: sequence,
+          acknowledgedControlEpoch: epoch,
+        });
+    }
+    if (changed.size)
+      this.transaction(() => {
+        for (const record of changed.values()) this.saveSession(record);
+      });
+  }
+
   transcript(
     sessionId: string,
     request: { before?: number; limit?: number } = {},
@@ -733,6 +775,7 @@ export class SessionJournal {
       if (Number(result.changes))
         this.saveSession({ ...record, generation: randomUUID(), revision: 0 });
     });
+    this.checkpointHistory();
   }
 
   /** Call only after Host confirms deletion and agent quiescence, never on a disconnect. */
@@ -766,6 +809,7 @@ export class SessionJournal {
       this.db.prepare("DELETE FROM sessions WHERE id=?").run(sessionId);
     });
     if (this.projection?.sessionId === sessionId) this.projection = undefined;
+    this.checkpointHistory();
   }
 
   purge(hostId: string, allowUnacknowledged = false): void {
@@ -790,6 +834,17 @@ export class SessionJournal {
       this.db.prepare("DELETE FROM retired_sessions WHERE host_id=?").run(hostId);
     });
     this.projection = undefined;
+    this.checkpointHistory();
+  }
+
+  private checkpointHistory(): void {
+    this.read(() => {
+      const result = this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+      if (Number(result?.busy ?? 0))
+        throw new Error(
+          "History was deleted, but a database reader still holds its WAL snapshot. Close database readers before retrying.",
+        );
+    });
   }
 
   close(): void {

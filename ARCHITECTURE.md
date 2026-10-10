@@ -561,13 +561,24 @@ Only an opened conversation loads a transcript and subscribes to changes.
 Native Copilot history is a distinct, explicitly expanded discovery surface.
 No live-session preview opens another ACP connection.
 
-`SessionJournal` uses the existing private SQLite directory conventions. It
+`SessionJournal` uses the existing private SQLite directory conventions and WAL
+with `synchronous=FULL`. Deletion/retirement checkpoints truncate the WAL rather
+than leaving deleted transcript bodies in a sidecar. It
 records every event of continuation-enabled non-lead sessions online and offline,
 independently of browser activity; output is group-committed before publication.
 Command identities are committed before invocation. A separate sequence high-water
 mark survives body trimming, and every resumed process continues above both Host
 and local sequence offsets. Accepted handoffs without proven completion become
 uncertain after restart and are never automatically re-prompted.
+
+Healthy live delivery is separate from reconnect catch-up. A producer burst is
+committed at the microtask boundary, then forwarded without waiting for another
+session's ACK. The Node keeps at most 128 live batches / 8 MiB in flight (a larger
+single event travels alone); excess output stays in the durable journal, not an
+unbounded memory queue. Per-session sent cursors and cumulative, coalesced ACK
+commits keep retries safe. Host validates the current grant without rewriting it
+for each batch and serializes ingestion, not network round trips. Local-control
+receipts precede their events; a validation failure fences subsequent packets.
 
 Reconnect has an explicit console synchronization barrier spanning all bounded
 event batches and local-operation receipts. Command reconnect, prompt pumps,

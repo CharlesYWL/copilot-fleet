@@ -10,6 +10,7 @@ import {
   NodeCommandSchema,
   SESSION_CONSOLE_CAPABILITY,
   type ConsoleRequest,
+  type ConsoleResponse,
   type NodeCommand,
 } from "@fleet/protocol";
 import { FleetStore } from "../apps/host/src/store.js";
@@ -21,7 +22,11 @@ import { MockAgentFactory } from "../apps/node/src/agents.js";
 import { CommandRouter } from "../apps/node/src/router.js";
 import { SessionJournal } from "../apps/node/src/session-journal.js";
 import { SessionFileReader } from "../apps/node/src/session-files.js";
-import { NodeSessionConsole } from "../apps/node/src/session-console.js";
+import {
+  NodeSessionConsole,
+  LIVE_EVENT_WINDOW_BATCHES,
+  LIVE_EVENT_WINDOW_BYTES,
+} from "../apps/node/src/session-console.js";
 import { startConfigServer } from "../apps/node/src/config-server.js";
 import { settingsFromEnv } from "../apps/node/src/settings.js";
 
@@ -31,7 +36,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-async function fixture(enable = true) {
+async function fixture(enable = true, journalBatchMs = 2) {
   const directory = mkdtempSync(join(tmpdir(), "fleet-console-"));
   const work = join(directory, "work");
   mkdirSync(work);
@@ -57,7 +62,10 @@ async function fixture(enable = true) {
   let online = true;
   let suppressEvents = false;
   let dropActionReply = false;
+  let holdReplays = false;
   const droppedIds = new Set<string>();
+  const heldIds = new Set<string>();
+  const heldResponses: ConsoleResponse[] = [];
   let controller: NodeSessionConsole;
   let journal: SessionJournal;
   let router: CommandRouter;
@@ -69,7 +77,8 @@ async function fixture(enable = true) {
       if (!online) return;
       const frame = HostToNodeMessageSchema.parse(JSON.parse(raw));
       if (frame.type === "session_console_response") {
-        if (!droppedIds.has(frame.response.requestId))
+        if (heldIds.has(frame.response.requestId)) heldResponses.push(frame.response);
+        else if (!droppedIds.has(frame.response.requestId))
           controller.response(frame.response);
       } else if (frame.type === "session_console_grant") controller.grant(frame.grant);
       else if (frame.type === "session_console_update") controller.update(frame.message);
@@ -88,7 +97,7 @@ async function fixture(enable = true) {
   const makeNode = () => {
     journal = new SessionJournal(join(directory, "history"), {
       secure: false,
-      batchMs: 2,
+      batchMs: journalBatchMs,
       onEvents: (events) => controller.committed(events),
       onFailure: (error) => errors.push(String(error)),
     });
@@ -120,6 +129,8 @@ async function fixture(enable = true) {
           });
           if (dropActionReply && message.request.kind === "action")
             droppedIds.add(message.requestId);
+          if (holdReplays && message.request.kind === "replay")
+            heldIds.add(message.requestId);
           void service.console.handle(node.id, message.requestId, message.request);
         }
         return true;
@@ -222,6 +233,16 @@ async function fixture(enable = true) {
     dropActionReply: () => {
       dropActionReply = true;
     },
+    holdReplayReplies: () => {
+      holdReplays = true;
+    },
+    releaseReplayReplies: (reverse = false) => {
+      holdReplays = false;
+      heldIds.clear();
+      const replies = heldResponses.splice(0);
+      if (reverse) replies.reverse();
+      for (const reply of replies) controller.response(reply);
+    },
     restart: async () => {
       disconnect();
       suppressEvents = true;
@@ -235,6 +256,266 @@ async function fixture(enable = true) {
 }
 
 describe("shared online and offline Node session control", () => {
+  it.each(["online", "reconnect"])(
+    "keeps control receipts ahead of their events across bounded %s batches",
+    async (mode) => {
+      const f = await fixture();
+      const id = await f.create();
+      await f.settled(id);
+      if (mode === "reconnect") f.disconnect();
+      const premature: string[] = [];
+      f.service.onSessionEvent((event) => {
+        if (typeof event.payload.control !== "string") return;
+        if (
+          !f.store.sessionConsole
+            .localOperations(id)
+            .some((operation) => operation.id === event.payload.control)
+        )
+          premature.push(event.eventId);
+      });
+      for (let index = 0; index < 110; index++) {
+        const operationId = randomUUID();
+        f.journal.acceptOperation({
+          id: operationId,
+          sessionId: id,
+          action: "prompt",
+          payload: {
+            action: "prompt",
+            operationId,
+            prompt: `Synthetic local turn ${index}`,
+            attachments: [],
+          },
+        });
+        f.journal.append({
+          eventId: randomUUID(),
+          sessionId: id,
+          sequence: f.journal.highWater(id) + 1,
+          type: "agent_text",
+          payload: { text: `turn ${index}`, control: operationId },
+          createdAt: new Date().toISOString(),
+        });
+        f.journal.settleOperation(operationId, "settled");
+      }
+      if (mode === "online") f.controller.grant(f.store.sessionConsole.get(id)!);
+      await f.journal.flush();
+      if (mode === "reconnect") await f.connect();
+      else await f.controller.prepareIdentityMove();
+      await f.settled(id);
+      expect(f.store.sessionConsole.localOperations(id)).toHaveLength(110);
+      expect(premature).toEqual([]);
+    },
+  );
+  it("publishes durable live output from multiple sessions without waiting for earlier ACKs", async () => {
+    // Online delivery must flush the producer burst, not wait for the offline batching timer.
+    const f = await fixture(true, 60_000);
+    const first = await f.create();
+    const second = await f.create();
+    await f.settled(first);
+    await f.settled(second);
+    f.holdReplayReplies();
+    const before = f.journal.get(first)!.acknowledgedSequence;
+    const emit = (sessionId: string) => {
+      const event = {
+        eventId: randomUUID(),
+        sessionId,
+        sequence: f.journal.highWater(sessionId) + 1,
+        type: "agent_text" as const,
+        payload: { text: "Live output" },
+        createdAt: new Date().toISOString(),
+      };
+      f.controller.capture(event);
+      return event;
+    };
+    const a = emit(first);
+    await vi.waitFor(() =>
+      expect(f.store.listEvents(first).some((event) => event.eventId === a.eventId)).toBe(
+        true,
+      ),
+    );
+    const b = emit(second);
+    const c = emit(first);
+    await vi.waitFor(() => {
+      expect(
+        f.store.listEvents(second).some((event) => event.eventId === b.eventId),
+      ).toBe(true);
+      expect(f.store.listEvents(first).some((event) => event.eventId === c.eventId)).toBe(
+        true,
+      );
+    });
+    expect(f.journal.get(first)!.acknowledgedSequence).toBe(before);
+    expect(f.journal.highWater(first)).toBeGreaterThan(before);
+    f.releaseReplayReplies(true);
+    await f.settled(first);
+    await f.settled(second);
+  });
+
+  it("bounds the live window while retaining excess output in the durable journal", async () => {
+    const f = await fixture();
+    const id = await f.create();
+    await f.settled(id);
+    f.holdReplayReplies();
+    const from = f.requests.length;
+    const before = f.journal.highWater(id);
+    for (let index = 0; index < LIVE_EVENT_WINDOW_BATCHES + 10; index++) {
+      f.controller.capture({
+        eventId: randomUUID(),
+        sessionId: id,
+        sequence: before + index + 1,
+        type: "agent_text",
+        payload: { text: "Window pressure" },
+        createdAt: new Date().toISOString(),
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    await f.journal.flush();
+    expect(
+      f.requests.slice(from).filter((entry) => entry.request.kind === "replay"),
+    ).toHaveLength(LIVE_EVENT_WINDOW_BATCHES);
+    expect(f.journal.highWater(id)).toBe(before + LIVE_EVENT_WINDOW_BATCHES + 10);
+    expect(f.journal.get(id)!.acknowledgedSequence).toBe(before);
+    f.releaseReplayReplies();
+    await f.settled(id);
+    expect(f.store.maxEventSequence(id)).toBe(f.journal.highWater(id));
+  });
+
+  it("bounds live bytes before the batch-count limit and drains the durable remainder", async () => {
+    const f = await fixture();
+    const id = await f.create();
+    await f.settled(id);
+    f.holdReplayReplies();
+    const from = f.requests.length;
+    const before = f.journal.highWater(id);
+    for (let index = 0; index < 12; index++) {
+      f.controller.capture({
+        eventId: randomUUID(),
+        sessionId: id,
+        sequence: before + index + 1,
+        type: "agent_text",
+        payload: { text: "x".repeat(1024 * 1024) },
+        createdAt: new Date().toISOString(),
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    const requests = f.requests
+      .slice(from)
+      .filter((entry) => entry.request.kind === "replay");
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.length).toBeLessThan(12);
+    expect(
+      requests.reduce(
+        (bytes, entry) => bytes + Buffer.byteLength(JSON.stringify(entry.request)),
+        0,
+      ),
+    ).toBeLessThanOrEqual(LIVE_EVENT_WINDOW_BYTES);
+    expect(f.journal.highWater(id)).toBe(before + 12);
+    expect(f.journal.get(id)!.acknowledgedSequence).toBe(before);
+    f.releaseReplayReplies();
+    await f.settled(id);
+    expect(f.store.maxEventSequence(id)).toBe(before + 12);
+  });
+
+  it("recovers unacknowledged live frames after disconnect and ignores old replies", async () => {
+    const f = await fixture();
+    const id = await f.create();
+    await f.settled(id);
+    f.holdReplayReplies();
+    const eventId = randomUUID();
+    f.controller.capture({
+      eventId,
+      sessionId: id,
+      sequence: f.journal.highWater(id) + 1,
+      type: "agent_text",
+      payload: { text: "Stored before ACK was lost" },
+      createdAt: new Date().toISOString(),
+    });
+    await vi.waitFor(() =>
+      expect(f.store.listEvents(id).some((event) => event.eventId === eventId)).toBe(
+        true,
+      ),
+    );
+    f.disconnect();
+    f.releaseReplayReplies(true);
+    await f.connect();
+    await f.settled(id);
+    expect(
+      f.store.listEvents(id).filter((event) => event.eventId === eventId),
+    ).toHaveLength(1);
+  });
+
+  it("fences subsequent pipelined frames after a grant mismatch without acknowledging them", async () => {
+    const f = await fixture();
+    const first = await f.create();
+    const second = await f.create();
+    await f.settled(first);
+    await f.settled(second);
+    f.holdReplayReplies();
+    const before = f.store.maxEventSequence(second);
+    f.store.sessionConsole.grant(
+      "host-test",
+      { ...f.store.getSession(first)!, placementId: "changed" },
+      f.store.maxEventSequence(first),
+    );
+    f.controller.capture({
+      eventId: randomUUID(),
+      sessionId: first,
+      sequence: f.journal.highWater(first) + 1,
+      type: "agent_text",
+      payload: { text: "Conflicting grant" },
+      createdAt: new Date().toISOString(),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    f.controller.capture({
+      eventId: randomUUID(),
+      sessionId: second,
+      sequence: before + 1,
+      type: "agent_text",
+      payload: { text: "Must remain local until reconciliation" },
+      createdAt: new Date().toISOString(),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.service.console.blocked(f.node.id)).toBe(true);
+    expect(f.store.maxEventSequence(second)).toBe(before);
+    expect(f.journal.highWater(second)).toBe(before + 1);
+    expect(f.journal.get(second)!.acknowledgedSequence).toBe(before);
+  });
+
+  it("does not make one session's retirement wait for another session's live ACK", async () => {
+    const f = await fixture();
+    const first = await f.create();
+    const second = await f.create();
+    await f.settled(first);
+    await f.settled(second);
+    f.holdReplayReplies();
+    f.controller.capture({
+      eventId: randomUUID(),
+      sessionId: second,
+      sequence: f.journal.highWater(second) + 1,
+      type: "agent_text",
+      payload: { text: "Other session still streaming" },
+      createdAt: new Date().toISOString(),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const route = vi.spyOn(f.router, "route").mockImplementation(async (command) => ({
+      commandId: command.commandId,
+      ok: true,
+    }));
+    const result = await f.controller.hostCommand(
+      NodeCommandSchema.parse({
+        type: "delete_session",
+        commandId: randomUUID(),
+        sessionId: first,
+        agentSessionId: f.journal.get(first)!.session.agentSessionId,
+        inactiveBefore: new Date().toISOString(),
+        retentionDays: 30,
+      }),
+      0,
+    );
+    expect(result.ok).toBe(true);
+    expect(f.journal.has(first)).toBe(false);
+    route.mockRestore();
+    f.releaseReplayReplies();
+    await f.settled(second);
+  });
   it.skipIf(process.env.FLEET_CONSOLE_BROWSER_SMOKE !== "1")(
     "runs the built Node chat in a real browser against the session bridge",
     async () => {

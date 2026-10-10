@@ -28,6 +28,10 @@ type Peer = {
   busy: string[];
   subscriptions: Set<string>;
   sentGrants: Map<string, string>;
+  replayTail: Promise<void>;
+  pendingReplays: number;
+  pendingReplayBytes: number;
+  replayFailed: boolean;
 };
 
 export class ConsoleRequestError extends Error {
@@ -55,6 +59,10 @@ export class SessionConsoleService {
       busy,
       subscriptions: new Set(),
       sentGrants: new Map(),
+      replayTail: Promise.resolve(),
+      pendingReplays: 0,
+      pendingReplayBytes: 0,
+      replayFailed: false,
     });
   }
   detach(nodeId: string): void {
@@ -160,6 +168,66 @@ export class SessionConsoleService {
   async handle(nodeId: string, requestId: string, raw: ConsoleRequest): Promise<void> {
     const peer = this.peers.get(nodeId);
     if (!peer) return;
+    if (raw.kind === "replay") {
+      const bytes = Buffer.byteLength(JSON.stringify(raw));
+      if (
+        bytes > CONSOLE_REPLAY_MAX_BYTES ||
+        peer.pendingReplays >= 128 ||
+        (peer.pendingReplays > 0 && peer.pendingReplayBytes + bytes > 8 * 1024 * 1024)
+      ) {
+        peer.replayFailed = true;
+        peer.syncing = true;
+        this.service.send(peer.link, {
+          type: "session_console_response",
+          response: {
+            requestId,
+            ok: false,
+            status: 429,
+            error: "Session event window is full; retain and reconcile local history",
+          },
+        });
+        return;
+      }
+      peer.pendingReplays++;
+      peer.pendingReplayBytes += bytes;
+      const work = peer.replayTail
+        .then(async () => {
+          if (
+            this.peers.get(nodeId) !== peer ||
+            this.service.nodeSocket(nodeId) !== peer.link
+          )
+            return;
+          if (peer.replayFailed) {
+            this.service.send(peer.link, {
+              type: "session_console_response",
+              response: {
+                requestId,
+                ok: false,
+                status: 409,
+                error:
+                  "Earlier history failed validation; reconnect to reconcile retained evidence",
+              },
+            });
+            return;
+          }
+          await this.handleRequest(nodeId, peer, requestId, raw);
+        })
+        .finally(() => {
+          peer.pendingReplays--;
+          peer.pendingReplayBytes -= bytes;
+        });
+      peer.replayTail = work.catch(() => undefined);
+      return work;
+    }
+    return this.handleRequest(nodeId, peer, requestId, raw);
+  }
+
+  private async handleRequest(
+    nodeId: string,
+    peer: Peer,
+    requestId: string,
+    raw: ConsoleRequest,
+  ): Promise<void> {
     try {
       const request = ConsoleRequestSchema.parse(raw);
       const data = await this.request(nodeId, peer, request);
@@ -181,6 +249,10 @@ export class SessionConsoleService {
         }
       }
     } catch (error) {
+      if (raw.kind === "replay") {
+        peer.replayFailed = true;
+        peer.syncing = true;
+      }
       if (this.peers.get(nodeId) === peer)
         this.service.send(peer.link, {
           type: "session_console_response",
@@ -218,6 +290,7 @@ export class SessionConsoleService {
   ): Promise<unknown> {
     if (request.kind === "initialize") {
       peer.syncing = true;
+      peer.replayFailed = false;
       for (const id of [...request.activeSessionIds, ...request.busySessionIds])
         this.own(nodeId, id);
       peer.active = request.activeSessionIds;
@@ -305,8 +378,7 @@ export class SessionConsoleService {
       const grant = this.store.sessionConsole.get(session.id);
       if (!grant || grant.grantId !== request.grantId || session.runRole === "lead")
         throw new ConsoleRequestError(409, "Offline session ownership changed");
-      const current = this.grant(session);
-      if (current.grantId !== grant.grantId)
+      if (!this.store.sessionConsole.matches(grant, session))
         throw new ConsoleRequestError(409, "Workspace binding changed");
       let previous = -1;
       const operations = [...request.operations].sort(
@@ -375,11 +447,14 @@ export class SessionConsoleService {
       if (operation.controlEpoch > grant.controlEpoch)
         this.store.sessionConsole.epoch(session.id, operation.controlEpoch);
       for (const message of this.store.queuedMessages(session.id)) {
-        if (message.state === "pending")
+        if (message.state === "pending" || message.state === "sending")
           this.store.saveQueuedMessage({
             ...message,
             state: "failed",
-            error: "Local console intervened. Confirm this message before sending.",
+            error:
+              message.state === "sending"
+                ? "Local console intervened during delivery. Review the transcript before confirming a resend."
+                : "Local console intervened. Confirm this message before sending.",
           });
       }
       if (operation.action === "prompt" && operation.state !== "rejected") {

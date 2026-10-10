@@ -30,6 +30,7 @@
     "test:coverage": "npm run build -w @fleet/protocol && vitest run --coverage",
     "benchmark:history": "npm run build -w @fleet/protocol && tsx scripts/benchmarks/history.ts",
     "benchmark:browser": "npm run build && tsx scripts/benchmarks/browser.ts",
+    "benchmark:session-stream": "npm run build -w @fleet/protocol && tsx scripts/benchmarks/session-stream.ts",
     "typecheck:benchmarks": "tsc -p scripts/benchmarks/tsconfig.json",
     "typecheck": "npm run build -w @fleet/protocol && npm run typecheck -w @fleet/host && npm run typecheck -w @fleet/node && npm run typecheck -w @fleet/protocol && npm run typecheck:benchmarks",
     "lint": "eslint .",

@@ -16,6 +16,7 @@ import {
   type BrowserMessage,
   type ConsoleAction,
   type ConsoleGrant,
+  type ConsoleOperation,
   type ConsoleRequest,
   type ConsoleResponse,
   type ConsoleSessionView,
@@ -60,6 +61,19 @@ type Waiter = {
   timer: NodeJS.Timeout;
 };
 
+export const LIVE_EVENT_WINDOW_BATCHES = 128;
+export const LIVE_EVENT_WINDOW_BYTES = 8 * 1024 * 1024;
+const LIVE_EVENT_BATCH_BYTES = 512 * 1024;
+type LiveControl = { operation: ConsoleOperation; signature: string };
+type LiveBatch = {
+  order: number;
+  sessionId: string;
+  throughSequence: number;
+  bytes: number;
+  controls: LiveControl[];
+};
+type LiveAcknowledgement = { sessionId: string; sequence: number; controlEpoch: number };
+
 /** Loopback client and executor adapter. Permission decisions have no local route. */
 export class NodeSessionConsole {
   private status: ConsoleStatus = "offline";
@@ -76,8 +90,23 @@ export class NodeSessionConsole {
   private readonly hostEpochs = new Map<string, number>();
   private readonly syncSessions = new Set<string>();
   private readonly sentOperations = new Map<string, string>();
-  private pumping: Promise<void> | undefined;
-  private pendingPump = false;
+  private fastFlush = false;
+  private liveWake = false;
+  private ackWake: NodeJS.Immediate | undefined;
+  private readonly pendingSessions = new Set<string>();
+  private readonly dirtyOperations = new Set<string>();
+  private readonly sentThrough = new Map<string, number>();
+  private readonly sentOperationStates = new Map<string, string>();
+  private readonly operationAckOrder = new Map<string, number>();
+  private readonly inFlight = new Set<LiveBatch>();
+  private readonly pendingAcks = new Map<string, LiveAcknowledgement>();
+  private readonly drains = new Set<{
+    sessionId?: string;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }>();
+  private liveBytes = 0;
+  private liveOrder = 0;
   private localPumping = new Set<string>();
   private readonly failedSessions = new Set<string>();
 
@@ -137,6 +166,7 @@ export class NodeSessionConsole {
 
   disconnected(): void {
     this.generation++;
+    this.resetLive("Host disconnected before live history was acknowledged");
     this.status = this.fenced ? "conflict" : "offline";
     if (!this.fenced)
       this.detail =
@@ -162,6 +192,7 @@ export class NodeSessionConsole {
     }
     this.supported = supported;
     const generation = ++this.generation;
+    this.resetLive("Session history is reconnecting");
     this.syncSessions.clear();
     this.sentOperations.clear();
     if (!supported) {
@@ -207,6 +238,10 @@ export class NodeSessionConsole {
         .filter((entry) =>
           response.grants.some((grant) => grant.session.id === entry.session.id),
         );
+      for (const entry of sessions)
+        this.sentThrough.set(entry.session.id, entry.acknowledgedSequence);
+      for (const [id, signature] of this.sentOperations)
+        this.sentOperationStates.set(id, signature);
       await this.request({
         kind: "synchronized",
         sessions: sessions.map((entry) => ({
@@ -271,12 +306,27 @@ export class NodeSessionConsole {
     this.journal.enable({ ...grant, session });
     this.syncSessions.add(grant.session.id);
     this.hostEpochs.set(grant.session.id, grant.controlEpoch);
+    this.markOperationsDirty(grant.session.id);
   }
 
   capture(event: SessionEvent): boolean {
     if (!this.journal.has(event.sessionId)) return false;
     try {
       this.journal.append(event);
+      if (this.status === "online" && !this.fastFlush && !this.closed) {
+        // Commit the current producer burst, without another timer or event-loop turn.
+        this.fastFlush = true;
+        const generation = this.generation;
+        queueMicrotask(() => {
+          if (generation !== this.generation) return;
+          this.fastFlush = false;
+          try {
+            this.journal.flush();
+          } catch (error) {
+            this.unavailable(`Local history could not be saved: ${errorMessage(error)}`);
+          }
+        });
+      }
     } catch (error) {
       this.unavailable(`Local history could not be saved: ${errorMessage(error)}`);
       if (!this.failedSessions.has(event.sessionId)) {
@@ -296,6 +346,7 @@ export class NodeSessionConsole {
 
   committed(events: SessionEvent[]): void {
     for (const event of events) {
+      this.pendingSessions.add(event.sessionId);
       if (
         this.status !== "online" &&
         ["permission", "permission_result"].includes(event.type)
@@ -308,8 +359,10 @@ export class NodeSessionConsole {
             operation.action === "prompt" &&
             event.sequence > operation.afterSequence &&
             !event.payload.historyReplay
-          )
+          ) {
             this.journal.settleOperation(operation.id, "settled");
+            if (operation.origin === "local") this.markOperationsDirty(event.sessionId);
+          }
       }
       const state = eventPayload(event, "state")?.state;
       if (state && ["stopped", "failed", "completed"].includes(state)) {
@@ -327,6 +380,8 @@ export class NodeSessionConsole {
               "rejected",
               "Session stopped before this queued message was sent",
             );
+          if (operation.state === "accepted" || operation.state === "queued")
+            this.markOperationsDirty(event.sessionId);
         }
       }
       if (state === "idle") {
@@ -339,12 +394,14 @@ export class NodeSessionConsole {
               operation.action === "prompt" &&
               operation.state === "accepted" &&
               event.sequence > operation.afterSequence
-            )
+            ) {
               this.journal.settleOperation(
                 operation.id,
                 "uncertain",
                 "The native turn became idle without an authoritative completion receipt; the prompt was not replayed.",
               );
+              this.markOperationsDirty(event.sessionId);
+            }
           }
           this.schedulePump();
           void this.pumpLocal(event.sessionId);
@@ -361,19 +418,229 @@ export class NodeSessionConsole {
   }
 
   private schedulePump(): void {
-    this.pendingPump = true;
-    if (this.status !== "online" || this.pumping) return;
-    this.pendingPump = false;
+    if (this.closed || this.status !== "online" || this.liveWake) return;
+    this.liveWake = true;
     const generation = this.generation;
-    const pumping = this.flushToHost()
-      .catch((error: unknown) => {
-        if (generation === this.generation) this.fail(error);
-      })
-      .finally(() => {
-        if (this.pumping === pumping) this.pumping = undefined;
-        if (this.pendingPump && this.status === "online") this.schedulePump();
+    queueMicrotask(() => {
+      if (generation !== this.generation) return;
+      this.liveWake = false;
+      try {
+        this.pumpLive();
+      } catch (error) {
+        this.fail(error);
+      }
+    });
+  }
+
+  private markOperationsDirty(sessionId: string): void {
+    this.dirtyOperations.add(sessionId);
+    this.pendingSessions.add(sessionId);
+    this.schedulePump();
+  }
+
+  private liveControls(
+    sessionId: string,
+    through: number,
+  ): { controls: LiveControl[]; through: number } {
+    if (!this.dirtyOperations.has(sessionId)) return { controls: [], through };
+    const result: LiveControl[] = [];
+    let bytes = 0;
+    const operations = this.journal
+      .operations(sessionId)
+      .sort(
+        (a, b) => a.afterSequence - b.afterSequence || a.controlEpoch - b.controlEpoch,
+      );
+    for (const operation of operations) {
+      if (operation.origin === "host" || operation.afterSequence > through) continue;
+      const signature = JSON.stringify(operation);
+      if (this.sentOperationStates.get(operation.id) === signature) continue;
+      const payload = z.record(z.string(), z.unknown()).parse(operation.payload);
+      const wire = {
+        ...operation,
+        payload: {
+          ...payload,
+          ...(operation.action === "prompt" ? { attachments: [] } : {}),
+        },
+        payloadDigest: createHash("sha256")
+          .update(JSON.stringify(operation.payload))
+          .digest("hex"),
+      };
+      const size = Buffer.byteLength(JSON.stringify(wire));
+      if (
+        result.length &&
+        (bytes + size > LIVE_EVENT_BATCH_BYTES || result.length >= 100)
+      )
+        return { controls: result, through: Math.min(through, operation.afterSequence) };
+      result.push({ operation: wire, signature });
+      bytes += size;
+    }
+    return { controls: result, through };
+  }
+
+  /** Healthy delivery is a bounded window, not a round trip per session. */
+  private pumpLive(): void {
+    if (this.closed || this.status !== "online") return;
+    while (
+      this.pendingSessions.size &&
+      this.inFlight.size < LIVE_EVENT_WINDOW_BATCHES &&
+      this.liveBytes < LIVE_EVENT_WINDOW_BYTES
+    ) {
+      const id = this.pendingSessions.values().next().value!;
+      this.pendingSessions.delete(id);
+      if (!this.syncSessions.has(id)) continue;
+      const entry = this.journal.get(id);
+      if (!entry || entry.hostId !== this.options.hostId()) continue;
+      const after = this.sentThrough.get(id) ?? entry.acknowledgedSequence;
+      let events: SessionEvent[];
+      try {
+        events = this.journal.events(id, after, 512, LIVE_EVENT_BATCH_BYTES);
+      } catch (error) {
+        if (!(error instanceof ReplayBudgetError)) throw error;
+        events = this.journal.events(
+          id,
+          after,
+          1,
+          CONSOLE_REPLAY_MAX_BYTES - 1024 * 1024,
+        );
+      }
+      const selected = this.liveControls(id, events.at(-1)?.sequence ?? after);
+      const controls = selected.controls;
+      events = events.filter(
+        (event) => event.sequence <= Math.max(after, selected.through),
+      );
+      const through = events.at(-1)?.sequence ?? after;
+      if (!events.length && !controls.length) {
+        this.dirtyOperations.delete(id);
+        continue;
+      }
+      const request: ConsoleRequest = {
+        kind: "replay",
+        sessionId: id,
+        grantId: entry.grantId,
+        events,
+        operations: controls.map((control) => control.operation),
+      };
+      const bytes = Buffer.byteLength(JSON.stringify(request));
+      if (this.inFlight.size && this.liveBytes + bytes > LIVE_EVENT_WINDOW_BYTES) {
+        this.pendingSessions.add(id);
+        break;
+      }
+      const batch: LiveBatch = {
+        order: ++this.liveOrder,
+        sessionId: id,
+        throughSequence: through,
+        bytes,
+        controls,
+      };
+      this.inFlight.add(batch);
+      this.liveBytes += bytes;
+      this.sentThrough.set(id, through);
+      for (const control of controls)
+        this.sentOperationStates.set(control.operation.id, control.signature);
+      // Only IDs are queued when the window fills; event bodies stay in SQLite.
+      if (through < entry.highWater || controls.length) this.pendingSessions.add(id);
+      const generation = this.generation;
+      void this.request(request)
+        .then((value) => {
+          if (generation !== this.generation) return;
+          const response = z
+            .object({ throughSequence: z.number().int().nonnegative() })
+            .parse(value);
+          if (response.throughSequence < through)
+            throw new Error("Host did not acknowledge the complete event batch");
+          this.acceptLiveAcknowledgement(batch);
+        })
+        .catch((error: unknown) => {
+          if (generation === this.generation) this.fail(error);
+        })
+        .finally(() => {
+          if (generation !== this.generation) return;
+          this.inFlight.delete(batch);
+          this.liveBytes -= bytes;
+          this.schedulePump();
+          this.finishDrains();
+        });
+    }
+    this.finishDrains();
+  }
+
+  private acceptLiveAcknowledgement(batch: LiveBatch): void {
+    const old = this.pendingAcks.get(batch.sessionId);
+    let epoch = old?.controlEpoch ?? 0;
+    for (const control of batch.controls) {
+      epoch = Math.max(epoch, control.operation.controlEpoch);
+      if ((this.operationAckOrder.get(control.operation.id) ?? 0) <= batch.order) {
+        this.operationAckOrder.set(control.operation.id, batch.order);
+        this.sentOperations.set(control.operation.id, control.signature);
+      }
+    }
+    this.hostEpochs.set(
+      batch.sessionId,
+      Math.max(this.hostEpochs.get(batch.sessionId) ?? 0, epoch),
+    );
+    this.pendingAcks.set(batch.sessionId, {
+      sessionId: batch.sessionId,
+      sequence: Math.max(old?.sequence ?? 0, batch.throughSequence),
+      controlEpoch: epoch,
+    });
+    if (!this.ackWake)
+      this.ackWake = setImmediate(() => {
+        this.ackWake = undefined;
+        try {
+          this.journal.acknowledgeBatch([...this.pendingAcks.values()]);
+          this.pendingAcks.clear();
+          this.finishDrains();
+        } catch (error) {
+          this.fail(error);
+        }
       });
-    this.pumping = pumping;
+  }
+
+  private finishDrains(): void {
+    for (const drain of this.drains) {
+      const pending = drain.sessionId
+        ? this.pendingSessions.has(drain.sessionId) ||
+          this.pendingAcks.has(drain.sessionId) ||
+          [...this.inFlight].some((batch) => batch.sessionId === drain.sessionId)
+        : this.inFlight.size ||
+          this.pendingSessions.size ||
+          this.pendingAcks.size ||
+          this.liveWake;
+      if (pending) continue;
+      this.drains.delete(drain);
+      drain.resolve();
+    }
+  }
+
+  private resetLive(reason: string): void {
+    if (this.ackWake) clearImmediate(this.ackWake);
+    this.fastFlush = this.liveWake = false;
+    this.ackWake = undefined;
+    this.pendingSessions.clear();
+    this.dirtyOperations.clear();
+    this.sentThrough.clear();
+    this.sentOperationStates.clear();
+    this.operationAckOrder.clear();
+    this.inFlight.clear();
+    this.pendingAcks.clear();
+    this.liveBytes = 0;
+    for (const drain of this.drains) drain.reject(new NodeConsoleError(503, reason));
+    this.drains.clear();
+  }
+
+  private drainOnline(sessionId?: string): Promise<void> {
+    this.journal.flush();
+    if (this.status !== "online")
+      return Promise.reject(new NodeConsoleError(503, this.detail));
+    for (const id of sessionId ? [sessionId] : this.syncSessions) {
+      this.pendingSessions.add(id);
+      this.dirtyOperations.add(id);
+    }
+    return new Promise((resolve, reject) => {
+      this.drains.add({ ...(sessionId ? { sessionId } : {}), resolve, reject });
+      this.schedulePump();
+      this.finishDrains();
+    });
   }
 
   private async flushToHost(): Promise<void> {
@@ -388,6 +655,9 @@ export class NodeSessionConsole {
           (operation) =>
             operation.origin !== "host" &&
             this.sentOperations.get(operation.id) !== JSON.stringify(operation),
+        )
+        .sort(
+          (a, b) => a.afterSequence - b.afterSequence || a.controlEpoch - b.controlEpoch,
         )
         .map((operation) => {
           const payload = z.record(z.string(), z.unknown()).parse(operation.payload);
@@ -416,14 +686,17 @@ export class NodeSessionConsole {
           );
         }
         events = events.filter((event) => event.sequence <= highWater);
-        const through = events.at(-1)?.sequence ?? after;
+        let through = events.at(-1)?.sequence ?? after;
         const controls: typeof operations = [];
         let bytes = Buffer.byteLength(JSON.stringify(events));
         for (const operation of operations) {
           if (operation.afterSequence > through) continue;
           const size = Buffer.byteLength(JSON.stringify(operation));
-          if (controls.length && (bytes + size > 512 * 1024 || controls.length >= 100))
+          if (controls.length && (bytes + size > 512 * 1024 || controls.length >= 100)) {
+            through = Math.max(after, Math.min(through, operation.afterSequence));
+            events = events.filter((event) => event.sequence <= through);
             break;
+          }
           controls.push(operation);
           bytes += size;
         }
@@ -439,7 +712,9 @@ export class NodeSessionConsole {
               operations: controls,
             }),
           );
-        const acknowledged = Math.min(response.throughSequence, highWater);
+        if (response.throughSequence < through)
+          throw new Error("Host did not acknowledge the complete replay batch");
+        const acknowledged = through;
         this.journal.acknowledge(entry.session.id, acknowledged);
         after = acknowledged;
         for (const control of controls) {
@@ -720,6 +995,8 @@ export class NodeSessionConsole {
   }
 
   unavailable(detail: string): void {
+    this.generation++;
+    this.resetLive(detail);
     this.fenced = true;
     this.status = "conflict";
     this.detail = detail;
@@ -775,8 +1052,7 @@ export class NodeSessionConsole {
       if (command.type === "delete_session" && entry && result.ok) {
         try {
           await this.journal.flush();
-          await this.pumping;
-          await this.flushToHost();
+          await this.drainOnline(command.sessionId);
           this.journal.retire(command.sessionId);
           this.syncSessions.delete(command.sessionId);
           this.views.delete(command.sessionId);
@@ -881,6 +1157,7 @@ export class NodeSessionConsole {
         queued,
       });
       if (!invoke) return this.operationResult(operation);
+      this.markOperationsDirty(id);
       if (invoke && !queued) await this.invokeLocal(operation);
       return { ok: true };
     });
@@ -889,8 +1166,7 @@ export class NodeSessionConsole {
   async prepareIdentityMove(): Promise<void> {
     await this.journal.flush();
     if (this.status === "online") {
-      await this.pumping;
-      await this.flushToHost();
+      await this.drainOnline();
     }
     if (
       this.journal
@@ -959,7 +1235,7 @@ export class NodeSessionConsole {
         }
       }
     });
-    this.schedulePump();
+    this.markOperationsDirty(id);
     if (action === "send-now") void this.pumpLocal(id);
     return { ok: true };
   }
@@ -967,6 +1243,7 @@ export class NodeSessionConsole {
   private async invokeLocal(operation: LocalSessionOperation): Promise<void> {
     const input = ConsoleActionSchema.parse(operation.payload);
     const id = operation.sessionId;
+    this.markOperationsDirty(id);
     let command: NodeCommand;
     if (input.action === "prompt") {
       const entry = this.journal.get(id)!;
@@ -994,9 +1271,13 @@ export class NodeSessionConsole {
     const result = await this.options.router.route(command);
     if (!result.ok) {
       this.journal.settleOperation(operation.id, "rejected", result.error);
+      this.markOperationsDirty(id);
       throw new NodeConsoleError(409, result.error || "Local command was refused");
     }
-    if (input.action !== "prompt") this.journal.settleOperation(operation.id, "settled");
+    if (input.action !== "prompt") {
+      this.journal.settleOperation(operation.id, "settled");
+      this.markOperationsDirty(id);
+    }
     this.emit(id, { type: "session", session: this.localView(id).session });
   }
 
@@ -1045,6 +1326,11 @@ export class NodeSessionConsole {
           throw new NodeConsoleError(
             409,
             "Stop local workers before deleting their history",
+          );
+        if (this.inFlight.size || this.pendingAcks.size)
+          throw new NodeConsoleError(
+            409,
+            "Wait for live history transfers before purging local history",
           );
         this.journal.purge(this.options.hostId(), input.discardUnsynchronized);
         this.views.clear();

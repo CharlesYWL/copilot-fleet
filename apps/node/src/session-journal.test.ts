@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -98,6 +106,71 @@ function operation(id = randomUUID(), sessionId = "worker") {
 }
 
 describe("durable Node session journal", () => {
+  it("migrates an existing rollback journal without losing pending history or uncertainty", () => {
+    const { directory, journal } = fixture();
+    enable(journal);
+    const saved = journal.append(event());
+    journal.flush();
+    const accepted = operation();
+    journal.acceptOperation(accepted);
+    journal.close();
+    const previous = new DatabaseSync(join(directory, "sessions.db"));
+    previous.exec("PRAGMA journal_mode=DELETE");
+    previous.close();
+    const reopened = open(directory);
+    expect(database(reopened).prepare("PRAGMA journal_mode").get()!.journal_mode).toBe(
+      "wal",
+    );
+    expect(reopened.events("worker", 0)).toEqual([saved]);
+    expect(reopened.get("worker")!.acknowledgedSequence).toBe(0);
+    expect(reopened.operations("worker")[0]).toMatchObject({
+      id: accepted.id,
+      state: "uncertain",
+    });
+    expect(reopened.acceptOperation(accepted).invoke).toBe(false);
+  });
+  it("keeps FULL durability in WAL mode and checkpoints deleted history", () => {
+    const { directory, journal } = fixture();
+    expect(database(journal).prepare("PRAGMA journal_mode").get()!.journal_mode).toBe(
+      "wal",
+    );
+    expect(
+      Number(database(journal).prepare("PRAGMA synchronous").get()!.synchronous),
+    ).toBe(2);
+    enable(journal);
+    journal.append(event(1, "agent_text", { text: "Sensitive temporary transcript" }));
+    journal.flush();
+    journal.acknowledge("worker", 1);
+    journal.retire("worker");
+    const wal = join(directory, "sessions.db-wal");
+    expect(existsSync(wal) ? statSync(wal).size : 0).toBe(0);
+  });
+
+  it("coalesces cumulative ACKs atomically without accepting uncommitted evidence", () => {
+    const { journal } = fixture();
+    enable(journal, "first");
+    enable(journal, "second");
+    journal.append(event(1, "agent_text", { text: "one" }, "first"));
+    journal.append(event(1, "agent_text", { text: "two" }, "second"));
+    journal.flush();
+    expect(() =>
+      journal.acknowledgeBatch([
+        { sessionId: "first", sequence: 1, controlEpoch: 0 },
+        { sessionId: "second", sequence: 2, controlEpoch: 0 },
+      ]),
+    ).toThrow("committed");
+    expect(journal.get("first")!.acknowledgedSequence).toBe(0);
+    const exec = vi.spyOn(database(journal), "exec");
+    journal.acknowledgeBatch([
+      { sessionId: "first", sequence: 1, controlEpoch: 0 },
+      { sessionId: "second", sequence: 1, controlEpoch: 0 },
+      { sessionId: "first", sequence: 0, controlEpoch: 0 },
+    ]);
+    expect(exec.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(1);
+    expect(journal.get("first")!.acknowledgedSequence).toBe(1);
+    expect(journal.get("second")!.acknowledgedSequence).toBe(1);
+    exec.mockRestore();
+  });
   it("journals only explicitly enabled, non-lead sessions and retains full metadata", () => {
     const { journal, directory } = fixture();
     expect(journal.has("worker")).toBe(false);
