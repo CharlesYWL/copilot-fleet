@@ -297,25 +297,25 @@ describe("local agent messages", () => {
     );
   });
 
-  it("lets a question reach a closed task but holds guidance for a person", () => {
+  it("lets questions and guidance reach closed and awaiting-review tasks", () => {
     const w = world();
     const closed = w.ownedTask("completed");
     const review = w.ownedTask("awaiting_human");
-    expect(codeOf(() => w.ask(closed.id, { intent: "guidance" }))).toBe(
-      "reopen_required",
-    );
-    expect(codeOf(() => w.ask(review.id, { intent: "guidance" }))).toBe(
-      "human_review_required",
-    );
     const asked = w.ask(closed.id);
     expect(asked.status).toBe(202);
     const [delivery] = w.deliveries();
     expect(delivery?.prompt).toContain('intent="question"');
-    expect(w.store.getRun(closed.id)!.state).toBe("completed");
+    expect(delivery?.prompt).toContain("fleet_reopen_task");
     expect(parseFleetControl(delivery!.prompt)).toEqual({
       title: "Local agent question",
       detail: `Unlabelled client · ${closed.name}`,
     });
+    // Guidance is no longer refused on closed or awaiting-review tasks; the
+    // Host leaves the state alone and the lead decides whether to reopen.
+    expect(w.ask(review.id, { intent: "guidance" }).status).toBe(202);
+    expect(w.ask(closed.id, { intent: "guidance" }).status).toBe(202);
+    expect(w.store.getRun(review.id)!.state).toBe("awaiting_human");
+    expect(w.store.getRun(closed.id)!.state).toBe("completed");
   });
 
   it("holds a question until the task's own brief has reached the orchestrator", async () => {

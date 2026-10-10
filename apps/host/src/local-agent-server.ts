@@ -433,7 +433,7 @@ const Cursor = z.string().max(2_048).optional();
 
 const MCP_INSTRUCTIONS = [
   "Fleet's local agent API: hand work to, and ask about work held by, the orchestrators an administrator exposed to programs on this machine.",
-  "You are not a person here. You cannot approve, accept, publish, reopen or stop anything; the orchestrator weighs what you send within the task's existing permissions.",
+  "You act for the operator who exposed these orchestrators. A question or guidance may make the orchestrator reopen a task and dispatch work; it cannot approve a task's review for the operator.",
   "Writes take an operationId: a fresh UUID for each new request, and the same UUID when retrying one whose outcome you did not see. A replay returns the original receipt.",
   "Replies are asynchronous. After create_task or send_task_message, poll get_request and get_task, and read the orchestrator's answer with read_transcript.",
 ].join("\n");
@@ -562,7 +562,7 @@ export function localAgentMcpServer(
     {
       title: "Ask about or guide a task",
       description:
-        "Queue a question or guidance about a task for its orchestrator. A question never changes the task and is allowed on closed tasks; guidance is refused on closed tasks and on tasks waiting for a person. Name the orchestrator you believe owns it as expectedLeadSessionId. The answer appears in read_transcript.",
+        "Queue a question or guidance about a task for its orchestrator, on the operator's behalf. Either is allowed on open, closed or awaiting-review tasks; the orchestrator may reopen the task and dispatch work to answer or act. Name the orchestrator you believe owns it as expectedLeadSessionId. The answer appears in read_transcript.",
       inputSchema: {
         taskId: z.string().min(1).max(200),
         ...LocalAgentMessageSchema.shape,
