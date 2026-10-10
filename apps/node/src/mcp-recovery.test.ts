@@ -37,6 +37,7 @@ function agent() {
     denyPendingPermissions: vi.fn(),
     setConfigOption: vi.fn(async () => {}),
     busy: false,
+    holdsBackgroundWork: false,
     resync: vi.fn(),
   };
 }
@@ -332,6 +333,36 @@ describe("bounded MCP session recovery", () => {
         }),
       }),
     ]);
+  });
+
+  it("does not restart a session over background work its finished turn left running", async () => {
+    const { router, start, agents, events, sinks } = await setup();
+    const idle = (eventId: string, sequence: number) =>
+      sinks[0]!({
+        eventId,
+        sessionId: "lead",
+        sequence,
+        type: "state",
+        payload: { state: "idle", activity: "Ready" },
+        createdAt: new Date().toISOString(),
+      });
+    agents[0]!.holdsBackgroundWork = true;
+    await router.refreshMcpSessions();
+    idle("released-turn", 13);
+    await flush();
+    expect(events.at(-1)?.payload.state).toBe("idle");
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(agents[0]!.stop).not.toHaveBeenCalled();
+
+    // The background work ends, and the deferred restoration goes ahead.
+    agents[0]!.holdsBackgroundWork = false;
+    idle("work-finished", 14);
+    expect(events.at(-1)?.payload).toMatchObject({
+      state: "running",
+      activity: "Restoring MCP tools",
+    });
+    await flush();
+    expect(start).toHaveBeenCalledTimes(2);
   });
 
   it("keeps subsequent live events ahead of recovery notices and ignores retired sinks", async () => {

@@ -568,6 +568,39 @@ starting and ending, which is the one silence that means the opposite of
 finished. Cancel settles such a Turn directly, because there is no prompt
 response to carry a stop reason back.
 
+### Turns Copilot keeps open for background work
+
+The reverse also happens. Copilot CLI holds `session/prompt` unanswered for as
+long as a shell the agent started with `mode: "async"` is still attached: the
+reply is written, the agent loop has stopped, yet the stop reason waits on the
+shell. When the shell ends, Copilot wakes inside that same request, reads the
+output, replies again, and only then answers. One worker that started a full
+end-to-end suite this way read as `running` — "nothing for 30m" — for hours
+after its last word; follow-ups queued behind it, and Cancel was the only way
+through. ACP carries nothing during the wait.
+
+Copilot's own session log does. Every model turn ends with
+`assistant.turn_end`, and once the whole loop is done Copilot writes a
+`session.usage_checkpoint` — the line the Node already tails every two seconds
+for AI credits. The Node therefore calls a Turn over without its answer when
+three things agree: the Turn has produced output, the log then shows the loop
+at rest (a checkpoint straight after a turn ended, with no prompt, model turn,
+tool start or background notification since), and that rest outlasts
+`HELD_PROMPT_GRACE_MS` with the prompt still open. The rest must first be seen
+after the Turn's output, so the rest a resumed conversation's log already ends
+on — which can stand for over a minute before Copilot records the new prompt —
+never counts.
+
+The released Turn reports `turn_complete` and `idle` ("background work still
+running"), and the request it was waiting on stays pending. Whatever Copilot
+does when the shell wakes it is reported as a Turn of its own, as above, and
+the eventual answer settles the Session `idle` without a second
+`turn_complete`. A follow-up goes straight through: Copilot answers the held
+request `cancelled`, which the Node discards, and runs the new prompt. Until the
+held request is answered the agent reports `holdsBackgroundWork`, so MCP
+restoration and context changes, which replace the Copilot process and would
+kill the shell, wait for it rather than for the Turn.
+
 ## Protocols
 
 ### Browser to Host

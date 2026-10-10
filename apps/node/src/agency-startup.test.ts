@@ -12,6 +12,8 @@ import {
   ACP_START_TIMEOUT_MS,
   AcpAgentFactory,
   AgentStartupCleanupError,
+  HELD_PROMPT_ACTIVITY,
+  HELD_PROMPT_GRACE_MS,
   type SessionAgent,
 } from "./agents.js";
 import type * as copilotLaunch from "./copilot-launch.js";
@@ -27,6 +29,7 @@ const credits = vi.hoisted(() => ({
   bySession: new Map<string, number>(),
   readers: [] as string[],
   pending: undefined as Promise<number | undefined> | undefined,
+  loop: { idle: false, generation: 0 },
 }));
 vi.mock("./session-credits.js", () => ({
   SessionCreditReader: class {
@@ -35,6 +38,9 @@ vi.mock("./session-credits.js", () => ({
     }
     async read() {
       return credits.pending ?? credits.bySession.get(this.sessionId) ?? credits.value;
+    }
+    get loop() {
+      return credits.loop;
     }
   },
 }));
@@ -87,6 +93,9 @@ let oversizedLoad = false;
 let missingHermesLoad = false;
 let oversizedPrompts = 0;
 let createdSessions = 0;
+/** Copilot answers prompts only when told to, as it does while a background shell runs. */
+let holdPrompts = false;
+const heldPrompts: Array<(stopReason: string) => void> = [];
 const platform = process.platform;
 
 beforeEach(() => {
@@ -105,6 +114,9 @@ beforeEach(() => {
   credits.bySession.clear();
   credits.readers.length = 0;
   credits.pending = undefined;
+  credits.loop = { idle: false, generation: 0 };
+  holdPrompts = false;
+  heldPrompts.length = 0;
   loadUsage = undefined;
   advertiseContext = false;
   contextResponse =
@@ -341,6 +353,22 @@ beforeEach(() => {
                 },
               })}\n`,
             );
+          }
+          if (request.method === "session/prompt" && !isContext) {
+            // A newer prompt makes Copilot answer the one it was holding.
+            for (const answer of heldPrompts.splice(0)) answer("cancelled");
+            if (holdPrompts) {
+              notify({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Started the suite in the background." },
+              });
+              heldPrompts.push((stopReason) =>
+                child.stdout.write(
+                  `${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { stopReason } })}\n`,
+                ),
+              );
+              return;
+            }
           }
           child.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...reply })}\n`);
         });
@@ -2147,6 +2175,181 @@ describe("Agency ACP startup", () => {
     expect(processes[0]?.child.kill).toHaveBeenCalled();
     expect(launches()).toHaveLength(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("Prompts Copilot holds open for background work", () => {
+  const POLL_MS = 2_000;
+  const stateOf = (event: SessionEvent | undefined) =>
+    event?.type === "state" ? event.payload : undefined;
+  const lastState = (events: SessionEvent[]) =>
+    stateOf(events.filter((event) => event.type === "state").at(-1));
+  const turnsCompleted = (events: SessionEvent[]) =>
+    events
+      .filter((event) => event.type === "turn_complete")
+      .map((event) => event.payload);
+
+  async function heldTurn() {
+    vi.useFakeTimers();
+    holdPrompts = true;
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      (event) => events.push(event),
+    );
+    agents.push(agent);
+    let answered = false;
+    const prompted = agent.prompt("Start the DAILY suite in the background").then(() => {
+      answered = true;
+    });
+    // Tests that never see it answered leave it to be rejected by the teardown.
+    prompted.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events.some((event) => event.type === "agent_text")).toBe(true);
+    // Copilot's log: the reply's turn ended and the loop's checkpoint followed.
+    credits.loop = { idle: true, generation: 1 };
+    return { agent, events, prompted, isAnswered: () => answered };
+  }
+
+  it("reports the turn finished once Copilot's loop has rested past the grace", async () => {
+    const { agent, events, prompted, isAnswered } = await heldTurn();
+    // First sight of the rest, then polls up to just short of the grace.
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    await vi.advanceTimersByTimeAsync(HELD_PROMPT_GRACE_MS - POLL_MS);
+    expect(turnsCompleted(events)).toEqual([]);
+    expect(agent.busy).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(2 * POLL_MS);
+    expect(turnsCompleted(events)).toEqual([{ stopReason: "end_turn" }]);
+    expect(stateOf(events.at(-1))).toEqual({
+      state: "idle",
+      activity: HELD_PROMPT_ACTIVITY,
+    });
+    expect(agent.busy).toBe(false);
+    expect(agent.holdsBackgroundWork).toBe(true);
+    expect(isAnswered()).toBe(false);
+
+    // The shell finishes and Copilot finally answers the request it held.
+    heldPrompts.shift()?.("end_turn");
+    await prompted;
+    expect(turnsCompleted(events)).toHaveLength(1);
+    expect(stateOf(events.at(-1))).toEqual({
+      state: "idle",
+      activity: "Ready for follow-up",
+    });
+    expect(agent.holdsBackgroundWork).toBe(false);
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  });
+
+  it("lets a follow-up through, without reporting the held turn as cancelled", async () => {
+    const { agent, events, prompted } = await heldTurn();
+    await vi.advanceTimersByTimeAsync(HELD_PROMPT_GRACE_MS + 2 * POLL_MS);
+    expect(agent.holdsBackgroundWork).toBe(true);
+    const before = events.length;
+
+    holdPrompts = false;
+    credits.loop = { idle: false, generation: 2 };
+    await agent.prompt("What about e2e?");
+    await prompted;
+
+    const after = events.slice(before);
+    expect(turnsCompleted(after)).toEqual([{ stopReason: "end_turn" }]);
+    expect(after.map(stateOf).filter(Boolean)).toEqual([
+      { state: "running", activity: "Copilot is working" },
+      { state: "idle", activity: "Ready for follow-up" },
+    ]);
+    expect(after.some((event) => event.type === "error")).toBe(false);
+    expect(agent.busy).toBe(false);
+    expect(agent.holdsBackgroundWork).toBe(false);
+  });
+
+  it("reports work Copilot resumes inside the held request as its own turn", async () => {
+    const { agent, events, prompted } = await heldTurn();
+    await vi.advanceTimersByTimeAsync(HELD_PROMPT_GRACE_MS + 2 * POLL_MS);
+    expect(agent.busy).toBe(false);
+
+    // The shell completes and wakes the agent, still under the held request.
+    const stdout = launches()[0]!.child.stdout as PassThrough;
+    stdout.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "acp-created",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "The suite finished: 20 passed." },
+          },
+        },
+      })}\n`,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastState(events)).toEqual({
+      state: "running",
+      activity: "Copilot picked up work on its own",
+    });
+    expect(events.at(-1)?.payload).toEqual({ text: "The suite finished: 20 passed." });
+    expect(agent.busy).toBe(true);
+
+    heldPrompts.shift()?.("end_turn");
+    await prompted;
+    expect(lastState(events)).toEqual({
+      state: "idle",
+      activity: "Ready for follow-up",
+    });
+    expect(agent.busy).toBe(false);
+    expect(turnsCompleted(events)).toHaveLength(1);
+  });
+
+  it("ignores rest Copilot's log showed before this turn said anything", async () => {
+    vi.useFakeTimers();
+    holdPrompts = true;
+    // The log already ends at rest: the previous turn's checkpoint.
+    credits.loop = { idle: true, generation: 7 };
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      (event) => events.push(event),
+    );
+    agents.push(agent);
+    agent.prompt("Keep going").catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(HELD_PROMPT_GRACE_MS * 4);
+    expect(turnsCompleted(events)).toEqual([]);
+    expect(agent.busy).toBe(true);
+
+    // Only rest the log reaches after this turn's output counts.
+    credits.loop = { idle: true, generation: 8 };
+    await vi.advanceTimersByTimeAsync(HELD_PROMPT_GRACE_MS + 2 * POLL_MS);
+    expect(turnsCompleted(events)).toEqual([{ stopReason: "end_turn" }]);
+  });
+
+  it("keeps a turn whose loop starts again inside the grace", async () => {
+    const { agent, events } = await heldTurn();
+    await vi.advanceTimersByTimeAsync(HELD_PROMPT_GRACE_MS - POLL_MS);
+    credits.loop = { idle: false, generation: 2 };
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    credits.loop = { idle: true, generation: 3 };
+    await vi.advanceTimersByTimeAsync(HELD_PROMPT_GRACE_MS - POLL_MS);
+    expect(turnsCompleted(events)).toEqual([]);
+    expect(agent.busy).toBe(true);
+  });
+
+  it("leaves an ordinary answered turn to Copilot's own stop reason", async () => {
+    vi.useFakeTimers();
+    credits.loop = { idle: true, generation: 1 };
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      (event) => events.push(event),
+    );
+    agents.push(agent);
+    await agent.prompt("Quick question");
+    await vi.advanceTimersByTimeAsync(HELD_PROMPT_GRACE_MS * 2);
+    expect(turnsCompleted(events)).toEqual([{ stopReason: "end_turn" }]);
+    expect(agent.holdsBackgroundWork).toBe(false);
   });
 });
 

@@ -4,9 +4,34 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const CHECKPOINT_TYPE = "session.usage_checkpoint";
+const TURN_END_TYPE = "assistant.turn_end";
+/**
+ * Events that show Copilot's agent loop running: a prompt arriving, a model
+ * call starting or answering, a tool starting, or a background task waking it.
+ * Hooks, compaction and model changes are deliberately absent — they happen
+ * around a finished loop as well as inside a running one.
+ */
+const LOOP_ACTIVITY_TYPES = new Set([
+  "user.message",
+  "assistant.turn_start",
+  "assistant.message",
+  "tool.execution_start",
+  "system.notification",
+  "abort",
+]);
 const CHUNK_BYTES = 64 * 1024;
 const MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024;
 const MAX_TYPE_TOKEN_BYTES = 128;
+
+/**
+ * Where Copilot's own agent loop stands, as its session log records it.
+ *
+ * `idle` means the loop's last model turn ended and Copilot then wrote its
+ * end-of-loop usage checkpoint, with no sign of the loop since. `generation`
+ * changes with every loop event read, so two equal values mean nothing new
+ * happened between the reads that produced them.
+ */
+export type AgentLoopState = { idle: boolean; generation: number };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -22,6 +47,9 @@ function invalidCheckpoint(detail: string): Error {
  * Only newline-terminated checkpoints are consumed. Checkpoints over 4 MiB fail
  * explicitly; unrelated lines can be arbitrarily large without growing the buffer.
  * Invalid checkpoints throw once per consumed line; subsequent reads continue.
+ *
+ * The same pass also follows the agent loop (see `loop`) from each line's
+ * top-level type, which the scan already has in hand, so it costs no parsing.
  */
 export class SessionCreditReader {
   private readonly path: string;
@@ -31,13 +59,15 @@ export class SessionCreditReader {
   private credits: number | undefined;
   private lineLength = 0;
   private oversized = false;
-  private checkpoint = false;
+  private lineType: string | undefined;
   private depth = 0;
   private inString = false;
   private escaped = false;
   private token: string | undefined = "";
   private key: string | undefined;
   private readingValue = false;
+  private loopPhase: "active" | "ended" | "settled" | undefined;
+  private loopGeneration = 0;
 
   constructor(
     agentSessionId: string,
@@ -52,6 +82,11 @@ export class SessionCreditReader {
       throw new Error("Invalid Copilot session id: expected one safe path component");
     }
     this.path = join(copilotHome, "session-state", agentSessionId, "events.jsonl");
+  }
+
+  /** The agent loop as of the last line read. */
+  get loop(): AgentLoopState {
+    return { idle: this.loopPhase === "settled", generation: this.loopGeneration };
   }
 
   async read(): Promise<number | undefined> {
@@ -114,7 +149,7 @@ export class SessionCreditReader {
   // is capped, and quoted/escaped payload text cannot masquerade as an event type.
   private scanType(part: Buffer): void {
     for (const byte of part) {
-      if (this.checkpoint) return;
+      if (this.lineType !== undefined) return;
       if (this.inString) {
         if (!this.escaped && byte === 34) {
           this.inString = false;
@@ -128,7 +163,7 @@ export class SessionCreditReader {
               }
             }
             if (this.readingValue) {
-              this.checkpoint = this.key === "type" && token === CHECKPOINT_TYPE;
+              if (this.key === "type" && typeof token === "string") this.lineType = token;
             } else {
               this.key = typeof token === "string" ? token : undefined;
             }
@@ -160,7 +195,8 @@ export class SessionCreditReader {
   }
 
   private finishLine(): void {
-    const checkpoint = this.checkpoint;
+    const type = this.lineType;
+    const checkpoint = type === CHECKPOINT_TYPE;
     const oversized = this.oversized;
     const line =
       checkpoint && !oversized
@@ -168,6 +204,7 @@ export class SessionCreditReader {
         : undefined;
     // Consume a malformed line before throwing so subsequent polls can recover.
     this.resetLine();
+    if (type !== undefined) this.followLoop(type);
     if (!checkpoint) return;
     if (oversized) {
       throw invalidCheckpoint(`exceeds ${MAX_CHECKPOINT_BYTES} bytes`);
@@ -190,10 +227,29 @@ export class SessionCreditReader {
     this.credits = nanoAiu / 1e9;
   }
 
+  /**
+   * Copilot ends every model turn with `assistant.turn_end` and writes a usage
+   * checkpoint once the whole loop is done, so a checkpoint straight after a
+   * turn ended — with nothing that starts the loop again since — is the loop
+   * at rest. A checkpoint anywhere else (compaction, mid-tool) proves nothing.
+   */
+  private followLoop(type: string): void {
+    if (type === CHECKPOINT_TYPE) {
+      if (this.loopPhase === "ended") this.loopPhase = "settled";
+    } else if (type === TURN_END_TYPE) {
+      this.loopPhase = "ended";
+    } else if (LOOP_ACTIVITY_TYPES.has(type)) {
+      this.loopPhase = "active";
+    } else {
+      return;
+    }
+    this.loopGeneration += 1;
+  }
+
   private resetLine(): void {
     this.lineLength = 0;
     this.oversized = false;
-    this.checkpoint = false;
+    this.lineType = undefined;
     this.depth = 0;
     this.inString = false;
     this.escaped = false;
@@ -206,6 +262,8 @@ export class SessionCreditReader {
     this.identity = undefined;
     this.offset = 0;
     this.credits = undefined;
+    this.loopPhase = undefined;
+    this.loopGeneration += 1;
     this.resetLine();
   }
 }

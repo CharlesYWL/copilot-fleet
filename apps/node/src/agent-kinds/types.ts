@@ -6,6 +6,7 @@ import type {
   PromptAttachment,
   SessionUsage,
 } from "@fleet/protocol";
+import type { AgentLoopState } from "../session-credits.js";
 
 export type AgentLaunch = {
   command: string;
@@ -42,6 +43,8 @@ export type UsageContext = {
   aborted: () => boolean;
   assertActive: () => void;
   prompt: (text: string, signal: AbortSignal) => Promise<void>;
+  /** Where the agent's own loop stands, each time its session log is read. */
+  agentLoop?: (state: AgentLoopState) => void;
 };
 
 export interface UsageReporter {

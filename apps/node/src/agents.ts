@@ -37,6 +37,7 @@ import type {
   AgentSessionHandle,
   UsageReporter,
 } from "./agent-kinds/types.js";
+import type { AgentLoopState } from "./session-credits.js";
 export {
   MIN_COPILOT_ACP_AUTH_VERSION,
   configRecoveryRequest,
@@ -156,6 +157,23 @@ export const UNPROMPTED_QUIET_MS = 45_000;
  * benefit of the doubt is bounded rather than open.
  */
 export const UNPROMPTED_TOOL_GRACE_MS = 10 * 60_000;
+
+/**
+ * How long a prompt may go unanswered after Copilot's own log shows its turn
+ * done before the fleet calls the turn over anyway.
+ *
+ * Copilot CLI keeps `session/prompt` open for as long as a shell the agent
+ * started in the background is still attached: the reply is written, the loop
+ * has stopped and the usage checkpoint is down, yet the stop reason waits on
+ * the shell — an end-to-end suite kept one open for hours. Without this the
+ * session reads as running throughout, every follow-up queues behind it, and
+ * Cancel is the only way through. The wait clears the second or so Copilot
+ * takes to answer an ordinary turn after its checkpoint, with room for hooks.
+ */
+export const HELD_PROMPT_GRACE_MS = 15_000;
+
+/** What an idle session says while Copilot still holds a turn open for background work. */
+export const HELD_PROMPT_ACTIVITY = "Ready for follow-up · background work still running";
 export interface SessionAgent {
   prompt(
     text: string,
@@ -170,6 +188,12 @@ export interface SessionAgent {
   setConfigOption(configId: string, value: string): Promise<void>;
   /** True while a turn is in flight, so a second prompt cannot be accepted. */
   readonly busy: boolean;
+  /**
+   * True while the agent's process still owns work its finished turn started —
+   * a background shell it is waiting on. The session takes prompts, but its
+   * process must not be replaced, which would kill that work.
+   */
+  readonly holdsBackgroundWork?: boolean;
   /**
    * Re-announces the state this agent is actually in.
    *
@@ -476,6 +500,16 @@ type PendingPermission = {
   timer: NodeJS.Timeout;
 };
 
+/** One `session/prompt` this node sent, from sending until Copilot answers it. */
+type PromptTurn = {
+  /** When the agent last said or did something for it; 0 until it has. */
+  outputAt: number;
+  /** Copilot has answered, so nothing may call the turn over on its behalf. */
+  answered: boolean;
+  /** Reported finished while Copilot still held the request open. */
+  released: boolean;
+};
+
 class AcpAgent extends SequencedAgent implements SessionAgent {
   private readonly pending = new Map<string, PendingPermission>();
   private agentSessionId: string | undefined;
@@ -484,6 +518,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private cwd = "";
   private stderrTail = "";
   private prompting = false;
+  /** The latest prompt, until Copilot answers it or a newer one replaces it. */
+  private turn: PromptTurn | undefined;
+  /** The agent loop's current rest, first seen at `since`; unset while it runs. */
+  private loopRest: { generation: number; since: number } | undefined;
   private stopping = false;
   private startupAborted = false;
   private abortStartupWait: (() => void) | undefined;
@@ -517,7 +555,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       // A process that has already ended has emitted the state that settles it,
       // and a queued timer must not walk that backwards.
       if (this.stopping || this.hasTerminated) return;
-      this.emit("state", { state: "idle", activity: "Ready for follow-up" });
+      this.emit("state", { state: "idle", activity: this.idleActivity });
     },
   );
 
@@ -573,6 +611,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           { cancellationSignal: signal },
         );
       },
+      agentLoop: (state) => this.observeAgentLoop(state),
     });
   }
 
@@ -696,6 +735,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           return;
         }
         if (this.replaying) return;
+        if (this.turn && !this.turn.released) this.turn.outputAt = Date.now();
         this.watchUnpromptedWork(params.update);
         this.forwardUpdate(params.update);
       });
@@ -889,6 +929,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     }
     if (this.prompting) throw new Error("A prompt is already active");
     this.prompting = true;
+    // A turn already reported finished may still be open on Copilot's side;
+    // this prompt replaces it, and Copilot answers that one as cancelled.
+    const turn: PromptTurn = { outputAt: 0, answered: false, released: false };
+    this.turn = turn;
     this.usageReporter.beforePrompt?.(text, attachments.length > 0);
     // The prompt owns the session's state from here, so whatever was inferred
     // from a turn Copilot started for itself stands down without a word.
@@ -914,11 +958,21 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           ),
         },
       );
+      turn.answered = true;
+      if (turn.released) {
+        this.endHeldTurn(turn);
+        return;
+      }
       await this.usageReporter.afterPrompt?.();
       this.emit("turn_complete", { stopReason: response.stopReason });
       this.prompting = false;
       this.emit("state", { state: "idle", activity: "Ready for follow-up" });
     } catch (error) {
+      turn.answered = true;
+      if (turn.released) {
+        this.endHeldTurn(turn, error);
+        return;
+      }
       let failure = error;
       const rollover = this.kind.rollover;
       if (rollover?.matches(error) && options.allowContextRollover !== false) {
@@ -942,9 +996,88 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       await this.stop();
       throw failure;
     } finally {
-      this.usageReporter.finishPrompt?.();
-      this.prompting = false;
+      if (this.turn === turn) this.turn = undefined;
+      // A released turn handed the session on already; a newer prompt may own it.
+      if (!turn.released) {
+        this.usageReporter.finishPrompt?.();
+        this.prompting = false;
+      }
     }
+  }
+
+  /**
+   * Weighs, on each read of Copilot's session log, whether the prompt in flight
+   * is only being held open for background work.
+   *
+   * Three things must agree before a turn is called over without its answer:
+   * the turn has produced something, Copilot's log then showed its loop at rest
+   * — first seen after that output, so a rest left over from an earlier turn
+   * cannot count — and the rest has outlasted the grace with the prompt still
+   * open. A turn that is genuinely still working breaks the rest in the log
+   * (a model call or tool starting) long before the grace runs out.
+   */
+  private observeAgentLoop(state: AgentLoopState): void {
+    if (!state.idle) {
+      this.loopRest = undefined;
+      return;
+    }
+    const now = Date.now();
+    if (this.loopRest?.generation !== state.generation) {
+      this.loopRest = { generation: state.generation, since: now };
+    }
+    const turn = this.turn;
+    if (
+      !turn ||
+      turn.answered ||
+      turn.released ||
+      !this.prompting ||
+      this.stopping ||
+      this.hasTerminated
+    )
+      return;
+    if (turn.outputAt === 0 || this.loopRest.since <= turn.outputAt) return;
+    if (now - this.loopRest.since < HELD_PROMPT_GRACE_MS) return;
+    this.releaseHeldTurn(turn);
+  }
+
+  /**
+   * Reports a turn finished while Copilot keeps its request open.
+   *
+   * The request stays pending — Copilot answers it when the background work
+   * ends, or as cancelled when a newer prompt replaces it — but it no longer
+   * owns the session: the composer reopens, follow-ups go straight through,
+   * and anything Copilot does when the work wakes it is its own turn.
+   */
+  private releaseHeldTurn(turn: PromptTurn): void {
+    turn.released = true;
+    this.prompting = false;
+    this.usageReporter.finishPrompt?.();
+    this.diagnosticLog(
+      "info",
+      `${this.kind.label} session=${this.fleetSessionId.slice(0, 8)}: turn finished but its prompt is still held open for background work; reporting it finished`,
+    );
+    this.emit("turn_complete", { stopReason: "end_turn" });
+    this.emit("state", { state: "idle", activity: HELD_PROMPT_ACTIVITY });
+  }
+
+  /** Copilot finally answered a turn already reported finished. */
+  private endHeldTurn(turn: PromptTurn, error?: unknown): void {
+    // A newer prompt replaced it and owns the session's state now.
+    if (this.turn !== turn || this.stopping || this.hasTerminated) return;
+    if (error !== undefined) {
+      this.diagnosticLog(
+        "warn",
+        `${this.kind.label} session=${this.fleetSessionId.slice(0, 8)}: a turn already reported finished ended with an error: ${errorMessage(error)}`,
+      );
+    }
+    // The background work is over, and so is anything it woke Copilot up for.
+    this.turn = undefined;
+    this.unprompted.clear();
+    this.emit("state", { state: "idle", activity: "Ready for follow-up" });
+  }
+
+  private get idleActivity(): string {
+    return this.holdsBackgroundWork ? HELD_PROMPT_ACTIVITY : "Ready for follow-up";
   }
 
   private async rollOverConversation(prompt: string): Promise<void> {
@@ -996,6 +1129,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     return this.prompting || this.unprompted.active;
   }
 
+  get holdsBackgroundWork(): boolean {
+    return this.turn?.released === true;
+  }
+
   /**
    * Restates where this agent is, for a Host that had to guess.
    *
@@ -1009,7 +1146,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       "state",
       this.busy
         ? { state: "running", activity: `${this.kind.label} is working` }
-        : { state: "idle", activity: "Ready for follow-up" },
+        : { state: "idle", activity: this.idleActivity },
     );
   }
 
