@@ -343,6 +343,69 @@ describe("OrchestratorEngine", () => {
     },
   );
 
+  it.each([false, true])(
+    "settles a completed review after MCP recovery with engine restart=%s",
+    (restart) => {
+      const { store, service, engine: initialEngine, commands, planned } = setup();
+      let engine = initialEngine;
+      const run = planned([
+        { stepKey: "review", title: "Review", prompt: "review", category: "review-deep" },
+      ]);
+      const unsubscribe = service.onSessionEvent((event) =>
+        engine.handleSessionEvent(event),
+      );
+      engine.tickRun(run.id);
+      const step = store.listRunSteps(run.id)[0]!;
+      let sequence = 0;
+      const emit = (type: SessionEvent["type"], payload: Record<string, unknown>) =>
+        service.handleEvent({
+          eventId: `recovery-${++sequence}`,
+          sessionId: step.sessionId,
+          sequence,
+          type,
+          payload,
+          createdAt: new Date().toISOString(),
+        });
+      try {
+        emit("state", { state: "starting" });
+        emit("state", { state: "running" });
+        emit("agent_text", { text: "Review PASS" });
+        emit("turn_complete", { stopReason: "end_turn" });
+        const completion = store.getSessionTurnCompletion(step.sessionId);
+        const boundary = store.getRunStep(step.id)!.eventSeqFrom;
+        expect(completion).toBeDefined();
+
+        for (const activity of [
+          "Restoring MCP tools",
+          "Restoring MCP tools (attempt 1/4)",
+        ]) {
+          emit("state", { state: "running", activity, historyReplay: true });
+          expect(store.getRunStep(step.id)?.state).toBe("running");
+        }
+        expect(store.getSessionTurnCompletion(step.sessionId)).toEqual(completion);
+        expect(store.getRunStep(step.id)?.eventSeqFrom).toBe(boundary);
+        if (restart) engine = new OrchestratorEngine(service);
+        emit("state", {
+          state: "idle",
+          activity: "MCP tools restored; ready for follow-up",
+          historyReplay: true,
+        });
+        expect(store.getRunStep(step.id)).toMatchObject({
+          state: "succeeded",
+          output: "Review PASS",
+        });
+        expect(store.getRun(run.id)?.settleSeq).toBe(1);
+        engine.tick();
+        expect(store.getRun(run.id)?.settleSeq).toBe(1);
+        expect(commands("start_session")).toHaveLength(1);
+        expect(commands("prompt")).toHaveLength(0);
+      } finally {
+        unsubscribe();
+        store.close();
+      }
+    },
+  );
+
   it("settles an idle autonomous continuation after the stale grace", () => {
     const { store, engine, planned } = setup();
     const run = planned([{ stepKey: "audit", title: "Audit", prompt: "audit it" }]);

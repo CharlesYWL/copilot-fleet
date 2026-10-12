@@ -114,7 +114,10 @@ export class OrchestratorEngine {
       // resumed session reaches `starting`, then `idle`, before its queued
       // follow-up starts; clearing here prevents that idle event from settling
       // the new attempt with the previous turn's receipt.
-      if (state === "starting" || state === "running") {
+      if (
+        (state === "starting" || state === "running") &&
+        event.payload.historyReplay !== true
+      ) {
         this.turnComplete.delete(event.sessionId);
       }
       this.reconcileStoppedAttempt(event.sessionId);

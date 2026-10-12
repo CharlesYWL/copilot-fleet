@@ -2517,6 +2517,7 @@ export class FleetService {
         }
         if (
           payload.state === "running" &&
+          event.payload.historyReplay !== true &&
           context.step &&
           event.sequence > context.step.eventSeqFrom
         ) {
@@ -2554,7 +2555,11 @@ export class FleetService {
         ) {
           this.store.consumeSessionTransitionIntent(session.id);
         }
-        this.clearConsumedTurnCompletion(transitioned, intent, context);
+        // MCP recovery reports running/idle without beginning another prompt.
+        // Keep the completed attempt's receipt until normal step settlement.
+        if (event.payload.historyReplay !== true) {
+          this.clearConsumedTurnCompletion(transitioned, intent, context);
+        }
         if (terminalSessionStates.has(payload.state)) {
           this.resolveSessionPermissionRequests(session.id);
         }
