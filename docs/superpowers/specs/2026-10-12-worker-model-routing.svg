@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="2026-10-12-worker-model-routing-title 2026-10-12-worker-model-routing-desc">
+          <title id="2026-10-12-worker-model-routing-title">New-worker routing and same-session recovery</title>
+          <desc id="2026-10-12-worker-model-routing-desc">An operator configures Host-owned routing, new worker briefs are classified by Foundry and stored as pinned model and effort pairs before ACP execution, while resumed workers reuse that record and direct unconfirmed execution is blocked.</desc>
+          <defs>
+            <style>
+              svg {
+                --paper: #fffcf9;
+                --ink: #0e1726;
+                --muted: #575453;
+                --soft: #8c8886;
+                --accent: #348c7e;
+                --link: #0078d4;
+              }
+              text { fill: var(--ink); font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; font-size: 12px; }
+              .mono { font-family: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace; font-size: 8px; }
+              .muted { fill: var(--muted); }
+              .name { font-weight: 600; }
+              .mask { fill: var(--paper); }
+              .box { fill: #ffffff; stroke: var(--ink); stroke-width: 1; }
+              .input { fill: rgba(87, 84, 83, 0.1); stroke: var(--soft); }
+              .focal { fill: rgba(73, 197, 177, 0.18); stroke: var(--accent); stroke-width: 1.2; }
+              .store { fill: rgba(14, 23, 38, 0.05); stroke: var(--muted); }
+              .external { fill: rgba(14, 23, 38, 0.03); stroke: rgba(14, 23, 38, 0.3); }
+              .tag { fill: none; stroke: rgba(14, 23, 38, 0.3); stroke-width: 0.8; }
+              .connector { fill: none; stroke: var(--muted); stroke-width: 1.2; }
+              .provider { stroke: var(--link); }
+              .resume { stroke-dasharray: 4 4; }
+              .blocked { stroke-dasharray: 4 4; }
+              .zone { fill: rgba(14, 23, 38, 0.02); stroke: rgba(14, 23, 38, 0.2); stroke-width: 0.8; stroke-dasharray: 4 4; }
+              .edge-label text { fill: var(--muted); letter-spacing: 0.06em; }
+            </style>
+            <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#575453"/></marker>
+            <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#348c7e"/></marker>
+            <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#0078d4"/></marker>
+          </defs>
+          <rect width="1280" height="720" fill="#fffcf9"/>
+          <text x="40" y="48" class="mono muted" letter-spacing="0.12em">PROPOSED / ROUTE MODE / NEW SESSIONS ONLY</text>
+
+          <rect class="zone" x="296" y="208" width="608" height="400" rx="8"/>
+          <rect class="mask" x="308" y="212" width="112" height="16" rx="4"/>
+          <text class="mono muted" x="320" y="224" letter-spacing="0.12em">HOST CONTROL</text>
+          <rect class="zone" x="936" y="208" width="288" height="256" rx="8"/>
+          <rect class="mask" x="948" y="212" width="168" height="16" rx="4"/>
+          <text class="mono muted" x="960" y="224" letter-spacing="0.12em">NODE / WORKER RUNTIME</text>
+
+          <g data-connectors="routing">
+            <path class="connector" data-edge="policy-to-router" d="M140 176 V224 Q140 232 148 232 H352 Q360 232 360 240 V248" marker-end="url(#arrow)"/>
+            <path class="connector" data-edge="new-brief-to-router" d="M240 304 H320" marker-end="url(#arrow)"/>
+            <path class="connector provider" data-edge="host-to-foundry" d="M436 248 V208 Q436 200 444 200 H708 Q716 200 716 192 V176" marker-end="url(#arrow-link)"/>
+            <path class="connector provider" data-edge="foundry-to-host" d="M772 176 V224 Q772 232 764 232 H516 Q508 232 508 240 V248" marker-end="url(#arrow-link)"/>
+            <path class="connector" data-edge="router-to-record" d="M560 304 H640" marker-end="url(#arrow)"/>
+            <path class="connector" data-edge="record-to-worker" d="M880 304 H960" marker-end="url(#arrow)"/>
+            <path class="connector blocked" data-edge="blocked-unconfirmed-bypass" d="M140 360 V412 Q140 420 148 420 H920"/>
+            <path class="connector resume" data-edge="resume-to-record" d="M240 536 H752 Q760 536 760 528 V428 a8 8 0 0 1 0 -16 V360" marker-end="url(#arrow)"/>
+            <g data-stop-symbol="blocked-bypass" fill="none" stroke="#575453" stroke-width="1.2">
+              <path d="M916 412 L924 428 M924 412 L916 428"/>
+            </g>
+          </g>
+
+          <g class="edge-label">
+            <rect class="mask" data-label-mask="policy" x="216" y="204" width="64" height="20" rx="4"/>
+            <text class="mono" x="248" y="216" text-anchor="middle">POLICY</text>
+          </g>
+          <g class="edge-label">
+            <rect class="mask" data-label-mask="new" x="260" y="276" width="40" height="20" rx="4"/>
+            <text class="mono" x="280" y="288" text-anchor="middle">NEW</text>
+          </g>
+          <g class="edge-label">
+            <rect class="mask" data-label-mask="decide" x="548" y="172" width="72" height="20" rx="4"/>
+            <text class="mono" x="584" y="184" text-anchor="middle">DECIDE</text>
+          </g>
+          <g class="edge-label">
+            <rect class="mask" data-label-mask="answer" x="564" y="204" width="72" height="20" rx="4"/>
+            <text class="mono" x="600" y="216" text-anchor="middle">ANSWER</text>
+          </g>
+          <g class="edge-label">
+            <rect class="mask" data-label-mask="pin" x="580" y="276" width="40" height="20" rx="4"/>
+            <text class="mono" x="600" y="288" text-anchor="middle">PIN</text>
+          </g>
+          <g class="edge-label">
+            <rect class="mask" data-label-mask="apply" x="896" y="276" width="48" height="20" rx="4"/>
+            <text class="mono" x="920" y="288" text-anchor="middle">APPLY</text>
+          </g>
+          <g class="edge-label">
+            <rect class="mask" data-label-mask="blocked" x="432" y="392" width="128" height="20" rx="4"/>
+            <text class="mono" x="496" y="404" text-anchor="middle">NO BYPASS</text>
+          </g>
+          <g class="edge-label">
+            <rect class="mask" data-label-mask="reuse" x="440" y="508" width="152" height="20" rx="4"/>
+            <text class="mono" x="516" y="520" text-anchor="middle">REUSE / NO API</text>
+          </g>
+
+          <g data-node="operator-settings">
+            <rect class="mask" x="40" y="64" width="200" height="112" rx="8"/>
+            <rect class="box input" data-box="operator-settings" x="40" y="64" width="200" height="112" rx="8"/>
+            <rect class="tag" x="52" y="76" width="48" height="12" rx="4"/>
+            <text class="mono muted" x="76" y="84" text-anchor="middle">OWNER</text>
+            <text class="name" x="140" y="108" text-anchor="middle">Operator settings</text>
+            <text x="140" y="132" text-anchor="middle">Endpoint, deployment, key</text>
+            <text class="mono muted" x="140" y="152" text-anchor="middle">Task type x level mappings</text>
+          </g>
+          <g data-node="orchestrator">
+            <rect class="mask" x="40" y="248" width="200" height="112" rx="8"/>
+            <rect class="box input" data-box="orchestrator" x="40" y="248" width="200" height="112" rx="8"/>
+            <rect class="tag" x="52" y="260" width="48" height="12" rx="4"/>
+            <text class="mono muted" x="76" y="268" text-anchor="middle">LEAD</text>
+            <text class="name" x="140" y="292" text-anchor="middle">Orchestrator brief</text>
+            <text x="140" y="316" text-anchor="middle">Deliverable, scope, verification</text>
+            <text class="mono muted" x="140" y="340" text-anchor="middle">fleet_start_work</text>
+          </g>
+          <g data-node="host-routing">
+            <rect class="mask" x="320" y="248" width="240" height="112" rx="8"/>
+            <rect class="box focal" data-box="host-routing" x="320" y="248" width="240" height="112" rx="8"/>
+            <rect class="tag" x="332" y="260" width="64" height="12" rx="4"/>
+            <text class="mono muted" x="364" y="268" text-anchor="middle">HOST-ONLY</text>
+            <text class="name" x="440" y="292" text-anchor="middle">Route the new worker</text>
+            <text x="440" y="316" text-anchor="middle">Bounded state + policy rubric</text>
+            <text class="mono muted" x="440" y="340" text-anchor="middle">Host-held key; one fenced attempt</text>
+          </g>
+          <g data-node="foundry">
+            <rect class="mask" x="640" y="64" width="240" height="112" rx="8"/>
+            <rect class="box external" data-box="foundry" x="640" y="64" width="240" height="112" rx="8"/>
+            <rect class="tag" x="652" y="76" width="64" height="12" rx="4"/>
+            <text class="mono muted" x="684" y="84" text-anchor="middle">EXTERNAL</text>
+            <text class="name" x="760" y="108" text-anchor="middle">Azure AI Foundry decision</text>
+            <text class="mono muted" x="760" y="132" text-anchor="middle">Microsoft-Decision-1</text>
+            <text class="mono muted" x="760" y="152" text-anchor="middle">level + needs_clarification</text>
+          </g>
+          <g data-node="selection-record">
+            <rect class="mask" x="640" y="248" width="240" height="112" rx="8"/>
+            <rect class="box store" data-box="selection-record" x="640" y="248" width="240" height="112" rx="8"/>
+            <rect class="tag" x="652" y="260" width="64" height="12" rx="4"/>
+            <text class="mono muted" x="684" y="268" text-anchor="middle">DURABLE</text>
+            <text class="name" x="760" y="292" text-anchor="middle">Pinned selection + receipt</text>
+            <text x="760" y="316" text-anchor="middle">New: resolve model + effort</text>
+            <text class="mono muted" x="760" y="340" text-anchor="middle">Resume: read effective saved pair</text>
+          </g>
+          <g data-node="acp-worker">
+            <rect class="mask" x="960" y="248" width="240" height="112" rx="8"/>
+            <rect class="box" data-box="acp-worker" x="960" y="248" width="240" height="112" rx="8"/>
+            <rect class="tag" x="972" y="260" width="64" height="12" rx="4"/>
+            <text class="mono muted" x="1004" y="268" text-anchor="middle">ACP GATE</text>
+            <text class="name" x="1080" y="292" text-anchor="middle">Copilot ACP worker</text>
+            <text x="1080" y="316" text-anchor="middle">Confirm pair before first prompt</text>
+            <text class="mono muted" x="1080" y="340" text-anchor="middle">Resume: verify / restore same pair</text>
+          </g>
+          <g data-node="resume-entry">
+            <rect class="mask" x="40" y="480" width="200" height="112" rx="8"/>
+            <rect class="box input" data-box="resume-entry" x="40" y="480" width="200" height="112" rx="8"/>
+            <rect class="tag" x="52" y="492" width="64" height="12" rx="4"/>
+            <text class="mono muted" x="84" y="500" text-anchor="middle">SAME ID</text>
+            <text class="name" x="140" y="524" text-anchor="middle">Resume or recovery</text>
+            <text x="140" y="548" text-anchor="middle">Existing worker session</text>
+            <text class="mono muted" x="140" y="572" text-anchor="middle">No reclassification</text>
+          </g>
+
+          <text class="mono muted" x="320" y="580">Record level, policy revision, source and confirmed values.</text>
+          <text class="mono muted" x="40" y="624">Clarification / provider failure: hold by default. Approved fallback is explicit, not a successful decision.</text>
+          <line x1="40" y1="648" x2="1240" y2="648" stroke="rgba(14,23,38,0.12)" stroke-width="0.8"/>
+          <text class="mono muted" x="40" y="680" letter-spacing="0.12em">LEGEND</text>
+          <line x1="136" y1="676" x2="168" y2="676" stroke="#575453" stroke-width="1.2"/>
+          <text class="mono muted" x="180" y="680">PERMITTED FLOW</text>
+          <line x1="376" y1="676" x2="408" y2="676" stroke="#0078d4" stroke-width="1.2"/>
+          <text class="mono muted" x="420" y="680">HOST PROVIDER API</text>
+          <line x1="656" y1="676" x2="688" y2="676" stroke="#575453" stroke-width="1.2" stroke-dasharray="4 4"/>
+          <text class="mono muted" x="700" y="680">SAVED-STATE REUSE</text>
+          <path d="M956 672 L964 680 M964 672 L956 680" fill="none" stroke="#575453" stroke-width="1.2"/>
+          <text class="mono muted" x="976" y="680">BLOCKED BYPASS</text>
+        </svg>
