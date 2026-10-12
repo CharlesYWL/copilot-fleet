@@ -243,6 +243,66 @@ function world({ maxSessions = 2 }: { maxSessions?: number } = {}) {
 }
 
 describe("queued follow-up admission", () => {
+  it("automatically resumes the queued writer once a reviewer finishes MCP recovery", () => {
+    const w = world();
+    const { run, step: writer, workerId } = w.retainedWorker();
+    const review = w.store.upsertRunStep(run.id, {
+      stepKey: "review",
+      title: "Review publication",
+      prompt: "Review the candidate",
+      category: "review-deep",
+    });
+    w.store.setRunState(run.id, "running");
+    w.engine.tickRun(run.id);
+    const reviewerId = w.store.getRunStep(review.id)!.sessionId;
+    w.emit(reviewerId, "agent_session", { agentSessionId: "copilot-reviewer-1" });
+    w.emit(reviewerId, "state", { state: "starting" });
+    w.emit(reviewerId, "state", { state: "running" });
+    w.emit(reviewerId, "agent_text", { text: "Exact-candidate review PASS" });
+    w.emit(reviewerId, "turn_complete", { stopReason: "end_turn" });
+
+    expect(w.followUp(workerId)).toContain("checkout_busy");
+    expect(w.commands("resume_session")).toHaveLength(0);
+    for (const activity of ["Restoring MCP tools", "Restoring MCP tools (attempt 1/4)"]) {
+      w.emit(reviewerId, "state", { state: "running", activity, historyReplay: true });
+      expect(w.store.getSession(reviewerId)?.stopRequested).toBe(false);
+      expect(w.commands("resume_session")).toHaveLength(0);
+    }
+    w.emit(reviewerId, "state", {
+      state: "idle",
+      activity: "MCP tools restored; ready for follow-up",
+      historyReplay: true,
+    });
+    w.engine.tick();
+    expect(w.store.getRunStep(review.id)).toMatchObject({
+      state: "succeeded",
+      output: "Exact-candidate review PASS",
+    });
+    expect(w.store.getSession(reviewerId)?.stopRequested).toBe(true);
+    // Checkout handoff still waits for the Node to confirm the reviewer stopped.
+    expect(w.commands("resume_session")).toHaveLength(0);
+    w.emit(reviewerId, "state", { state: "stopped", activity: "Process stopped" });
+    w.engine.tick();
+    expect(w.commands("resume_session")).toEqual([
+      expect.objectContaining({
+        sessionId: workerId,
+        agentSessionId: "copilot-worker-1",
+      }),
+    ]);
+    w.emit(workerId, "state", { state: "starting" });
+    w.emit(workerId, "state", {
+      state: "idle",
+      activity: "Resumed; ready for follow-up",
+    });
+    w.engine.tick();
+    w.engine.tick();
+    expect(w.commands("resume_session")).toHaveLength(1);
+    expect(w.commands("prompt")).toEqual([
+      expect.objectContaining({ sessionId: workerId, prompt: QUEUED }),
+    ]);
+    expect(w.store.getRunStep(writer.id)?.sessionId).toBe(workerId);
+  });
+
   it("names the same-checkout writer that holds a retained worker back, and never offers to override it", () => {
     const w = world({ maxSessions: 10 });
     const { run, step, workerId } = w.retainedWorker();
