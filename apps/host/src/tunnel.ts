@@ -78,14 +78,19 @@ export class BinaryProbe {
 }
 
 async function runVersionProbe(spec: ProviderSpec): Promise<boolean> {
+  let child: ChildProcess | undefined;
   try {
-    await run(spec.binary, spec.versionArgs, {
+    const probe = run(spec.binary, spec.versionArgs, {
       windowsHide: true,
       timeout: 5_000,
     });
+    child = probe.child;
+    await probe;
     return true;
   } catch {
-    return false;
+    // Dev Tunnels also contacts its service for --version. A failed or timed-out
+    // service check does not make a CLI that successfully spawned disappear.
+    return child?.pid !== undefined;
   }
 }
 
@@ -352,7 +357,7 @@ export class TunnelManager {
     if (generation !== this.generation) return;
     if (!present) {
       this.status = "error";
-      this.error = `${spec.binary} is not installed or not on PATH`;
+      this.error = `${spec.binary} is not installed, not on PATH, or could not be started`;
       this.wantEnabled = false;
       // The operator's likely next move is to install it, so do not let a
       // remembered "missing" answer make the retry fail without looking.
@@ -372,16 +377,19 @@ export class TunnelManager {
     let reusedId: string | undefined;
     if (spec.prepare && spec.newTunnelId && this.persistedTunnelId) {
       reusedId = this.persistedTunnelId.get(this.provider) ?? spec.newTunnelId();
+      // Setup may create the tunnel before port registration fails. Retrying
+      // must reuse that name rather than leave a new tunnel behind each time.
+      this.persistedTunnelId.set(this.provider, reusedId);
       try {
         await spec.prepare(this.target, reusedId);
         if (generation !== this.generation) return;
-        this.persistedTunnelId.set(this.provider, reusedId);
       } catch (error) {
         if (generation !== this.generation) return;
         this.status = "error";
-        this.error = error instanceof Error ? error.message : String(error);
-        this.wantEnabled = false;
-        this.onEnabledCleared?.(this.provider);
+        this.error = errorMessage(error);
+        // Service availability and CLI sign-in can recover without the operator
+        // changing the saved switch. Keep the error visible while backing off.
+        this.scheduleRestart();
         throw error;
       }
       // Reported straight away: the connect command depends on it, and for a
@@ -466,7 +474,8 @@ export class TunnelManager {
     this.cancelRestart();
     const delay = restartDelay(this.restartAttempt);
     this.restartAttempt += 1;
-    this.status = "starting";
+    // Backoff is not an in-flight start: keeping the error state lets Settings
+    // offer Retry and lets the operator switch the tunnel off while waiting.
     this.restartTimer = this.setTimer(() => {
       this.restartTimer = undefined;
       if (!this.wantEnabled) return;

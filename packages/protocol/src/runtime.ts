@@ -132,22 +132,16 @@ export function nodeConfigDirectory(env: NodeJS.ProcessEnv = process.env): strin
 }
 
 /**
- * The semver of the package a module belongs to.
- *
- * Read rather than repeated. Both services used to carry their own
- * `const VERSION = "0.1.0"`, which meant a release had to remember five files
- * — three manifests and two constants — and the constants are the two nobody
- * looks at. They disagree silently: the Host reports one number over `/api/health`
- * while `package.json` says another, and nothing fails.
+ * The Fleet release version, declared once in the workspace root manifest.
  *
  * Takes the caller's directory because `import.meta.url` only means anything in
- * the module it is written in; resolving from here would always answer with the
- * protocol package's own version.
+ * the module it is written in. Source and build output use the same workspace
+ * anchor without changing where package-scoped assets and data live.
  */
 export function packageVersion(startDirectory: string, fallback = "0.0.0"): string {
   try {
     const manifest: unknown = JSON.parse(
-      readFileSync(resolve(packageRoot(startDirectory), "package.json"), "utf8"),
+      readFileSync(resolve(repoRoot(startDirectory), "package.json"), "utf8"),
     );
     if (typeof manifest === "object" && manifest !== null && "version" in manifest) {
       const version = (manifest as { version: unknown }).version;

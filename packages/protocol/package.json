@@ -1,6 +1,5 @@
 {
   "name": "@fleet/protocol",
-  "version": "0.8.1",
   "private": true,
   "type": "module",
   "exports": {

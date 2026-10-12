@@ -1,6 +1,5 @@
 {
   "name": "@fleet/host",
-  "version": "0.8.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -14,7 +13,7 @@
     "@azure/msal-node": "^5.6.0",
     "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
-    "@fleet/protocol": "0.8.1",
+    "@fleet/protocol": "*",
     "@fluentui/react-components": "^9.74.4",
     "@fluentui/react-icons": "^2.0.334",
     "@github/copilot-sdk": "^1.0.18",

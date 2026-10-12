@@ -12,7 +12,11 @@ describe("filesystem anchors", () => {
     checkout = mkdtempSync(join(tmpdir(), "fleet-paths-"));
     writeFileSync(
       join(checkout, "package.json"),
-      JSON.stringify({ name: "copilot-fleet", workspaces: ["apps/*"] }),
+      JSON.stringify({
+        name: "copilot-fleet",
+        version: "1.2.3",
+        workspaces: ["apps/*", "packages/*"],
+      }),
     );
     mkdirSync(join(checkout, "apps", "host", "src"), { recursive: true });
     mkdirSync(join(checkout, "apps", "host", "dist", "server"), { recursive: true });
@@ -20,6 +24,14 @@ describe("filesystem anchors", () => {
       join(checkout, "apps", "host", "package.json"),
       JSON.stringify({ name: "@fleet/host" }),
     );
+    for (const [folder, name] of [
+      [join("apps", "node"), "@fleet/node"],
+      [join("packages", "protocol"), "@fleet/protocol"],
+    ] as const) {
+      mkdirSync(join(checkout, folder, "src"), { recursive: true });
+      mkdirSync(join(checkout, folder, "dist"), { recursive: true });
+      writeFileSync(join(checkout, folder, "package.json"), JSON.stringify({ name }));
+    }
   });
 
   afterEach(() => {
@@ -44,28 +56,36 @@ describe("filesystem anchors", () => {
   it("stops at the workspace manifest instead of climbing into a parent project", () => {
     const outer = mkdtempSync(join(tmpdir(), "fleet-outer-"));
     try {
-      writeFileSync(join(outer, "package.json"), JSON.stringify({ name: "unrelated" }));
+      writeFileSync(
+        join(outer, "package.json"),
+        JSON.stringify({ name: "unrelated", version: "9.9.9" }),
+      );
       const nested = join(outer, "copilot-fleet");
       mkdirSync(join(nested, "apps", "host", "src"), { recursive: true });
       writeFileSync(
         join(nested, "package.json"),
-        JSON.stringify({ name: "copilot-fleet", workspaces: ["apps/*"] }),
+        JSON.stringify({
+          name: "copilot-fleet",
+          version: "4.5.6",
+          workspaces: ["apps/*"],
+        }),
       );
       writeFileSync(
         join(nested, "apps", "host", "package.json"),
         JSON.stringify({ name: "@fleet/host" }),
       );
       expect(repoRoot(join(nested, "apps", "host", "src"))).toBe(nested);
+      expect(packageVersion(join(nested, "apps", "host", "src"))).toBe("4.5.6");
     } finally {
       rmSync(outer, { recursive: true, force: true });
     }
   });
 
-  it("reads a version from the package a module belongs to", () => {
+  it("reads the root version even if a workspace still declares an old version", () => {
     const host = join(checkout, "apps", "host");
     writeFileSync(
       join(host, "package.json"),
-      JSON.stringify({ name: "@fleet/host", version: "1.2.3" }),
+      JSON.stringify({ name: "@fleet/host", version: "0.8.1" }),
     );
     // Sources and build output sit at different depths and must still agree,
     // which is the whole reason this walks up rather than counting `../`.
@@ -73,30 +93,62 @@ describe("filesystem anchors", () => {
     expect(packageVersion(join(host, "dist", "server"))).toBe("1.2.3");
   });
 
-  it("answers with the workspace version, not a parent project's", () => {
-    // The checkout manifest has no version; climbing past the package would
-    // report whatever project the checkout happens to sit inside.
-    expect(packageVersion(join(checkout, "apps", "host", "src"))).toBe("0.0.0");
+  it.each([
+    join("apps", "host", "src"),
+    join("apps", "host", "dist", "server"),
+    join("apps", "node", "src"),
+    join("apps", "node", "dist"),
+    join("packages", "protocol", "src"),
+    join("packages", "protocol", "dist"),
+  ])("reports the same root version from %s", (folder) => {
+    expect(packageVersion(join(checkout, folder))).toBe("1.2.3");
   });
+
+  it.each([undefined, "", 123])(
+    "returns unknown when the root version is %s",
+    (version) => {
+      writeFileSync(
+        join(checkout, "package.json"),
+        JSON.stringify({ name: "copilot-fleet", version, workspaces: ["apps/*"] }),
+      );
+      expect(packageVersion(join(checkout, "apps", "host", "src"), "unknown")).toBe(
+        "unknown",
+      );
+    },
+  );
 
   it("still starts when the manifest cannot be read", () => {
     // An unknown version is a packaging problem, not a reason to refuse to run.
+    writeFileSync(join(checkout, "package.json"), "{");
     expect(packageVersion(join(checkout, "nowhere"), "unknown")).toBe("unknown");
   });
 });
 
 describe("declared versions", () => {
-  it("reports the version its own package.json declares", async () => {
-    /*
-     * The Host and the Node each used to carry `const VERSION = "0.1.0"`, so a
-     * release meant editing five files and the two constants were the ones
-     * nobody looked at. They then disagree in silence — `/api/health` says one
-     * number, `package.json` says another, and nothing fails.
-     */
+  it("declares the release version only at the root and reports it in every workspace", () => {
     const here = dirname(fileURLToPath(import.meta.url));
+    const root = repoRoot(here);
     const declared: { version?: string } = JSON.parse(
-      readFileSync(join(packageRoot(here), "package.json"), "utf8"),
+      readFileSync(join(root, "package.json"), "utf8"),
     );
+    expect(declared.version).toMatch(/^\d+\.\d+\.\d+$/);
     expect(packageVersion(here)).toBe(declared.version);
+    for (const folder of [
+      join("apps", "host"),
+      join("apps", "node"),
+      join("packages", "protocol"),
+    ]) {
+      const workspace: {
+        version?: string;
+        private?: boolean;
+        dependencies?: Record<string, string>;
+      } = JSON.parse(readFileSync(join(root, folder, "package.json"), "utf8"));
+      expect(workspace.version).toBeUndefined();
+      expect(workspace.private).toBe(true);
+      expect(packageVersion(join(root, folder, "src"))).toBe(declared.version);
+      if (folder !== join("packages", "protocol")) {
+        expect(workspace.dependencies?.["@fleet/protocol"]).toBe("*");
+      }
+    }
   });
 });

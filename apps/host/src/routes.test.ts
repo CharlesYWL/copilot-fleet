@@ -6,6 +6,7 @@ import {
 } from "@fleet/protocol";
 import { buildServer } from "./server.js";
 import { FleetStore } from "./store.js";
+import { packageVersion } from "./paths.js";
 
 const OPERATOR_PASSWORD = "test-password";
 
@@ -280,7 +281,7 @@ describe("host routes", () => {
   it("reports health and an empty snapshot", async () => {
     const health = await inject({ method: "GET", url: "/api/health" });
     expect(health.statusCode).toBe(200);
-    expect(health.json()).toMatchObject({ ok: true });
+    expect(health.json()).toMatchObject({ ok: true, version: packageVersion() });
 
     const snapshot = await inject({ method: "GET", url: "/api/snapshot" });
     expect(snapshot.json()).toMatchObject({

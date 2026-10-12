@@ -1277,8 +1277,15 @@ Host 只会在重启后核对 Node 上报的提交与预期构建一致时报告
 更新成功。重启后提交缺失或不符会报告失败。未上报预期构建的旧 Node 至少必须返回不同的
 已知提交。
 
-比较的是提交而不是包版本：`0.1.0` 在两次部署之间不会变，用它比较会把每台机器都报成
-最新的，无论它落后多远。
+共享发布版本只在根目录的 `package.json` 中声明；Host、Node 和 protocol 是不单独声明
+版本的私有 workspace。Host 和 Node 上报根目录版本，内部的 `@fleet/protocol: "*"` 依赖
+通过 lockfile 链接到本地 workspace。升级版本只需修改根 manifest 和生成的 lockfile，
+不用同步维护三个包版本。
+
+目前的检出更新器仍比较提交而不是发布版本，因为多个开发提交可能共用一个版本。
+精确发布包以及独立的版本新旧、协议兼容性判断仍属于
+[版本发布设计](docs/superpowers/specs/2026-09-14-versioned-node-releases.md)，
+本次集中版本声明并未实现这些更新行为。
 
 它不会做的事：
 
@@ -1399,8 +1406,13 @@ nssm start copilot-fleet-node
 旁边的 `self-update.log`。两种情况下的进度都记录在同目录的 `self-update.json`，重启后的
 Host 正是靠它得知更新结果。
 
-重启 `npm run dev:tunnel` 会连同隧道一起重启，就像手动停止再启动一样：Dev Tunnel 会保持
-原地址，而快速隧道（Cloudflare、免费 ngrok）会换一个新地址。launcher 本身不会被更新替换；
+在 **Settings → Tunnel** 中启用的隧道会在 Host 更新后自动恢复。如果 Dev Tunnels 服务
+暂时不可用或 CLI 尚未登录，Host 会保留启用状态和隧道 ID，并自动退避重试，最长每分钟一次。
+失败原因会继续显示在设置中；关闭隧道开关会取消重试。CLI 缺失或 Host 访问策略不允许的
+提供方仍会被关闭。
+
+重启 `npm run dev:tunnel` 会连同独立管理的隧道一起重启，就像手动停止再启动一样：
+Dev Tunnel 会保持原地址，而快速隧道（Cloudflare、免费 ngrok）会换一个新地址。launcher 本身不会被更新替换；
 对它的修改在你下次启动命令时生效。
 
 用其他方式启动的 Host —— `npm run host`、`npm run start:host`、任何 `*:bare` 脚本 —— 没有

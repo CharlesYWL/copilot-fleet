@@ -608,7 +608,6 @@ export async function buildServer(
       void tunnel
         .setEnabled(provider, true, provider === store.getTunnelProvider())
         .catch((error) => {
-          store.setTunnelProviderEnabled(provider, false);
           app.log.error({ err: error, provider }, "Failed to restore tunnel");
         });
     }
