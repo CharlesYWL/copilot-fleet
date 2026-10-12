@@ -548,6 +548,11 @@ reason, which keeps it resumable.
 
 ### Local Node session console
 
+See the [feature and implementation guide](docs/node-session-console.md) for
+operator usage, contributor entry points and focused checks, and the
+[sequence diagrams](docs/node-session-streaming.html) for live and reconnect
+message ordering.
+
 The local console is a scoped client on the sealed outbound Node connection,
 not an administrator REST proxy. Host-derived Node identity scopes every
 catalog read, session subscription, action and replay. Browser requests stay

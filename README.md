@@ -104,6 +104,9 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [attachments and images](#attaching-files-and-images),
   [downloading files from a session](#downloading-files-from-a-session), and
   [slash commands and session pickers](#slash-commands-and-session-pickers).
+- **Continue a worker from its VM:** [shared Node chat and offline continuation](#shared-worker-chat-and-offline-continuation),
+  [feature and implementation guide](docs/node-session-console.md), and
+  [live/reconnect sequence diagrams](docs/node-session-streaming.html).
 - **Monitor and organize active work:**
   [rows that fold themselves away](#rows-that-fold-themselves-away),
   [drag ordering and filing](#ordering-and-filing-by-dragging), and
@@ -1608,6 +1611,18 @@ Use the config page to retarget the node when a tunnel
 hands out a new URL — the node reconnects in place, so no restart is needed and
 running sessions survive.
 
+#### Shared worker chat and offline continuation
+
+When visiting a worker VM to inspect UI work, open this Node page's **Sessions**
+tab and continue the same Host-dispatched conversation locally. Host and Node
+share its chat and status while connected; eligible workers can keep chatting
+locally during an outage and synchronize their new history afterward.
+The [feature guide](docs/node-session-console.md) documents usage, offline limits,
+safety invariants, code entry points and focused checks for contributors and
+agents. Its [sequence diagrams](docs/node-session-streaming.html) show durable
+live streaming and reconnect ordering; download/open the HTML in a browser
+(GitHub displays its source).
+
 **Sessions** opens Fleet conversations on this Node using the same chat components
 as Host. Selecting a live conversation attaches a view to its existing worker;
 it never starts a second Copilot process. Lists are paginated, transcript pages
@@ -1650,6 +1665,8 @@ The Node UI is included in `npm run build:node` and the Node development startup
 Self-updates validate its generated asset manifest and revision before clearing
 update quarantine. An older Host or legacy shared-secret enrollment must be
 updated/re-enrolled before session-console synchronization is enabled.
+
+#### Other Node settings and identity
 
 It also edits the node name, session capacity, Copilot executable path, and
 permission timeout. Values are stored in `settings.json` beside the credentials
@@ -2877,6 +2894,8 @@ and `--output` customize the run. This measures event creation to Host
 publication, not model latency or browser painting, and never contacts running
 Fleet installations. Healthy delivery does not wait for per-session ACKs;
 offline recovery still uses the explicit synchronization barrier.
+See the [Node session console guide](docs/node-session-console.md#low-latency-live-delivery)
+for the pipeline, backpressure limits and durability rules behind this benchmark.
 
 ### Local verification and test monitoring
 
