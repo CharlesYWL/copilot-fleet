@@ -104,6 +104,9 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [attachments and images](#attaching-files-and-images),
   [downloading files from a session](#downloading-files-from-a-session), and
   [slash commands and session pickers](#slash-commands-and-session-pickers).
+- **Continue a worker from its VM:** [shared Node chat and offline continuation](#shared-worker-chat-and-offline-continuation),
+  [feature and implementation guide](docs/node-session-console.md), and
+  [live/reconnect sequence diagrams](docs/node-session-streaming.html).
 - **Monitor and organize active work:**
   [rows that fold themselves away](#rows-that-fold-themselves-away),
   [drag ordering and filing](#ordering-and-filing-by-dragging), and
@@ -1608,6 +1611,63 @@ Use the config page to retarget the node when a tunnel
 hands out a new URL — the node reconnects in place, so no restart is needed and
 running sessions survive.
 
+#### Shared worker chat and offline continuation
+
+When visiting a worker VM to inspect UI work, open this Node page's **Sessions**
+tab and continue the same Host-dispatched conversation locally. Host and Node
+share its chat and status while connected; eligible workers can keep chatting
+locally during an outage and synchronize their new history afterward.
+The [feature guide](docs/node-session-console.md) documents usage, offline limits,
+safety invariants, code entry points and focused checks for contributors and
+agents. Its [sequence diagrams](docs/node-session-streaming.html) show durable
+live streaming and reconnect ordering; download/open the HTML in a browser
+(GitHub displays its source).
+
+**Sessions** opens Fleet conversations on this Node using the same chat components
+as Host. Selecting a live conversation attaches a view to its existing worker;
+it never starts a second Copilot process. Lists are paginated, transcript pages
+and live subscriptions load only for the selected chat, and **Local Copilot
+history** does not start discovery until expanded. A native conversation already
+owned by Fleet offers **Open chat** instead of another resume.
+
+On a compatible, mutually authenticated Host/Node connection, existing non-lead
+workers receive a local-continuation grant at startup or their first reconnect
+after upgrade. If Host becomes unreachable, open the Node console and continue
+chatting with those running workers. Their prompts, output and queue operations
+are journaled locally and reconciled to Host before queued Host work resumes.
+The VM still needs access to the model provider; Host-backed tools and offline
+lead prompts are unavailable. A Node restart preserves the journal, not a running
+process: Host can reattach eligible sessions after synchronization without
+re-executing completed or uncertain prompts.
+
+**Permission approvals remain Host-only**, including when the Node is connected.
+The local console shows permission requests and outcomes but cannot approve them
+or enable a more permissive execution mode. A worker requiring new approval during
+an outage waits or follows its existing timeout/cancellation behavior. Local
+access intentionally also permits local programs to use chat: Origin/Fetch
+Metadata checks prevent unwanted browser requests, not impersonation by a
+shell-capable process. These controls are not an OS sandbox.
+
+Local transcripts and attachment payloads are sensitive. They live in the private
+`session-history` subdirectory of the Node's configuration directory, not in
+worktrees or identity exports. Unacknowledged data is not silently evicted.
+Moving the Node requires synchronization with the original Host first; service
+uninstall continues to preserve files. An explicit same-origin
+`POST /api/fleet-sessions/purge` with
+`{"confirmation":"Delete local session history","discardUnsynchronized":false}`
+removes this Host's local journal only when workers are stopped and pending
+history is acknowledged. Setting `discardUnsynchronized` to `true` explicitly
+discards pending evidence; it is not a secure-erasure guarantee. Older history
+from before local journaling is available from Host on demand, not preloaded for
+every session.
+
+The Node UI is included in `npm run build:node` and the Node development startup.
+Self-updates validate its generated asset manifest and revision before clearing
+update quarantine. An older Host or legacy shared-secret enrollment must be
+updated/re-enrolled before session-console synchronization is enabled.
+
+#### Other Node settings and identity
+
 It also edits the node name, session capacity, Copilot executable path, and
 permission timeout. Values are stored in `settings.json` beside the credentials
 and take precedence over the environment variables, so an edit here is not
@@ -2823,6 +2883,19 @@ See [Chat-history benchmarks](docs/chat-history-benchmarks.md) for workload
 sizes, before/after comparisons, and measurement limitations. The
 [chat-history performance plan](docs/chat-history-performance-plan.md) records
 what was implemented, the measured results, and the remaining limits.
+
+`npm run benchmark:session-stream -- --rtt 50 --max-regression-ms 15` compares
+direct event forwarding with durable Node forwarding for 1, 4 and 8 concurrent
+streams at 50 chunks/second each. It uses separate Host/Node processes, real
+WebSockets and SQLite stores, and a simulated round-trip delay. The optional
+budget fails the command if journaled P95 exceeds the direct baseline by more
+than that many milliseconds. `--rtt`, `--sessions`, `--duration` (milliseconds)
+and `--output` customize the run. This measures event creation to Host
+publication, not model latency or browser painting, and never contacts running
+Fleet installations. Healthy delivery does not wait for per-session ACKs;
+offline recovery still uses the explicit synchronization barrier.
+See the [Node session console guide](docs/node-session-console.md#low-latency-live-delivery)
+for the pipeline, backpressure limits and durability rules behind this benchmark.
 
 ### Local verification and test monitoring
 

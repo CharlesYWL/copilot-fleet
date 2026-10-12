@@ -692,6 +692,15 @@ export class CommandExecutionService {
   }
 
   private send(nodeId: string, message: CommandExecutionHostMessage): boolean {
+    if (
+      this.service.console?.blocked(nodeId) &&
+      [
+        "deliver_lead_prompt",
+        "prepare_command_execution",
+        "start_command_execution",
+      ].includes(message.type)
+    )
+      return false;
     if (message.type === "deliver_lead_prompt") {
       if (!this.capable(nodeId, DURABLE_LEAD_DELIVERY_CAPABILITY)) return false;
     } else {
@@ -1202,6 +1211,7 @@ export class CommandExecutionService {
   }
 
   reconnect(nodeId: string): void {
+    if (this.service.console?.blocked(nodeId)) return;
     this.reconcileSessionGrants();
     const executions = this.records
       .list({ limit: 10_000 })
@@ -1279,6 +1289,7 @@ export class CommandExecutionService {
       }
     }
     for (const execution of this.records.unsettled()) {
+      if (this.service.console?.blocked(execution.nodeId)) continue;
       if (execution.state === "preparing") {
         const timing = this.preparationTiming(execution);
         if (!timing.ok) {
@@ -1532,6 +1543,7 @@ export class CommandExecutionService {
       return;
     }
     if (
+      this.service.console?.blocked(lead.nodeId) ||
       !this.durableLead(leadId) ||
       lead.state !== "idle" ||
       this.records.reserved(leadId)

@@ -7,6 +7,8 @@ import {
   HOST_BACKUP_KIND,
   MUTUAL_AUTH_PROTOCOL,
   NODE_BACKUP_KIND,
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENTS_PER_PROMPT,
   NodeBackupSchema,
   CommandPermissionRuleSchema,
   CommandPermissionEntrySchema,
@@ -492,6 +494,8 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
 
   return async (method, url, body) => {
     try {
+      const consoleReply = await options.sessionConsole?.route(method, url, body);
+      if (consoleReply) return consoleReply;
       const sessionReply = await sessionRoute(method, url, body);
       if (sessionReply) return sessionReply;
       // Query strings belong to the page, not to the route key.
@@ -523,13 +527,23 @@ export function startConfigServer(options: ConfigServerOptions): Server {
   const server = createServer((request, response) => {
     const url = request.url ?? "/";
     const pathname = url.split("?")[0] ?? url;
-    const refusal = refuseRequest({
-      method: request.method ?? "GET",
-      host: request.headers.host,
-      origin: request.headers.origin,
-      contentType: request.headers["content-type"],
-      port,
-    });
+    const consoleMutation =
+      pathname.startsWith("/api/fleet-sessions") &&
+      !["GET", "HEAD"].includes(request.method ?? "GET");
+    const refusal =
+      consoleMutation &&
+      (!request.headers.origin || request.headers["sec-fetch-site"] !== "same-origin")
+        ? {
+            status: 403,
+            body: { error: "Session controls require a same-origin browser request" },
+          }
+        : refuseRequest({
+            method: request.method ?? "GET",
+            host: request.headers.host,
+            origin: request.headers.origin,
+            contentType: request.headers["content-type"],
+            port,
+          });
     if (refusal) {
       // Read to completion first: a body left unread makes a browser report the
       // refusal as a network error rather than as the answer it is.
@@ -541,13 +555,42 @@ export function startConfigServer(options: ConfigServerOptions): Server {
       response.end(JSON.stringify(refusal.body));
       return;
     }
+    const stream = /^\/api\/fleet-sessions\/([^/]+)\/(stream|files\/download)$/.exec(
+      pathname,
+    );
+    if (request.method === "GET" && stream?.[1] && options.sessionConsole) {
+      const id = decodeURIComponent(stream[1]);
+      const work =
+        stream[2] === "stream"
+          ? options.sessionConsole.stream(id, response)
+          : options.sessionConsole.download(
+              id,
+              new URL(url, "http://localhost").searchParams.get("path") ?? "",
+              response,
+            );
+      void work.catch((error: unknown) => {
+        if (response.headersSent) {
+          response.destroy();
+          return;
+        }
+        response.writeHead(409, {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+        });
+        response.end(JSON.stringify({ error: errorMessage(error) }));
+      });
+      return;
+    }
     const asset = request.method === "GET" ? configAsset(pathname) : undefined;
     if (asset) {
       response.writeHead(200, {
         "content-type": asset.contentType,
         // The page is same-origin only; no browser should embed or frame it.
         "cache-control": "no-store",
-        "content-security-policy": "frame-ancestors 'none'",
+        "content-security-policy":
+          pathname === "/session-console/index.html"
+            ? "frame-ancestors 'self'"
+            : "frame-ancestors 'none'",
         "x-content-type-options": "nosniff",
       });
       response.end(asset.body);
@@ -556,13 +599,32 @@ export function startConfigServer(options: ConfigServerOptions): Server {
 
     request.setEncoding("utf8");
     let body = "";
+    let bodyBytes = 0;
+    let tooLarge = false;
+    const bodyLimit = /^\/api\/fleet-sessions\/[^/]+\/prompt$/.test(pathname)
+      ? Math.ceil((MAX_ATTACHMENT_BYTES * MAX_ATTACHMENTS_PER_PROMPT * 4) / 3) + 1_000_000
+      : pathname === "/api/sessions/new"
+        ? 1_000_000
+        : 64_000;
     request.on("data", (chunk: string) => {
+      if (tooLarge) return;
+      bodyBytes += Buffer.byteLength(chunk);
+      if (bodyBytes > bodyLimit) {
+        tooLarge = true;
+        body = "";
+        response.writeHead(413, {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+        });
+        response.end(
+          JSON.stringify({ error: "Request exceeds this endpoint's size limit" }),
+        );
+        return;
+      }
       body += chunk;
-      // Nothing legitimate approaches this size; stop reading rather than
-      // buffering whatever a runaway client decides to send.
-      if (body.length > 64_000) request.destroy();
     });
     request.on("end", () => {
+      if (tooLarge) return;
       void route(request.method ?? "GET", url, body).then((reply) => {
         response.writeHead(reply.status, {
           "content-type": "application/json",

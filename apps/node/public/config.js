@@ -10,6 +10,7 @@ import { initCommandPermissions } from "./command-permissions.js";
 import { initFleetWorkspaces } from "./fleet-workspaces.js";
 import { initNodeSettings } from "./node-settings.js";
 import { initSessions } from "./sessions.js";
+import { initFleetSessions } from "./fleet-sessions.js";
 import { initShell } from "./ui.js";
 
 initShell();
@@ -21,3 +22,4 @@ initDiagnostics({
 });
 initFleetWorkspaces();
 initSessions();
+initFleetSessions();

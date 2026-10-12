@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>How Node session streaming works · Copilot Fleet</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #fffcf9;
+      --paper-2: #f3f1ef;
+      --ink: #0e1726;
+      --muted: #575453;
+      --soft: #8c8886;
+      --rule: rgba(14, 23, 38, 0.12);
+      --rule-solid: #bdc5d2;
+      --accent: #348c7e;
+      --accent-tint: rgba(73, 197, 177, 0.18);
+      --link: #0078d4;
+      --font-display: "Segoe UI Variable Display", "Segoe UI Semibold", "Segoe UI", system-ui, sans-serif;
+      --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+      --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--font-sans); }
+    main { max-width: 1376px; margin: 0 auto; padding: 48px 32px 32px; }
+    header { max-width: 1000px; }
+    .eyebrow { margin: 0 0 12px; color: var(--muted); font: 500 12px/1.5 var(--font-mono); letter-spacing: 0.12em; text-transform: uppercase; }
+    h1 { margin: 0 0 16px; font: 600 40px/1.2 var(--font-display); letter-spacing: -0.02em; }
+    .intro { margin: 0; max-width: 880px; font-size: 20px; line-height: 1.6; color: var(--muted); }
+    nav { display: flex; flex-wrap: wrap; gap: 24px; margin: 24px 0 48px; }
+    a { color: var(--link); text-underline-offset: 4px; }
+    a:focus-visible, .figure-scroll:focus-visible { outline: 2px solid var(--link); outline-offset: 4px; }
+    section { scroll-margin-top: 24px; }
+    section + section { margin-top: 64px; padding-top: 40px; border-top: 1px solid var(--rule-solid); }
+    h2 { margin: 0 0 12px; font: 600 28px/1.3 var(--font-display); }
+    .section-intro { margin: 0 0 16px; max-width: 960px; color: var(--muted); font-size: 16px; line-height: 1.6; }
+    figure { margin: 0; }
+    .figure-scroll { overflow-x: auto; }
+    svg { display: block; width: 100%; min-width: 960px; height: auto; }
+    svg text { fill: var(--ink); font-family: var(--font-sans); }
+    .paper { fill: var(--paper); }
+    .actor { fill: #fff; stroke: var(--ink); stroke-width: 1; }
+    .actor-store { fill: var(--paper-2); stroke: var(--muted); stroke-width: 1; }
+    .actor-input { fill: rgba(87, 84, 83, 0.08); stroke: var(--soft); stroke-width: 1; }
+    .actor-focal { fill: var(--accent-tint); stroke: var(--accent); stroke-width: 1.2; }
+    .name { font-size: 16px; font-weight: 600; text-anchor: middle; }
+    .sub { font: 12px var(--font-mono); fill: var(--muted); text-anchor: middle; }
+    .hint { font-size: 12px; fill: var(--muted); }
+    .life { stroke: var(--rule-solid); stroke-width: 1; stroke-dasharray: 4 4; }
+    .msg { fill: none; stroke: var(--muted); stroke-width: 1.2; }
+    .network { stroke: var(--link); }
+    .return { stroke-dasharray: 4 4; }
+    .async { stroke-dasharray: 4 4; }
+    .focal { stroke: var(--accent); }
+    .label rect { fill: var(--paper); }
+    .label text { font: 12px var(--font-mono); text-anchor: middle; letter-spacing: 0.04em; }
+    .label .accent-text { fill: var(--accent); font-weight: 600; }
+    .legend text { font-size: 12px; fill: var(--muted); }
+    .fragment { fill: rgba(14, 23, 38, 0.02); stroke: var(--rule-solid); stroke-width: 1; }
+    .tag { font: 12px var(--font-mono); fill: var(--muted); }
+    figcaption { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 40px; border-top: 1px solid var(--rule); padding: 20px 0; }
+    figcaption p { margin: 0; font-size: 16px; line-height: 1.6; }
+    figcaption p + p { color: var(--muted); }
+    .limits { padding: 20px 24px; margin-top: 24px; border-left: 4px solid var(--rule-solid); background: var(--paper-2); font-size: 16px; line-height: 1.6; }
+    .limits p { margin: 0; }
+    .limits p + p { margin-top: 12px; }
+    code { font: 0.875em var(--font-mono); }
+    footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 12px; line-height: 1.8; }
+    footer p { margin: 0 0 8px; }
+    @media (max-width: 720px) {
+      main { padding: 32px 16px; }
+      h1 { font-size: 32px; }
+      .intro { font-size: 16px; }
+      figcaption { grid-template-columns: 1fr; gap: 16px; }
+    }
+    @media print {
+      main { padding: 0; }
+      nav { display: none; }
+      section { break-inside: avoid; }
+      section + section { break-before: page; margin-top: 0; border: 0; }
+      svg { min-width: 0; }
+      .figure-scroll { overflow: visible; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Copilot Fleet / Node session console</p>
+      <h1>Save first. Stream without waiting.</h1>
+      <p class="intro">One worker conversation, accessible from Host or its Node. Local durability stays in the path; a network round trip no longer blocks every next batch.</p>
+    </header>
+    <nav aria-label="Diagram sections">
+      <a href="#live">Live streaming</a>
+      <a href="#reconnect">Offline and reconnect</a>
+      <a href="node-session-console.md">Feature and implementation guide</a>
+    </nav>
+
+    <section id="live" aria-labelledby="live-heading">
+      <p class="eyebrow">Connected / healthy delivery</p>
+      <h2 id="live-heading">The next batch does not wait for the previous ACK</h2>
+      <p class="section-intro">A representative pair of overlapping batches. Time runs downward; spacing is not a latency measurement. Other workers can use the same bounded window.</p>
+      <figure>
+        <div class="figure-scroll" tabindex="0" role="region" aria-label="Live streaming diagram; scroll horizontally on small screens">
+          <svg id="live-diagram" viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="node-session-streaming-live-title node-session-streaming-live-desc">
+            <title id="node-session-streaming-live-title">Durable, pipelined live session streaming</title>
+            <desc id="node-session-streaming-live-desc">The worker's events commit to the Node journal before transmission, batch B leaves before batch A's acknowledgment arrives, and Host publishes the same history to opened Host and Node chat views.</desc>
+            <defs>
+              <marker id="live-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#575453"/></marker>
+              <marker id="live-arrow-accent" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#348c7e"/></marker>
+              <marker id="live-arrow-link" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#0078d4"/></marker>
+              <marker id="live-arrow-open" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#575453" stroke-width="1.2"/></marker>
+            </defs>
+            <rect class="paper" width="1280" height="720"/>
+            <text x="40" y="28" class="hint">ACK = Host acknowledgment. Arrows show delivery and receipt order.</text>
+            <g aria-hidden="true">
+              <line class="life" x1="112" y1="128" x2="112" y2="624"/>
+              <line class="life" x1="352" y1="128" x2="352" y2="624"/>
+              <line class="life" x1="608" y1="128" x2="608" y2="624"/>
+              <line class="life" x1="864" y1="128" x2="864" y2="624"/>
+              <line class="life" x1="1120" y1="128" x2="1120" y2="624"/>
+            </g>
+            <g class="messages">
+              <line class="msg async" x1="112" y1="200" x2="352" y2="200" marker-end="url(#live-arrow-open)"/>
+              <line class="msg async" x1="352" y1="240" x2="608" y2="240" marker-end="url(#live-arrow-open)"/>
+              <line class="msg network" x1="608" y1="280" x2="864" y2="280" marker-end="url(#live-arrow-link)"/>
+              <line class="msg async" x1="864" y1="320" x2="1120" y2="320" marker-end="url(#live-arrow-open)"/>
+              <line class="msg async" x1="112" y1="360" x2="352" y2="360" marker-end="url(#live-arrow-open)"/>
+              <line class="msg async" x1="352" y1="400" x2="608" y2="400" marker-end="url(#live-arrow-open)"/>
+              <line class="msg focal" x1="608" y1="440" x2="864" y2="440" marker-end="url(#live-arrow-accent)"/>
+              <line class="msg return" x1="864" y1="480" x2="608" y2="480" marker-end="url(#live-arrow)"/>
+              <line class="msg async" x1="864" y1="520" x2="1120" y2="520" marker-end="url(#live-arrow-open)"/>
+              <line class="msg return" x1="864" y1="560" x2="608" y2="560" marker-end="url(#live-arrow)"/>
+              <line class="msg" x1="608" y1="600" x2="352" y2="600" marker-end="url(#live-arrow)"/>
+            </g>
+            <g class="label">
+              <rect x="184" y="176" width="96" height="16"/><text x="232" y="188">EVENT A</text>
+              <rect x="424" y="216" width="112" height="16"/><text x="480" y="228">COMMITTED A</text>
+              <rect x="680" y="256" width="112" height="16"/><text x="736" y="268">BATCH A</text>
+              <rect x="928" y="296" width="128" height="16"/><text x="992" y="308">PUBLISH A</text>
+              <rect x="184" y="336" width="96" height="16"/><text x="232" y="348">EVENT B</text>
+              <rect x="424" y="376" width="112" height="16"/><text x="480" y="388">COMMITTED B</text>
+              <rect x="680" y="416" width="112" height="16"/><text x="736" y="428" class="accent-text">BATCH B</text>
+              <rect x="672" y="456" width="128" height="16"/><text x="736" y="468">ACK A ARRIVES</text>
+              <rect x="928" y="496" width="128" height="16"/><text x="992" y="508">PUBLISH B</text>
+              <rect x="672" y="536" width="128" height="16"/><text x="736" y="548">ACK B ARRIVES</text>
+              <rect x="408" y="576" width="144" height="16"/><text x="480" y="588">ACK WATERMARK</text>
+            </g>
+            <g class="actors">
+              <rect class="actor-input" x="40" y="64" width="144" height="64" rx="8"/>
+              <text class="name" x="112" y="92">Existing worker</text>
+              <text class="sub" x="112" y="116">one ACP process</text>
+              <rect class="actor-store" x="248" y="64" width="208" height="64" rx="8"/>
+              <text class="name" x="352" y="92">Node journal</text>
+              <text class="sub" x="352" y="116">SQLite WAL + FULL</text>
+              <rect class="actor-focal" x="528" y="64" width="160" height="64" rx="8"/>
+              <text class="name" x="608" y="92">Live sender</text>
+              <text class="sub" x="608" y="116">bounded pipeline</text>
+              <rect class="actor-store" x="776" y="64" width="176" height="64" rx="8"/>
+              <text class="name" x="864" y="92">Host history</text>
+              <text class="sub" x="864" y="116">ordered ingestion</text>
+              <rect class="actor" x="1020" y="64" width="200" height="64" rx="8"/>
+              <text class="name" x="1120" y="92">Opened chat views</text>
+              <text class="sub" x="1120" y="116">Host + Node</text>
+            </g>
+            <g class="legend">
+              <line x1="40" y1="656" x2="1240" y2="656" stroke="#bdc5d2" stroke-width="0.8"/>
+              <line class="msg network" x1="40" y1="688" x2="80" y2="688" marker-end="url(#live-arrow-link)"/>
+              <text x="92" y="692">Transfer / write</text>
+              <line class="msg async" x1="312" y1="688" x2="352" y2="688" marker-end="url(#live-arrow-open)"/>
+              <text x="364" y="692">Event / publication</text>
+              <line class="msg return" x1="640" y1="688" x2="680" y2="688" marker-end="url(#live-arrow)"/>
+              <text x="692" y="692">Acknowledgment</text>
+              <line class="msg focal" x1="952" y1="688" x2="992" y2="688" marker-end="url(#live-arrow-accent)"/>
+              <text x="1004" y="692">No ACK wait here</text>
+            </g>
+          </svg>
+        </div>
+        <figcaption>
+          <p><strong>Read the middle two arrows:</strong> batch B is sent before ACK A arrives. The Node still commits every batch first, at a microtask boundary, without the old online batching timer.</p>
+          <p>ACKs advance cumulative watermarks; receipts arriving together share a durable write. The final arrow summarizes that bookkeeping, not a wait-for-all rule.</p>
+        </figcaption>
+      </figure>
+      <div class="limits">
+        <p><strong>Backpressure, not unlimited buffering.</strong> At most 128 live batches / 8 MiB are in flight. A larger individual event travels alone. When the window fills, additional output stays in the durable journal until capacity returns.</p>
+        <p><strong>The chat renderer is unchanged.</strong> Host publishes to its own UI and subscribed Node views. The Node loads a conversation's transcript and subscription only when you open it; native Copilot history discovery waits until expanded.</p>
+      </div>
+    </section>
+
+    <section id="reconnect" aria-labelledby="reconnect-heading">
+      <p class="eyebrow">Disconnected / local continuation and recovery</p>
+      <h2 id="reconnect-heading">Keep talking locally. Reconcile before Host sends new work.</h2>
+      <p class="section-intro">For an already-running, granted non-lead worker. The Node console records the local operation before invoking it; Host receives the resulting history after the connection returns.</p>
+      <figure>
+        <div class="figure-scroll" tabindex="0" role="region" aria-label="Offline and reconnect diagram; scroll horizontally on small screens">
+          <svg id="reconnect-diagram" viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="node-session-streaming-reconnect-title node-session-streaming-reconnect-desc">
+            <title id="node-session-streaming-reconnect-title">Local conversation and ordered reconnect recovery</title>
+            <desc id="node-session-streaming-reconnect-desc">During an ordinary Host outage the Node records and runs local prompts, then verifies grants and replays bounded history batches on reconnect before the synchronization acknowledgment releases Host work.</desc>
+            <defs>
+              <marker id="reconnect-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#575453"/></marker>
+              <marker id="reconnect-arrow-accent" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#348c7e"/></marker>
+              <marker id="reconnect-arrow-link" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#0078d4"/></marker>
+              <marker id="reconnect-arrow-open" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#575453" stroke-width="1.2"/></marker>
+            </defs>
+            <rect class="paper" width="1280" height="720"/>
+            <text x="40" y="24" class="hint">One existing worker; no second ACP process and no automatic re-execution of imported prompts.</text>
+            <g aria-hidden="true">
+              <line class="life" x1="144" y1="112" x2="144" y2="652"/>
+              <line class="life" x1="432" y1="112" x2="432" y2="652"/>
+              <line class="life" x1="752" y1="112" x2="752" y2="652"/>
+              <line class="life" x1="1088" y1="112" x2="1088" y2="652"/>
+            </g>
+            <rect class="fragment" x="96" y="456" width="1040" height="112" rx="4"/>
+            <rect class="paper" x="96" y="456" width="56" height="24" rx="4" stroke="#bdc5d2"/>
+            <text class="tag" x="104" y="472">LOOP</text>
+            <text class="tag" x="168" y="480">[each bounded recovery batch]</text>
+            <g class="messages">
+              <line class="msg" x1="144" y1="176" x2="752" y2="176" marker-end="url(#reconnect-arrow)"/>
+              <line class="msg return" x1="752" y1="212" x2="144" y2="212" marker-end="url(#reconnect-arrow)"/>
+              <line class="msg" x1="144" y1="248" x2="432" y2="248" marker-end="url(#reconnect-arrow)"/>
+              <line class="msg async" x1="432" y1="284" x2="752" y2="284" marker-end="url(#reconnect-arrow-open)"/>
+              <line class="msg async" x1="752" y1="320" x2="144" y2="320" marker-end="url(#reconnect-arrow-open)"/>
+              <line class="msg network" x1="144" y1="396" x2="1088" y2="396" marker-end="url(#reconnect-arrow-link)"/>
+              <line class="msg return" x1="1088" y1="432" x2="144" y2="432" marker-end="url(#reconnect-arrow)"/>
+              <line class="msg network" x1="144" y1="508" x2="1088" y2="508" marker-end="url(#reconnect-arrow-link)"/>
+              <line class="msg return" x1="1088" y1="548" x2="144" y2="548" marker-end="url(#reconnect-arrow)"/>
+              <line class="msg network" x1="144" y1="600" x2="1088" y2="600" marker-end="url(#reconnect-arrow-link)"/>
+              <line class="msg return focal" x1="1088" y1="636" x2="144" y2="636" marker-end="url(#reconnect-arrow-accent)"/>
+            </g>
+            <g class="label">
+              <rect x="512" y="152" width="160" height="16"/><text x="592" y="164">SAVE PROMPT</text>
+              <rect x="544" y="188" width="96" height="16"/><text x="592" y="200">SAVED</text>
+              <rect x="216" y="224" width="144" height="16"/><text x="288" y="236">RUN LOCALLY</text>
+              <rect x="544" y="260" width="96" height="16"/><text x="592" y="272">OUTPUT</text>
+              <rect x="520" y="296" width="144" height="16"/><text x="592" y="308">LOCAL VIEW</text>
+              <rect x="848" y="372" width="144" height="16"/><text x="920" y="384">INITIALIZE</text>
+              <rect x="872" y="408" width="96" height="16"/><text x="920" y="420">GRANTS</text>
+              <rect x="856" y="484" width="128" height="16"/><text x="920" y="496">REPLAY</text>
+              <rect x="880" y="524" width="80" height="16"/><text x="920" y="536">ACK</text>
+              <rect x="840" y="576" width="160" height="16"/><text x="920" y="588">SYNC BOUNDARY</text>
+              <rect x="864" y="612" width="112" height="16"/><text x="920" y="624" class="accent-text">SYNC OK</text>
+            </g>
+            <rect class="paper" x="40" y="128" width="288" height="20"/>
+            <text class="tag" x="40" y="144">HOST DISCONNECTED</text>
+            <rect class="paper" x="960" y="128" width="256" height="20"/>
+            <text class="hint" x="960" y="144">Host has no new local history yet</text>
+            <rect class="paper" x="40" y="340" width="1200" height="28"/>
+            <text x="40" y="360" font-size="16" font-weight="600">Connection returns: hold Host work and pause new local submissions during synchronization.</text>
+            <g class="actors">
+              <rect class="actor" x="48" y="48" width="192" height="64" rx="8"/>
+              <text class="name" x="144" y="76">Node console</text>
+              <text class="sub" x="144" y="100">local UI + controller</text>
+              <rect class="actor-input" x="344" y="48" width="176" height="64" rx="8"/>
+              <text class="name" x="432" y="76">Existing worker</text>
+              <text class="sub" x="432" y="100">runs on this VM</text>
+              <rect class="actor-store" x="648" y="48" width="208" height="64" rx="8"/>
+              <text class="name" x="752" y="76">Node journal</text>
+              <text class="sub" x="752" y="100">operations + events</text>
+              <rect class="actor" x="984" y="48" width="208" height="64" rx="8"/>
+              <text class="name" x="1088" y="76">Host</text>
+              <text class="sub" x="1088" y="100">history + scheduler</text>
+            </g>
+            <g class="legend">
+              <line x1="40" y1="668" x2="1240" y2="668" stroke="#bdc5d2" stroke-width="0.8"/>
+              <line class="msg" x1="40" y1="696" x2="80" y2="696" marker-end="url(#reconnect-arrow)"/>
+              <text x="92" y="700">Request / write</text>
+              <line class="msg async" x1="312" y1="696" x2="352" y2="696" marker-end="url(#reconnect-arrow-open)"/>
+              <text x="364" y="700">Event / local update</text>
+              <line class="msg return" x1="640" y1="696" x2="680" y2="696" marker-end="url(#reconnect-arrow)"/>
+              <text x="692" y="700">Response</text>
+              <line class="msg return focal" x1="952" y1="696" x2="992" y2="696" marker-end="url(#reconnect-arrow-accent)"/>
+              <text x="1004" y="700">Release barrier</text>
+            </g>
+          </svg>
+        </div>
+        <figcaption>
+          <p><strong>Replay is deliberately ordered.</strong> Verify grants, import local control receipts before their events, and acknowledge each recovery batch. Host acknowledges the final synchronization boundary before releasing new work.</p>
+          <p>Stable event IDs and sequence watermarks prevent duplicate history. Unacknowledged data stays local. A grant or binding conflict blocks progress instead of discarding evidence.</p>
+        </figcaption>
+      </figure>
+      <div class="limits">
+        <p><strong>Offline does not mean fully disconnected from everything.</strong> The model provider must remain reachable; Host-backed tools are unavailable. Permission approvals stay Host-only. Leads and resume require Host.</p>
+        <p>Local chat uses the same running worker. Busy workers can queue local prompts. Uncertain prompts are not automatically repeated; queued Host prompts affected by local intervention need confirmation. Safety stops and permission resolution are not ordinary queued work.</p>
+      </div>
+    </section>
+    <footer>
+      <p><strong>Scope:</strong> two 1280 × 720 sequence diagrams for the live path and offline recovery. File downloads, model internals and full lifecycle conflict handling are omitted to keep the message order readable. Static, self-contained HTML; no network requests or JavaScript.</p>
+      <p><strong>Implementation:</strong> <code>apps/node/src/session-console.ts</code> · <code>apps/node/src/session-journal.ts</code> · <code>apps/host/src/session-console-service.ts</code> · <code>ARCHITECTURE.md</code>. See the <a href="node-session-console.md">feature guide</a> for usage, invariants, code links and focused checks.</p>
+      <p>Diagram profile: Microsoft Fabric. Segoe UI Variable and Cascadia Code use local system fonts; declared fallbacks apply on machines without those families.</p>
+    </footer>
+  </main>
+</body>
+</html>

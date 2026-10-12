@@ -77,7 +77,10 @@ export default defineConfig({
         test: {
           name: "ui",
           environment: "jsdom",
-          include: ["apps/host/ui/src/**/*.test.{ts,tsx}"],
+          include: [
+            "apps/host/ui/src/**/*.test.{ts,tsx}",
+            "apps/node/ui/src/**/*.test.{ts,tsx}",
+          ],
           setupFiles: ["apps/host/ui/src/test-setup.ts"],
           testTimeout: inProcessTimeout,
         },

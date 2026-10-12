@@ -26,16 +26,30 @@ export const note = (id, text, ok) => {
 };
 
 export const showPanel = (id) => {
+  const navigationId = $(id)?.dataset.parentPanel || id;
   for (const panel of document.querySelectorAll(".panel")) {
     panel.classList.toggle("active", panel.id === id);
   }
   for (const item of document.querySelectorAll("[data-panel]")) {
-    item.classList.toggle("active", item.dataset.panel === id);
+    item.classList.toggle(
+      "active",
+      item.dataset.panel === (item.closest(".section-nav") ? navigationId : id),
+    );
   }
+  document
+    .querySelector(".app-shell")
+    ?.classList.toggle("without-sessions", id !== "sessionPanel");
+  document.dispatchEvent(new CustomEvent("node-panel-change", { detail: id }));
 };
 
 export const initShell = () => {
   for (const item of document.querySelectorAll("[data-panel]")) {
     item.addEventListener("click", () => showPanel(item.dataset.panel));
   }
+  const initial = location.hash.slice(1);
+  showPanel(
+    document.getElementById(initial)?.classList.contains("panel")
+      ? initial
+      : "sessionPanel",
+  );
 };

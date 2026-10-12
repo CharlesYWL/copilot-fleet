@@ -26,53 +26,84 @@
         </div>
       </header>
 
-      <aside class="session-sidebar" aria-label="Copilot sessions">
+      <aside class="session-sidebar" aria-label="Sessions">
         <div class="sidebar-head">
           <div>
             <h2>Sessions</h2>
-            <p class="sub">Copilot history on this user account</p>
+            <p class="sub">Fleet sessions on this node</p>
           </div>
           <button
             type="button"
             class="icon-button"
-            id="sessionRefresh"
-            aria-label="Refresh sessions"
-            title="Refresh sessions"
+            id="fleetSessionRefresh"
+            aria-label="Refresh Fleet sessions"
+            title="Refresh Fleet sessions"
           >
             ↻
           </button>
         </div>
         <label class="search">
-          <span class="sr-only">Search sessions</span>
+          <span class="sr-only">Search Fleet sessions</span>
           <input
-            id="sessionSearch"
+            id="fleetSessionSearch"
             type="search"
             placeholder="Search title or project"
             autocomplete="off"
           />
         </label>
-        <div class="filter-row" role="group" aria-label="Filter sessions">
-          <button type="button" class="filter active" data-session-filter="all">
-            All
-          </button>
-          <button type="button" class="filter" data-session-filter="resumable">
-            Resumable
-          </button>
-          <button type="button" class="filter" data-session-filter="legacy">Older</button>
-        </div>
-        <div id="sessionList" class="session-list" aria-live="polite">
-          <div class="skeleton-list" aria-label="Loading sessions">
-            <span></span><span></span><span></span>
-          </div>
-        </div>
-        <button type="button" class="secondary full hidden" id="sessionMore">
+        <div id="fleetSessionList" class="session-list" aria-live="polite"></div>
+        <button type="button" class="secondary full hidden" id="fleetSessionMore">
           Load more
         </button>
+        <details id="nativeSessions">
+          <summary>Native Copilot history</summary>
+          <div class="sidebar-head">
+            <div>
+              <h3>Native history</h3>
+              <p class="sub">Discovered only when expanded</p>
+            </div>
+            <button
+              type="button"
+              class="icon-button"
+              id="sessionRefresh"
+              aria-label="Refresh sessions"
+              title="Refresh sessions"
+            >
+              ↻
+            </button>
+          </div>
+          <label class="search">
+            <span class="sr-only">Search sessions</span>
+            <input
+              id="sessionSearch"
+              type="search"
+              placeholder="Search title or project"
+              autocomplete="off"
+            />
+          </label>
+          <div class="filter-row" role="group" aria-label="Filter sessions">
+            <button type="button" class="filter active" data-session-filter="all">
+              All
+            </button>
+            <button type="button" class="filter" data-session-filter="resumable">
+              Resumable
+            </button>
+            <button type="button" class="filter" data-session-filter="legacy">
+              Older
+            </button>
+          </div>
+          <div id="sessionList" class="session-list" aria-live="polite">
+            <div class="empty">Expand to discover native Copilot sessions.</div>
+          </div>
+          <button type="button" class="secondary full hidden" id="sessionMore">
+            Load more
+          </button>
+        </details>
       </aside>
 
       <nav class="section-nav" aria-label="Node tools">
         <button type="button" class="nav-item active" data-panel="sessionPanel">
-          Session details
+          Sessions
         </button>
         <button type="button" class="nav-item" data-panel="settingsPanel">
           Node settings
@@ -83,9 +114,6 @@
         <button type="button" class="nav-item" data-panel="diagnosticsPanel">
           Diagnostics
         </button>
-        <button type="button" class="nav-item" data-panel="transferPanel">
-          Move this node
-        </button>
       </nav>
 
       <main class="content">
@@ -94,10 +122,12 @@
             <div class="empty-icon" aria-hidden="true"></div>
             <h2 id="sessionTitle">Select a session</h2>
             <p>
-              Choose a Copilot session to inspect its metadata and load a context preview
-              only when needed.
+              Choose a Fleet session to open its chat. Other conversations stay unloaded.
+              Expand native Copilot history only when you want to discover or adopt a
+              session.
             </p>
           </div>
+          <div id="fleetChat" class="hidden"></div>
           <div id="sessionDetail" class="hidden">
             <div class="panel-header">
               <div>
@@ -146,6 +176,9 @@
               <p class="eyebrow">Runtime configuration</p>
               <h2 id="settingsTitle">Node settings</h2>
             </div>
+            <button type="button" class="secondary" data-panel="transferPanel">
+              Move this node
+            </button>
           </div>
           <form class="card form-grid" id="form">
             <div class="warn full-span">
@@ -403,12 +436,20 @@ Loading…</pre>
           </div>
         </section>
 
-        <section class="panel" id="transferPanel" aria-labelledby="transferTitle">
+        <section
+          class="panel"
+          id="transferPanel"
+          data-parent-panel="settingsPanel"
+          aria-labelledby="transferTitle"
+        >
           <div class="panel-header">
             <div>
               <p class="eyebrow">Identity archive</p>
               <h2 id="transferTitle">Move this node</h2>
             </div>
+            <button type="button" class="secondary" data-panel="settingsPanel">
+              Back to settings
+            </button>
           </div>
           <div class="card">
             <p class="sub spaced">

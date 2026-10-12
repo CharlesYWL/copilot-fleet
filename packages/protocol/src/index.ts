@@ -24,6 +24,7 @@ export * from "./managed-worktrees.js";
 import {
   PromptAttachmentSchema,
   MAX_ATTACHMENTS_PER_PROMPT,
+  MAX_ATTACHMENT_BYTES,
   base64Bytes,
   type PromptAttachment,
 } from "./attachments.js";
@@ -1084,6 +1085,180 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
 ]);
 export type NodeCommand = z.infer<typeof NodeCommandSchema>;
 
+export { SessionActorSchema, sessionActor, sessionActorId } from "./session-actor.js";
+export type { SessionActor } from "./session-actor.js";
+
+export const SESSION_CONSOLE_CAPABILITY = "session-console-v1";
+export const CONSOLE_REPLAY_MAX_BYTES = 64 * 1024 * 1024;
+export const ConsoleStatusSchema = z.enum(["online", "offline", "syncing", "conflict"]);
+export type ConsoleStatus = z.infer<typeof ConsoleStatusSchema>;
+export const ConsoleSessionViewSchema = z.object({
+  session: SessionSchema,
+  node: NodeSchema.optional(),
+  placement: PlacementSchema.optional(),
+  permissions: z.array(SessionEventSchema).default([]),
+  messages: z.array(z.lazy(() => PendingSessionMessageSchema)).default([]),
+  status: ConsoleStatusSchema,
+  offlineAllowed: z.boolean(),
+  detail: z.string().optional(),
+});
+export type ConsoleSessionView = z.infer<typeof ConsoleSessionViewSchema>;
+export const ConsoleGrantSchema = z.object({
+  hostId: z.string().min(1),
+  grantId: z.string().uuid(),
+  session: SessionSchema,
+  controlEpoch: z.number().int().nonnegative(),
+  sequenceOffset: z.number().int().nonnegative().default(0),
+});
+export type ConsoleGrant = z.infer<typeof ConsoleGrantSchema>;
+export const ConsoleActionSchema = z.discriminatedUnion("action", [
+  z
+    .object({
+      action: z.literal("prompt"),
+      operationId: z.string().uuid(),
+      prompt: z.string().min(1).max(100_000),
+      attachments: z
+        .array(PromptAttachmentSchema)
+        .max(MAX_ATTACHMENTS_PER_PROMPT)
+        .refine(
+          (attachments) =>
+            attachments.every(
+              (attachment) => base64Bytes(attachment.data) <= MAX_ATTACHMENT_BYTES,
+            ),
+          "An attachment exceeds the 10 MiB file limit",
+        )
+        .default([]),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.enum(["cancel", "stop", "resume"]),
+      operationId: z.string().uuid(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("config"),
+      operationId: z.string().uuid(),
+      configId: z.enum(["model", "reasoning_effort", CONTEXT_TIER_CONFIG_ID]),
+      value: z.string().max(500),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.enum(["queue_cancel", "queue_send_now"]),
+      operationId: z.string().uuid(),
+      messageId: z.string().min(1).max(500),
+    })
+    .strict(),
+]);
+export type ConsoleAction = z.infer<typeof ConsoleActionSchema>;
+export const ConsoleOperationSchema = z.object({
+  id: z.string().uuid(),
+  sessionId: z.string().min(1),
+  grantId: z.string().uuid(),
+  controlEpoch: z.number().int().nonnegative(),
+  action: z.enum(["prompt", "cancel", "stop", "config"]),
+  payload: z.unknown(),
+  afterSequence: z.number().int().nonnegative(),
+  state: z.enum(["queued", "accepted", "settled", "uncertain", "rejected"]),
+  payloadDigest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
+  priority: z.number().int().nonnegative().optional(),
+  error: z.string().optional(),
+  createdAt: z.string(),
+});
+export type ConsoleOperation = z.infer<typeof ConsoleOperationSchema>;
+export const ConsoleRequestSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("initialize"),
+      activeSessionIds: z.array(z.string().min(1)).max(1000).default([]),
+      busySessionIds: z.array(z.string().min(1)).max(1000).default([]),
+      sessions: z
+        .array(
+          z
+            .object({
+              sessionId: z.string().min(1),
+              grantId: z.string().uuid(),
+            })
+            .strict(),
+        )
+        .max(1000)
+        .default([]),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("catalog"),
+      cursor: z.string().max(500).optional(),
+      limit: z.number().int().min(1).max(100).default(50),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.enum(["session", "subscribe", "unsubscribe", "messages"]),
+      sessionId: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("transcript"),
+      sessionId: z.string().min(1),
+      before: z.number().int().nonnegative().optional(),
+      limit: z.number().int().min(1).max(1000).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("action"),
+      sessionId: z.string().min(1),
+      input: ConsoleActionSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("replay"),
+      sessionId: z.string().min(1),
+      grantId: z.string().uuid(),
+      events: z.array(SessionEventSchema).max(2_000),
+      operations: z.array(ConsoleOperationSchema).max(100),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("synchronized"),
+      activeSessionIds: z.array(z.string().min(1)).max(1000),
+      busySessionIds: z.array(z.string().min(1)).max(1000),
+      sessions: z
+        .array(
+          z
+            .object({
+              sessionId: z.string().min(1),
+              grantId: z.string().uuid(),
+              highWater: z.number().int().nonnegative(),
+              controlEpoch: z.number().int().nonnegative(),
+            })
+            .strict(),
+        )
+        .max(1000),
+    })
+    .strict(),
+]);
+export type ConsoleRequest = z.infer<typeof ConsoleRequestSchema>;
+export const ConsoleResponseSchema = z.discriminatedUnion("ok", [
+  z.object({ requestId: z.string().uuid(), ok: z.literal(true), data: z.unknown() }),
+  z.object({
+    requestId: z.string().uuid(),
+    ok: z.literal(false),
+    status: z.number().int(),
+    error: z.string(),
+  }),
+]);
+export type ConsoleResponse = z.infer<typeof ConsoleResponseSchema>;
+
 /** Identifies one immutable batch of buffered Node events. */
 export const OutboxFlushIdSchema = z.string().uuid().brand<"OutboxFlushId">();
 export type OutboxFlushId = z.infer<typeof OutboxFlushIdSchema>;
@@ -1200,6 +1375,11 @@ export const NodeReadySchema = z.object({
 export type NodeReady = z.infer<typeof NodeReadySchema>;
 
 export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("session_console_request"),
+    requestId: z.string().uuid(),
+    request: ConsoleRequestSchema,
+  }),
   ...CommandExecutionNodeSchemas,
   z.object({
     type: z.literal("repository_probe_result"),
@@ -1307,6 +1487,22 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
 
 export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("session_console_queue"),
+    sessionId: z.string().min(1),
+    messageId: z.string().uuid(),
+    operationId: z.string().uuid(),
+    action: z.enum(["cancel", "send-now"]),
+  }),
+  z.object({
+    type: z.literal("session_console_response"),
+    response: ConsoleResponseSchema,
+  }),
+  z.object({ type: z.literal("session_console_grant"), grant: ConsoleGrantSchema }),
+  z.object({
+    type: z.literal("session_console_update"),
+    message: z.lazy(() => BrowserMessageSchema),
+  }),
   ...CommandExecutionHostSchemas,
   z.object({
     type: z.literal("repository_probe"),
@@ -1335,6 +1531,7 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("welcome"),
+    sessionConsole: z.boolean().optional(),
     nodeId: z.string().min(1),
     commandExecutions: z.boolean().default(false),
     commandPermissions: z.boolean().default(false),
@@ -1358,7 +1555,11 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("outbox_flush_ack"),
     flushId: OutboxFlushIdSchema,
   }),
-  z.object({ type: z.literal("command"), command: NodeCommandSchema }),
+  z.object({
+    type: z.literal("command"),
+    command: NodeCommandSchema,
+    consoleEpoch: z.number().int().nonnegative().optional(),
+  }),
   /**
    * The Host's address changed and this is where to find it next time.
    *

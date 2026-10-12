@@ -7,7 +7,7 @@ import {
   type FleetSession,
   type PendingSessionMessage,
 } from "@fleet/protocol";
-import { api } from "../hooks/useFleet";
+import { sessionApiPath, sessionRequest as api } from "../lib/session-transport";
 
 const useStyles = makeStyles({
   root: { flexShrink: 0, minWidth: 0, padding: "4px 18px" },
@@ -41,7 +41,13 @@ const useStyles = makeStyles({
   error: { color: tokens.colorPaletteRedForeground1, fontSize: tokens.fontSizeBase200 },
 });
 
-export function SessionMessageQueue({ session }: { session: FleetSession }) {
+export function SessionMessageQueue({
+  session,
+  disabled = false,
+}: {
+  session: FleetSession;
+  disabled?: boolean;
+}) {
   const styles = useStyles();
   const [messages, setMessages] = useState<PendingSessionMessage[]>([]);
   const [error, setError] = useState("");
@@ -50,7 +56,7 @@ export function SessionMessageQueue({ session }: { session: FleetSession }) {
   const [expanded, setExpanded] = useState(false);
   const busy = useRef(false);
   const refresh = useRef<() => Promise<void>>(async () => {});
-  const path = `/api/sessions/${encodeURIComponent(session.id)}/messages`;
+  const path = sessionApiPath(session.id, "messages");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -84,7 +90,7 @@ export function SessionMessageQueue({ session }: { session: FleetSession }) {
   }, [path, session.state]);
 
   const act = async (message: PendingSessionMessage, action: "cancel" | "send-now") => {
-    if (busy.current) return;
+    if (busy.current || disabled) return;
     busy.current = true;
     setPending(message.id);
     setActionError("");
@@ -130,7 +136,7 @@ export function SessionMessageQueue({ session }: { session: FleetSession }) {
                 <div className={styles.actions}>
                   <Button
                     size="small"
-                    disabled={!!pending || !message.canSendNow}
+                    disabled={disabled || !!pending || !message.canSendNow}
                     title="Interrupt the current turn and send this message when the agent is idle"
                     onClick={() => void act(message, "send-now")}
                   >
@@ -139,7 +145,7 @@ export function SessionMessageQueue({ session }: { session: FleetSession }) {
                   <Button
                     size="small"
                     appearance="subtle"
-                    disabled={!!pending || !message.canCancel}
+                    disabled={disabled || !!pending || !message.canCancel}
                     onClick={() => void act(message, "cancel")}
                   >
                     Cancel

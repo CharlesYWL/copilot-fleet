@@ -16,6 +16,7 @@ import type { FolderListing } from "./pick-folder.js";
 import type { PathCheck } from "./path-check.js";
 import type { DiscoveredCopilotSession, SessionPreview } from "./copilot-sessions.js";
 import type { Settings } from "./settings.js";
+import type { NodeSessionConsole } from "./session-console.js";
 
 export type ConfigStatus = {
   nodeId: string;
@@ -74,6 +75,7 @@ export type SessionDiscoveryApi = {
 };
 
 export type ConfigServerOptions = {
+  sessionConsole?: NodeSessionConsole;
   getSettings: () => Settings;
   getStatus: () => ConfigStatus;
   applySettings: (settings: Settings) => Promise<void>;

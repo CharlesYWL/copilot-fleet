@@ -1,12 +1,14 @@
 import { $, el, note, post, showPanel } from "./ui.js";
 
 export const initSessions = () => {
+  const lifetime = new AbortController();
   let sessions = [];
   let selectedSessionId = "";
   let nextSessionCursor = "";
   let sessionFilter = "all";
   let sessionLoading = false;
   let previewRequest;
+  let discoveryRequest;
   let previewedSessionId = "";
   const resumedSessionIds = new Set();
 
@@ -115,16 +117,22 @@ export const initSessions = () => {
     $("sessionStableId").textContent = session.id;
     const resume = $("resumeSession");
     const alreadyResumed = resumedSessionIds.has(session.id);
-    resume.disabled = !session.resumable || alreadyResumed;
-    resume.textContent = alreadyResumed ? "Resumed" : "Resume";
+    resume.disabled = !session.fleetSessionId && (!session.resumable || alreadyResumed);
+    resume.textContent = session.fleetSessionId
+      ? "Open chat"
+      : alreadyResumed
+        ? "Resumed"
+        : "Resume";
     note(
       "resumeNotice",
-      session.resumable
-        ? session.legacy
-          ? "This older session has limited metadata, but Copilot reports that its context can be loaded."
-          : ""
-        : session.resumeReason || "This session cannot be resumed.",
-      session.resumable,
+      session.fleetSessionId
+        ? "This conversation is already in Fleet. Open its existing chat."
+        : session.resumable
+          ? session.legacy
+            ? "This older session has limited metadata, but Copilot reports that its context can be loaded."
+            : ""
+          : session.resumeReason || "This session cannot be resumed.",
+      Boolean(session.fleetSessionId) || session.resumable,
     );
     if (previewedSessionId !== session.id) {
       $("loadPreview").disabled = false;
@@ -135,8 +143,8 @@ export const initSessions = () => {
   };
 
   const selectSession = (id) => {
-    if (id === selectedSessionId) return;
     selectedSessionId = id;
+    document.dispatchEvent(new CustomEvent("node-native-session"));
     previewedSessionId = "";
     previewRequest?.abort();
     renderSessions();
@@ -145,8 +153,12 @@ export const initSessions = () => {
   };
 
   const loadSessions = async ({ append = false } = {}) => {
+    if (!$("nativeSessions").open || !$("sessionPanel").classList.contains("active"))
+      return;
     if (sessionLoading) return;
     sessionLoading = true;
+    const controller = new AbortController();
+    discoveryRequest = controller;
     $("sessionRefresh").disabled = true;
     if (!append) {
       $("sessionList").replaceChildren(
@@ -162,8 +174,11 @@ export const initSessions = () => {
         append && nextSessionCursor
           ? "?cursor=" + encodeURIComponent(nextSessionCursor)
           : "";
-      const response = await fetch("/api/sessions" + suffix);
+      const response = await fetch("/api/sessions" + suffix, {
+        signal: controller.signal,
+      });
       const data = await response.json();
+      if (controller.signal.aborted) return;
       if (!response.ok) throw new Error(data.error || "Could not discover sessions");
       const incoming = Array.isArray(data.sessions) ? data.sessions : [];
       const byId = new Map(
@@ -177,12 +192,16 @@ export const initSessions = () => {
       renderSessions();
       renderSelectedSession();
     } catch (error) {
+      if (controller.signal.aborted) return;
       $("sessionList").replaceChildren(
         el("div", { className: "msg err", textContent: error.message }),
       );
     } finally {
-      sessionLoading = false;
-      $("sessionRefresh").disabled = false;
+      if (discoveryRequest === controller) {
+        sessionLoading = false;
+        discoveryRequest = undefined;
+        $("sessionRefresh").disabled = false;
+      }
     }
   };
 
@@ -276,6 +295,12 @@ export const initSessions = () => {
 
   $("resumeSession").addEventListener("click", async () => {
     const session = selectedSession();
+    if (session?.fleetSessionId) {
+      document.dispatchEvent(
+        new CustomEvent("node-fleet-session", { detail: session.fleetSessionId }),
+      );
+      return;
+    }
     if (!session || !session.resumable || resumedSessionIds.has(session.id)) return;
     const button = $("resumeSession");
     button.disabled = true;
@@ -288,6 +313,7 @@ export const initSessions = () => {
       );
       resumedSessionIds.add(session.id);
       session.status = result.state || "starting";
+      session.fleetSessionId = result.sessionId || null;
       renderSessions();
       renderSelectedSession();
       note(
@@ -295,6 +321,11 @@ export const initSessions = () => {
         "Resume started. The session is now available in the Fleet Host.",
         true,
       );
+      if (result.sessionId) {
+        document.dispatchEvent(
+          new CustomEvent("node-fleet-session", { detail: result.sessionId }),
+        );
+      }
     } catch (error) {
       note("resumeNotice", error.message, false);
       button.disabled = false;
@@ -329,12 +360,11 @@ export const initSessions = () => {
       closeNewSession();
       $("newSessionPrompt").value = "";
       $("newSessionName").value = "";
-      await loadSessions();
-      note(
-        "resumeNotice",
-        `Session ${result.sessionId ? "created" : "started"} in the Fleet Host.`,
-        true,
-      );
+      if (result.sessionId) {
+        document.dispatchEvent(
+          new CustomEvent("node-fleet-session", { detail: result.sessionId }),
+        );
+      }
     } catch (error) {
       note("newSessionMsg", error.message, false);
     } finally {
@@ -342,5 +372,43 @@ export const initSessions = () => {
     }
   });
 
-  void loadSessions();
+  $("nativeSessions").addEventListener("toggle", () => {
+    if ($("nativeSessions").open && !sessions.length) void loadSessions();
+    if (!$("nativeSessions").open) {
+      previewRequest?.abort();
+      discoveryRequest?.abort();
+      discoveryRequest = undefined;
+      sessionLoading = false;
+    }
+  });
+  document.addEventListener(
+    "node-panel-change",
+    (event) => {
+      if (event.detail !== "sessionPanel") {
+        previewRequest?.abort();
+        discoveryRequest?.abort();
+        discoveryRequest = undefined;
+        sessionLoading = false;
+      } else if ($("nativeSessions").open && !sessions.length) void loadSessions();
+    },
+    { signal: lifetime.signal },
+  );
+  window.addEventListener(
+    "pageshow",
+    () => {
+      if ($("nativeSessions").open && !sessions.length) void loadSessions();
+    },
+    { signal: lifetime.signal },
+  );
+  window.addEventListener(
+    "pagehide",
+    (event) => {
+      previewRequest?.abort();
+      discoveryRequest?.abort();
+      discoveryRequest = undefined;
+      sessionLoading = false;
+      if (!event.persisted) lifetime.abort();
+    },
+    { signal: lifetime.signal },
+  );
 };

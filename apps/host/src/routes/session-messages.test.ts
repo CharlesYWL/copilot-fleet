@@ -1,5 +1,5 @@
 import Fastify from "fastify";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -108,6 +108,26 @@ async function setup(lead = false) {
 }
 
 describe("session message queue", () => {
+  it("preserves pre-console operator idempotency digests across upgrades", async () => {
+    const f = await setup();
+    const id = randomUUID();
+    expect((await f.submit("Existing queued input", id)).statusCode).toBe(202);
+    const message = f.store.queuedMessage(id)!;
+    const legacyDigest = createHash("sha256")
+      .update(
+        JSON.stringify([
+          message.sessionId,
+          message.prompt,
+          message.attachments,
+          message.handback,
+          message.operatorId,
+        ]),
+      )
+      .digest("hex");
+    expect(message.digest).toBe(legacyDigest);
+    expect((await f.submit("Existing queued input", id)).statusCode).toBe(202);
+    expect(f.store.queuedMessages(f.session.id)).toHaveLength(1);
+  });
   it("does not read queued attachment payloads for streamed agent text", async () => {
     const f = await setup();
     await f.submit("Wait while streaming");

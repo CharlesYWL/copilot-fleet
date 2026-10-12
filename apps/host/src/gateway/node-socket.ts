@@ -8,6 +8,7 @@ import {
   NodeProofSchema,
   NodeToHostMessageSchema,
   OUTBOX_ACK_CAPABILITY,
+  SESSION_CONSOLE_CAPABILITY,
   SUPERSEDED_CLOSE_CODE,
   WorktreeConflict,
   decodeFrame,
@@ -205,6 +206,16 @@ export function registerNodeGateway(
         );
       }
       service.attachNode(nodeId, input.link);
+      const sessionConsole =
+        input.link instanceof SealedNodeLink &&
+        inventory.capabilities.includes(SESSION_CONSOLE_CAPABILITY);
+      if (sessionConsole)
+        service.console.attach(
+          nodeId,
+          input.link,
+          inventory.activeSessionIds,
+          inventory.busySessionIds,
+        );
       service.store.setNodeIdentity(nodeId, {
         version: inventory.version,
         revision: inventory.revision,
@@ -256,6 +267,7 @@ export function registerNodeGateway(
       const commandSupport = service.commands.nodeReady(nodeId, inventory);
       service.send(input.link, {
         type: "welcome",
+        ...(sessionConsole ? { sessionConsole: true } : {}),
         nodeId,
         reconcileAfterOutbox: awaitingOutboxFlush,
         acknowledgeOutbox,
@@ -263,8 +275,8 @@ export function registerNodeGateway(
           ? commandSupport
           : {}),
       });
-      service.commands.reconnect(nodeId);
-      if (!awaitingOutboxFlush) {
+      if (!service.console.blocked(nodeId)) service.commands.reconnect(nodeId);
+      if (!awaitingOutboxFlush && !service.console.blocked(nodeId)) {
         try {
           service.reconcile(nodeId, activeSessionIds, inventory.busySessionIds);
         } catch (error) {
@@ -278,6 +290,14 @@ export function registerNodeGateway(
         if (service.nodeSocket(nodeId) !== input.link) return;
         const message = input.read(String(raw));
         if (!message) return;
+        if (message.type === "session_console_request") {
+          if (!sessionConsole) {
+            socket.close(1008, "Session console was not negotiated");
+            return;
+          }
+          void service.console.handle(nodeId, message.requestId, message.request);
+          return;
+        }
         const ownership = nodeMessageOwnership(nodeId, message, (id) =>
           service.store.getSession(id),
         );
@@ -761,6 +781,7 @@ export function registerNodeGateway(
       // socket, so identity is not enough: what matters is whether the link the
       // service holds is the one that just closed.
       if (link === socket || (link instanceof SealedNodeLink && link.wraps(socket))) {
+        service.console.detach(authenticatedNodeId);
         service.disconnectNode(
           authenticatedNodeId,
           "Execution stopped when the Node connection was lost",

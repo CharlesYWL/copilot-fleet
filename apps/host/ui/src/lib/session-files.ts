@@ -1,5 +1,5 @@
 import type { SessionFileInfo } from "@fleet/protocol";
-import { api } from "../hooks/useFleet";
+import { sessionApiPath, sessionRequest } from "./session-transport";
 
 const SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 const DRIVE = /^[A-Za-z]:[\\/]/;
@@ -129,7 +129,7 @@ export function sessionFileUrl(
   kind: "stat" | "download",
   path: string,
 ): string {
-  return `/api/sessions/${encodeURIComponent(sessionId)}/files/${kind}?path=${encodeURIComponent(path)}`;
+  return sessionApiPath(sessionId, `files/${kind}?path=${encodeURIComponent(path)}`);
 }
 
 /**
@@ -143,7 +143,9 @@ export async function downloadSessionFile(
   sessionId: string,
   path: string,
 ): Promise<SessionFileInfo> {
-  const info = await api<SessionFileInfo>(sessionFileUrl(sessionId, "stat", path));
+  const info = await sessionRequest<SessionFileInfo>(
+    sessionFileUrl(sessionId, "stat", path),
+  );
   const link = document.createElement("a");
   link.href = sessionFileUrl(sessionId, "download", info.path);
   link.download = info.name;

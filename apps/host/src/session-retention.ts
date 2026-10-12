@@ -199,6 +199,7 @@ export class SessionRetention {
   }
 
   private available(nodeId: string): boolean {
+    if (this.service.console?.blocked(nodeId)) return false;
     const socket = this.service.nodeSocket(nodeId);
     return (
       this.readyNodes.has(nodeId) &&
@@ -215,6 +216,7 @@ export class SessionRetention {
     this.service.publishSession(store.getSession(request.sessionId)!);
     this.service.send(this.service.nodeSocket(request.nodeId)!, {
       type: "command",
+      consoleEpoch: store.sessionConsole.get(request.sessionId)?.controlEpoch,
       command: {
         type: "delete_session",
         commandId: request.commandId,

@@ -32,6 +32,8 @@ export class UpdateQuarantine {
     private readonly directory: string,
     private readonly root: string,
     currentRevision: string,
+    private readonly validateBuild: (revision: string) => string | undefined = () =>
+      undefined,
   ) {
     this.file = join(directory, "update-incomplete.json");
     try {
@@ -43,7 +45,8 @@ export class UpdateQuarantine {
       this.marker?.phase === "built" &&
       this.marker.revision !== "" &&
       resolve(this.marker.root) === resolve(root) &&
-      this.marker.revision === currentRevision
+      this.marker.revision === currentRevision &&
+      !this.validateBuild(currentRevision)
     ) {
       this.clear();
     } else this.restoreBlock();
@@ -63,6 +66,8 @@ export class UpdateQuarantine {
   built(revision: string): void {
     if (!revision)
       throw new Error("A successful update must identify its built revision.");
+    const problem = this.validateBuild(revision);
+    if (problem) throw new Error(`Node UI build is incomplete: ${problem}`);
     this.write({ version: 1, phase: "built", root: this.root, revision });
     this.restoreBlock();
   }
