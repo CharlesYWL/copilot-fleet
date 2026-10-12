@@ -163,6 +163,29 @@ describe("BinaryProbe", () => {
     await cache.present(spec);
     expect(probe).toHaveBeenCalledTimes(2);
   });
+
+  it.each([
+    ["fails", "process.exit(1)"],
+    ["times out", "setTimeout(() => {}, 60_000)"],
+  ])("recognizes an installed CLI even when its version check %s", async (_, script) => {
+    const cache = new BinaryProbe();
+    expect(
+      await cache.present({
+        ...providerSpecs.devtunnel,
+        binary: process.execPath,
+        versionArgs: ["-e", script],
+      }),
+    ).toBe(true);
+  });
+
+  it("still reports a missing executable as unavailable", async () => {
+    expect(
+      await new BinaryProbe().present({
+        ...providerSpecs.devtunnel,
+        binary: `${process.execPath}.fleet-missing`,
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("tunnel manager binary guard", () => {

@@ -1,10 +1,14 @@
 import { ChildProcess, spawn } from "node:child_process";
 import type * as childProcess from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type { FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HostBackup, HostPortableBackup, TunnelInfo } from "@fleet/protocol";
 import { buildServer } from "../server.js";
+import { FleetStore } from "../store.js";
 import { BinaryProbe } from "../tunnel.js";
 import { providerSpecs } from "../tunnel-providers.js";
 import { readExternalTunnel } from "../external-tunnel.js";
@@ -25,6 +29,7 @@ const CLIENT = "11111111-2222-3333-4444-555555555555";
 type Host = { app: FastifyInstance; claimCode: string; cookies: Map<string, string> };
 const hosts: Host[] = [];
 const children: ChildProcess[] = [];
+const directories: string[] = [];
 
 beforeEach(() => {
   vi.mocked(readExternalTunnel).mockReturnValue(undefined);
@@ -61,16 +66,19 @@ beforeEach(() => {
 
 afterEach(async () => {
   for (const host of hosts.splice(0)) await host.app.close();
+  for (const directory of directories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
   children.length = 0;
   vi.restoreAllMocks();
   vi.mocked(spawn).mockReset();
   vi.mocked(readExternalTunnel).mockReset();
 });
 
-async function openHost(): Promise<Host> {
+async function openHost(databasePath = ":memory:"): Promise<Host> {
   let claimCode = "";
   const app = await buildServer({
-    databasePath: ":memory:",
+    databasePath,
     enrollmentToken: "test-token",
     operatorPassword: "",
     announceClaimCode: (code) => {
@@ -303,7 +311,7 @@ describe("tunnel migration through the real backup routes", () => {
       if (format === "portable") await signIn(host);
       const saved = await exportArchive(host, format);
       expect(saved.tunnel.ids).toEqual(backup.tunnel.ids);
-      expect(saved.tunnel.enabled).toBe(false);
+      expect(saved.tunnel.enabled).toBe(true);
 
       vi.mocked(providerSpecs.devtunnel.prepare!).mockResolvedValue(undefined);
       expect(
@@ -316,4 +324,106 @@ describe("tunnel migration through the real backup routes", () => {
       expect(providerSpecs.devtunnel.newTunnelId).toHaveBeenCalledOnce();
     },
   );
+});
+
+describe("tunnel startup recovery", () => {
+  it("restores the saved tunnel after a Host restart despite a setup failure", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-tunnel-startup-"));
+    directories.push(directory);
+    const databasePath = join(directory, "fleet.db");
+    const seed = new FleetStore(databasePath);
+    seed.setTunnelProviderEnabled("devtunnel", true);
+    seed.setSetting("tunnel.devtunnel.id", "fleet-saved.usw2");
+    seed.close();
+
+    let failSetup: (error: Error) => void = () => {};
+    vi.mocked(providerSpecs.devtunnel.prepare!).mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          failSetup = reject;
+        }),
+    );
+    const host = await openHost(databasePath);
+    const logged = vi.spyOn(host.app.log, "error");
+    const error = new Error("Tunnel service timed out during Host restart");
+    failSetup(error);
+    await vi.waitFor(() =>
+      expect(logged).toHaveBeenCalledWith(
+        { err: error, provider: "devtunnel" },
+        "Failed to restore tunnel",
+      ),
+    );
+
+    const saved = new FleetStore(databasePath);
+    try {
+      expect(saved.getEnabledTunnelProviders()).toEqual(["devtunnel"]);
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce(), { timeout: 3_000 });
+      expect(spawn).toHaveBeenCalledWith(
+        "devtunnel",
+        ["host", "fleet-saved.usw2"],
+        expect.any(Object),
+      );
+      expect(saved.getSetting("tunnel.devtunnel.id")).toBe("fleet-saved.usw2");
+      expect(providerSpecs.devtunnel.newTunnelId).not.toHaveBeenCalled();
+    } finally {
+      saved.close();
+    }
+  });
+
+  it("keeps an API enable request switched on while setup retries", async () => {
+    const host = await openHost();
+    await claim(host);
+    vi.mocked(providerSpecs.devtunnel.prepare!).mockRejectedValueOnce(
+      new Error("Tunnel service timed out"),
+    );
+
+    const response = await post(host, "/api/tunnel", {
+      provider: "devtunnel",
+      enabled: true,
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error).toBe("Tunnel service timed out");
+    expect(response.json<{ tunnel: TunnelInfo }>().tunnel.tunnels).toContainEqual(
+      expect.objectContaining({
+        provider: "devtunnel",
+        enabled: true,
+        status: "error",
+        error: "Tunnel service timed out",
+      }),
+    );
+    expect((await exportArchive(host, "data")).tunnel.enabled).toBe(true);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce(), { timeout: 3_000 });
+    expect((await get(host, "/api/tunnel")).json<TunnelInfo>().tunnels).toContainEqual(
+      expect.objectContaining({ provider: "devtunnel", enabled: true, status: "on" }),
+    );
+    expect(spawn).toHaveBeenCalledWith(
+      "devtunnel",
+      ["host", "fleet-machine1"],
+      expect.any(Object),
+    );
+    expect(providerSpecs.devtunnel.newTunnelId).toHaveBeenCalledOnce();
+  });
+
+  it("still switches the provider off when its CLI cannot start", async () => {
+    const host = await openHost();
+    await claim(host);
+    vi.mocked(BinaryProbe.prototype.present).mockResolvedValue(false);
+
+    const response = await post(host, "/api/tunnel", {
+      provider: "devtunnel",
+      enabled: true,
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error).toMatch(/not installed/);
+    expect(response.json<{ tunnel: TunnelInfo }>().tunnel.tunnels).toContainEqual(
+      expect.objectContaining({
+        provider: "devtunnel",
+        enabled: false,
+        status: "error",
+      }),
+    );
+    expect((await exportArchive(host, "data")).tunnel.enabled).toBe(false);
+    expect(providerSpecs.devtunnel.prepare).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
 });

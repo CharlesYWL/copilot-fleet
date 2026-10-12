@@ -16,10 +16,10 @@ tags:
 **Architect**: TBD  
 **Program Manager**: Not assigned  
 **Date**: 2026-09-14  
-**Updated**: 2026-10-05\
-**Status**: Proposed incremental delivery plan; phases below are not implemented\
+**Updated**: 2026-10-12\
+**Status**: Proposed incremental delivery plan; root-version declaration is implemented, but release production and managed-update phases below are not\
 **Work item**: Not assigned  
-**Source baseline**: `0757f34caf710404896f9800960a3b75be655da4`, workspace versions `0.8.0`
+**Source baseline**: `0757f34caf710404896f9800960a3b75be655da4`, historical workspace versions `0.8.0`; current version source is root `package.json` (`0.9.0`)
 
 ## Related documents
 
@@ -41,8 +41,9 @@ tags:
 This proposal supersedes the earlier NPX proposal's SHA-based update comparison and
 untargeted `@latest` update decisions for managed bundles. The October revision
 extends the original Node-only/manual-publication proposal to automated production
-and later Host updates. It does not implement NPX distribution, nor change the
-accepted login-start authentication model.
+and later Host updates. The October 12 revision makes the root manifest the sole
+version source and separates release freshness from wire compatibility. It does not
+implement NPX distribution, nor change the accepted login-start authentication model.
 
 ## Feature desired outcome
 
@@ -77,8 +78,9 @@ The first managed-update combination remains:
 - Update target: an explicitly approved, immutable release identity selected by the
   Host, not the newest branch commit or a moving `latest` alias.
 
-The later supported combination is a managed Host plus managed Nodes. Both use one
-Fleet release version and component-specific archives. Building a Host archive does
+The later supported combination is a managed Host plus managed Nodes. Artifacts
+built together use one Fleet release version and component-specific archives;
+compatible older Nodes may remain connected while the Host advances. Building a Host archive does
 not enable Host activation; state migration, backup/recovery, launch ownership, and
 verified restart are separate delivery gates.
 
@@ -91,6 +93,7 @@ evaluation is an isolated Host/Node update exercise with injected failures.
 | Incremental adoption | Install each phase on an existing checkout-based fleet. | Existing startup/update paths remain usable; unsupported bundle actions stay unavailable. |
 | Exact-version deployment | Publish/select A, then publish newer B during A's rollout. | Every operation for A installs A's pinned bytes, never B. |
 | Mixed installation support | Checkout Host and managed Node exchange inventory, execute a mock session, and update. | Installation type does not prevent compatible protocol operation. |
+| Mixed release support | Upgrade the Host first while an older Node remains connected, then update that Node to the approved target. | Report "update available, still compatible"; preserve baseline execution and gate unsupported features independently of freshness. |
 | Safe automation | Attempt an automatic update with running, idle, and permission-waiting sessions. | Zero unapproved session termination; activation waits for zero live sessions. |
 | Durable service restart | Update a real same-user login task and reconnect. | Same SID, task, `nodeId`, keys, settings, and workspace placements; no detached window. |
 | Failure isolation | Fail download, verification, extraction, or preparation. | Active release and its dependencies are untouched and remain restartable. |
@@ -107,8 +110,10 @@ claimed by this design.
 | Term | Meaning |
 | --- | --- |
 | npm-run Host | A cloned checkout using the repository's npm scripts, not a published npm/NPX package. |
-| Release version | Canonical SemVer shared by Host, Node, and protocol, for example `0.8.1`. |
-| Release tag | Git reference `v0.8.1`, resolving to a recorded full source commit. |
+| Release version | Canonical SemVer declared only in root `package.json`, for example `0.9.0`; each artifact embeds the version from its selected source. |
+| Release tag | Git reference `v0.9.1`, resolving to a recorded full source commit whose root version is `0.9.1`. |
+| Protocol epoch | Explicit application wire-contract generation, independent of release SemVer; change it for a breaking contract, not every release. |
+| Capability | A negotiated optional feature or update operation; peers must not send unsupported feature-specific messages. |
 | Release producer | Approved manual command or scheduled job that plans versions, builds, verifies, and publishes; it never authorizes deployment. |
 | Bundle | Compiled component code, production dependencies, assets, and metadata in an archive; not necessarily an executable. |
 | Release identity | Repository, version, tag, source commit, release ID, manifest digest, and selected asset ID/digest. |
@@ -171,8 +176,8 @@ milestone. Host activation must wait for the state/backup/launcher gates in sect
 
 | Source / symbol | Observed behavior | Required change |
 | --- | --- | --- |
-| Workspace manifests and root lockfile | Host, Node, and protocol report `0.8.0`; no release-planning/packaging scripts exist. | Add synchronized version planning through a release PR, followed by exact-tag packaging and publication. |
-| `packages/protocol/src/runtime.ts`: `packageVersion`, `gitRevision` | Reports package version and live checkout SHA separately. | Add build/release identity that belongs to the running artifact; preserve SHA as diagnostic information. |
+| Root/workspace manifests and root lockfile | Root `package.json` declares `0.9.0`; private Host, Node, and protocol manifests omit `version`; internal protocol dependencies use `*` and the lockfile links the local workspace. No release-planning/packaging scripts exist. | Plan root-version/lockfile changes through a release PR, followed by exact-tag packaging and publication; do not reintroduce manually synchronized workspace versions. |
+| `packages/protocol/src/runtime.ts`: `packageVersion`, `gitRevision` | Reports the root release version and live checkout SHA separately; package-scoped asset/data anchors remain unchanged. | Add immutable build/release identity that belongs to the running artifact; preserve SHA as diagnostic information. |
 | `packages/protocol/src/index.ts`: `nodeUpdateState` | Compares SHA equality and `self-update` capability. | Compare trusted release identity and SemVer against the approved target; distinguish ahead, unknown, incompatible, and legacy. |
 | `packages/protocol/src/updater.ts`: `updateCheckout`; `apps/node/src/updater.ts`: wrapper | Shared checkout updater fetches, resets the tracking branch, installs, and builds in place; the Node wrapper selects `build:node`. | Preserve the legacy path; managed components stage pinned bundles without resetting/building their active runtime. |
 | `apps/host/src/self-update.ts`, `scripts/self-update.mjs` | Existing launcher/login-service path performs a checkout update and verifies the restarted Host/colocated Node. | Retain that behavior while adding a separately gated managed-Host path with state-safe recovery. |
@@ -196,7 +201,7 @@ packaging convenience.
 
 | Owner | Responsibility |
 | --- | --- |
-| Publisher / scheduled producer | Plan synchronized versions through the approved PR/tag process, build/check exact source, and publish complete releases under an explicit publication policy. |
+| Publisher / scheduled producer | Plan the root release version through the approved PR/tag process, build/check exact source, and publish complete releases under an explicit publication policy. |
 | Host | Authenticate catalog reads, approve component targets, persist operations, gate dispatch, and verify Node completion; later request its own update through an external launcher. |
 | Node application | Validate requests, prepare candidate files, fence local execution, drain events, and report correlated readiness. |
 | Managed supervisor | Sole writer of its component's activation journal; own child lifetime, launch selection, promotion, and bounded compatible rollback. |
@@ -213,9 +218,43 @@ Installation type is not protocol compatibility:
 | Managed packaged Host | Managed bundle Node | Later milestone; same network contract plus Host state/launcher safety gates. |
 
 Compatibility is explicit: declare an application protocol epoch, required
-capabilities, a supported Host version range, and an update-protocol version.
+capabilities, certified peer version ranges, and an update-protocol version.
 Capabilities continue gating feature-specific messages. SemVer alone does not prove
 wire compatibility, particularly for `0.x` minor releases.
+
+Release equality is not required for ordinary Host/Node communication. Each artifact
+includes its own compiled protocol package from the tagged source; that package
+is not a separately deployed service or a version the peer must load. The private
+workspace dependency `*` is a build-time link, not permission to install an arbitrary
+protocol library or declare any deployed release compatible.
+
+On authenticated connection, each managed peer reports its immutable release identity,
+application protocol epoch, and capabilities. The Host advertises its supported peer
+epochs and evaluates the certified compatibility metadata. Optional inventory fields
+must remain parseable by supported older peers. Missing release identity means legacy
+or unknown freshness, not an invented release or proof of incompatibility.
+
+Keep three decisions separate:
+
+- **Freshness:** compare the running Node identity/version with the explicitly approved
+  Node target, not automatically with the Host version or GitHub's moving `latest`.
+- **Execution compatibility:** require a supported wire epoch and baseline contract;
+  negotiate optional capabilities before sending new feature commands.
+- **Update eligibility:** additionally require compatible target metadata, updater/
+  launcher capabilities, installation kind, platform, credentials, and safe session state.
+
+For example, a Host built as `1.0.1` and a Node built as `1.0.0`, both speaking a
+certified epoch 1 contract, may execute ordinary work while the Node is behind the
+approved `1.0.1` target. An unsupported feature stays disabled until its capability
+appears. A wire-incompatible peer must not receive normal execution commands; an
+update is possible only through a separately compatible negotiated management
+contract, otherwise report a manual upgrade requirement. Never use an incompatible
+application message as the way to repair that incompatibility.
+
+Protocol epochs are a compatibility declaration backed by mixed-version fixtures.
+A patch version, shared major number, or identical epoch alone is not test evidence.
+Do not bump the epoch for an additive optional capability; do not keep an epoch
+unchanged after a breaking message change without backward-compatible parsing.
 
 A release Host defaults its target only when its build identity is verified as a
 published release. A checkout with the same `package.json` version but extra or
@@ -233,13 +272,15 @@ All script names in this section are **proposed**, not commands implemented toda
 
 Start with a manually invoked `release:plan`; schedule it only after its behavior is
 proven. The initial rule is a patch increment for unreleased changes on `main`
-(`0.8.0` to `0.8.1`), with an explicit reviewed choice for minor/major increments.
+(`0.9.0` to `0.9.1`), with an explicit reviewed choice for minor/major increments.
 Do not infer breaking-change compatibility from commit wording. Protocol and data
 compatibility remain independent release checks.
 
-The planner updates `apps/host/package.json`, `apps/node/package.json`,
-`packages/protocol/package.json`, and the root lockfile's corresponding workspace
-entries together. It opens a release PR through the normal protected-branch process.
+The planner updates only the root `package.json` version and its generated
+`package-lock.json` metadata. The three private workspace manifests omit versions;
+Host and Node keep `@fleet/protocol: "*"` resolved to the local workspace by the
+lockfile. There is no version synchronization script or independent protocol release.
+It opens a release PR through the normal protected-branch process.
 It does not bump every developer commit or push directly to protected `main`.
 Approval/merge is a human/repository-policy gate, not a side effect of scheduling.
 
@@ -248,7 +289,18 @@ tag, build receipts, and eventual release identity in the producer's durable sta
 Allow only one active release plan for this repository. Repeated invocations reuse
 the pending plan rather than reserve another version. A merged version commit is
 tagged at its exact full SHA; newer `main` commits belong to the next release, not
-the build already selected. Recheck all workspace versions at the tag.
+the build already selected. Recheck the root version, matching tag, lockfile, and
+local workspace resolution at the selected commit.
+
+The producer stamps the selected root version and full source commit into each
+component's immutable build metadata. Protocol epoch/capabilities are separate
+contract declarations. If an executable embeds everything, embed that metadata in
+the executable; an archive may carry it inside its verified, immutable release
+directory. Never derive the running release from a mutable checkout manifest, a
+filename alone, Git HEAD after startup, or an environment version override. Verify
+the stamped version agrees with the root manifest, tag, and release manifest before
+publication. Any package versions required by future external packaging tooling
+must be generated from that same root value, not manually maintained source copies.
 
 An unchanged source selection is a no-op. Release-only version/lockfile commits are
 not new application changes: compare against the recorded plan/published baseline
@@ -259,11 +311,11 @@ a publication-success marker on failure.
 
 #### 4.2 Publisher sequence
 
-1. Merge the synchronized version PR and create/push its matching release tag
+1. Merge the root-version PR and create/push its matching release tag
    through the approved repository process; do not fabricate a tag from current
    `main` while publishing.
 2. In a disposable clean build checkout, resolve that tag to a full commit and verify
-   its package versions. Never build a release from the actively running Host tree
+   its root version and lockfile. Never build a release from the actively running Host tree
    or package a dirty workspace.
 3. Run `npm ci`, the repository verification suite, and the platform-specific
    packaging checks. A script may create output only under an explicit build/output
@@ -286,7 +338,7 @@ Proposed entry points:
 
 | Script | Inputs | Output / side effects |
 | --- | --- | --- |
-| `release:plan` | Source branch/baseline, default patch or reviewed increment, durable plan identity. | Synchronized version/lockfile change and release PR; no branch-protection bypass or automatic merge. |
+| `release:plan` | Source branch/baseline, default patch or reviewed increment, durable plan identity. | Root version/lockfile change and release PR; no branch-protection bypass or automatic merge. |
 | `release:prepare` | Existing tag, component set, supported target platform, output directory. | Bundles, manifest, and local verification receipts; no remote writes. |
 | `release:publish` | Prepared output, matching release receipt, explicit approval or approved publication policy. | Create/upload/verify draft, then publish; no automatic version bump, commit, or push. |
 | `release:run` | Existing release plan/receipt and approved producer configuration. | Resume eligible planning/build/publication steps; wait visibly at unmet approval gates; no runtime deployment. |
@@ -299,8 +351,8 @@ download or activation contracts. Manual invocation remains supported for recove
 Illustrative asset names once both component packaging gates have passed:
 
 - `release.json`
-- `fleet-node-0.8.1-win32-x64.zip`
-- `fleet-host-0.8.1-win32-x64.zip`
+- `fleet-node-0.9.1-win32-x64.zip`
+- `fleet-host-0.9.1-win32-x64.zip`
 
 Node-only releases explicitly omit the Host artifact. When Host packaging becomes
 available, publish it in a new version; never backfill the prior release.
@@ -323,6 +375,11 @@ asset loading from an isolated absolute data directory. A Host-only bundle does
 not imply that the existing combined Host+Node launcher can start an unbundled Node.
 Combined installation support must select separate verified component runtimes.
 
+The same version/identity rules apply if a later packaging milestone produces
+standalone executables instead of these archives. An `.exe` version tag is not a
+replacement for embedded metadata, digest verification, or readiness confirmation.
+Standalone executable packaging is not introduced by the root-version change.
+
 Materialize workspace packages as real in-archive directories at runtime-resolvable
 locations. No symlink/junction may point to the publisher's workspace. Packaging
 must preserve nested dependency versions and verify every `@fleet/protocol` export,
@@ -344,23 +401,26 @@ Illustrative schema; hash placeholders below are not valid release values:
 {
   "schemaVersion": 1,
   "repository": "charlesyin_microsoft/copilot-fleet",
-  "version": "0.8.1",
-  "tag": "v0.8.1",
+  "version": "0.9.1",
+  "tag": "v0.9.1",
   "sourceCommit": "<full 40-character commit>",
   "channel": "stable",
   "updateProtocolVersion": 1,
   "minimumLauncherVersion": "1.0.0",
   "compatibility": {
     "protocolEpoch": 1,
-    "hostVersionRange": ">=0.8.1 <0.9.0",
-    "requiredHostCapabilities": ["versioned-node-update-v1"]
+    "supportedProtocolEpochs": [1],
+    "hostVersionRange": ">=0.9.0 <0.10.0",
+    "nodeVersionRange": ">=0.9.0 <0.10.0",
+    "requiredHostCapabilities": ["versioned-node-update-v1"],
+    "requiredNodeCapabilities": ["versioned-node-update-v1"]
   },
   "artifacts": [
     {
       "component": "node",
       "platform": "win32",
       "arch": "x64",
-      "name": "fleet-node-0.8.1-win32-x64.zip",
+      "name": "fleet-node-0.9.1-win32-x64.zip",
       "sizeBytes": 123456,
       "unpackedSizeBytes": 456789,
       "sha256": "<64-character lowercase hex digest>",
@@ -371,7 +431,7 @@ Illustrative schema; hash placeholders below are not valid release values:
       "component": "host",
       "platform": "win32",
       "arch": "x64",
-      "name": "fleet-host-0.8.1-win32-x64.zip",
+      "name": "fleet-host-0.9.1-win32-x64.zip",
       "sizeBytes": 234567,
       "unpackedSizeBytes": 567890,
       "sha256": "<64-character lowercase hex digest>",
@@ -385,7 +445,10 @@ Illustrative schema; hash placeholders below are not valid release values:
 Schema paths use archive-relative separators; runtime resolution uses the platform's
 path APIs. The entry point is a validated relative path, never a shell command.
 Real runtime ranges must reflect validation evidence, not be copied blindly from
-this example. Component/platform entries must be unique. The example illustrates
+this example. Host/Node ranges certify candidate deployment against retained peers;
+the required updater capabilities gate managed updates, not ordinary execution.
+Protocol-epoch support and feature negotiation separately govern the wire contract.
+Component/platform entries must be unique. The example illustrates
 packaging, not activation authority: Host activation additionally requires certified
 state-schema compatibility and backup/recovery evidence from section 13. Missing
 Host activation metadata makes that artifact ineligible, not implicitly safe.
@@ -476,6 +539,12 @@ Keep release relation separate from update eligibility:
 | `different_build` | Same SemVer but different/unverified release identity. |
 | `unknown` | Missing or invalid identity information. |
 
+The Host returns/publishes release relation, execution compatibility, and update
+eligibility independently so both the fleet UI and the Node's local status can
+show "update available, still compatible". A Node never queries a moving `latest`
+alias to choose its own target. Advancing the Host does not silently approve a new
+Node target; existing publication/deployment approval gates remain in force.
+
 Eligibility separately reports unsupported platform, incompatible protocol, old
 launcher, legacy checkout, unavailable credentials, offline state, or live sessions.
 This avoids a green "current" badge masking an unsupported updater.
@@ -495,11 +564,11 @@ manifest digest, and archive hash and refuses metadata drift.
 Illustrative existing CLI command, after a release with these assets is published:
 
 ```powershell
-gh release download v0.8.1 `
+gh release download v0.9.1 `
   --repo charlesyin_microsoft/copilot-fleet `
   --pattern "release.json" `
-  --pattern "fleet-node-0.8.1-win32-x64.zip" `
-  --dir ".\staging\0.8.1"
+  --pattern "fleet-node-0.9.1-win32-x64.zip" `
+  --dir ".\staging\0.9.1"
 ```
 
 Service code uses a unique operation staging directory, not this illustrative
@@ -603,7 +672,8 @@ and send it to older Nodes that may ignore the field and update a branch anyway.
 
 | Surface | Proposed additions |
 | --- | --- |
-| Node inventory/register/ready | Optional installation kind, launch mode, verified release identity, launcher version, and pending/last update receipt. |
+| Node inventory/register/ready | Optional installation kind, launch mode, immutable release identity, application protocol epoch, capabilities, launcher version, and pending/last update receipt. |
+| Host welcome/status | Host release identity and supported protocol epochs, approved Node target, and independent freshness, execution compatibility, and update eligibility results. |
 | Host-to-Node request | `update_node_release`: `updateId`, pinned target identity, compatibility metadata, and explicit session policy. |
 | Host-to-Node activation request | `activate_node_update`: matching ID/target after the Host has persisted its admission fence. |
 | Final-event barrier | Node sends `node_update_drained` after its final events; Host persists those events and replies `restart_node_update` on the same authenticated connection, correlated to the operation/barrier. |
@@ -847,6 +917,9 @@ Extend existing Nodes/settings surfaces rather than building a separate update U
   and release notes.
 - In each Node row show running version first, source SHA in details, install/launch
   kind, eligibility reason, target, and durable operation stage.
+- Show a behind-but-compatible Node as "update available, still compatible", not
+  disconnected or up to date. Show wire incompatibility and missing optional/updater
+  capabilities separately; neither is inferred from release-version inequality.
 - Provide target approval, per-Node update, safe bulk update, automatic-policy opt-in,
   pause rollout, and cancel-before-activation actions.
 - Keep "stop sessions and update" behind the existing named-session confirmation.
@@ -919,7 +992,7 @@ the colocated Node as an incidental effect of changing the Host runtime.
 
 Reuse exact-release discovery, authenticated downloads, archive validation, staging,
 and durable operation conventions. Keep Host and Node approvals/operations distinct
-even when their package version is the same. Deploy only a Host version compatible
+even when their release version is the same. Deploy only a Host version compatible
 with the Nodes that will remain connected; do not assume a simultaneous fleet switch.
 
 Prepare the candidate without changing active code/data. Persist an update record
@@ -988,6 +1061,7 @@ this policy. Host downtime and tunnel behavior must be visible to the operator.
 | Outbox events vanish on process exit | M | H | Stop/event barrier before shutdown; refuse exit when acknowledgements are incomplete. |
 | Crash during activation strands the machine | M | H | Stable dependency-free supervisor, single-writer journal, retained known-good release, bounded recovery. |
 | Same version label reports success for wrong bytes | M | H | Verify full release identity and attempt, not only version/SHA or reconnect. |
+| Root manifest changes relabel an older executable, or version inequality blocks compatible Nodes | M | H | Embed immutable selected-source metadata; compare approved-target freshness separately from certified wire epochs/capabilities and update eligibility. |
 | Host/tunnel outage triggers rollback storm | M | H | Separate local readiness from connectivity; persist attempts and pause rollout. |
 | Task migration breaks ownership or reenables a stopped service | M | H | Old-manifest validation, recoverable task migration, preserve enabled state, explicit start authority. |
 | Host bundle starts against a fresh/wrong database or loses keys | M | H | Explicit stable data paths and owned migration; verify unchanged Host identity/database before promotion. |
@@ -1029,7 +1103,8 @@ These are approval/implementation gates, not missing assumptions to silently fil
 
 **Quality(verification)** — Turn the desired outcomes into deterministic tests.
 
-- [ ] Release planning: synchronized workspace/lockfile versions, explicit minor/
+- [ ] Release planning: one root version and generated lockfile metadata, unversioned
+  private workspace links, matching artifact/tag versions, explicit minor/
   major choice, protected PR flow, exact merged-commit tag, unchanged-source no-op,
   no release-commit feedback loop, concurrent invocations, and retry without
   duplicate versions.
@@ -1038,6 +1113,12 @@ These are approval/implementation gates, not missing assumptions to silently fil
   no replacement of a published version.
 - [ ] Unit: SemVer precedence, invalid versions, prerelease channels, same-version
   different identity, no downgrade, target pinning, and compatibility checks.
+- [ ] Mixed releases: an older compatible Node remains executable after a Host
+  upgrade; freshness/status reaches both UIs; unsupported feature/update messages
+  are withheld; a breaking epoch requires compatible management or manual recovery.
+- [ ] Build identity: replacing a checkout root manifest or changing live HEAD
+  cannot relabel an already-built managed archive/executable; internal metadata,
+  root source version, tag, manifest, and selected artifact agree.
 - [ ] Unit: manifest validation, absolute/traversal/case/ADS/link extraction rejection,
   byte/entry limits, path containment, and redaction.
 - [ ] Unit: duplicate requests, stale status sequence, mismatched operation/attempt,
@@ -1109,7 +1190,7 @@ milestones. No phase in this table is claimed complete by this document.
 | Phase | Scope and main surfaces | Depends on | Completion gate |
 | --- | --- | --- | --- |
 | P1 | Release/build identity, manifest/component schema, SemVer/compatibility fixtures, and optional inventory fields. No update actions. | None | Exact identity and mixed-version parsing pass; checkout behavior is unchanged. |
-| P2 | `release:plan`: default patch increment, synchronized manifests/lockfile, durable reservation, and reviewed release PR/tag flow. | P1 | Manual dry run/PR proof; races/retries reuse one plan and no protected-branch bypass occurs. |
+| P2 | `release:plan`: default patch increment, root version/generated lockfile, durable reservation, and reviewed release PR/tag flow. | P1 | Manual dry run/PR proof; races/retries reuse one plan and no protected-branch bypass occurs. |
 | P3 | Node-only `release:prepare`, dependency/asset closure, and isolated Windows x64 bundle check. No remote writes. | P1 | Node runs outside checkout without Git/npm/build in its launch path. |
 | P4 | Host `release:prepare`, server/UI/dependency closure, and isolated absolute-state smoke check. No installation changes. | P1 | Host artifact runs outside checkout; no production database/identity is accessed. |
 | P5 | `release:publish`: exact-tag draft upload, re-download checks, completeness, receipts, and explicit manual publication. | P2, P3; P4 only for releases including Host | One verified private Node release; later Host assets require a new verified version, not backfill. |
@@ -1215,7 +1296,7 @@ into one large PR.
 
 | **Phase** | **Description & objective** | **Depends on** |
 | --- | --- | --- |
-| 1 | Shared identity/schema and synchronized release planning. | P1, P2 |
+| 1 | Shared immutable identity/compatibility schema and root-version release planning. | P1, P2 |
 | 2 | Independent Node/Host packaging, verified publication, then scheduled producer. | P3-P6 |
 | 3 | Managed Node runtime/service migration and durable remote preparation. | P8-P10 |
 | 4 | Node activation/commit handshake, fault tests, then safe rollout policy. | P11, P12 |

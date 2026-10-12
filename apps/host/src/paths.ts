@@ -27,7 +27,7 @@ export function envFilePath(startDirectory = moduleDirectory()): string {
   return sharedEnvFilePath(startDirectory);
 }
 
-/** This package's semver, as `package.json` declares it. */
+/** The shared Fleet release version from the root `package.json`. */
 export function packageVersion(startDirectory = moduleDirectory()): string {
   return sharedPackageVersion(startDirectory);
 }

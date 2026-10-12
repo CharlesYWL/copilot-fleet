@@ -39,6 +39,7 @@ afterEach(async () => {
   for (const supervisor of supervisors.splice(0)) await supervisor.stop();
   for (const store of stores.splice(0)) store.close();
   children.length = 0;
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.mocked(spawn).mockReset();
 });
@@ -236,13 +237,102 @@ describe("restoring stable tunnels", () => {
       supervisor.restoreSettings(store.getTunnelBackupSettings()),
     ).rejects.toThrow(/Dev Tunnels: Tunnel not found/);
     expect(store.getSetting("tunnel.devtunnel.id")).toBe("fleet-source.usw2");
-    expect(store.getEnabledTunnelProviders()).toEqual(["ngrok"]);
+    expect(store.getEnabledTunnelProviders()).toEqual(["ngrok", "devtunnel"]);
     expect(providerSpecs.devtunnel.newTunnelId).not.toHaveBeenCalled();
     expect(spawn).toHaveBeenCalledExactlyOnceWith(
       "ngrok",
       expect.any(Array),
       expect.any(Object),
     );
+  });
+});
+
+describe("recovering tunnel setup", () => {
+  it("keeps the saved switch and ID through repeated failures, then recovers automatically", async () => {
+    vi.useFakeTimers();
+    const { store, supervisor } = managed("fleet-source.usw2");
+    store.setTunnelProviderEnabled("devtunnel", true);
+    vi.mocked(providerSpecs.devtunnel.prepare!)
+      .mockRejectedValueOnce(new Error("Tunnel service timed out"))
+      .mockRejectedValueOnce(new Error("Tunnel service is still unavailable"));
+
+    await expect(supervisor.setEnabled("devtunnel", true)).rejects.toThrow(
+      "Tunnel service timed out",
+    );
+    expect(store.getEnabledTunnelProviders()).toEqual(["devtunnel"]);
+    expect((await supervisor.info("http://127.0.0.1:8787")).tunnels).toContainEqual(
+      expect.objectContaining({
+        provider: "devtunnel",
+        enabled: true,
+        status: "error",
+        error: "Tunnel service timed out",
+      }),
+    );
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(providerSpecs.devtunnel.prepare).toHaveBeenCalledTimes(2);
+    expect(spawn).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(providerSpecs.devtunnel.prepare).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    ready(children[0]!, "fleet-source.usw2");
+
+    expect(providerSpecs.devtunnel.prepare).toHaveBeenCalledTimes(3);
+    expect(spawn).toHaveBeenCalledExactlyOnceWith(
+      "devtunnel",
+      ["host", "fleet-source.usw2"],
+      expect.any(Object),
+    );
+    expect(supervisor.activeTunnelId()).toBe("fleet-source.usw2");
+    expect(store.getEnabledTunnelProviders()).toEqual(["devtunnel"]);
+    expect(providerSpecs.devtunnel.newTunnelId).not.toHaveBeenCalled();
+  });
+
+  it("cancels setup retries when the operator switches the tunnel off", async () => {
+    vi.useFakeTimers();
+    const { store, supervisor } = managed("fleet-source.usw2");
+    store.setTunnelProviderEnabled("devtunnel", true);
+    vi.mocked(providerSpecs.devtunnel.prepare!).mockRejectedValue(
+      new Error("Tunnel service timed out"),
+    );
+    await expect(supervisor.setEnabled("devtunnel", true)).rejects.toThrow(
+      "Tunnel service timed out",
+    );
+
+    store.setTunnelProviderEnabled("devtunnel", false);
+    await supervisor.setEnabled("devtunnel", false);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(providerSpecs.devtunnel.prepare).toHaveBeenCalledOnce();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(store.getEnabledTunnelProviders()).toEqual([]);
+    expect((await supervisor.info("http://127.0.0.1:8787")).tunnels).toContainEqual(
+      expect.objectContaining({
+        provider: "devtunnel",
+        enabled: false,
+        status: "off",
+        error: null,
+      }),
+    );
+  });
+
+  it("retries immediately on request without leaving the previous backoff armed", async () => {
+    vi.useFakeTimers();
+    const { supervisor } = managed("fleet-source.usw2");
+    vi.mocked(providerSpecs.devtunnel.prepare!).mockRejectedValueOnce(
+      new Error("Tunnel service timed out"),
+    );
+    await expect(supervisor.setEnabled("devtunnel", true)).rejects.toThrow(
+      "Tunnel service timed out",
+    );
+
+    await supervisor.setEnabled("devtunnel", true);
+    ready(children[0]!, "fleet-source.usw2");
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(providerSpecs.devtunnel.prepare).toHaveBeenCalledTimes(2);
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(supervisor.activeTunnelId()).toBe("fleet-source.usw2");
   });
 });
 

@@ -404,7 +404,6 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     try {
       await tunnel.setEnabled(provider, input.enabled, input.primary ?? true);
     } catch (error) {
-      store.setTunnelProviderEnabled(provider, false);
       return reply.code(503).send({
         error: errorMessage(error, "Tunnel failed to start"),
         tunnel: await tunnel.info(fallbackPublicUrl()),

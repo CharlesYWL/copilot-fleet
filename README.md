@@ -1937,9 +1937,17 @@ missing or incorrect revision after restart is reported as a failure. Older
 Nodes without an announced build must at least return on a different known
 revision.
 
-The commit is compared, not the package version: `0.1.0` never moves between
-deploys, so comparing it would report every machine as current no matter how far
-behind it was.
+The shared release version is declared only in the root `package.json`; Host,
+Node, and protocol are private, unversioned workspaces. Host and Node report that
+root version, and their internal `@fleet/protocol: "*"` dependency resolves to the
+local workspace through the lockfile. A version bump changes the root manifest
+and generated lockfile, not three separate package versions.
+
+The current checkout updater compares commits, not release versions: multiple
+development commits can share one version. Exact-release bundles and independent
+freshness/protocol-compatibility checks are planned in the
+[versioned-release spec](docs/superpowers/specs/2026-09-14-versioned-node-releases.md),
+not implemented by this version-declaration change.
 
 What it will not do:
 
@@ -2097,8 +2105,15 @@ its output is kept in `self-update.log` beside the Host database. Progress in
 both cases is recorded in `self-update.json` there, which is how the restarted
 Host knows how the update went.
 
-Restarting `npm run dev:tunnel` restarts its tunnel with everything else, as
-stopping and starting it by hand would: a Dev Tunnel keeps its address, but a
+Tunnels enabled in **Settings → Tunnel** are restored after a Host update.
+If Dev Tunnels setup fails while its service or CLI sign-in is unavailable, the
+saved switch and tunnel ID are retained and setup retries automatically with
+backoff (up to one minute between attempts). The failure stays visible in
+Settings; switching the tunnel off cancels retries. A missing CLI or a provider
+refused by the Host's access policy still switches that provider off.
+
+Restarting `npm run dev:tunnel` restarts its separately managed tunnel with
+everything else, as stopping and starting it by hand would: a Dev Tunnel keeps its address, but a
 quick tunnel (Cloudflare, free ngrok) comes back on a new one. The launcher
 itself is not replaced by an update; changes to it take effect the next time you
 start the command.
