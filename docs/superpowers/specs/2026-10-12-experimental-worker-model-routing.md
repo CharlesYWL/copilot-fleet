@@ -168,8 +168,9 @@ bypass. Fallback and Shadow mode are specified below.
 - v1 supports Azure AI Foundry's Microsoft decision endpoint with API-key
   authentication. Other providers and Entra authentication are future work.
 - Only `fleet_start_work` is routed. Follow-ups, the REST plan endpoint
-  (`POST /api/runs/:id/plan`), ordinary Chats, adopted conversations and lead
-  sessions use today's behavior.
+  (`POST /api/runs/:id/plan`), PR-maintenance continuations of an existing
+  worker, ordinary Chats, adopted conversations and lead sessions use today's
+  behavior.
 - Workers remain Copilot ACP. A Hermes lead does not change the worker provider.
 - Workers always start with the `long_context` context tier (unchanged).
 - No live price feed, self-training, automatic promotion, extra scheduler or
@@ -584,7 +585,7 @@ Persist:
 | 8 | Clarification gate? | Pilot detected 4/4 but threshold uncalibrated | **Deferred:** no clarification question in v1. |
 | 9 | Secret storage on Windows? | Data directory already ACL-restricted by `data-permissions.ts` | **Resolved:** `0o600` credential file in that directory; verify ACL inheritance in a test. |
 | 10 | Raw model IDs in settings? | Defaults UI already stores ACP values | **Resolved:** ACP dropdowns, raw-ID tooltip, advanced Unverified input. |
-| 11 | Are PR-maintenance worker dispatches routed? | They use prepared steps | **Open:** proposed no for v1 (prepared steps keep defaults). |
+| 11 | Are PR-maintenance worker dispatches routed? | They usually continue an existing worker, which already has a model | **Resolved 2026-10-13:** no special handling. Existing workers keep their model; PR-maintenance is not a routing case in v1. |
 | 12 | Are the illustrative pairs good? | No worker-outcome benchmark | Keep editable; no shipped profiles. |
 
 # Common core checklist
