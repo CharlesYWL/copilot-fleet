@@ -38,7 +38,7 @@
       <div class="diagram">
         <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="2026-10-12-worker-model-routing-title 2026-10-12-worker-model-routing-desc">
           <title id="2026-10-12-worker-model-routing-title">New-worker routing and same-session recovery</title>
-          <desc id="2026-10-12-worker-model-routing-desc">An operator configures Host-owned routing, new worker briefs are classified by Foundry and stored as pinned model and effort pairs before ACP execution, while resumed workers reuse that record and direct unconfirmed execution is blocked.</desc>
+          <desc id="2026-10-12-worker-model-routing-desc">An operator configures profiles with exact Copilot model and effort pairs, Foundry selects a profile for new workers before ACP execution, and resumed workers reuse the saved pair without another classification or an unconfirmed bypass.</desc>
           <defs>
             <style>
               svg {
@@ -135,7 +135,7 @@
             <text class="mono muted" x="76" y="84" text-anchor="middle">OWNER</text>
             <text class="name" x="140" y="108" text-anchor="middle">Operator settings</text>
             <text x="140" y="132" text-anchor="middle">Endpoint, deployment, key</text>
-            <text class="mono muted" x="140" y="152" text-anchor="middle">Task type x level mappings</text>
+            <text class="mono muted" x="140" y="152" text-anchor="middle">Profiles: exact model + effort</text>
           </g>
           <g data-node="orchestrator">
             <rect class="mask" x="40" y="248" width="200" height="112" rx="8"/>
@@ -152,7 +152,7 @@
             <rect class="tag" x="332" y="260" width="64" height="12" rx="4"/>
             <text class="mono muted" x="364" y="268" text-anchor="middle">HOST-ONLY</text>
             <text class="name" x="440" y="292" text-anchor="middle">Route the new worker</text>
-            <text x="440" y="316" text-anchor="middle">Bounded state + policy rubric</text>
+            <text x="440" y="316" text-anchor="middle">Bounded state + profile rubric</text>
             <text class="mono muted" x="440" y="340" text-anchor="middle">Host-held key; one fenced attempt</text>
           </g>
           <g data-node="foundry">
@@ -162,7 +162,7 @@
             <text class="mono muted" x="684" y="84" text-anchor="middle">EXTERNAL</text>
             <text class="name" x="760" y="108" text-anchor="middle">Azure AI Foundry decision</text>
             <text class="mono muted" x="760" y="132" text-anchor="middle">Microsoft-Decision-1</text>
-            <text class="mono muted" x="760" y="152" text-anchor="middle">level + needs_clarification</text>
+            <text class="mono muted" x="760" y="152" text-anchor="middle">profile + needs_clarification</text>
           </g>
           <g data-node="selection-record">
             <rect class="mask" x="640" y="248" width="240" height="112" rx="8"/>
@@ -192,7 +192,7 @@
             <text class="mono muted" x="140" y="572" text-anchor="middle">No reclassification</text>
           </g>
 
-          <text class="mono muted" x="320" y="580">Record level, policy revision, source and confirmed values.</text>
+          <text class="mono muted" x="320" y="580">Record profile, policy revision, source and confirmed values.</text>
           <text class="mono muted" x="40" y="624">Clarification / provider failure: hold by default. Approved fallback is explicit, not a successful decision.</text>
           <line x1="40" y1="648" x2="1240" y2="648" stroke="rgba(14,23,38,0.12)" stroke-width="0.8"/>
           <text class="mono muted" x="40" y="680" letter-spacing="0.12em">LEGEND</text>
@@ -206,7 +206,7 @@
           <text class="mono muted" x="976" y="680">BLOCKED BYPASS</text>
         </svg>
       </div>
-      <figcaption><strong>Only a NEW worker is classified.</strong> Its model and effort are resolved through the owner's task-type mappings and recorded before dispatch. The Node confirms configuration before execution; resume and recovery reuse the effective saved pair.</figcaption>
+      <figcaption><strong>Only a NEW worker is classified.</strong> Foundry returns a profile ID, not a model or effort. Fleet resolves that profile's preselected exact ACP pair and records it before dispatch. The Node confirms configuration before execution; resume and recovery reuse the effective saved pair.</figcaption>
     </figure>
     <p class="note">Static overview, 1280 x 720. Secure-paved-road pattern, seven components and eight paths. Failure transitions, policy-edit permissions and shadow mode remain in the design document. Fabric tokens; local Segoe UI and Cascadia fonts with system fallbacks; no external assets or scripts.</p>
   </main>
