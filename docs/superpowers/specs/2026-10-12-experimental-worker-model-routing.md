@@ -27,7 +27,7 @@ tags:
 | **Feature Lifecycle Process** | Independent design review and an opt-in experimental rollout. The [template's Fabric lifecycle](https://dev.azure.com/powerbi/AI/_wiki/wikis/AI.wiki/90809/Feature-Lifecycle-Process) is background, not Fleet's deployment process. |
 | **PM Functional spec** | User request: configure an Azure AI Foundry decision deployment, test it, and route NEW workers through named execution profiles with preselected model/effort pairs. Choose exact worker IDs from ACP catalogs, preserve selection on resume and allow controlled orchestrator policy updates. |
 | **UX Design** | Proposed settings and task-detail behavior below; reuse Fluent controls and existing session model pickers. |
-| Existing behavior | [Model defaults and context](../../../README.md#slash-commands-and-session-pickers), [orchestration lifecycle](../../orchestration-lifecycle.md), [agent backends](../../orchestrator-agent-backend-plan.md) |
+| Existing behavior | [Model defaults and context](../../guide/using-fleet.md#slash-commands-and-session-pickers), [orchestration lifecycle](../../orchestration-lifecycle.md), [agent backends](../../orchestrator-agent-backend-plan.md) |
 | Execution constraints | [Managed worktrees](../../managed-worktree-isolation.md), [remote command execution](../../remote-command-execution-plan.md) |
 | ACP | [Session configuration options](https://agentclientprotocol.com/protocol/v1/session-config-options) |
 | Provider contract | [Microsoft-Decision-1 in Foundry](https://learn.microsoft.com/azure/foundry/foundry-models/how-to/use-foundry-models-microsoft-decision) |
