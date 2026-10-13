@@ -38,7 +38,7 @@
       <div class="diagram">
         <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="2026-10-12-worker-model-routing-title 2026-10-12-worker-model-routing-desc">
           <title id="2026-10-12-worker-model-routing-title">New-worker routing and same-session recovery</title>
-          <desc id="2026-10-12-worker-model-routing-desc">An operator configures profiles with exact Copilot model and effort pairs, Foundry selects a profile for new workers before ACP execution, and resumed workers reuse the saved pair without another classification or an unconfirmed bypass.</desc>
+          <desc id="2026-10-12-worker-model-routing-desc">An operator configures profiles with exact Copilot model and effort pairs, Foundry selects a profile for new workers before ACP execution, and resumed workers reuse the saved pair without another classification.</desc>
           <defs>
             <style>
               svg {
@@ -179,7 +179,7 @@
             <rect class="tag" x="972" y="260" width="64" height="12" rx="4"/>
             <text class="mono muted" x="1004" y="268" text-anchor="middle">ACP GATE</text>
             <text class="name" x="1080" y="292" text-anchor="middle">Copilot ACP worker</text>
-            <text x="1080" y="316" text-anchor="middle">Confirm pair before first prompt</text>
+            <text x="1080" y="316" text-anchor="middle">Apply pair before first prompt</text>
             <text class="mono muted" x="1080" y="340" text-anchor="middle">Resume: verify / restore same pair</text>
           </g>
           <g data-node="resume-entry">
@@ -192,8 +192,8 @@
             <text class="mono muted" x="140" y="572" text-anchor="middle">No reclassification</text>
           </g>
 
-          <text class="mono muted" x="320" y="580">Record profile, policy revision, source and confirmed values.</text>
-          <text class="mono muted" x="40" y="624">Clarification / provider failure: hold by default. Approved fallback is explicit, not a successful decision.</text>
+          <text class="mono muted" x="320" y="580">Record profile, source, and requested vs running values.</text>
+          <text class="mono muted" x="40" y="624">Provider failure, low probability, oversized brief or missing model: start with Fleet worker defaults.</text>
           <line x1="40" y1="648" x2="1240" y2="648" stroke="rgba(14,23,38,0.12)" stroke-width="0.8"/>
           <text class="mono muted" x="40" y="680" letter-spacing="0.12em">LEGEND</text>
           <line x1="136" y1="676" x2="168" y2="676" stroke="#575453" stroke-width="1.2"/>
@@ -206,7 +206,7 @@
           <text class="mono muted" x="976" y="680">BLOCKED BYPASS</text>
         </svg>
       </div>
-      <figcaption><strong>Only a NEW worker is classified.</strong> Foundry returns a profile ID, not a model or effort. Fleet resolves that profile's preselected exact ACP pair and records it before dispatch. The Node confirms configuration before execution; resume and recovery reuse the effective saved pair.</figcaption>
+      <figcaption><strong>Only a NEW worker is classified.</strong> Foundry returns a profile ID, not a model or effort. Fleet resolves that profile's preselected exact ACP pair and records it before dispatch. The Node applies it before the first prompt, falling back to Fleet worker defaults if that model is unavailable; resume and recovery reuse the session's own pair.</figcaption>
     </figure>
     <p class="note">Static overview, 1280 x 720. Secure-paved-road pattern, seven components and eight paths. Failure transitions, policy-edit permissions and shadow mode remain in the design document. Fabric tokens; local Segoe UI and Cascadia fonts with system fallbacks; no external assets or scripts.</p>
   </main>
