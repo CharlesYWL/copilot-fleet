@@ -29,7 +29,7 @@ tags:
 | **PM Functional spec** | This document captures the agreed direction: automatic versioning and packaging without Actions, followed by incremental Node and Host bundle updates. |
 | **UX Design** | No separate mockup; operator behavior is specified under Preferred option. |
 | Current architecture | [ARCHITECTURE.md](../../../ARCHITECTURE.md) |
-| Current update instructions | [README.md](../../../README.md#keeping-nodes-up-to-date) |
+| Current update instructions | [README.md](../../guide/operations.md#keeping-nodes-up-to-date) |
 | Supported service mode | [Windows login startup](../../windows-login-startup.md) |
 | Earlier distribution proposal | [NPX distribution design](2026-08-21-npx-distribution-design.md) |
 | Manual release creation | [GitHub CLI: release create](https://cli.github.com/manual/gh_release_create) |

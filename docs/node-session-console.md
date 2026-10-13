@@ -151,7 +151,7 @@ do not promise forensic secure erasure. **Move this node** must first settle
 history with the original Host; session history is excluded from identity
 exports. Service uninstall preserves files. The explicit, Host-scoped purge
 contract and its destructive-discard option are documented in the
-[README](../README.md#shared-worker-chat-and-offline-continuation).
+[README](guide/nodes.md#shared-worker-chat-and-offline-continuation).
 
 ## Code map for contributors and agents
 
