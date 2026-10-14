@@ -1232,6 +1232,28 @@ export class PrMaintenanceStore {
     );
   }
 
+  /**
+   * Settles Node-accepted manual commands whose worker process no longer exists.
+   *
+   * A Node restart ends the process without a turn or state receipt, which left
+   * the accepted command pending forever. Unknown delivery stays pending.
+   */
+  settleEndedManualCommands(ended: (sessionId: string) => boolean): boolean {
+    let changed = false;
+    for (const row of this.db
+      .prepare(
+        "SELECT session_id,command_id FROM pr_maintenance_manual_commands WHERE state='accepted'",
+      )
+      .all()) {
+      const sessionId = String(row.session_id);
+      if (ended(sessionId))
+        changed =
+          this.recordManualReceipt(sessionId, String(row.command_id), "settled") ||
+          changed;
+    }
+    return changed;
+  }
+
   private saveManualOwner(input: PrMaintenanceManualOwner): void {
     const owner = PrMaintenanceManualOwnerSchema.parse(input);
     if (
@@ -1442,7 +1464,7 @@ export class PrMaintenanceStore {
     if (this.hasPendingManualExecution(sessionId))
       refuse(
         "execution_uncertain",
-        "Wait for correlated execution and effect receipts before manual control; no work was replayed or stopped.",
+        "Waiting for receipts from an earlier manual prompt or resume on this worker. Fleet settles them when that turn completes or its Node confirms the process has ended; no work was replayed or stopped.",
       );
     const record = this.manualRecord(sessionId);
     if (!record) {

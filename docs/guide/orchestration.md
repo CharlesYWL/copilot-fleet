@@ -329,6 +329,9 @@ Host's existing human access (including its configured no-sign-in mode). Node
 credentials, MCP tokens, request flags, and prompt text do not establish human intent.
 Fleet atomically pauses maintenance and cancels only provably never-sent queued work;
 accepted/in-flight work and unknown effects must first produce correlated receipts.
+An accepted manual prompt or resume also settles when its Node reconnects or
+heartbeats without that worker's process after the Host recorded the session as
+ended; the prompt is never replayed. Delivery with an unknown receipt stays blocked.
 Busy, stopping, offline, capacity, and checkout restrictions still apply.
 An execution-settled `reconciling` batch with no reserved or uncertain effects
 does not block manual Resume or a new manual prompt merely because final finding

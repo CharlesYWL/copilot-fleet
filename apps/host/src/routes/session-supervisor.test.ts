@@ -857,14 +857,9 @@ describe("trusted supervisor session handoff", () => {
     ]);
   });
 
-  it.each([
-    ["store", "unknown"],
-    ["route", "unknown"],
-    ["store", "accepted"],
-    ["route", "accepted"],
-  ] as const)(
-    "retains manual evidence during mixed ended-session cleanup through %s (%s)",
-    async (path, state) => {
+  it.each(["store", "route"] as const)(
+    "retains unknown manual evidence during mixed ended-session cleanup through %s",
+    async (path) => {
       const f = await setup();
       await f.command("prompt", { operationId: randomUUID() });
       f.settle();
@@ -883,12 +878,6 @@ describe("trusted supervisor session handoff", () => {
         202,
       );
       const dispatch = f.store.getSessionDispatchAttempt(f.worker.id)!;
-      if (state === "accepted")
-        f.store.prMaintenance.recordManualReceipt(
-          f.worker.id,
-          dispatch.commandId,
-          "accepted",
-        );
       f.event("agent_text", { text: "Unsettled execution evidence" });
       f.service.disconnectNode(f.worker.nodeId, "Delivery unknown");
       f.service.attachNode(f.worker.nodeId, f.link);
@@ -1373,6 +1362,35 @@ describe("trusted supervisor session handoff", () => {
     expect(() => f.service.reconcile(f.worker.nodeId, [])).not.toThrow();
     expect(f.sent).toHaveLength(1);
     expect((await f.command("resume")).statusCode).toBe(409);
+  });
+
+  it("settles an accepted manual prompt once its Node reconnects without the worker process", async () => {
+    const f = await setup();
+    f.event("agent_session", { agentSessionId: "existing-conversation" });
+    await f.command("prompt", { operationId: randomUUID() });
+    const prompt = f.sent[0]!;
+    f.store.prMaintenance.recordManualReceipt(f.worker.id, prompt.commandId, "accepted");
+    f.service.disconnectNode(f.worker.nodeId, "Node restarted mid-turn");
+    f.service.attachNode(f.worker.nodeId, f.link);
+    f.store.setNodeOnline(f.worker.nodeId, true, 1);
+    f.service.reconcile(f.worker.nodeId, [f.worker.id], [f.worker.id]);
+    expect(
+      f.store.prMaintenance.manualCommand(f.worker.id, prompt.commandId)?.state,
+    ).toBe("accepted");
+    expect(f.sent).toHaveLength(1);
+
+    f.service.disconnectNode(f.worker.nodeId, "Node restarted without the worker");
+    f.service.attachNode(f.worker.nodeId, f.link);
+    f.store.setNodeOnline(f.worker.nodeId, true, 0);
+    f.service.reconcile(f.worker.nodeId, []);
+    expect(
+      f.store.prMaintenance.manualCommand(f.worker.id, prompt.commandId)?.state,
+    ).toBe("settled");
+    expect(f.sent.map((command) => command.type)).toEqual(["prompt", "resume_session"]);
+    expect(f.store.prMaintenance.get(f.record.id)).toMatchObject({
+      lifecycle: "paused",
+      pauseReason: "manual_control",
+    });
   });
 
   it.each(["busy", "stopping", "offline", "checkout"] as const)(
