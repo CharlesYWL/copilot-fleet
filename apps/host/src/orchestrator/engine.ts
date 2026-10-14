@@ -510,6 +510,10 @@ export class OrchestratorEngine {
       // not; capacity is read from sessions long after this point.
       readOnly: isReadOnlyCategory(step.category),
       dispatchAttempt: notificationAttemptKeyForStep(run, starting),
+      stepId: step.id,
+      ...(step.routing
+        ? { workerSelection: this.service.workerSelectionFor(step.routing) }
+        : {}),
       ...(starting.executionBinding
         ? { executionBinding: starting.executionBinding }
         : {}),
@@ -518,7 +522,11 @@ export class OrchestratorEngine {
     if (!result.ok) {
       // Nothing is running, so the step goes back in the queue rather than
       // being blamed for a failure that happened before it started.
-      this.store.updateRunStep(step.id, { state: "pending", dispatchedAt: "" });
+      this.store.updateRunStep(step.id, {
+        state: "pending",
+        dispatchedAt: "",
+        sessionId: "",
+      });
       holds.set(step.id, {
         code: "no_placement",
         detail: `The Host could not start it on ${placement.nodeName}: ${result.error}`,
@@ -533,9 +541,6 @@ export class OrchestratorEngine {
       ...(result.session.executionBinding
         ? { executionBinding: result.session.executionBinding }
         : {}),
-      // Output collected from here on belongs to this step; a session that is
-      // prompted again must not replay the previous turn.
-      eventSeqFrom: this.store.maxEventSequence(result.session.id),
     });
 
     /*

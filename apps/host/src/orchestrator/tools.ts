@@ -35,6 +35,10 @@ import {
   type RunCriterion,
   type RunStep,
   type StepAdmission,
+  WORKER_CATEGORIES,
+  type ProposeWorkerRoutingPolicySchema,
+  workerRoutingFallbackLabels,
+  type WorkerRoutingReceipt,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { reservedSessionCount } from "../session-policy.js";
@@ -56,15 +60,10 @@ import { truncateMiddle, workerOutput } from "./engine.js";
 import { CommandConflict } from "../command-execution-store.js";
 import { PrMaintenanceError } from "../pr-maintenance-store.js";
 import { WorkerResumeConflict } from "../worker-resume-store.js";
+import { WorkerRoutingSettingsError } from "../worker-model-routing.js";
 
 /** The kinds of work an orchestrator can ask for, and what each one means. */
-export const WORKER_CATEGORIES = [
-  "implement",
-  "test",
-  "explore",
-  "review-quick",
-  "review-deep",
-] as const;
+export { WORKER_CATEGORIES, ProposeWorkerRoutingPolicySchema } from "@fleet/protocol";
 
 /**
  * Every limit below is advertised to the caller, because `mcp-routes` builds
@@ -86,6 +85,14 @@ export const WORKER_CATEGORIES = [
  * a matter of taste.
  */
 export const StartWorkSchema = z.object({
+  profile: z
+    .string()
+    .min(1)
+    .max(40)
+    .optional()
+    .describe(
+      "Optional execution profile ID from fleet_get_worker_routing_policy. Omit or use auto for automatic routing. Ignored when routing is off. This never changes permissions.",
+    ),
   category: z
     .enum(WORKER_CATEGORIES)
     .describe("What kind of work this is. Reviews are read-only."),
@@ -2374,7 +2381,7 @@ export class FleetTools {
    * cannot see — hardware, credentials, a toolchain — and every other rule
    * still applies on top of it.
    */
-  startWork(input: z.infer<typeof StartWorkSchema>): ToolResult {
+  private admitStartWork(input: z.infer<typeof StartWorkSchema>) {
     const existing = this.run(input.task);
     if (existing && "ok" in existing) return existing;
     if (!existing && input.task && z.uuid().safeParse(input.task.trim()).success) {
@@ -2429,7 +2436,51 @@ export class FleetTools {
     });
     if (reserved) return reserved;
 
-    const stepKey = `step-${steps.length + 1}`;
+    let ordinal = steps.length + 1;
+    const keys = new Set(steps.map((step) => step.stepKey));
+    while (keys.has(`step-${ordinal}`)) ordinal++;
+    return { run, placement, stepKey: `step-${ordinal}` };
+  }
+
+  async startRoutedWork(input: z.infer<typeof StartWorkSchema>): Promise<ToolResult> {
+    const routingService = this.service.workerModelRouting;
+    if (!routingService || this.store.getWorkerModelRouting().mode === "off")
+      return this.startWork(input);
+    const admission = this.admitStartWork(input);
+    if ("ok" in admission) return admission;
+    const epoch = this.store.getSetting("workerModelRouting.epoch");
+    let routing: WorkerRoutingReceipt | undefined;
+    try {
+      routing = await routingService.decide(input);
+    } catch (error) {
+      if (error instanceof WorkerRoutingSettingsError) return refuse(error.message);
+      throw error;
+    }
+    const lead = this.store.getSession(this.leadSessionId);
+    if (this.store.getSetting("workerModelRouting.epoch") !== epoch)
+      return refuse(
+        "The Host was restored while choosing a model. No worker was started.",
+      );
+    if (
+      !lead ||
+      lead.runRole !== "lead" ||
+      lead.stopRequested ||
+      lead.cleanupRequested ||
+      terminalSessionStates.has(lead.state)
+    )
+      return refuse(
+        "The orchestrator stopped while choosing a model. No worker was started.",
+      );
+    return this.startWork({ ...input, task: admission.run.id }, routing);
+  }
+
+  startWork(
+    input: z.infer<typeof StartWorkSchema>,
+    routing?: WorkerRoutingReceipt,
+  ): ToolResult {
+    const admission = this.admitStartWork(input);
+    if ("ok" in admission) return admission;
+    const { run, placement, stepKey } = admission;
     const step = this.store.upsertRunStep(run.id, {
       stepKey,
       title: input.title,
@@ -2442,6 +2493,7 @@ export class FleetTools {
       placementId: placement.id,
       // And so the phase this belonged to survives the phase moving on.
       phaseIndex: run.phaseIndex,
+      ...(routing ? { routing } : {}),
     });
 
     // The receipt is already written; the engine takes it from here, which is
@@ -2460,7 +2512,8 @@ export class FleetTools {
       return ok(
         `Queued "${input.title}" in task "${run.name}" (task id: ${run.id}, step: ${stepKey}). ` +
           "The request is recorded and will start when scheduling allows. " +
-          "Do not dispatch it again; you will be woken when it finishes.",
+          "Do not dispatch it again; you will be woken when it finishes." +
+          (routing ? `\n${this.routingLine(routing)}` : ""),
       );
     }
     const session = dispatched.sessionId
@@ -2478,10 +2531,48 @@ export class FleetTools {
         // still has to know where its changes now live.
         `  node: ${session?.nodeName ?? placement.nodeName ?? "?"}${input.node ? " (as asked)" : ""}`,
         `  path: ${session?.executionBinding?.cwd ?? placement.localPath}`,
+        ...(routing ? [this.routingLine(routing)] : []),
         "",
         "You will be woken when it finishes. Do not poll for it.",
       ].join("\n"),
     );
+  }
+
+  private routingLine(receipt: WorkerRoutingReceipt): string {
+    if (receipt.source === "fallback")
+      return `Routing: worker defaults (${receipt.fallbackReason ? workerRoutingFallbackLabels[receipt.fallbackReason] : "decision unavailable"}).`;
+    if (receipt.source === "shadow")
+      return `Routing (shadow): predicted ${receipt.profileId}; using worker defaults.`;
+    return `Routing: ${receipt.profileId} / ${receipt.model}${receipt.reasoningEffort ? ` / ${receipt.reasoningEffort}` : ""} (${receipt.source}). The Node reports the settings actually applied.`;
+  }
+
+  getWorkerRoutingPolicy(): ToolResult {
+    const configuration = this.store.getWorkerModelRouting();
+    return ok(
+      JSON.stringify({
+        revision: configuration.revision,
+        mode: configuration.mode,
+        minProbability: configuration.minProbability,
+        profiles: configuration.profiles,
+      }),
+    );
+  }
+
+  proposeWorkerRoutingPolicy(
+    input: z.infer<typeof ProposeWorkerRoutingPolicySchema>,
+  ): ToolResult {
+    const routing = this.service.workerModelRouting;
+    const lead = this.store.getSession(this.leadSessionId);
+    if (!routing || !lead) return refuse("Worker routing is not available on this Host.");
+    try {
+      const proposal = routing.propose(input, lead.id, lead.name);
+      return ok(
+        `Proposed, awaiting operator review (${proposal.id}). This does not change the Host-wide policy until the operator applies it.`,
+      );
+    } catch (error) {
+      if (error instanceof WorkerRoutingSettingsError) return refuse(error.message);
+      throw error;
+    }
   }
 
   /**

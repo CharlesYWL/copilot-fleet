@@ -5,7 +5,11 @@ import {
   ChevronRight20Regular,
   Open16Regular,
 } from "@fluentui/react-icons";
-import type { FleetSession, RunStep } from "@fleet/protocol";
+import {
+  workerRoutingFallbackLabels,
+  type FleetSession,
+  type RunStep,
+} from "@fleet/protocol";
 import { terminal } from "../../theme";
 import { stepStatusDescriptor } from "../../lib/run-step-status";
 import { StatusIndicator } from "../StatusIndicator";
@@ -170,6 +174,17 @@ export const WorkerStepTimeline = ({
                       ? "Session no longer available"
                       : "Not dispatched"}
                 </span>
+                {step.routing ? (
+                  <span className={styles.node}>
+                    {step.routing.source === "shadow"
+                      ? "Shadow prediction: "
+                      : "Routing: "}
+                    {step.routing.profileName ??
+                      step.routing.profileId ??
+                      "worker defaults"}{" "}
+                    ({step.routing.source})
+                  </span>
+                ) : null}
               </span>
               <span className={styles.status}>
                 <StatusIndicator descriptor={status} wrap />
@@ -205,6 +220,56 @@ export const WorkerStepTimeline = ({
                     <Text className={styles.meta}>attempt {step.attempts}</Text>
                   )}
                 </div>
+                {step.routing ? (
+                  <div aria-label="Worker model routing receipt">
+                    <Text className={styles.meta}>
+                      Policy {step.routing.policyRevision};{" "}
+                      {Math.round(step.routing.durationMs)} ms
+                    </Text>
+                    {step.routing.model ? (
+                      <p className={styles.node}>
+                        {step.routing.source === "shadow" ? "Predicted" : "Requested"}:{" "}
+                        {step.routing.model}
+                        {step.routing.reasoningEffort
+                          ? ` / ${step.routing.reasoningEffort}`
+                          : " / no effort override"}
+                      </p>
+                    ) : null}
+                    <p className={styles.node}>
+                      Running:{" "}
+                      {session?.configOptions.find((option) => option.id === "model")
+                        ?.currentValue || "not yet reported"}
+                      {session?.configOptions.find(
+                        (option) => option.id === "reasoning_effort",
+                      )?.currentValue
+                        ? ` / ${session.configOptions.find((option) => option.id === "reasoning_effort")!.currentValue}`
+                        : ""}
+                    </p>
+                    {step.routing.fallbackReason ? (
+                      <p className={styles.node}>
+                        Worker defaults:{" "}
+                        {workerRoutingFallbackLabels[step.routing.fallbackReason]}
+                      </p>
+                    ) : null}
+                    {step.routing.workerFallbackReason ? (
+                      <p className={styles.node}>
+                        {workerRoutingFallbackLabels[step.routing.workerFallbackReason]};
+                        the Node attempted ordinary settings. The running values above are
+                        authoritative.
+                      </p>
+                    ) : null}
+                    {step.routing.attempts.map((attempt, index) => (
+                      <p key={index} className={styles.node}>
+                        {attempt.providerName} ({attempt.kind}, {attempt.requestedModel}):{" "}
+                        {attempt.success ? "selected" : attempt.code};{" "}
+                        {Math.round(attempt.durationMs)} ms;{" "}
+                        {attempt.usage
+                          ? `${attempt.usage.inputTokens} in / ${attempt.usage.outputTokens} out`
+                          : "usage not reported"}
+                      </p>
+                    ))}
+                  </div>
+                ) : null}
                 {step.output ? (
                   <pre className={styles.output}>{step.output}</pre>
                 ) : (

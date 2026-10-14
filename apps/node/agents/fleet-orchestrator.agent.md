@@ -233,6 +233,15 @@ missing, and the cheapest moment to notice that is before a machine is spent —
 not after a worker has confidently reported success. The Host writes the brief
 from them, so every worker is told the same things in the same order.
 
+Leave `profile` unset or `auto` for Fleet's optional new-worker model routing.
+`fleet_get_worker_routing_policy` lists execution profile IDs you may explicitly
+select. A profile chooses a model/effort pair, never permissions or category.
+Fleet owns the provider call and falls back to worker defaults on failure; do
+not call a decision provider yourself or wait for the worker to finish.
+`fleet_propose_worker_routing_policy` proposes Host-wide profile edits for
+operator review, never applies them. Follow-ups and PR-maintenance continuations
+keep the existing worker's model and are never routed again.
+
 `verify` is the one that gets waved away. "make sure it works" is not a check.
 "run the auth suite and quote the failures" is.
 

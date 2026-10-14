@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="2026-10-12-worker-model-routing-title 2026-10-12-worker-model-routing-desc">
           <title id="2026-10-12-worker-model-routing-title">New-worker routing and same-session recovery</title>
-          <desc id="2026-10-12-worker-model-routing-desc">An operator configures profiles with exact Copilot model and effort pairs, Foundry selects a profile for new workers before ACP execution, and resumed workers reuse the saved pair without another classification.</desc>
+          <desc id="2026-10-12-worker-model-routing-desc">An operator configures profiles with exact Copilot model and effort pairs, ordered decision models select a profile for new workers before ACP execution, and resumed workers reuse the saved pair without another classification.</desc>
           <defs>
             <style>
               svg {
@@ -123,8 +123,8 @@
             <rect class="box external" data-box="foundry" x="640" y="64" width="240" height="112" rx="8"/>
             <rect class="tag" x="652" y="76" width="64" height="12" rx="4"/>
             <text class="mono muted" x="684" y="84" text-anchor="middle">EXTERNAL</text>
-            <text class="name" x="760" y="108" text-anchor="middle">Azure AI Foundry decision</text>
-            <text class="mono muted" x="760" y="132" text-anchor="middle">Microsoft-Decision-1</text>
+            <text class="name" x="760" y="108" text-anchor="middle">Decision model chain</text>
+            <text class="mono muted" x="760" y="132" text-anchor="middle">Foundry / TypeSafe</text>
             <text class="mono muted" x="760" y="152" text-anchor="middle">profile + needs_clarification</text>
           </g>
           <g data-node="selection-record">

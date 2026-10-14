@@ -31,6 +31,7 @@ import { useMessageNotification } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { HostUpdateCard } from "./HostUpdateCard";
 import { ModelDefaultsCard } from "./ModelDefaultsCard";
+import { WorkerModelRoutingControl } from "./WorkerModelRoutingControl";
 
 const useStyles = makeStyles({
   panel: {
@@ -477,7 +478,9 @@ export const GeneralPanel = ({
         reasoningEffort={reasoningEffort}
         busy={busy}
         onChange={(patch) => void update(patch)}
-      />
+      >
+        <WorkerModelRoutingControl sessions={sessions} />
+      </ModelDefaultsCard>
 
       {hostUpdate && <HostUpdateCard status={hostUpdate} revision={hostRevision} />}
 

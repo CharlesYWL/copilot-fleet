@@ -71,9 +71,11 @@ describe("GeneralPanel", () => {
       </FluentProvider>,
     );
     const model = await screen.findByRole("combobox", { name: "Default Copilot model" });
+    const defaultsCard = screen.getByRole("region", { name: "Copilot model defaults" });
+    expect(defaultsCard.textContent).toContain("Default Copilot modelCopilot's choice");
     expect(
-      screen.getByRole("region", { name: "Copilot model defaults" }).textContent,
-    ).toBe("Default Copilot modelCopilot's choiceReasoning effortCopilot's choice");
+      within(defaultsCard).getByRole("button", { name: "Decision settings" }),
+    ).toBeDefined();
     fireEvent.click(model);
     fireEvent.click(screen.getByRole("option", { name: "Worker model" }));
     await waitFor(() => expect(model.textContent).toContain("Worker model"));

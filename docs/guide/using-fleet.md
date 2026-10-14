@@ -386,3 +386,53 @@ every setting — switching to a model without reasoning levels removes the
 Reasoning Effort control. The agent's whole option list is republished on every
 change for that reason, so the bar never keeps a control the current model has
 stopped offering.
+
+### Experimental worker model routing
+
+Open **Settings → General → Decision settings**, beside the default Copilot
+model and effort pickers. Routing starts **Off** and applies only to new workers
+started by `fleet_start_work`; ordinary Chats, leads, existing workers and
+PR-maintenance continuations are not classified.
+
+Add an ordered list of **Azure AI Foundry** deployments and/or direct
+**TypeSafe** decision models. Each row has its own endpoint, deployment/model,
+write-only API key and **Test connection** action. Multiple models on the same
+provider are supported. Test uses a paid, sanitized sample, validates the typed
+answer, and never starts a worker or enables routing. A successful draft test
+can be saved without another call; the browser clears its password input and
+the Host retains the tested key privately for up to 15 minutes until Save.
+Provider/endpoint changes require a new key, not forwarding an existing key
+to a different destination.
+
+Create named **worker profiles** with descriptions, compatible automatic
+categories and fixed Copilot model/effort pairs. Friendly model names come from
+observed Copilot sessions; saved values are the exact ACP IDs, including any
+provider prefix. Unobserved IDs are marked **Unverified**. Changing a profile's
+model resets its effort choice. An explicit `profile` ID on `fleet_start_work`
+is allowed in both active modes without changing the work's permissions.
+
+**Shadow** records an automatic prediction but uses ordinary worker defaults;
+explicit profiles still apply. **Route new workers** applies the selected
+profile and requires at least one tested decision connection. Failed, invalid,
+timed-out or below-threshold answers advance through the ordered connections.
+The entire chain shares a five-second deadline by default (configurable up to
+ten seconds); it does not wait five seconds for every model. Requests larger
+than 32 KiB use ordinary defaults without truncating the worker's full brief.
+If no decision qualifies, or the Node cannot apply the requested model/effort,
+Fleet attempts ordinary worker defaults and reports the actual running values.
+Older Nodes can ignore the optional fallback field and retain their existing
+best-effort startup behavior; update Nodes for paired fallback support.
+
+Task details show the profile, policy revision, source, provider attempts and
+**requested/predicted versus running** settings. Snapshot-enabled workers keep
+their own observed model/effort through follow-up, reconnect and conversation
+rollover, including explicit session-picker changes. The decision provider is
+never called again for that worker.
+
+Keys stay in a separately protected Host credential directory, never in Node
+commands, MCP policy views, transcripts or backups. Restoring a backup retains
+profiles and worker selections but turns routing Off, drops connection
+readiness and requires local keys, tests and a fresh opt-in. Orchestrators can
+read profiles and propose Host-wide edits; only an operator can apply them.
+Routing remains experimental: connection success and a high probability are
+not proof of worker quality or cost savings.

@@ -72,6 +72,8 @@ import { orchestratorRoutes } from "./routes/orchestrators.js";
 import { systemRoutes } from "./routes/system.js";
 import { hostUpdateRoutes } from "./routes/host-update.js";
 import { localAgentSettingsRoutes } from "./routes/local-agent-settings.js";
+import { workerModelRoutingRoutes } from "./routes/worker-model-routing.js";
+import { WorkerModelRoutingService } from "./worker-model-routing.js";
 import {
   HostSelfUpdate,
   checkoutBusy,
@@ -287,6 +289,16 @@ export async function buildServer(
     cachedGitRevision(),
     sessionRetentionDays,
   );
+  const workerModelRouting = new WorkerModelRoutingService(
+    store,
+    app.log,
+    databasePath === ":memory:"
+      ? undefined
+      : join(dirname(databasePath), "worker-model-routing", "credentials.json"),
+  );
+  await workerModelRouting.initialize();
+  service.workerModelRouting = workerModelRouting;
+  service.onRestored(() => workerModelRouting.reset());
   const checkout = repoRoot();
   const selfUpdate = options.hostSelfUpdate ?? {};
   const hostLaunch = selfUpdate.launch ?? detectHostLaunch(defaultLaunchProbe(checkout));
@@ -509,6 +521,7 @@ export async function buildServer(
       );
   });
   await app.register(runRoutes, { service, engine });
+  await app.register(workerModelRoutingRoutes, { routing: workerModelRouting, auth });
   await app.register(workerResumeRoutes, { engine });
   await app.register(managedWorktreeRoutes, { service });
   await app.register(orchestratorRoutes, { service, engine });
@@ -614,6 +627,7 @@ export async function buildServer(
   });
 
   app.addHook("onClose", async () => {
+    workerModelRouting.reset();
     await localAgentListener.close();
     clearInterval(presenceTimer);
     clearInterval(notificationRetentionTimer);

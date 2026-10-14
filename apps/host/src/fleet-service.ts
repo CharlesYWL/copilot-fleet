@@ -22,6 +22,7 @@ import {
   nodeUpdateState,
   prMaintenanceTaskStatuses,
   terminalRunStepStates,
+  terminalRunStates,
   terminalSessionStates,
   type BrowserMessage,
   type AgentParams,
@@ -39,6 +40,8 @@ import {
   type PromptAttachment,
   type PrMaintenanceRegistration,
   type StartupConfig,
+  type WorkerSelection,
+  type WorkerRoutingReceipt,
   type Run,
   type RunRole,
   type RunStep,
@@ -71,6 +74,7 @@ import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
 import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
 import type { WorkerResumeService } from "./orchestrator/resume-now.js";
+import type { WorkerModelRoutingService } from "./worker-model-routing.js";
 import {
   NotificationService,
   notificationAttemptKey,
@@ -188,6 +192,7 @@ type AcceptedSessionTransition = {
  * reachable from a test.
  */
 export class FleetService {
+  workerModelRouting: WorkerModelRoutingService | undefined;
   /**
    * What the service needs from a Node connection, which is not a WebSocket.
    *
@@ -944,6 +949,8 @@ export class FleetService {
     /** Authoritative orchestration attempt when the step is not attached yet. */
     dispatchAttempt?: string;
     executionBinding?: ExecutionBinding;
+    workerSelection?: WorkerSelection;
+    stepId?: string;
   }):
     | { ok: true; session: FleetSession }
     | { ok: false; status: number; error: string; session?: FleetSession } {
@@ -1011,19 +1018,28 @@ export class FleetService {
         error: error instanceof Error ? error.message : "Workspace unavailable",
       };
     }
-    let session = this.store.createSession(
-      input.placement,
-      input.prompt,
-      input.yolo,
-      input.name ?? "",
-      {
-        runId: input.runId ?? "",
-        runRole: input.runRole ?? "",
-        readOnly: input.readOnly ?? false,
-        operatorUsername: input.operatorUsername ?? "",
-        agentParams,
-      },
-    );
+    let session = this.store.writeAtomically(() => {
+      const created = this.store.createSession(
+        input.placement,
+        input.prompt,
+        input.yolo,
+        input.name ?? "",
+        {
+          runId: input.runId ?? "",
+          runRole: input.runRole ?? "",
+          readOnly: input.readOnly ?? false,
+          operatorUsername: input.operatorUsername ?? "",
+          agentParams,
+          ...(input.workerSelection ? { workerSelection: input.workerSelection } : {}),
+        },
+      );
+      if (input.stepId)
+        this.store.updateRunStep(input.stepId, {
+          sessionId: created.id,
+          eventSeqFrom: this.store.maxEventSequence(created.id),
+        });
+      return created;
+    });
     if (binding) {
       this.store.setSessionExecutionBinding(session.id, binding);
       session = this.store.getSession(session.id)!;
@@ -1060,6 +1076,7 @@ export class FleetService {
         mcpServers: this.mcpServersFor(session),
         agent: this.agentFor(session, node),
         config: this.startupConfigFor(session),
+        ...(session.workerSelection ? { contextTier: "long_context" as const } : {}),
         readOnly: session.readOnly,
       },
       { state: "failed", activity: "Node disconnected before process start" },
@@ -1520,7 +1537,8 @@ export class FleetService {
    * carries on.
    */
   startupConfigFor(
-    session: Pick<FleetSession, "runRole" | "agentParams">,
+    session: Pick<FleetSession, "runRole" | "agentParams"> &
+      Partial<Pick<FleetSession, "workerSelection" | "configOptions">>,
   ): StartupConfig[] {
     const kind = session.agentParams?.kind ?? "copilot";
     const config: StartupConfig[] = [];
@@ -1529,6 +1547,38 @@ export class FleetService {
       (session.runRole === "lead" || session.runRole === "worker")
     ) {
       config.push({ id: "mode", value: "agent" });
+    }
+    if (kind === "copilot" && session.workerSelection) {
+      const selection = session.workerSelection;
+      const observedModel = session.configOptions?.find(
+        (option) => option.id === "model",
+      )?.currentValue;
+      const observedEffort = session.configOptions?.find(
+        (option) => option.id === "reasoning_effort",
+      )?.currentValue;
+      if (observedModel) {
+        config.push({ id: "model", value: observedModel });
+        if (observedEffort)
+          config.push({ id: "reasoning_effort", value: observedEffort });
+      } else {
+        if (selection.model)
+          config.push({
+            id: "model",
+            value: selection.model,
+            ...(selection.fallbackModel !== undefined
+              ? { fallback: selection.fallbackModel }
+              : {}),
+          });
+        if (selection.reasoningEffort || selection.fallbackReasoningEffort !== undefined)
+          config.push({
+            id: "reasoning_effort",
+            value: selection.reasoningEffort ?? "",
+            ...(selection.fallbackReasoningEffort !== undefined
+              ? { fallback: selection.fallbackReasoningEffort }
+              : {}),
+          });
+      }
+      return config;
     }
     const model =
       session.runRole === "lead"
@@ -1544,6 +1594,31 @@ export class FleetService {
         : this.store.getDefaultReasoningEffort();
     if (effort) config.push({ id: "reasoning_effort", value: effort });
     return config;
+  }
+
+  workerSelectionFor(receipt: WorkerRoutingReceipt): WorkerSelection {
+    const defaults = receipt.defaults ?? {
+      model: this.store.getDefaultModel(),
+      reasoningEffort: this.store.getDefaultReasoningEffort() || null,
+    };
+    const applied =
+      receipt.source === "explicit" ||
+      receipt.source === "single" ||
+      receipt.source === "decision";
+    return {
+      source: receipt.source,
+      ...(applied && receipt.profileId ? { profileId: receipt.profileId } : {}),
+      model: applied ? (receipt.model ?? "") : defaults.model,
+      reasoningEffort: applied
+        ? (receipt.reasoningEffort ?? null)
+        : defaults.reasoningEffort,
+      ...(applied
+        ? {
+            fallbackModel: defaults.model,
+            fallbackReasoningEffort: defaults.reasoningEffort ?? "",
+          }
+        : {}),
+    };
   }
 
   /**
@@ -2476,6 +2551,23 @@ export class FleetService {
           manual.id,
           "settled",
         );
+
+      if (
+        event.type === "system" &&
+        event.payload.workerModelRoutingFallback === true &&
+        session.workerSelection
+      ) {
+        this.store.setSessionWorkerSelection(session.id, {
+          ...session.workerSelection,
+          fallbackApplied: true,
+        });
+        const step = this.store.getRunStepBySession(session.id);
+        const run = step ? this.store.getRun(step.runId) : undefined;
+        if (step?.routing && run && !terminalRunStates.has(run.state))
+          this.store.updateRunStep(step.id, {
+            routing: { ...step.routing, workerFallbackReason: "model_unavailable" },
+          });
+      }
 
       if (event.type === "state") {
         const payload = eventPayload(event, "state");

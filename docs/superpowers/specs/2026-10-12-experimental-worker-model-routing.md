@@ -14,11 +14,11 @@ tags:
 **EM owner**: Not assigned  
 **Architect**: Not assigned  
 **Program Manager**: Not assigned  
-**Status**: Design agreed for implementation; no feature code yet  
+**Status**: Implemented as an opt-in experiment; routing-quality evaluation remains outstanding<br>
 **Date**: 2026-10-12  
-**Revision**: 2026-10-13 (b); synchronous decision inside `fleet_start_work`, fallback to Fleet worker defaults instead of holds, no new Node capability<br>
+**Revision**: 2026-10-13 (c); General model-picker dialog, ordered Azure AI Foundry / TypeSafe decision-model failover, and protected local credentials<br>
 **Work item**: Not supplied  
-**Source baseline**: Original lifecycle inspection at `ae58fca`; profile/model-ID revision at `0015e58`; gap review and this revision against the current `main`. No runtime code changes.
+**Source baseline**: Original lifecycle inspection at `ae58fca`; profile/model-ID revision at `0015e58`; agreed fallback design at `fc88642` / `c7ff61d`. The implementation uses the same worker-start lifecycle and adds no routing holds.
 
 ## Related documents
 
@@ -165,8 +165,11 @@ bypass. Fallback and Shadow mode are specified below.
 
 - Experimental setting is off by default. Modes: **Off**, **Shadow**, **Route
   new workers**. Enabling initially selects Shadow.
-- v1 supports Azure AI Foundry's Microsoft decision endpoint with API-key
-  authentication. Other providers and Entra authentication are future work.
+- Supports Azure AI Foundry's Microsoft decision endpoint and the direct
+  TypeSafe decision API with API-key authentication. Configure up to eight
+  ordered decision-model connections, including multiple deployments/models
+  on the same provider. Entra provider authentication and generative
+  OpenAI-compatible decision adapters are not included.
 - Only `fleet_start_work` is routed. Follow-ups, the REST plan endpoint
   (`POST /api/runs/:id/plan`), PR-maintenance continuations of an existing
   worker, ordinary Chats, adopted conversations and lead sessions use today's
@@ -178,8 +181,12 @@ bypass. Fallback and Shadow mode are specified below.
 
 ### Fallback rule
 
-There is exactly one fallback: **Fleet's worker defaults, applied the way they
-are today.** It is used, and its reason recorded on the routing receipt, when:
+Try tested decision-model connections in configured order. An unavailable,
+failed, invalid or below-threshold decision advances to the next connection.
+The entire chain shares the deadline; each HTTP attempt reserves time for
+remaining connections after obtaining its rate/concurrency permit.
+When none qualifies, the final fallback is **Fleet's worker defaults**,
+snapshotted at request acceptance and applied the way they are today:
 
 | Reason code | When |
 | --- | --- |
@@ -191,7 +198,9 @@ are today.** It is used, and its reason recorded on the routing receipt, when:
 | `provider_error` | Timeout, 401/403, 404, 422, 429/503/529 after the permitted retry, 5xx, DNS/TLS failure |
 | `invalid_answer` | Malformed JSON, missing answer, a choice outside the candidates, or invalid probabilities |
 | `low_probability` | The chosen profile's probability is below the policy's `minProbability` |
-| `model_unavailable` | Detected on the Node: the profile's model is not offered there (see below) |
+| `timeout` | The shared decision deadline, including permit waiting, expires |
+| `disabled` | Routing was disabled while deciding |
+| `model_unavailable` | The Node cannot apply the requested model/effort, including an unsupported choice or failed ACP setter |
 
 Fallback is not an error. The dispatch reply says which profile was used, or
 that defaults were used and why, in one line. It does not wake the lead
@@ -199,19 +208,23 @@ separately.
 
 ### Settings UX
 
-Add an **Experimental worker model routing** card under Settings -> Orchestrator.
-Leave General worker defaults and lead model defaults unchanged.
+Add **Worker model routing** beside the existing default Copilot model and
+reasoning controls in Settings -> General. **Decision settings** opens a
+dialog containing mode, threshold, deadline, ordered provider/model
+connections, worker profiles and operator-reviewed proposals. Lead model
+defaults remain separate and unchanged.
 
 | Control | Behavior |
 | --- | --- |
 | Mode | Off / Shadow / Route new workers. Leaving Off explains that brief text is sent to an external provider and can incur charges. Route requires a successful Test of the saved provider configuration. |
-| Provider | Azure AI Foundry only; the discriminator is kept in the stored schema. |
-| Endpoint | A Foundry resource URL or the full decision URL; normalize to `/providers/microsoft/v1/systemone` once. |
-| Deployment name | Exact, case-preserving deployment name sent as request `model`. |
+| Decision models | Ordered rows with Move earlier/later, Add and Remove; each row names one Foundry deployment or TypeSafe model. Up to eight rows. |
+| Provider | Azure AI Foundry or TypeSafe; saved keys cannot be sent to a changed provider/destination. |
+| Endpoint | A Foundry resource URL/full decision URL, or `https://api.typesafe.ai[/v1/systemone]`; normalize once and enforce provider-specific host/path admission. |
+| Deployment / model name | Case-preserving Foundry deployment name or TypeSafe model ID/alias, sent as request `model`. |
 | API key | Password field with Keep / Replace / Clear; the server returns only `keyConfigured`. Empty input does not overwrite a saved key. |
 | **Test connection** | One Host-side decision request with a fixed sanitized sample. Uses unsaved form values if present, otherwise saved ones. Never starts a worker or changes mode. |
-| Minimum probability | `minProbability`, default 0.5. Explain that it is not calibrated. |
-| Timeout | Total decision deadline, default 5 s, maximum 10 s. |
+| Minimum probability | `minProbability`, default 0.5. Below it, try the next model; if none qualifies, use defaults. Explain that it is not calibrated. |
+| Timeout | Shared decision deadline, default 5 s, configurable from 0.5 to 10 s; not a separate deadline per provider. |
 | Execution profiles | Flat table of ID, display name, description, compatible categories, model and reasoning. |
 | Worker model | Friendly-name dropdown from observed Copilot ACP choices; saves the exact `value`, shows it in a tooltip/copy field. |
 | Profile reasoning | Dropdown of values observed for the selected model; refreshed when the model changes. |
@@ -223,12 +236,14 @@ answer within the submitted choices, not only HTTP 200. Report authentication,
 bad deployment, throttling, timeout, DNS/TLS and invalid output separately,
 without upstream bodies or credential-bearing details.
 
-Readiness for Route is bound to a **provider revision**: a hash of endpoint,
-deployment and credential revision. A Test of unsaved values records that
-revision. Saving the same values keeps readiness, so no second paid Test is
-needed. Changing endpoint, deployment or key clears readiness. Profile edits
-never need a Test. A 401/403 at dispatch time also clears readiness and shows
-the error on the card.
+Readiness for each connection is bound to its provider kind, normalized
+endpoint, model/deployment and credential revision. A successful unsaved Test
+returns an opaque, operator-bound proof usable for 15 minutes. The tested key
+is held privately on the Host so the browser can clear its password field
+before Save. Saving the same connection consumes that proof without another
+paid Test. A changed endpoint, model or key needs a new Test; names and profile
+edits do not. A 401/403 clears the saved connection's readiness; subsequent
+assignments skip it. Untested rows are never called automatically.
 
 ### Worker model IDs and reasoning choices
 
@@ -267,6 +282,7 @@ separately from provider settings and the credential.
 | `revision` | Incremented on every change; writes require `expectedRevision`. |
 | `minProbability` | 0-1; below it, the decision falls back. Default 0.5. |
 | `timeoutMs` | Total decision deadline including queue wait and retry. Default 5000, maximum 10000. |
+| `providers[]` | Up to eight ordered connections: stable `id`, display `name`, `kind` (`foundry`/`typesafe`), normalized `endpoint`, and decision `model`. Keys, test proofs and credential revisions are not policy inputs to the lead. |
 | `profiles[]` | Up to 20. Each: `id` (`^[a-z][a-z0-9-]{1,39}$`, not `auto` or `default`), `name`, `description` (<=400 characters), `categories` (non-empty subset of the five), `model` (exact ACP value), `reasoningEffort` (string or `null`). |
 
 Rate and concurrency limits are fixed constants in v1 (see Bounds).
@@ -385,22 +401,23 @@ If exactly one profile is compatible, it is selected locally with no call.
    candidate -> that profile; zero candidates -> `no_candidates`; otherwise
    call the provider within `timeoutMs` (default 5 s). Any failure or
    below-threshold answer becomes a fallback reason, never a refusal.
-3. **Recheck** the lead's liveness and every check from step 1, because other
+3. **Recheck** the lead's liveness, Host restore epoch and every check from step 1, because other
    calls may have dispatched during the wait. If the dispatch is now refused,
    return the same refusal it would have received without routing.
 4. Write the step with its routing receipt in the existing `upsertRunStep`
    call, then continue exactly as today (`tickRun`, queued/started reply).
 5. When the engine starts the step, `startStep` passes the step's requested
    pair to `createAndStartSession`, which records it on the session as its
-   worker selection. `startupConfigFor` sends it with worker defaults as
+   worker selection. Session creation and step/session association commit
+   together before the start command is sent. `startupConfigFor` sends it with snapshotted worker defaults as
    fallback (next section).
 6. The reply names the profile and source, or says defaults were used and why.
 
 Because the decision happens before the step exists, routing adds no new step
-states, no new admission hold codes, and no new crash window: a Host crash
+states and no new admission hold codes: a Host crash
 during the wait leaves no step and the lead's tool call fails as any
-interrupted call does today. The existing write-then-send ordering in
-`startStep` is unchanged.
+interrupted call does today. The session, selection and step association are now all recorded before send;
+the existing synchronous scheduler and command fencing remain authoritative.
 
 A step queued for a while keeps the pair chosen at dispatch; policy edits do not
 rewrite it.
@@ -426,12 +443,17 @@ model's choices. Change it so that:
   default "Y"`.
 - Once the model entry has used its fallback, later entries use their
   fallbacks too, so a routed effort is never applied to a different model.
+- An unsupported effort or rejected/unconfirmed ACP setter also attempts the
+  ordinary pair. If Fleet's configured default is unavailable, restore the
+  agent's initial model before applying a supported ordinary effort.
 - A `null` profile effort sends no effort entry.
 - If neither is offered, keep today's behavior: notice and continue.
 
 The Host learns what actually runs from the existing `config` events
 (`session.configOptions[].currentValue`) and shows **requested vs running** in
-the task detail, recording `model_unavailable` when they differ. No new
+the task detail. A structured system notice records a startup fallback attempt;
+an explicit manual picker change is not misclassified as a missing model.
+No new
 confirmation event or Node capability is needed. An older Node strips the
 unknown `fallback` field and behaves as today: it tries the routed model and, if
 missing, leaves Copilot's own default.
@@ -457,8 +479,9 @@ not clear the routing receipt and must not route again.
 
 ### Provider, endpoint and secret handling
 
-A small Host-side Foundry function returns a normalized result. No registry,
-SDK abstraction or background agent.
+A small Host-side HTTPS function handles the two providers' shared typed
+decision shape and returns a normalized result. No registry, provider SDK or
+background agent.
 
 ```text
 POST https://<resource>.services.ai.azure.com/providers/microsoft/v1/systemone
@@ -468,10 +491,18 @@ api-key: <Host-held-secret>
 {"model":"<deployment-name>","state":{...},"questions":{...}}
 ```
 
+TypeSafe uses `POST https://api.typesafe.ai/v1/systemone`,
+`Authorization: Bearer <Host-held-secret>`, and its configured model ID/alias
+in the same body. The response's model identity is diagnostic, not a worker
+model selection.
+
 - Endpoint admission: HTTPS only; host matching
   `<name>.services.ai.azure.com`, `<name>.openai.azure.com` or
   `<name>.cognitiveservices.azure.com`; canonical path; no userinfo, query,
-  fragment, non-default port or redirects. Private-link and sovereign clouds
+  fragment, non-default port or redirects. TypeSafe admits only
+  `api.typesafe.ai/v1/systemone`. DNS answers must all be public; the chosen
+  validated address is pinned to the TLS connection to avoid a second lookup.
+  Private-link and sovereign clouds
   are out of scope.
 - Response validation: `answers.profile.type === "choice"`, `choice` in the
   submitted candidates, `probabilities` finite in [0,1] with sum within 0.01
@@ -479,11 +510,15 @@ api-key: <Host-held-secret>
   recorded as unknown. Response size <=64 KiB.
 - Retry: at most one retry for 429, 503 or 529 when `Retry-After` (or 500 ms)
   fits the remaining deadline. 422 is a Fleet bug: log it and fall back.
-- The key is stored in a credential file in the Host data directory, written
-  atomically with `0o600` using the `saveHostMcpConfig` pattern. The directory
-  itself is already restricted to the running account, SYSTEM and
-  Administrators on Windows by `data-permissions.ts`. SQLite stores only a
-  non-secret credential revision.
+- Keys are stored in `<Host data directory>/worker-model-routing/credentials.json`,
+  atomically written with `0o600` through the shared private-JSON writer.
+  The dedicated directory is secured before any key bytes are written, in
+  development as well as production: `0700` on Unix and a Windows DACL allowing
+  only the running account, SYSTEM and local Administrators. Reuse the
+  existing `data-permissions.ts` ACL construction asynchronously; do not
+  reconfigure the rest of a developer's data directory. Key generations keep
+  the old authority usable until metadata commits, then obsolete keys are
+  physically removed. SQLite holds only non-secret credential/test revisions.
 - The key is write-only: never returned by GET, MCP, logs, events or errors.
   Host backups list their fields explicitly (`exportHostBackup` in
   `store.ts`), so the key is excluded by not being added. The policy and
@@ -499,8 +534,9 @@ api-key: <Host-held-secret>
 | Bound | Value |
 | --- | --- |
 | Decision deadline | `timeoutMs`, default 5 s, maximum 10 s, including queue wait and retry |
+| Clock | Monotonic per-Host timing for deadlines, permit spacing, proof expiry and elapsed time; UTC timestamps only for display/audit |
 | Concurrent provider calls | 2 per Host |
-| Provider rate | 30 requests/minute; no permit before the deadline -> `provider_unavailable` |
+| Provider rate | 30 requests/minute with burst 1; permit waiting consumes the shared deadline and ends in defaults on timeout |
 | Request size | 32 KiB total JSON; larger -> `over_size`, no truncation |
 | Response size | 64 KiB |
 | Profiles | Up to 20; descriptions <=400 characters, which leaves most of the 32 KiB for the brief |
@@ -513,9 +549,8 @@ large to route simply uses worker defaults.
 | Surface | Access and behavior |
 | --- | --- |
 | `GET /api/worker-model-routing` | Node operator; mode, provider metadata, readiness, `keyConfigured`, policy and pending proposals |
-| `PUT /api/worker-model-routing/provider` | Node operator plus recent reauth; endpoint, deployment, key (keep/replace/clear), mode |
-| `POST /api/worker-model-routing/test` | Node operator; bounded draft or saved Test; no persistence except readiness for the tested provider revision |
-| `PUT /api/worker-model-routing/policy` | Node operator; `expectedRevision`; validates and saves profiles, threshold and timeout |
+| `PUT /api/worker-model-routing` | Node operator plus recent reauth; `expectedRevision`, mode, threshold, deadline, ordered connection drafts and profiles. Key actions are keep/replace/clear; successful draft tests are bound to the exact connection and actor. |
+| `POST /api/worker-model-routing/test` | Node operator; one connection draft or saved-key Test; returns a temporary proof, never saves form values, enables routing or launches a worker |
 | `POST /api/worker-model-routing/proposals/:id` | Node operator; apply or reject an orchestrator proposal (apply is a policy write with CAS) |
 | `fleet_get_worker_routing_policy` | Live lead; mode and profiles; no credentials or provider configuration |
 | `fleet_propose_worker_routing_policy` | Live lead; `expectedRevision`, `reason`, full proposed profile list; stored as **awaiting operator review**, never applied |
@@ -538,10 +573,10 @@ Persist:
 
 | Existing source | Behavior | Change |
 | --- | --- | --- |
-| `apps/host/src/orchestrator/tools.ts` `StartWorkSchema`, `startWork` | Synchronous checks, `upsertRunStep`, `tickRun` | Add `profile`; make `startWork` async; decide, recheck, then write the receipt with the step |
+| `apps/host/src/orchestrator/tools.ts` `StartWorkSchema`, `startRoutedWork` | Synchronous checks, `upsertRunStep`, `tickRun` | Add `profile`; async MCP entry decides, rechecks, then delegates to the shared synchronous admission/write path |
 | `apps/host/src/orchestrator/mcp-routes.ts` `guard` | Synchronous tool wrapper | Allow an async action |
 | `apps/host/src/orchestrator/engine.ts` `startStep` | Calls `createAndStartSession` | Pass the step's requested pair |
-| `apps/host/src/fleet-service.ts` `createAndStartSession` | Creates and dispatches | Accept and store an optional worker selection |
+| `apps/host/src/fleet-service.ts` `createAndStartSession` | Creates and dispatches | Store optional selection and bind the step/session atomically before dispatch |
 | `apps/host/src/fleet-service.ts` `startupConfigFor` | Global defaults for every worker start/resume | Routed start: pair with default fallbacks. Routed resume: the session's last observed values. Legacy: unchanged |
 | `packages/protocol/src/index.ts` `StartupConfigSchema`, `RunStepSchema`, session schema | No fallback, no routing fields | Optional `fallback`; optional `routing`; optional `workerSelection` |
 | `apps/node/src/agents.ts` `applyStartupConfig`, `rollOverConversation` | Best-effort, re-applies launch config on rollover | Fallback chain; rollover re-applies current values |
@@ -583,7 +618,7 @@ Persist:
 | 6 | Synchronous or asynchronous decision? | Async needed holds, recovery and idempotency | **Resolved 2026-10-13:** synchronous, <=5 s by default. |
 | 7 | Missing model on the Node? | Catalogs differ by Node/account | **Resolved 2026-10-13:** Node falls back to worker defaults. |
 | 8 | Clarification gate? | Pilot detected 4/4 but threshold uncalibrated | **Deferred:** no clarification question in v1. |
-| 9 | Secret storage on Windows? | Data directory already ACL-restricted by `data-permissions.ts` | **Resolved:** `0o600` credential file in that directory; verify ACL inheritance in a test. |
+| 9 | Secret storage on Windows? | Existing ACL helper provides the correct SID-based trust boundary; mode bits alone do not | **Resolved:** a separately secured credential subdirectory, asynchronous ACL application before writing keys, and a real-platform file-permission test. |
 | 10 | Raw model IDs in settings? | Defaults UI already stores ACP values | **Resolved:** ACP dropdowns, raw-ID tooltip, advanced Unverified input. |
 | 11 | Are PR-maintenance worker dispatches routed? | They usually continue an existing worker, which already has a model | **Resolved 2026-10-13:** no special handling. Existing workers keep their model; PR-maintenance is not a routing case in v1. |
 | 12 | Are the illustrative pairs good? | No worker-outcome benchmark | Keep editable; no shipped profiles. |
@@ -623,8 +658,9 @@ Persist:
 # Backend (workload) checklist <!-- optional -->
 
 - **State/Metadata** - Routing receipt per step and worker selection per
-  session, both optional JSON. Corrupt records are ignored and the session uses
-  legacy behavior. Backups carry policy, not the key.
+  session, both optional validated JSON. Invalid stored records are explicit
+  data errors, never silently treated as successful selections. Backups carry
+  policy and selections, not keys or test readiness.
 - **Config options and resource consumption** - Bounded request, response,
   rate, concurrency and deadline. No executable policy.
 - **MWC DMS workload - Coding Best Practices** - Not applicable. No database
