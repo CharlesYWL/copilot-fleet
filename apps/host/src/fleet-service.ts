@@ -655,6 +655,68 @@ export class FleetService {
     return this.notifications.resolveSessionPermissionRequests(sessionId);
   }
 
+  /**
+   * Answers the permission requests an ended agent left open.
+   *
+   * A request lives in the agent process that asked it. When that process dies
+   * with the request open — a Node reboot, a crash — nothing is left to deliver
+   * Allow or Deny to, yet the event log still says the session is waiting on a
+   * person. That request then held the session hostage: PR maintenance refused
+   * Resume while a permission was pending, and the banner offered buttons that
+   * reached nothing. Recording the withdrawal is what the agent would have done
+   * had it lived, and keeps it durable so a later read cannot resurrect it.
+   *
+   * Only call this when the Node can no longer emit events for the session:
+   * the Host writes the next sequence number itself.
+   */
+  withdrawOrphanedPermissions(sessionId: string): number {
+    const session = this.store.getSession(sessionId);
+    if (!session || !terminalSessionStates.has(session.state)) return 0;
+    const withdrawn = this.store.withdrawPendingPermissions(sessionId);
+    this.resolveSessionPermissionRequests(sessionId);
+    if (withdrawn.length === 0) return 0;
+    this.log.info(
+      { sessionId, count: withdrawn.length },
+      "Withdrew permission requests left open by an agent that is gone",
+    );
+    for (const event of withdrawn) {
+      const transcript = this.transcripts.apply(event);
+      if (this.permissionLedger) {
+        this.permissionLedger.apply([event]);
+        this.permissionLedgerWrites += 1;
+      }
+      this.broadcast({ type: "event", event, ...(transcript ? { transcript } : {}) });
+    }
+    // The snapshot carries the permission ledger and PR maintenance holds.
+    this.publishSnapshot();
+    return withdrawn.length;
+  }
+
+  /**
+   * Withdraws open requests of ended sessions a reconciled Node no longer runs.
+   *
+   * Reconciliation follows the Node's outbox flush, so once the inventory omits
+   * a session nothing more will arrive for it. Reads the cached ledger, not the
+   * event table, because this runs on every heartbeat.
+   */
+  private withdrawOrphanedPermissionsOn(
+    nodeId: string,
+    activeSessionIds: readonly string[],
+  ): void {
+    this.permissionEvents();
+    const active = new Set(activeSessionIds);
+    const orphaned = new Set(
+      (this.permissionLedger?.requests() ?? [])
+        .map((event) => event.sessionId)
+        .filter((sessionId) => {
+          if (active.has(sessionId)) return false;
+          const session = this.store.getSession(sessionId);
+          return session?.nodeId === nodeId && terminalSessionStates.has(session.state);
+        }),
+    );
+    for (const sessionId of orphaned) this.withdrawOrphanedPermissions(sessionId);
+  }
+
   settleOrchestrationStep(input: {
     runId: string;
     stepId: string;
@@ -1179,6 +1241,9 @@ export class FleetService {
     if (!session) return { ok: false, status: 404, error: "Session not found" };
     if (this.console.blocked(session.nodeId))
       return { ok: false, status: 409, error: "Node history is synchronizing" };
+    // A request the ended agent left open must not hold the resume hostage.
+    if (this.store.getNode(session.nodeId)?.online)
+      this.withdrawOrphanedPermissions(session.id);
     const manual =
       supervisor && this.supervisorCommand(sessionId, "resume_session", supervisor);
     if (manual && this.isSupervisorRetry(sessionId, manual)) return { ok: true, session };
@@ -2296,6 +2361,7 @@ export class FleetService {
       );
     };
     if (this.store.prMaintenance.settleEndedManualCommands(ended)) this.publishSnapshot();
+    this.withdrawOrphanedPermissionsOn(nodeId, activeSessionIds);
     this.sessionRetention.nodeReconciled(nodeId);
     this.worktrees.onNodeReconciled(nodeId);
     this.autoResume(nodeId, settled);
