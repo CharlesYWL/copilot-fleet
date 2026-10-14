@@ -116,6 +116,14 @@ On reconnect:
    worktree mutations or auto-resume. Safety stop/cancel and Host permission
    resolution remain possible without deleting outstanding history.
 
+If an inactive journal session no longer exists on Host, initialization identifies
+it separately instead of blocking the entire Node. Its local events and control
+receipts remain unacknowledged and retained; they are not replayed, discarded or
+executed. That session is read-only with a scoped conflict diagnostic, while
+known sessions finish synchronization and unrelated orchestrators can resume.
+Missing live sessions, foreign ownership and changed grants still block
+synchronization.
+
 Replay imports evidence; it does not execute the recorded prompt. Original task
 completion must be settled from its own events before a local follow-up starts a
 separate attempt.

@@ -1473,7 +1473,9 @@ export class PrMaintenanceStore {
       record.batches.some(
         (batch) =>
           batch.effects.some(unsettledEffect) ||
-          ((outstanding.has(batch.state) || (batch.stepId && !batch.executionSettled)) &&
+          (((outstanding.has(batch.state) &&
+            (batch.state !== "reconciling" || !batch.executionSettled)) ||
+            (batch.stepId && !batch.executionSettled)) &&
             !this.neverDispatched(record, batch)),
       )
     )

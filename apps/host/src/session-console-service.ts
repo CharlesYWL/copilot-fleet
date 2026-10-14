@@ -296,10 +296,15 @@ export class SessionConsoleService {
       peer.active = request.activeSessionIds;
       peer.busy = request.busySessionIds;
       const grants: ConsoleGrant[] = [];
+      const unavailableSessionIds: string[] = [];
       for (const id of new Set([
         ...peer.active,
         ...request.sessions.map((entry) => entry.sessionId),
       ])) {
+        if (!this.store.getSession(id)) {
+          unavailableSessionIds.push(id);
+          continue;
+        }
         const session = this.own(nodeId, id);
         if (session.runRole === "lead") continue;
         const old = request.sessions.find((entry) => entry.sessionId === id);
@@ -311,7 +316,7 @@ export class SessionConsoleService {
           );
         grants.push(this.grant(session));
       }
-      return { grants };
+      return { grants, unavailableSessionIds };
     }
     if (request.kind === "catalog") {
       const all = this.store

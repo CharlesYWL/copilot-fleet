@@ -1196,7 +1196,61 @@ describe("trusted supervisor session handoff", () => {
     expect(f.store.prMaintenance.get(f.record.id)?.lifecycle).toBe("paused");
   });
 
-  it.each(["sent", "unknown-effect"] as const)(
+  it("resumes a stopped worker with correlated quiescence while its maintenance batch awaits final bookkeeping", async () => {
+    const f = await setup("password", true);
+    f.queue();
+    f.store.updateRunStep(f.step.id, {
+      state: "starting",
+      dispatchedAt: new Date().toISOString(),
+    });
+    f.service.dispatch(f.worker.nodeId, {
+      type: "prompt",
+      sessionId: f.worker.id,
+      prompt: "automatic repair",
+      attachments: [],
+    });
+    const unsubscribe = f.service.onSessionEvent((event) =>
+      f.engine.handleSessionEvent(event),
+    );
+    f.settle();
+    unsubscribe();
+    expect(f.store.getRunStep(f.step.id)?.state).toBe("succeeded");
+    const before = f.store.prMaintenance.get(f.record.id)!;
+    expect(before.batches).toMatchObject([
+      {
+        state: "reconciling",
+        executionSettled: true,
+        effects: [],
+      },
+    ]);
+    const step = f.store.getRunStep(f.step.id);
+    f.resumable();
+    const reply = await f.command("resume", { operationId: randomUUID() });
+    expect(reply.statusCode, reply.body).toBe(202);
+    expect(f.sent.map((command) => command.type)).toEqual(["prompt", "resume_session"]);
+    f.event("state", { state: "idle" });
+    const manual = f.store.prMaintenance.get(f.record.id)!;
+    expect(manual).toMatchObject({
+      lifecycle: "paused",
+      pauseReason: "manual_control",
+      batches: before.batches,
+      authorization: before.authorization,
+      manualControl: { commands: [{ kind: "resume_session", state: "settled" }] },
+    });
+    expect(f.store.getRunStep(f.step.id)).toEqual(step);
+    const prompt = await f.command("prompt", { operationId: randomUUID() });
+    expect(prompt.statusCode, prompt.body).toBe(202);
+    f.settle();
+    expect(f.store.prMaintenance.get(f.record.id)?.batches).toEqual(manual.batches);
+  });
+
+  it.each([
+    "sent",
+    "unknown execution",
+    "reserved effect",
+    "uncertain effect",
+    "uncertain batch",
+  ] as const)(
     "refuses %s maintenance without deleting receipts, pausing or cancelling its worker",
     async (state) => {
       const f = await setup("password", true);
@@ -1213,15 +1267,33 @@ describe("trusted supervisor session handoff", () => {
           attachments: [],
         });
       } else {
+        const executionSettled = state !== "unknown execution";
+        if (executionSettled) f.store.updateRunStep(f.step.id, { state: "succeeded" });
         record = f.store.prMaintenance.checkpoint(f.leadId, record.id, record.version, {
           kind: "batch",
           batchId: "queued",
           generation: record.generation,
-          state: "uncertain",
+          state:
+            state === "reserved effect" || state === "uncertain effect"
+              ? "reconciling"
+              : "uncertain",
           findings: [],
-          effects: [],
-          executionSettled: false,
-          evidence: "Lost execution receipt",
+          effects:
+            state === "reserved effect" || state === "uncertain effect"
+              ? [
+                  {
+                    key: "unsettled-push",
+                    kind: "push",
+                    state: state === "reserved effect" ? "reserved" : "uncertain",
+                    headSha,
+                    actor: "worker",
+                    actionIdentity: "publish-head",
+                    attempts: 1,
+                  },
+                ]
+              : [],
+          executionSettled,
+          evidence: "Retain unresolved execution or effect evidence",
         });
       }
       const before = f.store.prMaintenance.get(record.id);
@@ -1229,6 +1301,12 @@ describe("trusted supervisor session handoff", () => {
       const reply = await f.command("prompt");
       expect(reply.statusCode, reply.body).toBe(409);
       expect(reply.body).toMatch(/receipts/);
+      expect(f.sent).toHaveLength(sent);
+      expect(f.store.prMaintenance.get(record.id)).toEqual(before);
+      f.resumable();
+      const resume = await f.command("resume", { operationId: randomUUID() });
+      expect(resume.statusCode, resume.body).toBe(409);
+      expect(resume.body).toMatch(/receipts/);
       expect(f.sent).toHaveLength(sent);
       expect(f.store.prMaintenance.get(record.id)).toEqual(before);
     },

@@ -64,6 +64,8 @@ type Waiter = {
 export const LIVE_EVENT_WINDOW_BATCHES = 128;
 export const LIVE_EVENT_WINDOW_BYTES = 8 * 1024 * 1024;
 const LIVE_EVENT_BATCH_BYTES = 512 * 1024;
+const UNAVAILABLE_SESSION_DETAIL =
+  "The Host no longer has this session. Local history is retained for inspection and was not replayed; session control is unavailable.";
 type LiveControl = { operation: ConsoleOperation; signature: string };
 type LiveBatch = {
   order: number;
@@ -89,6 +91,7 @@ export class NodeSessionConsole {
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly hostEpochs = new Map<string, number>();
   private readonly syncSessions = new Set<string>();
+  private readonly unavailableSessions = new Set<string>();
   private readonly sentOperations = new Map<string, string>();
   private fastFlush = false;
   private liveWake = false;
@@ -188,6 +191,7 @@ export class NodeSessionConsole {
         for (const response of viewers) response.end();
       this.viewers.clear();
       this.hostEpochs.clear();
+      this.unavailableSessions.clear();
       this.hostIdentity = this.options.hostId();
     }
     this.supported = supported;
@@ -217,18 +221,28 @@ export class NodeSessionConsole {
             entry.highWater > entry.acknowledgedSequence ||
             entry.controlEpoch > entry.acknowledgedControlEpoch,
         );
-      const response = z.object({ grants: z.array(ConsoleGrantSchema) }).parse(
-        await this.request({
-          kind: "initialize",
-          activeSessionIds: this.options.router.activeSessionIds,
-          busySessionIds: this.options.router.busySessionIds,
-          sessions: pending.map((entry) => ({
-            sessionId: entry.session.id,
-            grantId: entry.grantId,
-          })),
-        }),
-      );
+      const response = z
+        .object({
+          grants: z.array(ConsoleGrantSchema),
+          unavailableSessionIds: z.array(z.string().min(1)).max(1000).default([]),
+        })
+        .parse(
+          await this.request({
+            kind: "initialize",
+            activeSessionIds: this.options.router.activeSessionIds,
+            busySessionIds: this.options.router.busySessionIds,
+            sessions: pending.map((entry) => ({
+              sessionId: entry.session.id,
+              grantId: entry.grantId,
+            })),
+          }),
+        );
       if (generation !== this.generation) return;
+      this.unavailableSessions.clear();
+      for (const id of response.unavailableSessionIds) {
+        this.unavailableSessions.add(id);
+        this.options.onError(`Session console ${id}: ${UNAVAILABLE_SESSION_DETAIL}`);
+      }
       for (const grant of response.grants) this.grant(grant);
       await this.flushToHost();
       if (generation !== this.generation) return;
@@ -258,6 +272,11 @@ export class NodeSessionConsole {
       this.detail = "";
       this.connection();
       for (const id of this.viewers.keys()) {
+        if (this.unavailableSessions.has(id)) {
+          this.emit(id, { type: "session", session: this.localView(id).session });
+          this.emit(id, { type: "transcript_reset", sessionId: id });
+          continue;
+        }
         const view = ConsoleSessionViewSchema.parse(
           await this.request({ kind: "subscribe", sessionId: id }),
         );
@@ -304,6 +323,7 @@ export class NodeSessionConsole {
         }
       : grant.session;
     this.journal.enable({ ...grant, session });
+    this.unavailableSessions.delete(grant.session.id);
     this.syncSessions.add(grant.session.id);
     this.hostEpochs.set(grant.session.id, grant.controlEpoch);
     this.markOperationsDirty(grant.session.id);
@@ -777,21 +797,24 @@ export class NodeSessionConsole {
       );
     }
     const live = this.options.router.activeSessionIds.includes(id);
+    const unavailable = this.unavailableSessions.has(id);
     return {
       session: entry.session,
       permissions: this.journal.permissions(id),
       messages: this.localMessages(id),
-      status: this.status,
+      status: unavailable ? "conflict" : this.status,
       offlineAllowed:
         !this.closed &&
+        !unavailable &&
         live &&
         entry.session.runRole !== "lead" &&
         !entry.session.stopRequested &&
         !entry.session.cleanupRequested &&
         this.status !== "conflict",
-      detail:
-        this.detail ||
-        (!live ? "The session process is not running. Resume through Host." : ""),
+      detail: unavailable
+        ? UNAVAILABLE_SESSION_DETAIL
+        : this.detail ||
+          (!live ? "The session process is not running. Resume through Host." : ""),
     };
   }
 
@@ -823,7 +846,8 @@ export class NodeSessionConsole {
   }
 
   async view(id: string): Promise<ConsoleSessionView> {
-    if (this.status !== "online") return this.localView(id);
+    if (this.status !== "online" || this.unavailableSessions.has(id))
+      return this.localView(id);
     const view = ConsoleSessionViewSchema.parse(
       await this.request({ kind: "session", sessionId: id }),
     );
@@ -844,7 +868,7 @@ export class NodeSessionConsole {
   }
 
   async transcript(id: string, before?: number, limit?: number): Promise<TranscriptPage> {
-    if (this.status !== "online") {
+    if (this.status !== "online" || this.unavailableSessions.has(id)) {
       this.localView(id);
       await this.journal.flush();
       return this.journal.transcript(id, {
@@ -937,14 +961,14 @@ export class NodeSessionConsole {
       viewers.delete(response);
       if (!viewers.size) {
         this.viewers.delete(id);
-        if (this.status === "online")
+        if (this.status === "online" && !this.unavailableSessions.has(id))
           void this.request({ kind: "unsubscribe", sessionId: id }).catch(
             (error: unknown) => this.options.onError(errorMessage(error)),
           );
       }
     });
     this.connection();
-    if (this.status === "online") {
+    if (this.status === "online" && !this.unavailableSessions.has(id)) {
       try {
         if (first) {
           const current = ConsoleSessionViewSchema.parse(
@@ -976,16 +1000,21 @@ export class NodeSessionConsole {
   private connection(): void {
     for (const id of this.viewers.keys()) {
       let allowed = false;
+      let status = this.status;
+      let detail = this.detail;
       try {
-        allowed = this.localView(id).offlineAllowed;
+        const view = this.localView(id);
+        allowed = view.offlineAllowed;
+        status = view.status;
+        detail = view.detail ?? detail;
       } catch {
         /* An online-only view has no local grant. */
       }
       this.emit(id, {
         type: "connection",
-        status: this.status,
+        status,
         offlineAllowed: allowed,
-        detail: this.detail,
+        detail,
       });
     }
   }
@@ -1019,6 +1048,13 @@ export class NodeSessionConsole {
   hostCommand(command: NodeCommand, epoch?: number): Promise<CommandResult> {
     return this.exclusive(command.sessionId, async () => {
       const safety = ["stop", "cancel", "permission_response"].includes(command.type);
+      if (!safety && this.unavailableSessions.has(command.sessionId))
+        return {
+          commandId: command.commandId,
+          ok: false,
+          fatal: false,
+          error: UNAVAILABLE_SESSION_DETAIL,
+        };
       const entry = this.journal.get(command.sessionId);
       if (
         !safety &&
@@ -1070,6 +1106,8 @@ export class NodeSessionConsole {
   }
 
   private async action(id: string, input: ConsoleAction): Promise<unknown> {
+    if (this.unavailableSessions.has(id))
+      throw new NodeConsoleError(409, UNAVAILABLE_SESSION_DETAIL);
     if (
       (input.action === "queue_cancel" || input.action === "queue_send_now") &&
       input.messageId.startsWith("node:")
@@ -1202,12 +1240,16 @@ export class NodeSessionConsole {
     messageId: string,
     action: "cancel" | "send-now",
   ): Promise<{ ok: true }> {
+    if (this.unavailableSessions.has(id))
+      throw new NodeConsoleError(409, UNAVAILABLE_SESSION_DETAIL);
     if (this.status === "syncing" || this.status === "conflict")
       throw new NodeConsoleError(409, "Reconcile the session before changing its queue");
     const entry = this.journal.get(id);
     if (!entry || entry.hostId !== this.options.hostId())
       throw new NodeConsoleError(404, "Local session not found");
     await this.exclusive(id, async () => {
+      if (this.unavailableSessions.has(id))
+        throw new NodeConsoleError(409, UNAVAILABLE_SESSION_DETAIL);
       if (this.status === "syncing" || this.status === "conflict")
         throw new NodeConsoleError(
           409,
@@ -1335,6 +1377,7 @@ export class NodeSessionConsole {
         this.journal.purge(this.options.hostId(), input.discardUnsynchronized);
         this.views.clear();
         this.syncSessions.clear();
+        this.unavailableSessions.clear();
         return { status: 200, body: { ok: true } };
       }
       if (method === "GET" && parsed.pathname === "/api/fleet-sessions") {
@@ -1370,7 +1413,7 @@ export class NodeSessionConsole {
       if (method === "GET" && !action) return { status: 200, body: await this.view(id) };
       if (method === "GET" && action === "messages") {
         const host =
-          this.status === "online"
+          this.status === "online" && !this.unavailableSessions.has(id)
             ? PendingSessionMessageSchema.array().parse(
                 await this.request({ kind: "messages", sessionId: id }),
               )

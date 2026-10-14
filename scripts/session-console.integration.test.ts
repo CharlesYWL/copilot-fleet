@@ -964,6 +964,115 @@ describe("shared online and offline Node session control", () => {
     expect(f.starts).toHaveBeenCalledTimes(1);
   });
 
+  it("quarantines deleted inactive sessions without blocking history recovery or orchestrator resume", async () => {
+    const f = await fixture();
+    const deletedId = await f.create();
+    const workerId = await f.create();
+    const leadId = await f.create(true);
+    await f.settled(deletedId);
+    await f.settled(workerId);
+    for (const sessionId of [deletedId, leadId])
+      await f.router.route({ type: "stop", sessionId, commandId: randomUUID() });
+    await vi.waitFor(() =>
+      expect(f.journal.get(deletedId)!.acknowledgedSequence).toBe(
+        f.journal.highWater(deletedId),
+      ),
+    );
+    f.disconnect();
+    const retained = f.journal.append({
+      eventId: randomUUID(),
+      sessionId: deletedId,
+      sequence: f.journal.highWater(deletedId) + 1,
+      type: "agent_text",
+      payload: { text: "Retained history from a deleted session" },
+      createdAt: new Date().toISOString(),
+    });
+    const operation = f.journal.acceptOperation({
+      id: randomUUID(),
+      sessionId: deletedId,
+      action: "prompt",
+      payload: { prompt: "Must never execute" },
+      queued: true,
+    }).operation;
+    const recovered = f.journal.append({
+      eventId: randomUUID(),
+      sessionId: workerId,
+      sequence: f.journal.highWater(workerId) + 1,
+      type: "agent_text",
+      payload: { text: "Recover the existing worker normally" },
+      createdAt: new Date().toISOString(),
+    });
+    f.store.deleteSession(deletedId);
+    const from = f.requests.length;
+    await f.connect();
+    expect(f.controller.readyForHostWork).toBe(true);
+    expect(f.service.nodeWorkBlocked(f.node.id)).toBeUndefined();
+    expect(f.store.listEvents(workerId)).toContainEqual(recovered);
+    expect(
+      f.requests.slice(from).filter((entry) => entry.request.kind === "replay"),
+    ).toEqual([expect.objectContaining({ blocked: true })]);
+    expect(f.journal.events(deletedId, 0)).toContainEqual(retained);
+    expect(f.journal.get(deletedId)!.acknowledgedSequence).toBeLessThan(
+      retained.sequence,
+    );
+    expect(f.journal.operations(deletedId)).toContainEqual(operation);
+    expect(await f.controller.view(deletedId)).toMatchObject({
+      status: "conflict",
+      offlineAllowed: false,
+      detail: expect.stringContaining("retained"),
+    });
+    expect(JSON.stringify(await f.controller.transcript(deletedId))).toContain(
+      "Retained history from a deleted session",
+    );
+    expect(await f.prompt(deletedId, "Do not replay this")).toMatchObject({
+      status: 409,
+    });
+    await expect(
+      f.controller.queueAction(deletedId, operation.id, "send-now"),
+    ).rejects.toThrow(/retained/);
+    expect(f.errors).toEqual([expect.stringContaining(deletedId)]);
+    expect(f.service.resumeSession(leadId)).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(f.store.getSession(leadId)?.state).toBe("idle"));
+    expect(f.starts).toHaveBeenCalledTimes(4);
+    f.disconnect();
+    await f.connect();
+    expect(f.controller.readyForHostWork).toBe(true);
+    expect(f.journal.operations(deletedId)).toContainEqual(operation);
+  });
+
+  it.each(["missing live session", "foreign history"] as const)(
+    "keeps the synchronization barrier for %s",
+    async (condition) => {
+      const f = await fixture();
+      const other = f.store.registerNode({
+        name: "other",
+        os: "win32",
+        arch: "x64",
+        version: "test",
+        capabilities: [],
+        maxSessions: 1,
+      }).node;
+      const placement = f.store.createPlacement(f.workspace.id, other.id, "C:\\other");
+      const foreign = f.store.createSession(placement, "Other node", false);
+      const sent = vi.spyOn(f.link, "send");
+      f.service.console.attach(f.node.id, f.link, [], []);
+      await f.service.console.handle(f.node.id, randomUUID(), {
+        kind: "initialize",
+        activeSessionIds: condition === "missing live session" ? ["missing"] : [],
+        busySessionIds: [],
+        sessions:
+          condition === "foreign history"
+            ? [{ sessionId: foreign.id, grantId: randomUUID() }]
+            : [],
+      });
+      expect(JSON.parse(sent.mock.calls.at(-1)![0])).toMatchObject({
+        type: "session_console_response",
+        response: { ok: false, status: 404 },
+      });
+      expect(f.service.console.blocked(f.node.id)).toBe(true);
+    },
+  );
+
   it("rejects local approvals, permission-policy configuration and offline leads", async () => {
     const f = await fixture();
     const id = await f.create();
