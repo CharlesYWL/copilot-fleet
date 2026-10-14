@@ -1,6 +1,6 @@
 import type * as acp from "@agentclientprotocol/sdk";
 import { errorMessage } from "@fleet/protocol";
-import { parseContextUsage } from "../context-usage.js";
+import { acpContextUsage, parseContextUsage } from "../context-usage.js";
 import { SessionCreditReader } from "../session-credits.js";
 import type { UsageContext, UsageReporter } from "./types.js";
 
@@ -63,9 +63,15 @@ export class CopilotUsageReporter implements UsageReporter {
 
   onUpdate(update: acp.SessionUpdate): boolean {
     if (update.sessionUpdate === "usage_update") {
+      const model = this.context.model();
       this.context.report({
         contextTokens: update.used,
-        ...(update.size > 0 ? { contextWindow: update.size } : {}),
+        contextWindow: update.size > 0 ? update.size : null,
+        context: acpContextUsage(
+          update.used,
+          update.size,
+          model === "auto" ? undefined : model,
+        ),
       });
       return true;
     }
@@ -145,12 +151,9 @@ export class CopilotUsageReporter implements UsageReporter {
         throw new Error("Copilot's /context report was too large");
       const context = parseContextUsage(this.capture.text);
       const model = this.context.model();
-      this.context.report({
-        context:
-          context && model && model !== "auto" && model !== context.model
-            ? null
-            : context,
-      });
+      // A missing or stale local snapshot must not erase the latest ACP reading.
+      if (context && (!model || model === "auto" || model === context.model))
+        this.context.report({ context });
       this.contextError = undefined;
     } catch (error) {
       this.contextFailed(error);
@@ -158,8 +161,7 @@ export class CopilotUsageReporter implements UsageReporter {
   }
 
   private contextFailed(error: unknown): void {
-    this.context.report({ context: null });
-    const message = `Context usage is unavailable: ${errorMessage(error)}`;
+    const message = `Copilot's /context snapshot is unavailable: ${errorMessage(error)}`;
     if (message !== this.contextError && !this.context.stopping())
       this.context.notice(message);
     this.contextError = message;

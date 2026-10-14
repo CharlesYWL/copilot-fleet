@@ -12,7 +12,7 @@ export function contextConfigOption(tier: ContextTier): SessionConfigOption {
     id: CONTEXT_TIER_CONFIG_ID,
     name: "Context window",
     description:
-      "Requests a context tier and restarts the session, keeping conversation history. Some Copilot ACP versions ignore this request; check the reported window in session usage.",
+      "Requests a context tier and restarts the session, keeping conversation history. Some Copilot ACP versions ignore this request or reset it after model changes; check session usage.",
     category: "context",
     currentValue: tier,
     choices: [

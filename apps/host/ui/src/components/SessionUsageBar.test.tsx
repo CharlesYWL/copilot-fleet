@@ -117,9 +117,7 @@ describe("SessionUsageBar", () => {
     expect(updatedAt?.textContent).toBe(new Date(snapshot().updatedAt).toLocaleString());
     expect(screen.getByText("Last ACP input tokens / input budget")).toBeTruthy();
     expect(screen.getByText("50,000 / 272,000 tokens")).toBeTruthy();
-    expect(
-      screen.getByText(/Not the full context window.*timing may differ/),
-    ).toBeTruthy();
+    expect(screen.getByText(/Not the full model window.*timing may differ/)).toBeTruthy();
     expect(
       screen.getByText("Last /context snapshot. Refreshed after turns."),
     ).toBeTruthy();
@@ -218,6 +216,40 @@ describe("SessionUsageBar", () => {
     expect(screen.getByText(/Hermes ACP · Updated/)).toBeTruthy();
     expect(screen.getByText("~8,000 / ~32,000 tokens")).toBeTruthy();
     expect(screen.queryByText(/CLI \/context|Model:|input budget/)).toBeNull();
+  });
+
+  it("shows Copilot ACP input pressure while /context is still unavailable", () => {
+    show({
+      usage: {
+        contextTokens: 68000,
+        contextWindow: 272000,
+        context: snapshot({
+          model: "gpt-5.5",
+          usedTokens: 68000,
+          tokenLimit: 272000,
+          percentage: 25,
+          estimated: true,
+          source: "acp",
+        }),
+      },
+      canCompact: false,
+    });
+    expect(ring().getAttribute("aria-label")).toBe(
+      "Session context usage: approximately 25% used",
+    );
+    fireEvent.click(ring());
+    expect(screen.getByText("Context input budget")).toBeTruthy();
+    expect(screen.getByText("~68,000 / ~272,000 tokens")).toBeTruthy();
+    expect(screen.getByText(/Copilot ACP · Updated \(local\):/)).toBeTruthy();
+    expect(
+      screen.getByText(/pre-response input budget, not the full model window/),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText(/^No \/context snapshot|^CLI \/context · Updated/),
+    ).toBeNull();
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Compact context" }).disabled,
+    ).toBe(true);
   });
 
   it("keeps partial ACP details explicitly separate from unknown full-window usage", () => {
