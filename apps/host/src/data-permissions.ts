@@ -1,6 +1,8 @@
 import { chmodSync, existsSync } from "node:fs";
 import { posix, win32 } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { chmod } from "node:fs/promises";
+import { promisify } from "node:util";
 
 /**
  * The database is the fleet.
@@ -108,6 +110,29 @@ function windowsAclScript(directory: string): string {
       "$item.SetAccessControl($acl)}",
     "exit 0",
   ].join("; ");
+}
+
+export async function securePrivateDirectory(directory: string): Promise<void> {
+  if (process.platform !== "win32") {
+    await chmod(directory, 0o700);
+    return;
+  }
+  const systemRoot =
+    process.env.SystemRoot ?? process.env.SYSTEMROOT ?? process.env.windir;
+  if (!systemRoot)
+    throw new Error("SystemRoot is required to protect decision API keys.");
+  await promisify(execFile)(
+    `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      windowsAclScript(directory),
+    ],
+    { windowsHide: true },
+  );
 }
 
 /**

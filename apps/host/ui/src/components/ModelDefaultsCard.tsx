@@ -7,6 +7,7 @@ import {
   type SessionConfigOption,
 } from "@fleet/protocol";
 import { observedChoices } from "../lib/session-config";
+import type { ReactNode } from "react";
 
 const useStyles = makeStyles({
   card: {
@@ -40,6 +41,7 @@ export type ModelDefaultsCardProps = {
   reasoningEffort?: string | undefined;
   busy: boolean;
   onChange: (patch: { model?: string; reasoningEffort?: string }) => void;
+  children?: ReactNode;
 };
 
 const labelFor = (
@@ -58,6 +60,7 @@ export function ModelDefaultsCard({
   reasoningEffort,
   busy,
   onChange,
+  children,
 }: ModelDefaultsCardProps) {
   const styles = useStyles();
   const label = agentKindLabels[kind];
@@ -115,6 +118,7 @@ export function ModelDefaultsCard({
       {modelChoices.length === 0 && (
         <Text className={styles.caption}>Start a {label} session to load models.</Text>
       )}
+      {children}
     </section>
   );
 }

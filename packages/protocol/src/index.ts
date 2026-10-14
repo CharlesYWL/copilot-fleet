@@ -49,6 +49,12 @@ export * from "./heartbeat-schedule.js";
 export * from "./worker-resume.js";
 export * from "./local-agent.js";
 export * from "./host-mcp.js";
+export * from "./worker-model-routing.js";
+import {
+  WorkerRoutingConfigurationSchema,
+  WorkerRoutingReceiptSchema,
+  WorkerSelectionSchema,
+} from "./worker-model-routing.js";
 import {
   HEARTBEAT_SCHEDULE_MAX_LENGTH,
   HeartbeatScheduleSchema,
@@ -463,6 +469,7 @@ export type RunRole = z.infer<typeof RunRoleSchema>;
 
 export const SessionSchema = z.object({
   executionBinding: ExecutionBindingSchema.optional(),
+  workerSelection: WorkerSelectionSchema.optional(),
   id: z.string().min(1),
   workspaceId: z.string().min(1),
   workspaceName: z.string().min(1),
@@ -933,6 +940,7 @@ export type McpHttpServer = z.infer<typeof McpHttpServerSchema>;
 export const StartupConfigSchema = z.object({
   id: z.string().min(1).max(60),
   value: z.string().max(200),
+  fallback: z.string().max(200).optional(),
 });
 export type StartupConfig = z.infer<typeof StartupConfigSchema>;
 
@@ -1994,6 +2002,7 @@ export type Run = z.infer<typeof RunSchema>;
 
 export const RunStepSchema = z.object({
   executionBinding: ExecutionBindingSchema.optional(),
+  routing: WorkerRoutingReceiptSchema.optional(),
   managedWorktreeId: z.string().optional(),
   workspaceState: z
     .enum([
@@ -3191,6 +3200,7 @@ const hostBackupDataShape = {
   publicUrl: z.string().url().optional(),
   tunnel: HostBackupTunnelSchema,
   defaults: z.object({
+    workerModelRouting: WorkerRoutingConfigurationSchema.optional(),
     orchestratorAgent: AgentParamsSchema.nullable().optional(),
     model: z.string().max(120).optional(),
     reasoningEffort: z.string().max(60).optional(),

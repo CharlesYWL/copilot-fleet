@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { open, rename, rm } from "node:fs/promises";
 import type { FastifyBaseLogger, FastifyPluginAsync } from "fastify";
 import {
   HostMcpSelectionSchema,
@@ -22,6 +21,7 @@ import {
   type ConfiguredHostMcp,
 } from "../host-mcp-client.js";
 import { requireNodeOperator } from "./require-administrator.js";
+import { savePrivateJson } from "../private-config.js";
 
 export const hostMcpRevision = (config: HostMcpConfig): string =>
   createHash("sha256").update(JSON.stringify(config)).digest("hex");
@@ -30,19 +30,7 @@ export async function saveHostMcpConfig(
   path: string,
   config: HostMcpConfig,
 ): Promise<void> {
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  const file = await open(temporary, "wx", 0o600);
-  try {
-    try {
-      await file.writeFile(`${JSON.stringify(config, null, 2)}\n`);
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await rename(temporary, path);
-  } finally {
-    await rm(temporary, { force: true });
-  }
+  await savePrivateJson(path, config);
 }
 
 class SettingsError extends Error {

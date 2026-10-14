@@ -255,6 +255,110 @@ export function resolveConfigValue(
   return choices.find((choice) => choice.name.trim().toLowerCase() === want)?.value;
 }
 
+export async function applyStartupConfig(
+  handle: Pick<
+    AgentSessionHandle,
+    "options" | "setConfigOption" | "notice" | "assertActive"
+  >,
+  config: readonly StartupConfig[],
+): Promise<boolean> {
+  const modelSetting = config.find((wanted) => wanted.id === "model");
+  const routed = modelSetting?.fallback !== undefined;
+  const initialModel = handle
+    .options()
+    .find((option) => option.id === "model")?.currentValue;
+  let fellBack = false;
+
+  const set = async (id: string, wanted: string, exact = false) => {
+    handle.assertActive();
+    const option = handle.options().find((entry) => entry.id === id);
+    if (!option) throw new Error(`This agent has no "${id}" setting`);
+    const value = exact
+      ? toSessionConfigOptions([option])[0]?.choices.find(
+          (choice) => choice.value === wanted,
+        )?.value
+      : resolveConfigValue(option, wanted);
+    if (value === undefined)
+      throw new Error(`"${wanted}" is not one of the choices for ${id}`);
+    if (String(option.currentValue ?? "") !== value) {
+      await handle.setConfigOption(id, value);
+      handle.assertActive();
+    }
+    if (
+      routed &&
+      handle.options().find((entry) => entry.id === id)?.currentValue !== value
+    )
+      throw new Error(`The agent did not confirm ${id} as "${value}"`);
+  };
+
+  const useDefaults = async (reason: unknown) => {
+    handle.assertActive();
+    fellBack = true;
+    handle.notice(
+      `Worker profile could not be applied: ${errorMessage(reason)}. Using Fleet worker defaults.`,
+    );
+    const models = [
+      modelSetting?.fallback ?? "",
+      typeof initialModel === "string" ? initialModel : "",
+    ].filter((value, index, values) => value && values.indexOf(value) === index);
+    const effort = config.find((wanted) => wanted.id === "reasoning_effort")?.fallback;
+    for (const model of models) {
+      try {
+        await set("model", model);
+        break;
+      } catch (error) {
+        handle.assertActive();
+        handle.notice(
+          `Could not apply fallback model "${model}": ${errorMessage(error)}.`,
+        );
+      }
+    }
+    if (effort) {
+      try {
+        await set("reasoning_effort", effort);
+      } catch (error) {
+        handle.assertActive();
+        handle.notice(
+          `Could not apply Fleet default reasoning: ${errorMessage(error)}. The agent's current setting was retained.`,
+        );
+      }
+    }
+  };
+
+  for (const wanted of config) {
+    handle.assertActive();
+    if (wanted.id === CONTEXT_TIER_CONFIG_ID) continue;
+    const isPair = ["model", "reasoning_effort"].includes(wanted.id);
+    if (isPair && fellBack) continue;
+    if (routed && wanted.id === "reasoning_effort" && wanted.value === "") continue;
+    try {
+      await set(wanted.id, wanted.value, routed && isPair);
+    } catch (error) {
+      handle.assertActive();
+      if (routed && isPair) await useDefaults(error);
+      else
+        handle.notice(
+          `Could not set ${wanted.id} to "${wanted.value}": ${errorMessage(error)}; it was left alone`,
+        );
+    }
+  }
+  return fellBack;
+}
+
+export function rolloverStartupConfig(
+  config: readonly StartupConfig[],
+  options: readonly acp.SessionConfigOption[],
+): StartupConfig[] {
+  const model = options.find((option) => option.id === "model")?.currentValue;
+  if (typeof model !== "string") return [...config];
+  const effort = options.find((option) => option.id === "reasoning_effort")?.currentValue;
+  return [
+    ...config.filter((entry) => !["model", "reasoning_effort"].includes(entry.id)),
+    { id: "model", value: model },
+    ...(typeof effort === "string" ? [{ id: "reasoning_effort", value: effort }] : []),
+  ];
+}
+
 export type EventSink = (event: SessionEvent) => void;
 type AgentDiagnosticSink = (level: LogLevel, message: string) => void;
 const logAgentDiagnostic: AgentDiagnosticSink = (level, message) =>
@@ -819,34 +923,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
    * raised. A session running on yesterday's model is worth far more than no
    * session, and the Host's defaults are a preference, not a requirement.
    */
-  private async applyStartupConfig(): Promise<void> {
-    for (const wanted of this.startupConfig) {
-      this.assertActive();
-      if (wanted.id === CONTEXT_TIER_CONFIG_ID) continue;
-      const option = this.configOptions.find((entry) => entry.id === wanted.id);
-      if (!option) {
-        this.emit("system", {
-          message: `This agent has no "${wanted.id}" setting, so the fleet default was not applied`,
-        });
-        continue;
-      }
-      const value = resolveConfigValue(option, wanted.value);
-      if (value === undefined) {
-        this.emit("system", {
-          message: `"${wanted.value}" is not one of the choices for ${wanted.id}, so it was left alone`,
-        });
-        continue;
-      }
-      if (String(option.currentValue ?? "") === value) continue;
-      try {
-        await this.setConfigOption(wanted.id, value);
-      } catch (error) {
-        this.assertActive();
-        this.emit("system", {
-          message: `Could not set ${wanted.id} to "${wanted.value}": ${errorMessage(error)}`,
-        });
-      }
-    }
+  private async applyStartupConfig(
+    config: readonly StartupConfig[] = this.startupConfig,
+  ): Promise<void> {
+    if (await applyStartupConfig(this.sessionHandle(), config))
+      this.emit("system", {
+        message:
+          "Worker profile could not be applied. Ordinary settings were attempted; inspect the reported running model.",
+        workerModelRoutingFallback: true,
+      });
   }
 
   private sessionHandle(): AgentSessionHandle {
@@ -1086,6 +1171,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (!this.kind.rollover)
       throw new Error("This agent does not support context rollover");
     this.denyPendingPermissions();
+    const config = rolloverStartupConfig(this.startupConfig, this.configOptions);
     this.usageReporter.reset?.();
     this.reportUsage({ context: null });
     this.configOptions = [];
@@ -1101,7 +1187,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     this.captureSessionConfig(created);
     await this.kind.afterSessionStart?.(this.sessionHandle());
     this.assertActive();
-    await this.applyStartupConfig();
+    await this.applyStartupConfig(config);
     this.assertActive();
     this.emit("agent_session", { agentSessionId: created.sessionId });
     await this.usageReporter.start?.(created.sessionId, true);

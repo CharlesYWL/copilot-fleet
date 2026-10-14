@@ -116,6 +116,13 @@ import {
   HeartbeatScheduleSchema,
   heartbeatSchedule,
   heartbeatScheduleProblem,
+  WORKER_ROUTING_SETTINGS_KEY,
+  WorkerRoutingConfigurationSchema,
+  WorkerRoutingReceiptSchema,
+  WorkerSelectionSchema,
+  type WorkerRoutingConfiguration,
+  type WorkerRoutingReceipt,
+  type WorkerSelection,
 } from "@fleet/protocol";
 import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
 import { CommandConflict, CommandExecutionStore } from "./command-execution-store.js";
@@ -162,6 +169,7 @@ export type RunStepInput = {
   placementId?: string | undefined;
   /** The phase its task was in when this was dispatched. */
   phaseIndex?: number | undefined;
+  routing?: WorkerRoutingReceipt | undefined;
 };
 
 type Row = Record<string, unknown>;
@@ -887,6 +895,8 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "name", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "commands", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "config_options", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "worker_selection", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("run_steps", "routing", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "usage", "TEXT NOT NULL DEFAULT '{}'");
     this.addColumnIfMissing("placements", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("workspaces", "position", "INTEGER NOT NULL DEFAULT 0");
@@ -2255,6 +2265,7 @@ export class FleetStore {
       ...(input.publicUrl ? { publicUrl: input.publicUrl } : {}),
       tunnel: input.tunnel ?? this.getTunnelBackupSettings(),
       defaults: {
+        workerModelRouting: this.getWorkerModelRouting(),
         orchestratorAgent: this.getOrchestratorAgent() ?? null,
         model: this.getDefaultModel(),
         reasoningEffort: this.getDefaultReasoningEffort(),
@@ -2467,6 +2478,20 @@ export class FleetStore {
     this.setOrchestratorAgent(parsed.defaults.orchestratorAgent ?? null);
     this.setDefaultModel(parsed.defaults.model ?? "");
     this.setDefaultReasoningEffort(parsed.defaults.reasoningEffort ?? "");
+    this.setWorkerModelRouting({
+      ...(parsed.defaults.workerModelRouting ??
+        WorkerRoutingConfigurationSchema.parse({})),
+      revision:
+        Math.max(
+          this.getWorkerModelRouting().revision,
+          parsed.defaults.workerModelRouting?.revision ?? 0,
+        ) + 1,
+      mode: "off",
+    });
+    this.setSetting("workerModelRouting.providerState", "{}");
+    this.setSetting("workerModelRouting.proposals", "[]");
+    this.setSetting("workerModelRouting.epoch", randomUUID());
+    this.setSetting("workerModelRouting.suspended", "true");
     this.setOrchestratorModels({
       ...this.getOrchestratorModels(),
       ...parsed.defaults.orchestratorModels,
@@ -2571,6 +2596,8 @@ export class FleetStore {
         session.readOnly ? 1 : 0,
         session.agentParams ? JSON.stringify(session.agentParams) : "",
       );
+      if (session.workerSelection)
+        this.setSessionWorkerSelection(session.id, session.workerSelection);
       if (session.executionBinding?.worktreeId)
         this.statement("UPDATE sessions SET execution_binding=? WHERE id=?").run(
           JSON.stringify({ ...session.executionBinding, quarantined: true }),
@@ -2670,6 +2697,11 @@ export class FleetStore {
         step.workspaceError ?? "",
         step.resultSha ?? "",
       );
+      if (step.routing)
+        this.statement("UPDATE run_steps SET routing=? WHERE id=?").run(
+          JSON.stringify(step.routing),
+          step.id,
+        );
       if (step.executionBinding?.worktreeId)
         this.statement("UPDATE run_steps SET execution_binding=? WHERE id=?").run(
           JSON.stringify({ ...step.executionBinding, quarantined: true }),
@@ -4295,6 +4327,7 @@ export class FleetStore {
       runRole?: RunRole;
       readOnly?: boolean;
       operatorUsername?: string;
+      workerSelection?: WorkerSelection;
     } = {},
   ): FleetSession {
     if (run.runId) this.assertRunMutable(run.runId);
@@ -4302,8 +4335,8 @@ export class FleetStore {
     const id = randomUUID();
     this.statement(
       `INSERT INTO sessions
-       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only,last_activity_at,operator_username,agent_params)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only,last_activity_at,operator_username,agent_params,worker_selection)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       placement.workspaceId,
@@ -4323,8 +4356,34 @@ export class FleetStore {
       now,
       run.operatorUsername ?? "",
       JSON.stringify(AgentParamsSchema.parse(run.agentParams ?? { kind: "copilot" })),
+      run.workerSelection
+        ? JSON.stringify(WorkerSelectionSchema.parse(run.workerSelection))
+        : "",
     );
     return this.getSession(id)!;
+  }
+
+  setSessionWorkerSelection(
+    id: string,
+    selection: WorkerSelection,
+  ): FleetSession | undefined {
+    this.statement("UPDATE sessions SET worker_selection=? WHERE id=?").run(
+      JSON.stringify(WorkerSelectionSchema.parse(selection)),
+      id,
+    );
+    return this.getSession(id);
+  }
+
+  getWorkerModelRouting(): WorkerRoutingConfiguration {
+    const stored = this.getSetting(WORKER_ROUTING_SETTINGS_KEY);
+    return WorkerRoutingConfigurationSchema.parse(stored ? JSON.parse(stored) : {});
+  }
+
+  setWorkerModelRouting(configuration: WorkerRoutingConfiguration): void {
+    this.setSetting(
+      WORKER_ROUTING_SETTINGS_KEY,
+      JSON.stringify(WorkerRoutingConfigurationSchema.parse(configuration)),
+    );
   }
 
   /**
@@ -5564,8 +5623,8 @@ export class FleetStore {
     const id = randomUUID();
     this.statement(
       `INSERT INTO run_steps
-       (id,run_id,step_key,title,prompt,category,depends_on,state,attempts,position,placement_id,phase_index,created_at,updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,run_id,step_key,title,prompt,category,depends_on,state,attempts,position,placement_id,phase_index,created_at,updated_at,routing)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       runId,
@@ -5581,6 +5640,9 @@ export class FleetStore {
       input.phaseIndex ?? 0,
       now,
       now,
+      input.routing
+        ? JSON.stringify(WorkerRoutingReceiptSchema.parse(input.routing))
+        : "",
     );
     return this.getRunStep(id)!;
   }
@@ -5688,6 +5750,7 @@ export class FleetStore {
         | "workspaceState"
         | "workspaceError"
         | "resultSha"
+        | "routing"
       >
     >,
   ): RunStep | undefined {
@@ -5718,6 +5781,10 @@ export class FleetStore {
       workspace_state: patch.workspaceState,
       workspace_error: patch.workspaceError,
       result_sha: patch.resultSha,
+      routing:
+        patch.routing === undefined
+          ? undefined
+          : JSON.stringify(WorkerRoutingReceiptSchema.parse(patch.routing)),
     };
     const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
     if (entries.length === 0) return this.getRunStep(id);
@@ -6437,6 +6504,9 @@ function placementFromRow(row: Row): Placement {
 
 function sessionFromRow(row: Row): FleetSession {
   return SessionSchema.parse({
+    workerSelection: row.worker_selection
+      ? JSON.parse(String(row.worker_selection))
+      : undefined,
     executionBinding: row.execution_binding
       ? JSON.parse(String(row.execution_binding))
       : undefined,
@@ -6507,6 +6577,7 @@ function runFromRow(row: Row): Run {
 
 function runStepFromRow(row: Row): RunStep {
   return RunStepSchema.parse({
+    routing: row.routing ? JSON.parse(String(row.routing)) : undefined,
     executionBinding: row.execution_binding
       ? JSON.parse(String(row.execution_binding))
       : undefined,

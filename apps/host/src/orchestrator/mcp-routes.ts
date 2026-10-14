@@ -8,6 +8,7 @@ import {
   CancelCommandExecutionSchema,
   terminalRunStates,
   terminalSessionStates,
+  ProposeWorkerRoutingPolicySchema,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { hostnameOf } from "../request-guard.js";
@@ -248,11 +249,17 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
    * Passing the shape through means a limit cannot exist without being visible.
    */
   const guard =
-    <T>(name: string, schema: z.ZodType<T>, act: (input: T) => ToolResult) =>
-    (args: unknown) => {
+    <T>(
+      name: string,
+      schema: z.ZodType<T>,
+      act: (input: T) => ToolResult | Promise<ToolResult>,
+    ) =>
+    async (args: unknown) => {
       const parsed = schema.safeParse(args);
       return reply(
-        parsed.success ? act(parsed.data) : explainInvalidArgs(name, parsed.error, args),
+        parsed.success
+          ? await act(parsed.data)
+          : explainInvalidArgs(name, parsed.error, args),
       );
     };
 
@@ -302,11 +309,36 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
   );
 
   server.registerTool(
+    "fleet_get_worker_routing_policy",
+    {
+      title: "Read worker routing profiles",
+      description:
+        "Read the Host-wide routing mode, policy revision, and execution profiles. An explicit profile on fleet_start_work is always allowed when routing is enabled. No provider credentials are returned.",
+      inputSchema: {},
+    },
+    async () => reply(tools.getWorkerRoutingPolicy()),
+  );
+  server.registerTool(
+    "fleet_propose_worker_routing_policy",
+    {
+      title: "Propose worker routing profiles",
+      description:
+        "Propose a full replacement profile list against the current revision. This never applies policy: the operator must review it. Changes affect future assignments from every lead, not existing workers.",
+      inputSchema: ProposeWorkerRoutingPolicySchema.shape,
+    },
+    guard(
+      "fleet_propose_worker_routing_policy",
+      ProposeWorkerRoutingPolicySchema,
+      (input) => tools.proposeWorkerRoutingPolicy(input),
+    ),
+  );
+  server.registerTool(
     "fleet_start_work",
     {
       title: "Start work on a node",
       description: [
-        "Start one worker agent on a node and return immediately.",
+        "Start one worker agent on a node. Experimental model routing may wait up to its configured decision deadline before dispatch.",
+        "Optionally name a profile from fleet_get_worker_routing_policy, or omit it for automatic routing. Router failures use ordinary worker defaults.",
         "This creates a NEW session. For follow-up requests, first find the prior task with fleet_list_work and read fleet_get_task; use fleet_follow_up for the same deliverable.",
         "Say what must come back, where to work, and what will show it is real — the Host writes the worker's brief from those, so a dispatch with no way to check it is refused before a machine is spent on it.",
         "Include authoritative links/paths, necessary decisions and constraints, and observable acceptance; distinguish history from current observations. Let the worker choose investigation, implementation and commands, not an invented runbook.",
@@ -318,7 +350,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       ].join(" "),
       inputSchema: StartWorkSchema.shape,
     },
-    guard("fleet_start_work", StartWorkSchema, (input) => tools.startWork(input)),
+    guard("fleet_start_work", StartWorkSchema, (input) => tools.startRoutedWork(input)),
   );
 
   server.registerTool(
