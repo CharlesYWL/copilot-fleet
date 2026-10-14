@@ -17,8 +17,9 @@ async function setup() {
   let noAuth = false;
   const auth = {
     administratorFor: () => ({ id: "admin" }),
-    requireRecentReauth: (session: { tokenHash: string }) =>
-      session.tokenHash === "fresh",
+    requireRecentReauth: vi.fn(
+      (session: { tokenHash: string }) => session.tokenHash === "fresh",
+    ),
     noAuthEnabled: () => noAuth,
     noAuthEndpointAllowed: (host: string | undefined) => host === "localhost",
     audit: vi.fn(),
@@ -116,7 +117,7 @@ describe("decision settings operator boundary", () => {
     expect(h.routing.view().providers).toHaveLength(0);
   });
 
-  it("requires recent Microsoft authorization for settings writes and never returns keys", async () => {
+  it("allows an authenticated operator to save repeatedly without recent reauthentication or key disclosure", async () => {
     const h = await setup();
     const stale = await h.app.inject({
       method: "PUT",
@@ -124,14 +125,15 @@ describe("decision settings operator boundary", () => {
       headers: { "fixture-admin": "stale" },
       payload: update(),
     });
-    expect(stale.statusCode).toBe(403);
-    expect(stale.json().reauthRequired).toBe(true);
+    expect(stale.statusCode).toBe(200);
+    expect(stale.json().reauthRequired).toBeUndefined();
+    expect(stale.body).not.toContain("private-route-fixture-key");
     expect(h.evaluate).not.toHaveBeenCalled();
     const saved = await h.app.inject({
       method: "PUT",
       url: "/api/worker-model-routing",
-      headers: { "fixture-admin": "fresh" },
-      payload: update(),
+      headers: { "fixture-admin": "stale" },
+      payload: { ...update(), expectedRevision: stale.json().revision },
     });
     expect(saved.statusCode).toBe(200);
     expect(saved.body).not.toContain("private-route-fixture-key");
@@ -141,6 +143,7 @@ describe("decision settings operator boundary", () => {
     });
     expect(read.json().providers[0]).toMatchObject({ keyConfigured: true, ready: false });
     expect(read.body).not.toContain("private-route-fixture-key");
+    expect(h.auth.requireRecentReauth).not.toHaveBeenCalled();
     expect(h.auth.audit).toHaveBeenCalledWith(
       expect.objectContaining({
         eventType: "worker_model_routing_updated",

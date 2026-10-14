@@ -23,7 +23,6 @@ const profiles = WorkerExecutionProfilesSchema.parse([
     id: "ordinary",
     name: "Ordinary",
     description: "Bounded ordinary implementation.",
-    categories: ["implement", "test"],
     model: "worker-ordinary",
     reasoningEffort: "medium",
   },
@@ -31,7 +30,6 @@ const profiles = WorkerExecutionProfilesSchema.parse([
     id: "deep",
     name: "Deep",
     description: "Cross-component recovery and lifecycle.",
-    categories: ["implement", "review-deep"],
     model: "worker-deep",
     reasoningEffort: "high",
   },
@@ -207,6 +205,18 @@ describe("new-worker routing through admission and dispatch", () => {
       workerSelection: { source: "explicit", model: "worker-deep" },
     });
     expect(readOnly.evaluate).not.toHaveBeenCalled();
+  });
+
+  it("uses description-based routing for read-only work without widening its permissions", async () => {
+    const h = await setup();
+    expect((await h.tools.startRoutedWork({ ...input, category: "explore" })).ok).toBe(
+      true,
+    );
+    expect(h.evaluate).toHaveBeenCalledTimes(1);
+    expect(h.worker()).toMatchObject({
+      readOnly: true,
+      workerSelection: { source: "decision", model: "worker-ordinary" },
+    });
   });
 
   it("rechecks task parallel limits after simultaneous decisions instead of starting duplicates", async () => {

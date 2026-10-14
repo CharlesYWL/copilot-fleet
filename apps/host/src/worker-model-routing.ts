@@ -627,9 +627,7 @@ export class WorkerModelRoutingService {
         );
       return select(profile, "explicit");
     }
-    const candidates = configuration.profiles.filter((profile) =>
-      profile.categories.some((category) => category === brief.category),
-    );
+    const candidates = configuration.profiles;
     if (!candidates.length) {
       receipt.fallbackReason = "no_candidates";
       return receipt;

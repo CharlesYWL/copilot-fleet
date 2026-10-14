@@ -16,7 +16,7 @@ tags:
 **Program Manager**: Not assigned  
 **Status**: Implemented as an opt-in experiment; routing-quality evaluation remains outstanding<br>
 **Date**: 2026-10-12  
-**Revision**: 2026-10-13 (c); General model-picker dialog, ordered Azure AI Foundry / TypeSafe decision-model failover, and protected local credentials<br>
+**Revision**: 2026-10-14 (d); description-only profile matching and routine operator saves without additional Microsoft reauthentication<br>
 **Work item**: Not supplied  
 **Source baseline**: Original lifecycle inspection at `ae58fca`; profile/model-ID revision at `0015e58`; agreed fallback design at `fc88642` / `c7ff61d`. The implementation uses the same worker-start lifecycle and adds no routing holds.
 
@@ -131,7 +131,7 @@ establish the least expensive adequate model.
 | Decision deployment | The small Foundry model called by the Host. Its deployment name is distinct from its returned underlying model name. |
 | Worker model | The model inside Copilot ACP that performs the work; independent of the decision deployment and orchestrator model. |
 | Category | Existing authoritative `fleet_start_work.category`: `implement`, `test`, `explore`, `review-quick`, or `review-deep`. Determines existing behavior and read-only admission. |
-| Execution profile | A stable configured ID, display name, description, compatible categories and one preselected worker model/effort pair. It describes the ask, not worker permissions. |
+| Execution profile | A stable configured ID, display name, description and one preselected worker model/effort pair. It describes the ask, not worker permissions; all profiles are considered by description. |
 | Worker model ID | The exact opaque `value` advertised by Copilot's ACP model selector. A friendly name, another backend's spelling or the Foundry deployment name is not this ID. |
 | Worker defaults | Today's Fleet worker model and reasoning settings (`Settings -> General`), applied exactly as today. The universal fallback. |
 | Routing receipt | What was decided for one step: mode, source, profile, requested pair, fallback reason, probabilities, duration and usage. Diagnostic only. |
@@ -193,7 +193,7 @@ snapshotted at request acceptance and applied the way they are today:
 | `off` | Routing is Off (no receipt is written) |
 | `shadow` | Shadow mode with an automatic decision; the prediction is recorded but not applied |
 | `over_size` | The provider request would exceed 32 KiB |
-| `no_candidates` | No profile is compatible with the category |
+| `no_candidates` | No worker profiles are configured |
 | `provider_unavailable` | No credential, a failed readiness state, or no rate-limit permit within the deadline |
 | `provider_error` | Timeout, 401/403, 404, 422, 429/503/529 after the permitted retry, 5xx, DNS/TLS failure |
 | `invalid_answer` | Malformed JSON, missing answer, a choice outside the candidates, or invalid probabilities |
@@ -225,7 +225,7 @@ defaults remain separate and unchanged.
 | **Test connection** | One Host-side decision request with a fixed sanitized sample. Uses unsaved form values if present, otherwise saved ones. Never starts a worker or changes mode. |
 | Minimum probability | `minProbability`, default 0.5. Below it, try the next model; if none qualifies, use defaults. Explain that it is not calibrated. |
 | Timeout | Shared decision deadline, default 5 s, configurable from 0.5 to 10 s; not a separate deadline per provider. |
-| Execution profiles | Flat table of ID, display name, description, compatible categories, model and reasoning. |
+| Execution profiles | Flat table of ID, display name, description, model and reasoning. No per-profile category restrictions. |
 | Worker model | Friendly-name dropdown from observed Copilot ACP choices; saves the exact `value`, shows it in a tooltip/copy field. |
 | Profile reasoning | Dropdown of values observed for the selected model; refreshed when the model changes. |
 | Policy proposals | List of orchestrator-proposed edits with a diff and Apply / Reject. |
@@ -283,7 +283,7 @@ separately from provider settings and the credential.
 | `minProbability` | 0-1; below it, the decision falls back. Default 0.5. |
 | `timeoutMs` | Total decision deadline including queue wait and retry. Default 5000, maximum 10000. |
 | `providers[]` | Up to eight ordered connections: stable `id`, display `name`, `kind` (`foundry`/`typesafe`), normalized `endpoint`, and decision `model`. Keys, test proofs and credential revisions are not policy inputs to the lead. |
-| `profiles[]` | Up to 20. Each: `id` (`^[a-z][a-z0-9-]{1,39}$`, not `auto` or `default`), `name`, `description` (<=400 characters), `categories` (non-empty subset of the five), `model` (exact ACP value), `reasoningEffort` (string or `null`). |
+| `profiles[]` | Up to 20. Each: `id` (`^[a-z][a-z0-9-]{1,39}$`, not `auto` or `default`), `name`, `description` (<=400 characters), `model` (exact ACP value), `reasoningEffort` (string or `null`). Legacy `categories` fields are discarded on read. |
 
 Rate and concurrency limits are fixed constants in v1 (see Bounds).
 
@@ -311,7 +311,6 @@ price ordering. Fleet ships with **no** profiles; the operator creates them.
       "id": "implementation",
       "name": "Implementation",
       "description": "Ordinary bounded features, bug fixes, tests and focused reviews.",
-      "categories": ["implement", "test", "review-quick"],
       "model": "gpt-6.1-sol",
       "reasoningEffort": "medium"
     },
@@ -319,7 +318,6 @@ price ordering. Fleet ships with **no** profiles; the operator creates them.
       "id": "deep-implementation",
       "name": "Deep implementation",
       "description": "Root-cause work across interacting lifecycle, persistence or recovery paths.",
-      "categories": ["implement", "test", "review-deep"],
       "model": "gpt-6.1-sol",
       "reasoningEffort": "high"
     }
@@ -327,9 +325,13 @@ price ordering. Fleet ships with **no** profiles; the operator creates them.
 }
 ```
 
-Category compatibility only narrows the **automatic** candidate set. It never
-changes the category or its permissions: `architecture-review` on `implement` is
-a writing worker; on `review-deep` it is read-only.
+All profiles are eligible for automatic selection. Their descriptions guide
+matching, while the actual work category remains a fact in the decision brief
+and remains authoritative for permissions. For example, `architecture-review`
+on `implement` is a writing worker; on `review-deep` it is read-only. Removing
+profile filtering does not remove the actual work categories or their checks.
+Existing saved profiles and proposals with `categories` lists still load; those
+lists are ignored rather than restricting future routing.
 
 ### Orchestrator input and provider payload
 
@@ -356,7 +358,7 @@ Extend `fleet_start_work` with one optional field:
   field. `fleet_start_work` stays non-idempotent exactly as today.
 
 `fleet_get_worker_routing_policy` returns the mode and profiles (ID, name,
-description, categories) so the lead knows what it can name. The orchestrator
+description and fixed pair) so the lead knows what it can name. The orchestrator
 agent instructions (`apps/node/agents/fleet-orchestrator.agent.md`) and Host
 briefing (`apps/host/src/orchestrator/briefing.ts`) mention the field. Because the
 field is optional and ignored when Off, an older Node agent file that never
@@ -390,7 +392,8 @@ is asked; v1 has no clarification question.
 }
 ```
 
-If exactly one profile is compatible, it is selected locally with no call.
+If exactly one profile is configured, it is selected locally with no call and
+acts as the configured choice for every work category.
 
 ### Decision and dispatch sequence
 
@@ -398,7 +401,7 @@ If exactly one profile is compatible, it is selected locally with no call.
    maintenance, parallel limit, session budget and placement. A refused
    dispatch makes no provider call.
 2. Resolve the profile: Off -> no receipt; explicit -> that profile; one
-   candidate -> that profile; zero candidates -> `no_candidates`; otherwise
+   configured profile -> that profile; zero profiles -> `no_candidates`; otherwise
    call the provider within `timeoutMs` (default 5 s). Any failure or
    below-threshold answer becomes a fallback reason, never a refusal.
 3. **Recheck** the lead's liveness, Host restore epoch and every check from step 1, because other
@@ -524,10 +527,12 @@ model selection.
   `store.ts`), so the key is excluded by not being added. The policy and
   provider metadata are added to `defaults`. A restored Host has no key, so
   routing falls back until the operator enters one and Tests again.
-- Settings routes use `requireNodeOperator`. Endpoint, key and mode changes
-  require recent reauthentication (`RECENT_REAUTH_MS`) where sign-in is
-  configured, and existing CSRF/origin rules. An MCP lead token is never
-  operator authority.
+- Settings routes use `requireNodeOperator` with the existing valid operator
+  session. Per the operator's explicit decision, routing saves do not require
+  additional recent Microsoft reauthentication. Existing operator
+  authorization, session expiry, CSRF/origin checks and connection-test
+  requirements remain enforced. An MCP lead token is never operator authority;
+  safeguards for unrelated high-impact settings are unchanged.
 
 ### Bounds
 
@@ -549,7 +554,7 @@ large to route simply uses worker defaults.
 | Surface | Access and behavior |
 | --- | --- |
 | `GET /api/worker-model-routing` | Node operator; mode, provider metadata, readiness, `keyConfigured`, policy and pending proposals |
-| `PUT /api/worker-model-routing` | Node operator plus recent reauth; `expectedRevision`, mode, threshold, deadline, ordered connection drafts and profiles. Key actions are keep/replace/clear; successful draft tests are bound to the exact connection and actor. |
+| `PUT /api/worker-model-routing` | Authenticated Node operator, without an additional recent-login requirement; `expectedRevision`, mode, threshold, deadline, ordered connection drafts and profiles. Key actions are keep/replace/clear; successful draft tests are bound to the exact connection and actor. |
 | `POST /api/worker-model-routing/test` | Node operator; one connection draft or saved-key Test; returns a temporary proof, never saves form values, enables routing or launches a worker |
 | `POST /api/worker-model-routing/proposals/:id` | Node operator; apply or reject an orchestrator proposal (apply is a policy write with CAS) |
 | `fleet_get_worker_routing_policy` | Live lead; mode and profiles; no credentials or provider configuration |
@@ -645,12 +650,12 @@ Persist:
 
 | Layer | Required cases |
 | --- | --- |
-| Policy validation | ID pattern, reserved IDs, duplicate IDs, empty categories, description length, profile count, threshold/timeout range, stale revision. |
+| Policy validation | ID pattern, reserved IDs, duplicate IDs, description length, profile count, threshold/timeout range, stale revision; legacy category lists are ignored and do not exclude profiles. |
 | Provider adapter | Path normalization, deployment, header; valid choice; choice outside candidates; bad probabilities; missing answer; oversized response; 401/403 clears readiness; 404/422/5xx; 429/503/529 retry within deadline; timeout; redirect rejected; disallowed host. |
 | Dispatch | Off makes zero calls and output identical to today; explicit profile skips the call in Shadow and Route; unknown profile refused with list; one candidate skips the call; each fallback reason; recheck after the wait refuses when budget filled; Host crash during the wait leaves no step. |
 | Node | Routed model applied before first prompt; missing model uses fallback model and fallback effort; null effort; neither offered keeps today's behavior; older Node ignores `fallback`. |
 | Continuity | Zero decision calls on follow-up, resume, reconnect sweep, MCP restore and rollover; routed resume sends observed values, not current defaults; manual picker change survives reconnect and rollover; legacy resume unchanged. |
-| Authority | Lead cannot read provider/key, change mode or apply a proposal; settings require operator and reauth; read-only categories unchanged. |
+| Authority | Lead cannot read provider/key, change mode or apply a proposal; settings require a valid operator session but not recent reauthentication; repeated saves work and read-only categories remain authoritative. |
 | Privacy | Key absent from GET, MCP, logs, events, errors, backups and Node frames; restore leaves no key. |
 | UI/accessibility | Keyboard-only editing, masked key, Test status announcements, raw-ID tooltip/copy, empty catalog, Unverified entry, effort reset on model change, fallback labels, proposal diff. |
 | AI eval | Newly labeled flat profiles, unseen real briefs, ordinary vs deep in one domain, mechanical edits touching many files, urgency without complexity, quoted routing injection. |

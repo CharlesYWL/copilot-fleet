@@ -417,8 +417,15 @@ the Host retains the tested key privately for up to 15 minutes until Save.
 Provider/endpoint changes require a new key, not forwarding an existing key
 to a different destination.
 
-Create named **worker profiles** with descriptions, compatible automatic
-categories and fixed Copilot model/effort pairs. Friendly model names come from
+Saving uses your normal authenticated operator session; routing settings do not
+require an extra Microsoft sign-in confirmation. Operator authorization, CSRF
+protection and connection-test requirements remain enforced.
+
+Create named **worker profiles** with descriptions and fixed Copilot
+model/effort pairs. The router considers every profile using its description,
+without per-profile category checkboxes. Older saved category restrictions are
+ignored. The actual work category still controls read-only permissions.
+Friendly model names come from
 observed Copilot sessions; saved values are the exact ACP IDs, including any
 provider prefix. Unobserved IDs are marked **Unverified**. Changing a profile's
 model resets its effort choice. An explicit `profile` ID on `fleet_start_work`
