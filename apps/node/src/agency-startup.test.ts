@@ -312,7 +312,7 @@ beforeEach(() => {
           if (
             advertiseContext &&
             request.method === "session/prompt" &&
-            !contextFailure
+            (!isContext || !contextFailure)
           ) {
             if (!isContext)
               notify({ sessionUpdate: "usage_update", used: 28000, size: 272000 });
@@ -1105,7 +1105,16 @@ describe("Agency ACP startup", () => {
       events.filter((event) => event.type === "usage").map((event) => event.payload),
     ).toEqual([
       { context: null },
-      { contextTokens: 50000, contextWindow: 200000 },
+      expect.objectContaining({
+        contextTokens: 50000,
+        contextWindow: 200000,
+        context: expect.objectContaining({
+          usedTokens: 50000,
+          tokenLimit: 200000,
+          percentage: 25,
+          source: "acp",
+        }),
+      }),
       { aiCredits: 27.4014 },
     ]);
     expect(agent.busy).toBe(false);
@@ -1148,7 +1157,11 @@ describe("Agency ACP startup", () => {
     expect(usage).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          payload: { contextTokens: 28000, contextWindow: 272000 },
+          payload: expect.objectContaining({
+            contextTokens: 28000,
+            contextWindow: 272000,
+            context: expect.objectContaining({ source: "acp" }),
+          }),
         }),
       ]),
     );
@@ -1171,7 +1184,7 @@ describe("Agency ACP startup", () => {
     await agent.prompt("Continue on the new model");
     expect(
       events.filter((event) => event.type === "usage").at(-1)?.payload.context,
-    ).toBeNull();
+    ).toMatchObject({ model: "model-b", source: "acp", tokenLimit: 272000 });
   });
 
   it("uses an explicit /context result without running the command twice", async () => {
@@ -1257,9 +1270,17 @@ describe("Agency ACP startup", () => {
         events.some(
           (event) =>
             event.type === "system" &&
-            String(event.payload.text).includes("Context usage is unavailable"),
+            String(event.payload.text).includes("/context snapshot is unavailable"),
         ),
       ).toBe(true);
+      expect(
+        events.filter((event) => event.type === "usage").at(-1)?.payload.context,
+      ).toMatchObject({
+        model: "model-a",
+        usedTokens: 28000,
+        tokenLimit: 272000,
+        source: "acp",
+      });
     },
   );
 
@@ -1436,7 +1457,10 @@ describe("Agency ACP startup", () => {
       {},
       ...events.filter((event) => event.type === "usage").map((event) => event.payload),
     );
-    expect(usage).toMatchObject({ aiCredits: 2, context: null });
+    expect(usage).toMatchObject({
+      aiCredits: 2,
+      context: { model: "model-a", source: "acp", usedTokens: 28000 },
+    });
     expect(events).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -2211,6 +2235,28 @@ describe("Prompts Copilot holds open for background work", () => {
     credits.loop = { idle: true, generation: 1 };
     return { agent, events, prompted, isAnswered: () => answered };
   }
+
+  it("reports ACP context pressure before a held-open prompt can return /context", async () => {
+    advertiseContext = true;
+    const { agent, events, isAnswered } = await heldTurn();
+    expect(agent.busy).toBe(true);
+    expect(isAnswered()).toBe(false);
+    expect(
+      events.filter((event) => event.type === "usage").at(-1)?.payload.context,
+    ).toMatchObject({
+      model: "model-a",
+      usedTokens: 28000,
+      tokenLimit: 272000,
+      percentage: (28000 / 272000) * 100,
+      estimated: true,
+      source: "acp",
+    });
+    expect(
+      requests
+        .filter((request) => request.method === "session/prompt")
+        .map((request) => request.params.prompt),
+    ).toEqual([[{ type: "text", text: "Start the DAILY suite in the background" }]]);
+  });
 
   it("reports the turn finished once Copilot's loop has rested past the grace", async () => {
     const { agent, events, prompted, isAnswered } = await heldTurn();

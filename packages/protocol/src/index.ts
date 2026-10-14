@@ -417,7 +417,7 @@ export const SessionUsageSchema = z.object({
   /** ACP's pre-response input usage and prompt budget, not the full model window. */
   contextTokens: z.number().int().nonnegative().nullable().optional(),
   contextWindow: z.number().int().positive().nullable().optional(),
-  /** A fresh /context snapshot. Null invalidates an earlier model/tier's snapshot. */
+  /** A /context snapshot or ACP pressure estimate. Null invalidates older readings. */
   context: ContextUsageSchema.nullable().optional(),
 });
 export type SessionUsage = z.infer<typeof SessionUsageSchema>;
@@ -425,8 +425,7 @@ export type SessionUsage = z.infer<typeof SessionUsageSchema>;
 /**
  * How full a session's context is, as a whole percentage, when it has said.
  *
- * A /context snapshot wins over ACP's prompt budget, as it does in the usage
- * bar: it measures the model's window rather than the last request.
+ * A local snapshot or ACP estimate wins over the raw input-budget fields.
  */
 export function contextUsePercent(usage: SessionUsage | undefined): number | undefined {
   const reported = usage?.context?.percentage;

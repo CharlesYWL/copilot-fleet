@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseContextUsage } from "./context-usage.js";
+import { acpContextUsage, parseContextUsage } from "./context-usage.js";
 
 const at = "2026-09-15T07:00:00.000Z";
 const report = (header: string) =>
@@ -32,6 +32,7 @@ describe("Copilot context snapshots", () => {
 
   it.each([
     ["gpt-6-astra · 8.1k/1M tokens (1%)", 8100, 1000000, 1],
+    ["gpt-5.5 · 16k/922k tokens (2%)", 16000, 922000, 2],
     ["model • 0/200,000 tokens (0%)", 0, 200000, 0],
     ["model · 210k/200k tokens (105%)", 210000, 200000, 105],
   ])("reads %s", (line, usedTokens, tokenLimit, percentage) => {
@@ -39,6 +40,28 @@ describe("Copilot context snapshots", () => {
       usedTokens,
       tokenLimit,
       percentage,
+    });
+
+    describe("ACP context estimates", () => {
+      it.each([0, 68000, 300000])(
+        "uses the reported input budget for %i tokens",
+        (used) => {
+          expect(acpContextUsage(used, 272000, "gpt-5.5", at)).toEqual({
+            model: "gpt-5.5",
+            usedTokens: used,
+            tokenLimit: 272000,
+            percentage: (used / 272000) * 100,
+            updatedAt: at,
+            estimated: true,
+            source: "acp",
+          });
+        },
+      );
+
+      it("does not invent a budget or model", () => {
+        expect(acpContextUsage(1000, 0, undefined, at)).toBeNull();
+        expect(acpContextUsage(1000, 200000, undefined, at)).not.toHaveProperty("model");
+      });
     });
   });
 

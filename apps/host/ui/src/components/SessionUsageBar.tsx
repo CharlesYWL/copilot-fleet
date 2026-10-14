@@ -115,6 +115,7 @@ export function SessionUsageBar({
   const credits = usage?.aiCredits;
   const context = usage?.context;
   const fromAcp = context?.source === "acp";
+  const copilotInputBudget = agentKind === "copilot" && fromAcp;
   const used = usage?.contextTokens;
   const size = usage?.contextWindow;
   const hasUsed = used != null && Number.isFinite(used) && used >= 0;
@@ -283,7 +284,13 @@ export function SessionUsageBar({
         </div>
         <div className={styles.details}>
           <div className={styles.metric}>
-            <span>Context window</span>
+            <span>
+              {copilotInputBudget
+                ? "Context input budget"
+                : agentKind === "copilot"
+                  ? "Context allowance"
+                  : "Context window"}
+            </span>
             <strong>
               {percentage === undefined
                 ? "? (Usage unavailable)"
@@ -324,7 +331,9 @@ export function SessionUsageBar({
           <div className={styles.reportingBody}>
             <span>
               {fromAcp
-                ? "Estimated context pressure reported by the agent over ACP."
+                ? copilotInputBudget
+                  ? "Estimated pressure on Copilot's pre-response input budget, not the full model window. Updated from ACP without waiting for the turn to finish."
+                  : "Estimated context pressure reported by the agent over ACP."
                 : agentKind !== "copilot"
                   ? "Usage is shown only when the agent reports it. Unreported metrics stay unknown."
                   : context
@@ -346,7 +355,7 @@ export function SessionUsageBar({
                 </span>
                 <span>
                   {agentKind === "copilot"
-                    ? "Not the full context window. Reported separately from /context; timing may differ. ACP timestamp unavailable."
+                    ? "Not the full model window. Older CLI /context reports used a different allowance; timing may differ. ACP timestamp unavailable."
                     : "Agent-reported values, not measured or inferred by Fleet."}
                 </span>
               </div>

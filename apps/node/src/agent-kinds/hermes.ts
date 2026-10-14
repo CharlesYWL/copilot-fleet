@@ -3,6 +3,7 @@ import { z } from "zod";
 import { errorMessage, type AgentParams } from "@fleet/protocol";
 import type { LogLevel } from "@fleet/protocol/log-buffer";
 import { agentOutput, findAgentCommand } from "../copilot-launch.js";
+import { acpContextUsage } from "../context-usage.js";
 import type {
   AgentKindAdapter,
   AgentLaunch,
@@ -160,18 +161,7 @@ export class HermesAgentKind implements AgentKindAdapter {
         context.report({
           contextTokens: update.used,
           contextWindow: update.size > 0 ? update.size : null,
-          context:
-            update.size > 0
-              ? {
-                  ...(model ? { model } : {}),
-                  usedTokens: update.used,
-                  tokenLimit: update.size,
-                  percentage: (update.used / update.size) * 100,
-                  updatedAt: new Date().toISOString(),
-                  estimated: true,
-                  source: "acp",
-                }
-              : null,
+          context: acpContextUsage(update.used, update.size, model),
         });
         return true;
       },

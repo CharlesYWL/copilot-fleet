@@ -11,6 +11,25 @@ function tokens(value: string, suffix: string): number {
   return Number(value.replaceAll(",", "")) * scale;
 }
 
+export function acpContextUsage(
+  used: number,
+  size: number,
+  model?: string,
+  updatedAt = new Date().toISOString(),
+): ContextUsage | null {
+  return size > 0
+    ? {
+        ...(model ? { model } : {}),
+        usedTokens: used,
+        tokenLimit: size,
+        percentage: (used / size) * 100,
+        updatedAt,
+        estimated: true,
+        source: "acp",
+      }
+    : null;
+}
+
 /** Keep the CLI's rounded percentage rather than deriving false precision from 1.1M. */
 export function parseContextUsage(
   report: string,

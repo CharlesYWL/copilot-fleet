@@ -310,24 +310,37 @@ tier in the ACP bridge at creation or model changes
 Fleet preserves the request but never substitutes the catalog maximum for the
 window Copilot actually reports.
 
-Fleet continues to use ACP. Verify the upstream context-flag fix against the
-running CLI before considering a separately approved backend migration. If a
-fixed CLI meets the requirements, no migration is needed; a fixed release has
-not yet been confirmed here.
+Copilot CLI [1.0.95](https://github.com/github/copilot-cli/releases/tag/v1.0.95)
+fixes `--context` for new and resumed ACP sessions. Live checks on 2026-10-13
+confirmed this in both 1.0.95 and 1.0.97, but also confirmed the remaining
+model-switch bug: `session/set_model` and `session/set_config_option` for `model`
+reset the context tier to default. Startup model selections sent over ACP are
+model switches too. In the probe, GPT-5.5 reported a 922k allowance at long-context
+startup, 272k after switching away and back, and 922k again after restarting
+with `--context long_context` and loading the same conversation. ACP still rejects
+`contextTier` as a live config option. Restart/resume reapplies the requested tier;
+Fleet continues to use ACP without a backend migration.
 
 A small **context ring beside Send** opens on hover, focus, or click. Its popover
 contains **AI credits**, **context details**, and **Compact**, without adding a
-second composer row. The ring uses a fresh local `/context` report after each
-requested turn completes (including compaction); an explicit `/context` also updates it.
+second composer row. The ring updates from Copilot's ACP `usage_update` even while a
+turn is running or held open for background work. This is explicitly labeled
+**Context input budget** and an estimate, not a full-window measurement. A fresh
+local `/context` report replaces it when the ACP prompt request returns (including
+compaction); an explicit `/context` also updates it.
 These local status commands do not ask the model to answer. Values rounded by the
 CLI are marked as estimates, its percentage is retained, and the popover shows the
-report's model and timestamp. Restarting or changing models invalidates old readings.
+report's model and local observation timestamp. Restarting or changing models
+invalidates old readings until a new reading arrives. An unavailable or unreadable
+`/context` report does not erase a valid ACP reading; failures are still reported.
 
 Copilot's ACP `usage_update.size` is an **input/prompt budget**, not the full model window:
-for example, 272k input plus a 128k output reserve gives the 400k `/context` window.
-Its used-token count is also an earlier snapshot, often before the response.
-Those readings are labeled separately rather than mixed into the ring's full-window
-percentage. A missing `/context` snapshot leaves a neutral ring, not a fake zero.
+older `/context` reports showed the full window (for example, 400k versus a 272k
+input budget), while 1.0.95 and 1.0.97 report the input allowance in `/context` too.
+Fleet uses the allowance actually reported by the CLI and never infers it from a
+model catalog or an assumed output reserve. ACP's used-token count is an earlier,
+pre-response snapshot, so its source and timing remain distinct from the local
+readback. A missing budget leaves a neutral ring, not a fake zero.
 
 AI credits come from the session's cumulative
 billing checkpoint (`totalNanoAiu / 1,000,000,000`), polled on its node; premium
