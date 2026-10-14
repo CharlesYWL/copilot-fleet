@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DecisionProviderSchema,
   WorkerExecutionProfilesSchema,
+  WORKER_ROUTING_SETTINGS_KEY,
   type DecisionProvider,
   type DecisionProviderDraft,
   type WorkerExecutionProfile,
@@ -33,7 +34,6 @@ const profiles = WorkerExecutionProfilesSchema.parse([
     id: "ordinary",
     name: "Ordinary",
     description: "Bounded ordinary implementation.",
-    categories: ["implement", "test", "review-quick"],
     model: "worker-ordinary",
     reasoningEffort: "medium",
   },
@@ -41,7 +41,6 @@ const profiles = WorkerExecutionProfilesSchema.parse([
     id: "deep",
     name: "Deep",
     description: "Cross-component lifecycle and recovery.",
-    categories: ["implement", "test", "review-deep"],
     model: "worker-deep",
     reasoningEffort: "high",
   },
@@ -445,6 +444,7 @@ describe("ordered decision-model fallback", () => {
       model: "ordinary-default",
     });
     h.evaluate.mockClear();
+    await h.configure([connection("primary")], "shadow", [profiles[1]!]);
     const single = await h.routing.decide({ ...brief, category: "review-deep" });
     expect(single).toMatchObject({ source: "shadow", profileId: "deep" });
     expect(h.evaluate).not.toHaveBeenCalled();
@@ -593,17 +593,43 @@ describe("ordered decision-model fallback", () => {
     expect(h.evaluate.mock.calls.map(([provider]) => provider.id)).toEqual(["secondary"]);
   });
 
-  it("does not call a provider for oversized UTF-8 input or missing category candidates", async () => {
+  it("does not call a provider for oversized UTF-8 input or an empty profile list", async () => {
     const h = await setup();
     await h.configure();
     expect(
       (await h.routing.decide({ ...brief, deliverable: "é".repeat(17_000) }))
         ?.fallbackReason,
     ).toBe("over_size");
+    await h.configure([connection("primary")], "route", []);
     expect(
       (await h.routing.decide({ ...brief, category: "explore" }))?.fallbackReason,
     ).toBe("no_candidates");
     expect(h.evaluate).not.toHaveBeenCalled();
+  });
+
+  it("considers every profile by description, including profiles saved with legacy category restrictions", async () => {
+    const h = await setup();
+    await h.configure();
+    const configuration = h.store.getWorkerModelRouting();
+    h.store.setSetting(
+      WORKER_ROUTING_SETTINGS_KEY,
+      JSON.stringify({
+        ...configuration,
+        profiles: configuration.profiles.map((profile) => ({
+          ...profile,
+          categories: ["implement"],
+        })),
+      }),
+    );
+    const result = await h.routing.decide({ ...brief, category: "explore" });
+    expect(result).toMatchObject({ source: "decision", profileId: "ordinary" });
+    expect(h.evaluate.mock.calls[0]?.[2].state.category).toBe("explore");
+    expect(h.evaluate.mock.calls[0]?.[2].questions.profile.criteria).toEqual(
+      Object.fromEntries(profiles.map((profile) => [profile.id, profile.description])),
+    );
+    expect(h.routing.view().profiles.every((profile) => !("categories" in profile))).toBe(
+      true,
+    );
   });
 
   it("accepts an exact 32 KiB request and defaults at one byte over the limit", async () => {

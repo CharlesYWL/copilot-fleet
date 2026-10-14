@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 import {
   Badge,
   Button,
-  Checkbox,
   Dialog,
   DialogActions,
   DialogBody,
@@ -32,7 +31,6 @@ import {
 import {
   DecisionProviderDraftSchema,
   UpdateWorkerRoutingSchema,
-  WORKER_CATEGORIES,
   errorMessage,
   type DecisionConnectionTest,
   type DecisionProviderDraft,
@@ -40,13 +38,8 @@ import {
   type WorkerExecutionProfile,
   type WorkerRoutingSettings,
 } from "@fleet/protocol";
-import { api, ApiError } from "../hooks/useFleet";
+import { api } from "../hooks/useFleet";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
-import {
-  confirmIdentityInNewTab,
-  forgetCsrfToken,
-  onIdentityConfirmed,
-} from "../lib/auth";
 import { observedChoices } from "../lib/session-config";
 import { terminal } from "../theme";
 import type { ModelDefaultsCardProps } from "./ModelDefaultsCard";
@@ -133,7 +126,6 @@ const useStyles = makeStyles({
   },
   actions: { display: "flex", gap: "4px", alignItems: "center", flexWrap: "wrap" },
   dropdown: { width: "100%", minWidth: 0 },
-  checkboxGroup: { display: "flex", flexWrap: "wrap", gap: "4px" },
   summary: {
     cursor: "pointer",
     fontWeight: tokens.fontWeightSemibold,
@@ -172,10 +164,7 @@ const fromSettings = (settings: WorkerRoutingSettings): Draft => ({
   mode: settings.mode,
   minProbability: String(settings.minProbability),
   timeoutSeconds: String(settings.timeoutMs / 1000),
-  profiles: settings.profiles.map((profile) => ({
-    ...profile,
-    categories: [...profile.categories],
-  })),
+  profiles: settings.profiles.map((profile) => ({ ...profile })),
   providers: settings.providers.map((provider) => ({
     provider: {
       id: provider.id,
@@ -214,7 +203,6 @@ export function WorkerModelRoutingControl({
   const [busy, setBusy] = useState<string>();
   const [error, setError] = useState<string>();
   const [success, setSuccess] = useState<string>();
-  const [reauth, setReauth] = useState(false);
   const [exactIds, setExactIds] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
@@ -231,15 +219,6 @@ export function WorkerModelRoutingControl({
   useEffect(() => {
     if (active) void load();
   }, [active, load]);
-  useEffect(() => {
-    if (!reauth) return;
-    return onIdentityConfirmed(() => {
-      forgetCsrfToken();
-      setReauth(false);
-      setError("Identity confirmed. Save the settings again.");
-      return true;
-    });
-  }, [reauth]);
 
   const open = async () => {
     const value = await load();
@@ -253,7 +232,6 @@ export function WorkerModelRoutingControl({
   const close = () => {
     setDraft(undefined);
     setError(undefined);
-    setReauth(false);
     setSuccess(undefined);
   };
   const changeProvider = (id: string, change: (form: ProviderForm) => ProviderForm) =>
@@ -344,10 +322,8 @@ export function WorkerModelRoutingControl({
       });
       setSettings(next);
       setDraft(fromSettings(next));
-      setReauth(false);
       setSuccess("Worker routing settings saved.");
     } catch (reason) {
-      setReauth(reason instanceof ApiError && reason.body.reauthRequired === true);
       setError(errorMessage(reason, "Could not save worker routing settings."));
     } finally {
       setBusy(undefined);
@@ -413,7 +389,6 @@ export function WorkerModelRoutingControl({
             id: `profile-${index}`,
             name: `Profile ${index}`,
             description: "",
-            categories: ["implement"],
             model: "",
             reasoningEffort: null,
           },
@@ -507,20 +482,6 @@ export function WorkerModelRoutingControl({
                     >
                       <MessageBarBody>{success}</MessageBarBody>
                     </MessageBar>
-                  ) : null}
-                  {reauth ? (
-                    <Button
-                      disabled={Boolean(busy)}
-                      onClick={() => {
-                        void confirmIdentityInNewTab().catch((reason: unknown) =>
-                          setError(
-                            errorMessage(reason, "Could not start Microsoft sign-in."),
-                          ),
-                        );
-                      }}
-                    >
-                      Confirm identity with Microsoft
-                    </Button>
                   ) : null}
                   <div className={styles.limits}>
                     <Field label="Routing mode">
@@ -919,9 +880,9 @@ export function WorkerModelRoutingControl({
                   {tab === "profiles" ? (
                     <div className={styles.list}>
                       <Text>
-                        A profile fixes the worker&apos;s Copilot model and effort.
-                        Automatic routing uses the checked categories; an explicit profile
-                        can be used for any category without changing permissions.
+                        A profile fixes the worker&apos;s Copilot model and effort. The
+                        router considers every profile by its description. The
+                        worker&apos;s actual category still controls permissions.
                       </Text>
                       {models.length === 0 ? (
                         <Text className={styles.caption}>
@@ -1009,27 +970,6 @@ export function WorkerModelRoutingControl({
                                       changeProfile(index, { description: data.value })
                                     }
                                   />
-                                </Field>
-                                <Field label="Automatically consider for">
-                                  <div className={styles.checkboxGroup}>
-                                    {WORKER_CATEGORIES.map((category) => (
-                                      <Checkbox
-                                        key={category}
-                                        label={category}
-                                        checked={profile.categories.includes(category)}
-                                        disabled={Boolean(busy)}
-                                        onChange={(_event, data) =>
-                                          changeProfile(index, {
-                                            categories: data.checked
-                                              ? [...profile.categories, category]
-                                              : profile.categories.filter(
-                                                  (value) => value !== category,
-                                                ),
-                                          })
-                                        }
-                                      />
-                                    ))}
-                                  </div>
                                 </Field>
                                 <div className={styles.grid}>
                                   <Field

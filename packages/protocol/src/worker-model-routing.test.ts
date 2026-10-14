@@ -10,7 +10,6 @@ const profile = {
   id: "ordinary",
   name: "Ordinary",
   description: "Bounded ordinary implementation.",
-  categories: ["implement"],
   model: "Provider/Exact.Model-ID",
   reasoningEffort: null,
 };
@@ -39,10 +38,16 @@ describe("worker routing configuration", () => {
     },
   );
 
-  it("rejects duplicates, empty categories, incomplete pairs and unbounded policy", () => {
+  it("accepts description-only profiles and discards legacy category restrictions", () => {
+    expect(WorkerExecutionProfilesSchema.parse([profile])).toEqual([profile]);
+    expect(
+      WorkerExecutionProfilesSchema.parse([{ ...profile, categories: ["explore"] }]),
+    ).toEqual([profile]);
+  });
+
+  it("rejects duplicates, incomplete pairs and unbounded policy", () => {
     for (const profiles of [
       [profile, profile],
-      [{ ...profile, categories: [] }],
       [{ ...profile, reasoningEffort: "" }],
       [{ ...profile, description: "x".repeat(401) }],
       Array.from({ length: 21 }, (_, index) => ({ ...profile, id: `profile-${index}` })),

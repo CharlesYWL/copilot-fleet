@@ -18,7 +18,7 @@ export const workerModelRoutingRoutes: FastifyPluginAsync<{
     "/api/worker-model-routing",
     { bodyLimit: 64 * 1024 },
     async (request, reply) => {
-      const actor = requireNodeOperator(auth, request, reply, true);
+      const actor = requireNodeOperator(auth, request, reply, false);
       if (!actor) return;
       const input = UpdateWorkerRoutingSchema.parse(request.body);
       const settings = await routing.update(input, `${actor.actorKind}:${actor.actorId}`);

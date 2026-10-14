@@ -89,11 +89,6 @@ export const WorkerExecutionProfileSchema = z.object({
     .refine((value) => !["auto", "default"].includes(value), "This ID is reserved."),
   name: z.string().trim().min(1).max(80),
   description: z.string().trim().min(1).max(400),
-  categories: z
-    .array(z.enum(WORKER_CATEGORIES))
-    .min(1)
-    .max(WORKER_CATEGORIES.length)
-    .refine((values) => new Set(values).size === values.length, "Duplicate category."),
   model: z.string().min(1).max(200),
   reasoningEffort: z.string().min(1).max(200).nullable(),
 });
@@ -165,7 +160,7 @@ export type WorkerRoutingProposal = z.infer<typeof WorkerRoutingProposalSchema>;
 export const workerRoutingFallbackLabels = {
   shadow: "Shadow mode uses worker defaults",
   over_size: "The decision request exceeds 32 KiB",
-  no_candidates: "No profile matches this category",
+  no_candidates: "No worker profiles are configured",
   provider_unavailable: "No tested decision model is available",
   provider_error: "The decision providers could not answer",
   invalid_answer: "The decision answer was invalid",
