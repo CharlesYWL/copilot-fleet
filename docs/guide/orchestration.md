@@ -330,6 +330,10 @@ credentials, MCP tokens, request flags, and prompt text do not establish human i
 Fleet atomically pauses maintenance and cancels only provably never-sent queued work;
 accepted/in-flight work and unknown effects must first produce correlated receipts.
 Busy, stopping, offline, capacity, and checkout restrictions still apply.
+An execution-settled `reconciling` batch with no reserved or uncertain effects
+does not block manual Resume or a new manual prompt merely because final finding
+bookkeeping is unfinished. Fleet preserves that batch and its receipts and keeps
+maintenance paused; it does not replay the original work or certify its findings.
 
 Ongoing takeover keeps maintenance **paused** after the turn. For explicit **one-turn handback**,
 Fleet accepts missing/stale cache without treating it as fresh, then resumes only after the exact
