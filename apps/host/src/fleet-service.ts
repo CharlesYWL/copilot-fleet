@@ -2285,6 +2285,17 @@ export class FleetService {
       if (!session.stopRequested || terminalSessionStates.has(session.state)) continue;
       this.dispatch(nodeId, { type: "stop", sessionId: session.id });
     }
+    const active = new Set(activeSessionIds);
+    const ended = (sessionId: string) => {
+      const session = this.store.getSession(sessionId);
+      return Boolean(
+        session?.nodeId === nodeId &&
+        !active.has(sessionId) &&
+        !session.stopRequested &&
+        terminalSessionStates.has(session.state),
+      );
+    };
+    if (this.store.prMaintenance.settleEndedManualCommands(ended)) this.publishSnapshot();
     this.sessionRetention.nodeReconciled(nodeId);
     this.worktrees.onNodeReconciled(nodeId);
     this.autoResume(nodeId, settled);
