@@ -204,13 +204,24 @@ orchestrator reads the same text in `fleet_list_work`, `fleet_get_task` and the
 | starting | Sent; the Node has not acknowledged the turn | `resuming`, `dispatched` |
 | running | The Node acknowledged the turn | `running` |
 
-Same-checkout and same-Node concurrency are distinct. `checkout_busy` names the
-live sessions holding the worker's checkout (a Node with managed worktrees
-treats every live non-lead session as holding its checkout; the legacy key is
-the placement). A settled task worker occupying it is parked by the scheduler
-before the handoff, so that wait clears by itself; a session no task manages
-keeps the checkout until whoever uses it stops it. Sessions in different
-checkouts on one Node never block each other while the Node has capacity.
+Same-checkout and same-Node concurrency are distinct. In Legacy mode, only
+writers (`implement` and `test`) reserve a checkout. Reviews and exploration,
+including planning work, may share it with a writer or with other read-only workers,
+regardless of model. A Node advertising managed-worktree support does not make its
+legacy read-only sessions exclusive. Writing and read-only sessions retain
+separate Node capacity budgets, and task parallel limits still apply. On a
+managed-capable Node, an idle writer retains its reservation because its process
+can still have background work; Fleet parks a settled task writer and waits for
+the Node's Stop receipt before handing the checkout to another writer.
+
+Actual managed-worktree bindings retain exclusive physical process ownership,
+including idle and shell-capable read-only workers. Concurrent steps use their
+separate isolated workspaces; a settled managed worker is parked before handing
+its checkout over. Merely declaring work read-only is not a filesystem sandbox.
+Legacy reviews running alongside an implementation can observe an evolving tree;
+use step dependencies or managed step workspaces for a stable review input.
+Sessions in different checkouts on one Node never block each other while the Node
+has capacity.
 
 **Resume now** (task page, worker transcript banner, `POST
 /api/runs/:id/steps/:stepId/resume-now`, or `fleet_request_resume`) first runs an
@@ -253,10 +264,13 @@ that follow-up's attempt; the engine forgets that turn's completion receipt
 when it sends the queued prompt, so the earlier turn cannot settle the queued
 one before the Node acknowledges it.
 
-The manual session **Resume** control applies the scheduler's checkout rule to
-task workers and reviewers: it refuses (`409 checkout_busy`, naming the holder)
-while another live session holds the checkout the worker would write to.
-Sessions no task manages, and orchestrators, keep the control unchanged.
+The session **Resume** control applies the same checkout rule as scheduling:
+a legacy reviewer or exploration worker can resume while a writer is running;
+another task writer is refused (`409 checkout_busy`, naming the holder).
+Deliberately created manual source-placement sessions bypass writer exclusion
+for their own creation and resume, as do orchestrators. This is not a bypass of
+hard Node capacity, deletion/Stop fences, PR-maintenance holds or managed-checkout
+ownership: a manual alias cannot enter a Fleet-owned worktree without its binding.
 
 ## Worker delivery and publication
 

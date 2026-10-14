@@ -24,6 +24,7 @@ import { capacityFor, type SessionKind } from "../session-policy.js";
 import { WorkerResumeConflict } from "../worker-resume-store.js";
 import {
   executionKey,
+  holdsCheckout,
   remainingCapacity,
   type ScheduleException,
   type StepHold,
@@ -433,12 +434,13 @@ export class WorkerResumeService {
     }
     const sessions = this.store.listSessions();
     const localPath = step.executionBinding?.cwd ?? placement.localPath;
+    const needsLease = Boolean(session.executionBinding?.worktreeId) || !session.readOnly;
     const sharing = sessions.filter((candidate) => {
       if (
+        !needsLease ||
         candidate.id === session.id ||
         candidate.nodeId !== node.id ||
-        candidate.runRole === "lead" ||
-        terminalSessionStates.has(candidate.state)
+        !holdsCheckout(candidate, node)
       )
         return false;
       if (checkoutLockKey(candidate) === checkoutKey) return true;
@@ -453,7 +455,7 @@ export class WorkerResumeService {
     if (sharing.length)
       return `${localPath} on ${node.name} is in use by ${sharing
         .map((candidate) => candidate.name || candidate.id)
-        .join(", ")}; two writers never share one checkout.`;
+        .join(", ")}; the required checkout lease cannot be shared.`;
     const kind: SessionKind = session.readOnly ? "read-only" : "writing";
     const holders = sessions.filter(
       (candidate) =>
@@ -511,6 +513,10 @@ export class WorkerResumeService {
   ): WorkerResumeRequest {
     const { run, step, session, node } = binding;
     const at = new Date(nowMs).toISOString();
+    const checkoutRisk =
+      !session.executionBinding?.worktreeId && session.readOnly
+        ? "Read-only work may share this legacy checkout; write-worker exclusion is unchanged."
+        : `Checkout exclusivity is unchanged — no conflicting live session uses ${binding.localPath}.`;
     const activeSessions: WorkerResumeSession[] = this.store
       .listSessions()
       .filter(
@@ -556,7 +562,7 @@ export class WorkerResumeService {
           promptDigest: binding.promptDigest,
           restriction: "node_headroom",
           restrictionDetail: `${node.name} is at Fleet's scheduling limit for ${binding.kind} work: ${binding.reserved} of ${binding.limit} slots are held, and Fleet keeps the last slot free on a multi-slot Node so ordinary dispatch never fills it.`,
-          risk: `Approving spends that reserved slot once: ${node.name} will run ${binding.reserved + 1} of ${binding.limit} ${binding.kind} sessions, its hard limit, and other work for ${node.name} waits until a slot frees. Checkout exclusivity is unchanged — no other live session uses ${binding.localPath} — and so are task budgets, human holds and PR-maintenance restrictions.`,
+          risk: `Approving spends that reserved slot once: ${node.name} will run ${binding.reserved + 1} of ${binding.limit} ${binding.kind} sessions, its hard limit, and other work for ${node.name} waits until a slot frees. ${checkoutRisk} Task budgets, human holds and PR-maintenance restrictions are unchanged.`,
           capacity: {
             kind: binding.kind,
             reserved: binding.reserved,

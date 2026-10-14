@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   AGENT_IDENTITY_CAPABILITY,
+  MANAGED_WORKTREES_CAPABILITY,
   RunCriterionSchema,
   type CriterionOutcome,
   type RunCriterion,
@@ -405,6 +406,10 @@ describe("FleetTools", () => {
   });
 
   it("does not start a writer beside another task's writer on the checkout", () => {
+    const node = store.listNodes()[0]!;
+    store.setNodeIdentity(node.id, {
+      capabilities: [...node.capabilities, MANAGED_WORKTREES_CAPABILITY],
+    });
     const first = start({ task: "First change", category: "implement" });
     expect(first.ok).toBe(true);
 
@@ -413,6 +418,38 @@ describe("FleetTools", () => {
     expect(second.ok).toBe(false);
     expect(second.text).toContain("Only one writer");
   });
+
+  it.each([
+    ["implement", "review-quick"],
+    ["review-deep", "implement"],
+    ["explore", "test"],
+    ["test", "explore"],
+    ["review-quick", "review-deep"],
+  ])(
+    "dispatches legacy %s and %s to the same checkout on a managed-capable Node",
+    (firstCategory, secondCategory) => {
+      const node = store.listNodes()[0]!;
+      store.setNodeIdentity(node.id, {
+        capabilities: [...node.capabilities, MANAGED_WORKTREES_CAPABILITY],
+      });
+      const first = start({
+        task: "Concurrent roles",
+        category: firstCategory,
+        title: "first",
+      });
+      expect(first.ok, first.text).toBe(true);
+      const second = start({
+        task: "Concurrent roles",
+        category: secondCategory,
+        title: "second",
+      });
+      expect(second.ok, second.text).toBe(true);
+      const steps = store.listRunSteps(tasks()[0]!.id);
+      expect(steps).toHaveLength(2);
+      expect(steps[0]?.placementId).toBe(steps[1]?.placementId);
+      expect(steps.every((step) => Boolean(step.sessionId))).toBe(true);
+    },
+  );
 
   it("lets a distinct writing role start beside an idle retained worker", () => {
     start({ task: "Ship Beta", category: "implement" });

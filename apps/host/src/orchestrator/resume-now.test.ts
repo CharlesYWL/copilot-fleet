@@ -137,8 +137,8 @@ function world({ maxSessions = 2 }: { maxSessions?: number } = {}) {
       .filter((frame) => frame.command?.type === type)
       .map((frame) => frame.command!);
 
-  /** A settled implementer, parked the way the scheduler parks one for a checkout handoff. */
-  const retainedWorker = () => {
+  /** A settled worker with its conversation retained for the next turn. */
+  const retainedWorker = (category = "implement") => {
     const run = store.createRun({
       workspaceId: repo.id,
       name: "S03 - Miles action-log comparison prototype",
@@ -150,7 +150,7 @@ function world({ maxSessions = 2 }: { maxSessions?: number } = {}) {
         stepKey: "step-1",
         title: "Build isolated S03 action-log alternative",
         prompt: "Implement the prototype.",
-        category: "implement",
+        category,
       },
     ]);
     store.updateRun(run.id, { leadSessionId: lead.id, state: "running" });
@@ -243,7 +243,7 @@ function world({ maxSessions = 2 }: { maxSessions?: number } = {}) {
 }
 
 describe("queued follow-up admission", () => {
-  it("automatically resumes the queued writer once a reviewer finishes MCP recovery", () => {
+  it("resumes a legacy writer without stopping a reviewer still recovering MCP tools", () => {
     const w = world();
     const { run, step: writer, workerId } = w.retainedWorker();
     const review = w.store.upsertRunStep(run.id, {
@@ -261,12 +261,17 @@ describe("queued follow-up admission", () => {
     w.emit(reviewerId, "agent_text", { text: "Exact-candidate review PASS" });
     w.emit(reviewerId, "turn_complete", { stopReason: "end_turn" });
 
-    expect(w.followUp(workerId)).toContain("checkout_busy");
-    expect(w.commands("resume_session")).toHaveLength(0);
+    w.followUp(workerId);
+    expect(w.commands("resume_session")).toEqual([
+      expect.objectContaining({
+        sessionId: workerId,
+        agentSessionId: "copilot-worker-1",
+      }),
+    ]);
     for (const activity of ["Restoring MCP tools", "Restoring MCP tools (attempt 1/4)"]) {
       w.emit(reviewerId, "state", { state: "running", activity, historyReplay: true });
       expect(w.store.getSession(reviewerId)?.stopRequested).toBe(false);
-      expect(w.commands("resume_session")).toHaveLength(0);
+      expect(w.commands("resume_session")).toHaveLength(1);
     }
     w.emit(reviewerId, "state", {
       state: "idle",
@@ -278,17 +283,10 @@ describe("queued follow-up admission", () => {
       state: "succeeded",
       output: "Exact-candidate review PASS",
     });
-    expect(w.store.getSession(reviewerId)?.stopRequested).toBe(true);
-    // Checkout handoff still waits for the Node to confirm the reviewer stopped.
-    expect(w.commands("resume_session")).toHaveLength(0);
-    w.emit(reviewerId, "state", { state: "stopped", activity: "Process stopped" });
-    w.engine.tick();
-    expect(w.commands("resume_session")).toEqual([
-      expect.objectContaining({
-        sessionId: workerId,
-        agentSessionId: "copilot-worker-1",
-      }),
-    ]);
+    expect(w.store.getSession(reviewerId)?.stopRequested).toBe(false);
+    expect(w.commands("stop").some((command) => command.sessionId === reviewerId)).toBe(
+      false,
+    );
     w.emit(workerId, "state", { state: "starting" });
     w.emit(workerId, "state", {
       state: "idle",
@@ -384,6 +382,42 @@ describe("Resume now with an operator-approved exception", () => {
     expect(w.commands("resume_session")).toHaveLength(0);
     return { ...w, ...retained, other };
   };
+
+  it("can approve read-only headroom while a writer and another reviewer share the legacy checkout", () => {
+    const w = world({ maxSessions: 2 });
+    const { run, step, workerId } = w.retainedWorker("review-deep");
+    w.otherTasksWriter();
+    const reviewer = w.store.createSession(w.checkout, "review", true, "Other reviewer", {
+      runRole: "reviewer",
+      readOnly: true,
+    });
+    w.store.transitionSession(reviewer.id, "starting");
+    w.store.transitionSession(reviewer.id, "running");
+    w.followUp(workerId);
+    expect(w.engine.resume.admission(run.id, step.id)).toMatchObject({
+      code: "node_headroom",
+      exception: "node_headroom",
+    });
+
+    const asked = w.engine.resume.request(
+      { stepId: step.id },
+      { kind: "operator", id: "administrator-1" },
+    );
+    expect(asked.status).toBe("awaiting_approval");
+    expect(asked.request?.capacity).toEqual({
+      kind: "read-only",
+      reserved: 1,
+      limit: 2,
+    });
+    expect(asked.request?.risk).toContain(
+      "Read-only work may share this legacy checkout",
+    );
+    expect(w.approve(asked.request!.id).state).toBe("launching");
+    expect(w.commands("resume_session")).toEqual([
+      expect.objectContaining({ sessionId: workerId, readOnly: true }),
+    ]);
+    expect(w.store.getSession(reviewer.id)?.state).toBe("running");
+  });
 
   it("holds a follow-up for the reserved slot until an authenticated approval, then resumes the same conversation once", () => {
     const w = headroomWorld();
@@ -944,48 +978,116 @@ describe("Resume now over HTTP and MCP", () => {
 });
 
 describe("the manual session Resume control", () => {
-  it("refuses to put a task worker into a checkout another live session holds", async () => {
+  it.each(["explore", "review-quick", "review-deep"])(
+    "resumes a stopped legacy %s worker beside a running code worker",
+    async (category) => {
+      const w = world({ maxSessions: 10 });
+      const { workerId } = w.retainedWorker(category);
+      const { session: writer } = w.otherTasksWriter();
+      const app = Fastify({ logger: false });
+      await app.register(sessionRoutes, { service: w.service });
+      await app.ready();
+      try {
+        const resumed = await app.inject({
+          method: "POST",
+          url: `/api/sessions/${workerId}/resume`,
+          payload: {},
+        });
+        expect(resumed.statusCode).toBe(202);
+        expect(w.commands("resume_session")).toEqual([
+          expect.objectContaining({ sessionId: workerId, readOnly: true }),
+        ]);
+        expect(w.store.getSession(writer.id)?.state).toBe("running");
+      } finally {
+        await app.close();
+      }
+    },
+  );
+
+  it("allows deliberately created manual sessions to start and resume in an occupied source checkout", async () => {
     const w = world({ maxSessions: 10 });
-    const { workerId } = w.retainedWorker();
-    const { session: occupant } = w.otherTasksWriter();
-    const manual = w.liveSession(w.otherCheckout, "A person's own session");
+    const { session: writer } = w.otherTasksWriter();
     const app = Fastify({ logger: false });
     await app.register(sessionRoutes, { service: w.service });
     await app.ready();
     try {
-      const refused = await app.inject({
+      const first = await app.inject({
         method: "POST",
-        url: `/api/sessions/${workerId}/resume`,
+        url: "/api/sessions",
+        payload: { placementId: w.checkout.id, prompt: "Ask about the code" },
+      });
+      const second = await app.inject({
+        method: "POST",
+        url: "/api/sessions",
+        payload: { placementId: w.checkout.id, prompt: "Inspect the same checkout" },
+      });
+      expect(first.statusCode).toBe(202);
+      expect(second.statusCode).toBe(202);
+      expect(first.json()).toMatchObject({ runRole: "", readOnly: false });
+      const id = first.json().id as string;
+      w.emit(id, "agent_session", { agentSessionId: "copilot-manual" });
+      w.store.transitionSession(id, "stopped");
+      const resumed = await app.inject({
+        method: "POST",
+        url: `/api/sessions/${id}/resume`,
         payload: {},
       });
-      expect(refused.statusCode).toBe(409);
-      expect(refused.json()).toMatchObject({ code: "checkout_busy" });
-      expect(refused.json().error).toContain("Publish and link Ontology MSIT PR");
-      expect(w.commands("resume_session")).toHaveLength(0);
-
-      // Sessions no task manages keep the control as it was.
-      w.store.transitionSession(manual.id, "stopped");
-      w.emit(manual.id, "agent_session", { agentSessionId: "copilot-manual" });
-      const person = await app.inject({
-        method: "POST",
-        url: `/api/sessions/${manual.id}/resume`,
-        payload: {},
-      });
-      expect(person.statusCode).toBe(202);
-
-      w.store.transitionSession(occupant.id, "stopped");
-      const allowed = await app.inject({
-        method: "POST",
-        url: `/api/sessions/${workerId}/resume`,
-        payload: {},
-      });
-      expect(allowed.statusCode).toBe(202);
-      expect(w.commands("resume_session").map((command) => command.sessionId)).toEqual([
-        manual.id,
-        workerId,
+      expect(resumed.statusCode).toBe(202);
+      expect(w.commands("resume_session")).toEqual([
+        expect.objectContaining({ sessionId: id }),
       ]);
+      expect(w.store.getSession(writer.id)?.state).toBe("running");
     } finally {
       await app.close();
     }
   });
+
+  it.each(["running", "idle"] as const)(
+    "refuses a second task writer while the first is %s",
+    async (state) => {
+      const w = world({ maxSessions: 10 });
+      const { workerId } = w.retainedWorker();
+      const { session: occupant } = w.otherTasksWriter();
+      if (state === "idle") w.store.transitionSession(occupant.id, "idle");
+      const manual = w.liveSession(w.otherCheckout, "A person's own session");
+      const app = Fastify({ logger: false });
+      await app.register(sessionRoutes, { service: w.service });
+      await app.ready();
+      try {
+        const refused = await app.inject({
+          method: "POST",
+          url: `/api/sessions/${workerId}/resume`,
+          payload: {},
+        });
+        expect(refused.statusCode).toBe(409);
+        expect(refused.json()).toMatchObject({ code: "checkout_busy" });
+        expect(refused.json().error).toContain("Publish and link Ontology MSIT PR");
+        expect(w.commands("resume_session")).toHaveLength(0);
+
+        // Sessions no task manages keep the control as it was.
+        w.store.transitionSession(manual.id, "stopped");
+        w.emit(manual.id, "agent_session", { agentSessionId: "copilot-manual" });
+        const person = await app.inject({
+          method: "POST",
+          url: `/api/sessions/${manual.id}/resume`,
+          payload: {},
+        });
+        expect(person.statusCode).toBe(202);
+
+        w.store.transitionSession(occupant.id, "stopped");
+        const allowed = await app.inject({
+          method: "POST",
+          url: `/api/sessions/${workerId}/resume`,
+          payload: {},
+        });
+        expect(allowed.statusCode).toBe(202);
+        expect(w.commands("resume_session").map((command) => command.sessionId)).toEqual([
+          manual.id,
+          workerId,
+        ]);
+      } finally {
+        await app.close();
+      }
+    },
+  );
 });

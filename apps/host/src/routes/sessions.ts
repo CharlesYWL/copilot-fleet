@@ -274,9 +274,9 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       .object({ operationId: z.string().uuid().optional() })
       .parse(request.body ?? {});
     /*
-     * A task worker is the scheduler's to place, and it never puts two writers
-     * in one checkout. A person resuming one by hand is held to the same rule;
-     * "Resume now" on its task waits for the checkout and says who holds it.
+     * Task writers share the scheduler's checkout rule; legacy read-only roles
+     * can resume alongside them. An operator-created session bypasses this
+     * writer gate, not Node capacity or managed-worktree ownership checks.
      */
     const conflict = service.resumeCheckoutProblem(id);
     if (conflict) return reply.code(409).send(conflict);
