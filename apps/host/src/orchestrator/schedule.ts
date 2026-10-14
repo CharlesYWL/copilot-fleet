@@ -31,9 +31,9 @@ const sessionLabel = (session: FleetSession) =>
 /**
  * Names who holds a checkout, and whether Fleet will hand it over by itself.
  *
- * A settled task worker is parked before another task's worker takes its
- * checkout, so waiting clears. A session no task manages is a person's, and
- * nothing here stops it on their behalf.
+ * Capable Nodes park settled writing processes before checkout handoff.
+ * Older legacy reservations end with the writing turn. A person's own session
+ * is never stopped on their behalf.
  */
 function checkoutBusyDetail(
   placement: Placement,
@@ -43,14 +43,23 @@ function checkoutBusyDetail(
   const managed = occupants.every(
     (occupant) => occupant.runRole === "worker" || occupant.runRole === "reviewer",
   );
+  const managedCheckout = occupants.some(
+    (occupant) => occupant.executionBinding?.worktreeId,
+  );
+  const needsQuiescence =
+    managedCheckout || node.capabilities.includes(MANAGED_WORKTREES_CAPABILITY);
   return [
     `${placement.localPath} on ${node.name} is in use by ${occupants
       .map((occupant) => `${sessionLabel(occupant)} (${occupant.state})`)
       .join(", ")}.`,
-    "One live session holds a checkout at a time, because Git state and build output are shared.",
-    managed
-      ? "Fleet parks a settled task worker before handing its checkout over, so this resumes by itself once that session finishes its turn."
-      : "A session that no task manages keeps the checkout until whoever is using it stops it.",
+    managedCheckout
+      ? "One live process holds a managed checkout at a time."
+      : "Only one writer can use a legacy checkout at a time; read-only work can share it.",
+    needsQuiescence
+      ? managed
+        ? "Fleet parks a settled task worker before handing its checkout over, so this resumes by itself once that session finishes its turn."
+        : "A session that no task manages keeps the checkout until whoever is using it stops it."
+      : "This resumes by itself once the writing turn finishes or its session is stopped.",
   ].join(" ");
 }
 
@@ -203,10 +212,9 @@ const isInFlight = (state: RunStepState) => state === "starting" || state === "r
 /**
  * Whether a live session holds its checkout against another writer.
  *
- * On a Node with managed worktrees every live non-lead session holds its
- * physical checkout, idle or not, because its process can still change it.
- * Elsewhere only a writing session in a turn does. Shared by the scheduler
- * and the manual Resume guard so the two cannot disagree.
+ * Managed-bound processes and legacy writers on capable Nodes retain
+ * reservations while idle. Legacy read-only roles are exempt.
+ * Shared by scheduling, placement and manual Resume admission.
  */
 export function holdsCheckout(
   session: FleetSession,
@@ -214,7 +222,8 @@ export function holdsCheckout(
 ): boolean {
   const strict =
     Boolean(session.executionBinding?.worktreeId) ||
-    Boolean(node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY));
+    (!session.readOnly &&
+      Boolean(node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)));
   return (
     session.runRole !== "lead" &&
     !terminalSessionStates.has(session.state) &&
@@ -225,21 +234,17 @@ export function holdsCheckout(
 /**
  * The live sessions holding the checkout `target` would write to, if it needs one.
  *
- * A read-only session on a Node without managed worktrees takes no lease, the
- * same exemption the scheduler gives a reviewer beside a writer.
+ * Legacy read-only sessions take no writer lease. Managed-bound sessions
+ * retain exclusive process ownership, even when their role is read-only.
  */
 export function checkoutOccupants(
   target: FleetSession,
   sessions: readonly FleetSession[],
   nodes: readonly FleetNode[],
 ): FleetSession[] {
-  const nodeById = new Map(nodes.map((node) => [node.id, node]));
-  const node = nodeById.get(target.nodeId);
-  const needsLease =
-    Boolean(target.executionBinding?.worktreeId) ||
-    Boolean(node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)) ||
-    !target.readOnly;
+  const needsLease = Boolean(target.executionBinding?.worktreeId) || !target.readOnly;
   if (!needsLease) return [];
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const key = checkoutLockKey(target);
   return sessions.filter(
     (candidate) =>
@@ -463,23 +468,11 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
     return reservedByNode.get(cacheKey)!;
   };
 
-  const strictSession = (session: FleetSession) =>
-    Boolean(session.executionBinding?.worktreeId) ||
-    Boolean(
-      nodeById.get(session.nodeId)?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY),
-    );
   const heldBy = (session: FleetSession) =>
     holdsCheckout(session, nodeById.get(session.nodeId));
   const writingInFlight = new Set(input.sessions.filter(heldBy).map(checkoutLockKey));
   for (const step of [...inFlight, ...activeRetries]) {
-    if (
-      requiresCheckoutLease(
-        run,
-        step.category,
-        nodeById.get(placementById.get(step.placementId)?.nodeId ?? ""),
-      ) &&
-      step.placementId
-    ) {
+    if (requiresCheckoutLease(run, step.category) && step.placementId) {
       writingInFlight.add(
         step.executionBinding?.checkoutKey ?? executionKey(run, step.placementId),
       );
@@ -546,11 +539,11 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
     const desiredKey =
       step.executionBinding?.checkoutKey ??
       executionKey(run, step.placementId || run.placementId);
-    if (!heldByHuman && workspaceReady) {
+    if (!heldByHuman && workspaceReady && requiresCheckoutLease(run, step.category)) {
       for (const occupant of input.sessions) {
         if (
           occupant.id === step.sessionId ||
-          !strictSession(occupant) ||
+          !heldBy(occupant) ||
           occupant.runRole === "lead" ||
           occupant.state !== "idle" ||
           occupant.stopRequested ||
@@ -631,7 +624,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         });
         continue;
       }
-      const needsLease = requiresCheckoutLease(run, step.category, node);
+      const needsLease = requiresCheckoutLease(run, step.category);
       const retryKey =
         step.executionBinding?.checkoutKey ?? executionKey(run, placementId);
       const occupants = needsLease
@@ -654,7 +647,12 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       }
       const sameTaskWriters = () =>
         [...inFlight, ...activeRetries]
-          .filter((entry) => entry.id !== step.id && stepKeyOf(entry) === retryKey)
+          .filter(
+            (entry) =>
+              entry.id !== step.id &&
+              stepKeyOf(entry) === retryKey &&
+              requiresCheckoutLease(run, entry.category),
+          )
           .map((entry) => entry.sessionId)
           .filter(Boolean);
       const sameTaskBusy: StepHold = {
@@ -673,7 +671,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         if (
           needsLease &&
           writingInFlight.has(retryKey) &&
-          !(strictSession(session) && started === 0)
+          !(heldBy(session) && started === 0)
         ) {
           hold(step, sameTaskBusy);
           continue;
@@ -798,7 +796,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       key(placement.nodeId, startedKind),
       reservedFor(placement.nodeId, startedKind) + 1,
     );
-    if (requiresCheckoutLease(run, step.category, nodeById.get(placement.nodeId))) {
+    if (requiresCheckoutLease(run, step.category)) {
       writingInFlight.add(
         step.executionBinding?.checkoutKey ?? executionKey(run, placementId),
       );
@@ -872,7 +870,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
   return actions;
 }
 
-/** Capacity label only. Shell-capable reviewers still require a checkout lease. */
+/** Legacy readers share checkouts; managed-bound processes still hold a lease. */
 export function isReadOnlyCategory(category: string): boolean {
   return !isWritingCategory(category);
 }
@@ -1072,11 +1070,8 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
     if (onlyNode && onlyNode.id !== pinned!.nodeId) {
       return `${pinned!.nodeName} ${why}, so this cannot run on ${onlyNode.name}. Send it to ${pinned!.nodeName}, or name a workspace if this is unrelated work.`;
     }
-    if (
-      requiresCheckoutLease(run, request.category, nodeById.get(pinned!.nodeId)) &&
-      writingInFlight.has(pinned!.id)
-    ) {
-      return `Another session holds the checkout on ${pinned!.nodeName}, which ${why}. Wait for process quiescence; read-only labels do not grant filesystem isolation.`;
+    if (requiresCheckoutLease(run, request.category) && writingInFlight.has(pinned!.id)) {
+      return `Another writer holds the checkout on ${pinned!.nodeName}, which ${why}. Only one writer at a time; a review or an explore can go there now.`;
     }
     const node = nodeById.get(pinned!.nodeId);
     if (!usable(node, run)) {
@@ -1141,7 +1136,7 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
 
   for (const { placement, free } of ranked) {
     if (
-      requiresCheckoutLease(run, request.category, nodeById.get(placement.nodeId)) &&
+      requiresCheckoutLease(run, request.category) &&
       writingInFlight.has(placement.id)
     ) {
       blockedByWriter = true;
@@ -1199,7 +1194,7 @@ function choosePlacement(
     if (remainingCapacity(node!, context.reservedFor(node!.id, kind), kind) < 1)
       return { reason: `${node!.name} has no free slot for ${kind} work.` };
     if (
-      requiresCheckoutLease(context.run, step.category, node) &&
+      requiresCheckoutLease(context.run, step.category) &&
       context.writingInFlight.has(step.executionBinding.checkoutKey)
     )
       return { reason: "Another session is writing to this step's checkout." };
@@ -1219,7 +1214,7 @@ function choosePlacement(
     if (!usable(node, context.run))
       return { reason: `${chosen.nodeName} is offline or cannot run this task.` };
     if (
-      requiresCheckoutLease(context.run, step.category, node) &&
+      requiresCheckoutLease(context.run, step.category) &&
       context.writingInFlight.has(executionKey(context.run, chosen.id))
     ) {
       return {
@@ -1257,14 +1252,6 @@ export function executionKey(run: Run, placementId: string): string {
     : placementId;
 }
 
-function requiresCheckoutLease(
-  run: Run,
-  category: string,
-  node: FleetNode | undefined,
-): boolean {
-  return (
-    run.workspaceBinding?.effectiveMode === "managed" ||
-    Boolean(node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)) ||
-    isWritingCategory(category)
-  );
+function requiresCheckoutLease(run: Run, category: string): boolean {
+  return run.workspaceBinding?.effectiveMode === "managed" || isWritingCategory(category);
 }

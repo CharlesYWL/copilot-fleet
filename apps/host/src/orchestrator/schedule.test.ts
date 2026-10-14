@@ -140,7 +140,7 @@ function world(overrides: Partial<ScheduleInput> = {}): ScheduleInput {
 
 const types = (input: ScheduleInput) => planNextActions(input).map((a) => a.type);
 
-describe("managed checkout scheduling", () => {
+describe("checkout scheduling on managed-capable Nodes", () => {
   const managed = () =>
     run({
       placementId: "p1",
@@ -168,6 +168,98 @@ describe("managed checkout scheduling", () => {
       checkoutKey: `physical-${key}`,
       leaseAttempt: "attempt",
     });
+
+  it("runs legacy reviewers and exploration alongside a writer in the same checkout", () => {
+    const actions = planNextActions(
+      world({
+        run: run({
+          placementId: "p1",
+          policy: RunPolicySchema.parse({ maxParallel: 4 }),
+        }),
+        nodes: [capable()],
+        steps: [
+          step("write", {
+            state: "running",
+            sessionId: "writer",
+            placementId: "p1",
+          }),
+          step("quick", { category: "review-quick" }),
+          step("deep", { category: "review-deep" }),
+          step("plan", { category: "explore" }),
+        ],
+        sessions: [session("writer")],
+      }),
+    );
+    expect(actions.filter((action) => action.type === "start_step")).toEqual([
+      expect.objectContaining({ stepId: "quick", placementId: "p1" }),
+      expect.objectContaining({ stepId: "deep", placementId: "p1" }),
+      expect.objectContaining({ stepId: "plan", placementId: "p1" }),
+    ]);
+    expect(actions.some((action) => action.type === "stop_session")).toBe(false);
+  });
+
+  it.each(["implement", "test"])(
+    "starts legacy %s work beside a read-only session without parking it",
+    (category) => {
+      const actions = planNextActions(
+        world({
+          nodes: [capable()],
+          steps: [step("write", { category })],
+          sessions: [
+            session("reviewer", {
+              readOnly: true,
+              runRole: "reviewer",
+              state: "idle",
+            }),
+          ],
+          parkableSessionIds: new Set(["reviewer"]),
+        }),
+      );
+      expect(actions.filter((action) => action.type === "start_step")).toHaveLength(1);
+      expect(actions.some((action) => action.type === "stop_session")).toBe(false);
+    },
+  );
+
+  it("parks an idle legacy writer and waits for Stop before handing its checkout to another writer", () => {
+    const input = world({
+      nodes: [capable()],
+      steps: [step("next-writer", { placementId: "p1" })],
+      sessions: [session("retained-writer", { state: "idle", runId: "another-task" })],
+      parkableSessionIds: new Set(["retained-writer"]),
+    });
+    const actions = planNextActions(input);
+    expect(actions).toContainEqual(
+      expect.objectContaining({
+        type: "stop_session",
+        sessionId: "retained-writer",
+      }),
+    );
+    expect(actions.some((action) => action.type === "start_step")).toBe(false);
+    expect(
+      planNextActions({
+        ...input,
+        sessions: [
+          session("retained-writer", { state: "stopped", runId: "another-task" }),
+        ],
+      }).filter((action) => action.type === "start_step"),
+    ).toHaveLength(1);
+  });
+
+  it.each(["review-quick", "review-deep", "explore"])(
+    "leaves an idle legacy writer attached when starting %s in its checkout",
+    (category) => {
+      const actions = planNextActions(
+        world({
+          nodes: [capable()],
+          steps: [step("reader", { category, placementId: "p1" })],
+          sessions: [session("retained-writer", { state: "idle" })],
+          parkableSessionIds: new Set(["retained-writer"]),
+        }),
+      );
+      expect(actions.filter((action) => action.type === "start_step")).toHaveLength(1);
+      expect(actions.some((action) => action.type === "stop_session")).toBe(false);
+    },
+  );
 
   it("allows another task's writer in the same repository without sharing its checkout", () => {
     const actions = planNextActions(
@@ -1310,6 +1402,27 @@ describe("why a queued follow-up waits", () => {
     });
     expect(hold).toBeUndefined();
   });
+
+  it.each(["stopped", "idle"] as const)(
+    "continues a %s legacy reviewer beside a running writer",
+    (state) => {
+      const { actions, hold } = planned({
+        steps: [retry({ category: "review-deep" })],
+        sessions: [
+          worker({ state, readOnly: true, runRole: "reviewer" }),
+          session("writer", { placementId: "repo", runId: "another-task" }),
+        ],
+      });
+      expect(actions).toContainEqual(
+        expect.objectContaining({
+          type: state === "stopped" ? "resume_step" : "prompt_step",
+          sessionId: "worker",
+        }),
+      );
+      expect(hold).toBeUndefined();
+      expect(actions.some((action) => action.type === "stop_session")).toBe(false);
+    },
+  );
 
   it("says a worker still in a turn is waited for, not refused", () => {
     const { actions, hold } = planned({ sessions: [worker({ state: "running" })] });

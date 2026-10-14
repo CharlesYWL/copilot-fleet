@@ -5,7 +5,6 @@ import {
   AGENT_NODE_ID_ENV,
   CriterionOutcomeSchema,
   HOST_YOLO_CAPABILITY,
-  MANAGED_WORKTREES_CAPABILITY,
   WorkspaceModeSchema,
   AccessIntentSchema,
   contextUsePercent,
@@ -51,7 +50,7 @@ import {
   taskNeedsOrchestrator,
   transferRun,
 } from "./lifecycle.js";
-import { decidePlacement, remainingCapacity } from "./schedule.js";
+import { decidePlacement, holdsCheckout, remainingCapacity } from "./schedule.js";
 import { truncateMiddle, workerOutput } from "./engine.js";
 import { CommandConflict } from "../command-execution-store.js";
 import { PrMaintenanceError } from "../pr-maintenance-store.js";
@@ -2512,16 +2511,7 @@ export class FleetTools {
         )
         .filter(
           (session) =>
-            session.runRole !== "lead" &&
-            (Boolean(session.executionBinding?.worktreeId) ||
-              Boolean(
-                nodeById
-                  .get(session.nodeId)
-                  ?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY),
-              ) ||
-              (!session.readOnly && session.state !== "idle")) &&
-            !terminalSessionStates.has(session.state) &&
-            session.placementId,
+            holdsCheckout(session, nodeById.get(session.nodeId)) && session.placementId,
         )
         .map(checkoutLockKey),
     );
