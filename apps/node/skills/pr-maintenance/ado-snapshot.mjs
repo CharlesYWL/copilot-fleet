@@ -1497,6 +1497,14 @@ export function toAdoHostObservation(
       ],
       knownSelfEffectIds: value.effects.matched.map((effect) => effect.effectId),
     });
+    if (value.mergeability === "conflicting") {
+      observation.sources.push({
+        id: "merge-conflict",
+        revision: `${value.headSha}:${value.baseSha}`,
+        groupKey: "merge-conflict",
+        evidence: `${value.url}; provider reports conflicting HEAD ${value.headSha} and base ${value.baseSha}. Preserve accepted semantics and user work; ambiguous conflict choices require a design decision.`,
+      });
+    }
   }
   bounded(observation, "observation");
   return PrMaintenanceObservationSchema.parse(observation);

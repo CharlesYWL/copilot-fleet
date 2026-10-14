@@ -219,6 +219,63 @@ beforeEach(() => {
 });
 
 describe("PR maintenance task controls", () => {
+  it("queues routine generated-artifact work on the current worker without a renewal dialog", async () => {
+    const record = observed();
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [record],
+      canAuthorize: true,
+    });
+    vi.mocked(actOnTaskMaintenance).mockResolvedValue(record);
+    show();
+    const input = await screen.findByRole("textbox", { name: "Routine work" });
+    const button = screen.getByRole("button", { name: "Queue routine work" });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(input, {
+      target: {
+        value: "Regenerate the API report from the accepted implementation.",
+      },
+    });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    await waitFor(() =>
+      expect(actOnTaskMaintenance).toHaveBeenCalledExactlyOnceWith(
+        task.id,
+        expect.objectContaining({ id: record.id, version: record.version }),
+        {
+          action: "work",
+          requestId: expect.any(String),
+          direction: "Regenerate the API report from the accepted implementation.",
+        },
+      ),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("retries a lost routine-work response with the original request key, without hiding the error", async () => {
+    const record = observed();
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [record],
+      canAuthorize: true,
+    });
+    vi.mocked(actOnTaskMaintenance)
+      .mockRejectedValueOnce(new Error("Response lost; review delivery before retry."))
+      .mockResolvedValueOnce(record);
+    show();
+    fireEvent.change(await screen.findByRole("textbox", { name: "Routine work" }), {
+      target: { value: "Regenerate the accepted API report." },
+    });
+    const button = screen.getByRole("button", { name: "Queue routine work" });
+    fireEvent.click(button);
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "Response lost; review delivery before retry.",
+    );
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    const first = vi.mocked(actOnTaskMaintenance).mock.calls[0]![2];
+    fireEvent.click(button);
+    await waitFor(() => expect(actOnTaskMaintenance).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(actOnTaskMaintenance).mock.calls[1]![2]).toEqual(first);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
   it.each([false, true])(
     "allows only repair-authorized proposals from Commands (repairs=%s)",
     async (repairs) => {

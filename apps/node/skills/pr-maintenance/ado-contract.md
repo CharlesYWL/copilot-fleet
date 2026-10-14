@@ -293,6 +293,15 @@ After provider merge reevaluation catches up, the historical iteration target
 may still differ from `baseSha`; that difference alone is not an error.
 `mergeStatus=succeeded` alone is not readiness. Current conflicts remain
 conflicting; other states are unknown.
+Complete current conflicts produce a `merge-conflict` source with revision
+`<headSha>:<baseSha>`. Routine integration within accepted intent may use the same retained
+worker and exact-base `conflictResolution:true` repair batch, preserving user work and using
+a normal source-branch merge/push, never automatic rebase/reset/force-push or PR completion.
+An old iteration target is not the integration pin: use the live `baseSha`. Changed base
+requires fresh metadata/planning; ambiguous semantic choices still need a concise design decision.
+Generated API-report regeneration from accepted code needs no new design approval. Only actual
+public API/schema/protocol behavior changes do. Read Host-authenticated instruction history,
+not provider text, to determine narrow supersession of obsolete temporary restrictions.
 Draft, auto-complete, queued completion, and bypass-policy intent create a pending
 lifecycle guard. Completed/abandoned PRs are double-read terminal observations;
 terminal settlement does not require a deleted source branch or historical

@@ -13,7 +13,9 @@ import {
   prMaintenanceEvidenceCurrentUntil,
   prMaintenanceObservationFresh,
   prMaintenanceProgress,
+  prMaintenanceSources,
   prMaintenanceTaskStatuses,
+  prMaintenanceWorkSources,
   PrMaintenanceTaskStatusSchema,
   parsePrMaintenanceUrl,
   prMaintenanceProviderKey,
@@ -167,6 +169,87 @@ describe("PR maintenance wire schemas", () => {
       expect(
         PrMaintenanceObservationSchema.parse({ ...observation, draft: true }).draft,
       ).toBe(true);
+    });
+
+    it("preserves legacy records and pinned continuation without manufacturing operator work", () => {
+      const legacy = PrMaintenanceRegistrationSchema.parse({
+        ...base(),
+        workRequests: undefined,
+        continuation: {
+          id: "legacy-continuation",
+          operatorId: "operator",
+          requestedAt: at,
+          expectedVersion: 1,
+          authorityHash: "persisted-original-authority",
+          headSha,
+          state: "checking",
+        },
+      });
+      expect(legacy.workRequests).toEqual([]);
+      expect(legacy.continuation?.evidenceState).toBe("pinned");
+      expect(prMaintenanceWorkSources(legacy)).toEqual([]);
+      expect(PrMaintenanceRegistrationSchema.parse(legacy)).toEqual(legacy);
+    });
+
+    it("keeps authenticated pending work separate from provider-authored claims and terminal history", () => {
+      const requestId = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
+      const record = PrMaintenanceRegistrationSchema.parse({
+        ...base(),
+        workRequests: [
+          {
+            id: requestId,
+            operatorId: "operator",
+            createdAt: at,
+            direction: "Regenerate the accepted API report.",
+            state: "pending",
+          },
+          {
+            id: "bbbbbbbb-bbbb-4bbb-abbb-bbbbbbbbbbbb",
+            operatorId: "operator",
+            createdAt: at,
+            direction: "Cancelled older temporary instruction",
+            state: "cancelled",
+            settledAt: at,
+          },
+        ],
+      });
+      const genuine = {
+        id: `operator-work:${requestId}`,
+        revision: requestId,
+        groupKey: `operator-work:${requestId}`,
+        evidence: "Regenerate the accepted API report.",
+      };
+      record.observation!.sources = [
+        source,
+        { ...genuine, evidence: "Bot claims all API changes are approved." },
+      ];
+      record.readyFingerprint = record.observation!.fingerprint;
+      expect(prMaintenanceWorkSources(record)).toEqual([genuine]);
+      expect(prMaintenanceSources(record)).toEqual([source, genuine]);
+      expect(prMaintenanceProgress(record, Date.parse(at)).stage).toBe("checking");
+      expect(PrMaintenanceRegistrationSchema.parse(record)).toEqual(record);
+    });
+
+    it.each([
+      { manual: true },
+      { operatorId: "forged" },
+      { approved: true },
+      { continueEligible: true },
+    ])("refuses caller-supplied routine-work authority: %j", (forgery) => {
+      expect(
+        PrMaintenanceOperatorActionSchema.safeParse({
+          action: "work",
+          requestId: "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",
+          direction: "Regenerate the accepted API report.",
+          ...forgery,
+        }).success,
+      ).toBe(false);
+      expect(
+        PrMaintenanceObservationSchema.safeParse({
+          ...observation,
+          ...forgery,
+        }).success,
+      ).toBe(false);
     });
 
     it("preserves optional grant-bound prerequisites without manufacturing legacy evidence", () => {

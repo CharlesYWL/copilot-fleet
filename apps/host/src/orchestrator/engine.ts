@@ -915,11 +915,19 @@ export class OrchestratorEngine {
         `Authenticated bounded continuation ${intent.id} for maintenance record ${record.id}, task ${record.taskId}.`,
         intent.state === "handback"
           ? "Selected manual turn has completed. Reconcile its exact execution and effects read-only; the Host alone decides when quiescent handback is safe. Do not dispatch while manual control is active."
-          : "Read the retained record and claim the existing bounded maintenance visit. Refresh provider evidence before preparing or retrying the exact retained-worker batch.",
+          : "Read the retained record and claim the existing bounded maintenance visit. Refresh complete provider metadata automatically before preparing or retrying the exact retained-worker batch; do not ask for another approval just to refresh expired or missing cache.",
         record.decision?.state === "directed"
           ? `Operator direction: ${record.decision.direction}`
           : "",
-        "Reuse the retained worker, immutable accepted prompt and existing grant. No replacement, new rights, budget reset, merge or autocomplete. Independent Stop, access, identity and unresolved-effect holds win.",
+        ...record.workRequests
+          .filter((request) => request.state === "pending")
+          .map(
+            (request) =>
+              `Authenticated routine work ${request.id} (${request.createdAt}, operator ${request.operatorId}): ${request.direction}`,
+          ),
+        "Routine code, tests, documentation, CI, generated API reports and straightforward conflict integration within the accepted intent need no new design approval. Read the Host's operatorWorkSources and instruction history. Newer explicit operator direction supersedes only overlapping obsolete temporary restrictions; preserve unrelated still-applicable prohibitions and mutation grants. Escalate genuine semantic/design changes or ambiguous conflicts, not artifact regeneration.",
+        "If this compatible task completed while awaiting the requested work, use fleet_reopen_task under the existing maintenance grant after refreshing evidence, then continue its retained worker. This is not task acceptance or a new product approval; preserve criteria and history.",
+        "Reuse the retained worker, immutable accepted prompt and existing grant. No replacement, new rights, budget reset, PR merge or autocomplete. An exact-base conflict repair may integrate the target into the source branch by a non-forcing merge; preserve user work and stop on ambiguous choices. Independent Stop, access, identity and unresolved-effect holds win.",
       ]
         .filter(Boolean)
         .join("\n");

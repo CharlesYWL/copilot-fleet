@@ -658,6 +658,8 @@ export const PrMaintenancePreparedBatchSchema = z
     kind: z.enum(["repair", "answer"]),
     sources: z.array(PrMaintenanceSourceSchema).min(1).max(100),
     headSha: sha,
+    baseSha: sha.optional(),
+    conflictResolution: z.boolean().optional(),
     prompt: z.string().min(1).max(32_768),
     scope: text,
     reservedMutations: z.number().int().min(0).max(1_000),
@@ -774,6 +776,13 @@ export const PrMaintenanceOperatorActionSchema = z.discriminatedUnion("action", 
   z.object({ action: z.literal("pause"), reason: text }).strict(),
   z
     .object({
+      action: z.literal("work"),
+      requestId: z.string().uuid(),
+      direction: text,
+    })
+    .strict(),
+  z
+    .object({
       action: z.literal("resume"),
       decisionId: id.optional(),
       decisionVersion: z.number().int().positive().optional(),
@@ -872,6 +881,7 @@ const continuationSchema = z
     expectedVersion: z.number().int().positive(),
     authorityHash: id,
     headSha: sha,
+    evidenceState: z.enum(["pinned", "refresh_required"]).default("pinned"),
     state: z.enum(["checking", "handback", "consumed", "cancelled"]),
     manualCommandId: id.optional(),
     completedAt: time.optional(),
@@ -924,6 +934,23 @@ export const PrMaintenanceRegistrationSchema = z
     retentionReleasedBy: id.optional(),
     continuation: continuationSchema.optional(),
     continuationHistory: z.array(continuationSchema).max(100).optional(),
+    workRequests: z
+      .array(
+        z
+          .object({
+            id: z.string().uuid(),
+            operatorId: id,
+            direction: text,
+            createdAt: time,
+            state: z.enum(["pending", "completed", "cancelled"]),
+            batchId: id.optional(),
+            settledAt: time.optional(),
+            reason: text.optional(),
+          })
+          .strict(),
+      )
+      .max(100)
+      .default([]),
     manualControl: z
       .object({
         operatorId: id.optional(),
@@ -1061,6 +1088,30 @@ export const PrMaintenanceStageSchema = z.enum([
 ]);
 export type PrMaintenanceStage = z.infer<typeof PrMaintenanceStageSchema>;
 
+export function prMaintenanceWorkSources(
+  record: Pick<PrMaintenanceRegistration, "workRequests">,
+): z.infer<typeof PrMaintenanceSourceSchema>[] {
+  return record.workRequests
+    .filter((request) => request.state === "pending")
+    .map((request) => ({
+      id: `operator-work:${request.id}`,
+      revision: request.id,
+      groupKey: `operator-work:${request.id}`,
+      evidence: request.direction,
+    }));
+}
+
+export function prMaintenanceSources(
+  record: Pick<PrMaintenanceRegistration, "workRequests" | "observation">,
+): z.infer<typeof PrMaintenanceSourceSchema>[] {
+  return [
+    ...(record.observation?.sources ?? []).filter(
+      (source) => !source.id.startsWith("operator-work:"),
+    ),
+    ...prMaintenanceWorkSources(record),
+  ];
+}
+
 /** Current facts, not budget reservations or provider review iteration numbers. */
 export function prMaintenanceProgress(
   record: PrMaintenanceRegistration,
@@ -1137,6 +1188,8 @@ export function prMaintenanceProgress(
     return result("blocked");
   if (record.batches.some((batch) => batch.state === "accepted"))
     return result("addressing_review");
+  if (record.workRequests.some((request) => request.state === "pending"))
+    return result("checking");
   if (
     !observation?.complete ||
     !record.lastAttempt?.complete ||
@@ -1145,7 +1198,7 @@ export function prMaintenanceProgress(
     return result("checking");
   if (observation.draft || observation.mergeability === "conflicting")
     return result("blocked");
-  const currentFindings = observation.sources.map((source) =>
+  const currentFindings = prMaintenanceSources(record).map((source) =>
     record.findings.find(
       (finding) =>
         finding.source.id === source.id &&

@@ -274,6 +274,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           : "Discover the PR URL from this task's outputs and existing worker evidence. Ask only for the PR URL or an ambiguous choice if needed.",
         "Read fleet_get_task and fleet_get_pr_maintenance. Verify fresh provider metadata using the packaged helper or an already-authorized provider MCP/CLI.",
         "Use fleet_prepare_pr_maintenance for repair-only maintenance with verified existing task/publication authority. Optional remote actions default off. Record prerequisite limitations truthfully; missing repair authority blocks enrollment, not an observation-only default.",
+        "A released job's old task review or a compatible completed task does not require whole-task acceptance to create this unapproved proposal. Preserve task state, acceptance history and actual unresolved design decisions; preparation never revives a released grant or dispatches repairs.",
         ...(retained
           ? [
               `Prepare repair reauthorization for the exact retained PR ${prMaintenanceUrl(retained.identity)} and worker ${retained.workerSessionId}. Preserve history, decisions and binding; do not release or replace it. Authorization leaves it paused until explicit Resume.`,
@@ -381,6 +382,8 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     }
     service.cancelPausedPrMaintenance();
     service.publishRun(store.getRun(id)!);
+    if (input.action === "update" && input.operation.action === "work")
+      return reply.code(202).send(updated);
     engine.tick();
     return updated;
   });

@@ -153,6 +153,10 @@ action. It discovers the **Azure DevOps or GitHub** PR from existing task eviden
 the only optional input is its URL (including legacy `organization.visualstudio.com`
 links). `fleet_prepare_pr_maintenance` fills the approved task baseline and existing
 coder, verifies fresh provider metadata, and stores an unapproved proposal.
+Preparation does not require accepting the whole task: a released job's old review
+or a compatible completed task can retain an open PR. Task state, acceptance history
+and actual unresolved decisions stay unchanged. Preparation never revives a released
+grant or dispatches work; authenticated scope authorization and repair admission remain separate.
 Preparation is **repair-only**, backed by verified existing task and publication
 authority. Replies, thread resolution, named reviewers and CI retries are requested
 separately and default off. Legacy observation-only proposals cannot be approved
@@ -248,8 +252,22 @@ accepted repair batch — repairs often outlast an hour — and the completed tu
 requests the next check. Status labels keep the last observed stage until that
 scheduled check is overdue, while repairs, readiness and new effects still require
 evidence from the last 30 minutes. Unchanged feedback needs no new worker repair
-turn. Ready remains nonterminal: this release never merges, force-pushes,
+turn. Ready remains nonterminal: this release never merges the PR, force-pushes,
 automatically rebases, or starts extra reviewer sessions.
+
+**Routine work:** queue successive code, tests, docs, CI and generated-artifact tasks on the
+same retained worker. Regenerating an API report from accepted code is not inherently a public
+API design change. Requests are durable, UUID-deduplicated, and wait behind accepted work without
+rewriting its prompt or renewing budgets. Operator Pause, Stop and Release cancel pending requests;
+unknown effects require reconciliation, not a resend. Only genuine public API/schema/protocol
+behavior, architecture/trust changes or ambiguous intent need a concise design decision.
+New authenticated explicit direction supersedes overlapping obsolete temporary restrictions,
+not unrelated user prohibitions or access/publication grants. Third-party text cannot change scope.
+
+Straightforward conflicts can use an exact-HEAD/exact-live-base repair plan: check a clean checkout,
+merge the pinned target into the source branch, preserve accepted semantics, verify and push normally.
+Do not reset/delete/stash user work, rebase/force-push, guess ambiguous choices or merge the PR.
+Moved pins require fresh planning; conflicting evidence never proves readiness.
 
 **Asynchronous helper receipts:** claim a due visit, then immediately dispatch the
 finite helper command on a separate authorized placement with returned
@@ -297,6 +315,13 @@ whole PR. Use the task's **Send back with instructions** to record bounded,
 versioned direction. **Approve task** and ordinary **Reopen** cannot clear that
 hold, certify a defect fixed, or approve a redesign.
 
+**Direct and continue** accepts authenticated explicit direction even when cached evidence is
+missing or older than 30 minutes. Fleet keeps that evidence unchanged, records refresh-required
+intent, and obtains current metadata automatically before execution; there is no refresh-and-click-again
+loop. Heartbeat actions and execution still require fresh evidence. Ownership, grant, Stop,
+design/access holds and unsettled effects remain enforced. Intent and normal busy/offline queues
+survive same-database restart; a portable restore remains paused for operator reconciliation.
+
 **Manual supervisor control:** open the retained worker and send an ordinary prompt,
 or use the worker's **Resume** button. This works for legacy observation-only and paused
 registrations without Release or a separate unattended-publication grant, using the
@@ -306,7 +331,10 @@ Fleet atomically pauses maintenance and cancels only provably never-sent queued 
 accepted/in-flight work and unknown effects must first produce correlated receipts.
 Busy, stopping, offline, capacity, and checkout restrictions still apply.
 
-After the manual turn, maintenance **stays paused**. Registration, authorization
+Ongoing takeover keeps maintenance **paused** after the turn. For explicit **one-turn handback**,
+Fleet accepts missing/stale cache without treating it as fresh, then resumes only after the exact
+command receipt, correlated completed turn, worker quiescence and fresh effect reconciliation.
+Registration, authorization
 scope, pending design decisions, and execution/effect receipts remain intact.
 Manual direction is neither design approval, evidence of readiness, nor permission
 to renew unattended publication. Use explicit maintenance controls to resume the
@@ -356,7 +384,7 @@ by this change; the existing 50 MiB portable-backup limit still applies.
 
 ![PR maintenance human decision gate: local repairs use the retained worker; design changes or uncertainty pause the whole PR until a human records bounded instructions and explicitly resumes maintenance after rechecking authorization and binding.](../pr-maintenance-human-gate.png)
 
-_Design choices stay human: record direction, then explicitly resume maintenance._
+_Design choices stay human; Direct and continue records direction and queues its automatic refresh together._
 
 [Editable diagram source (HTML)](../pr-maintenance-flow.html) ·
 [Technical flow: MCP calls, stages and lifecycles (HTML)](../pr-maintenance-technical-flow.html).

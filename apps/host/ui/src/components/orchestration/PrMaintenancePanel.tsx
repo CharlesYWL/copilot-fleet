@@ -266,6 +266,11 @@ export function PrMaintenancePanel({
   const [renew, setRenew] = useState<PrMaintenanceRegistration>();
   const [releaseReason, setReleaseReason] = useState("");
   const [message, setMessage] = useState("");
+  const [routineWork, setRoutineWork] = useState("");
+  const pendingAction = useRef(false);
+  const routineRequest = useRef<
+    { recordId: string; direction: string; id: string } | undefined
+  >(undefined);
 
   useEffect(() => {
     let active = true;
@@ -278,6 +283,8 @@ export function PrMaintenancePanel({
       setConfirmed(false);
       setMessage("");
       setPrUrl("");
+      setRoutineWork("");
+      routineRequest.current = undefined;
       onChange(undefined);
     }
     void getTaskMaintenance(run.id)
@@ -312,7 +319,8 @@ export function PrMaintenancePanel({
     action: () => Promise<unknown>,
     successMessage = "Maintenance action recorded.",
   ) => {
-    if (busy || !view?.canAuthorize) return;
+    if (pendingAction.current || busy || !view?.canAuthorize) return;
+    pendingAction.current = true;
     setBusy(true);
     setError("");
     setMessage("");
@@ -329,6 +337,7 @@ export function PrMaintenancePanel({
       // A failed approval must be reviewed again, never silently replayed.
       setConfirmed(false);
     } finally {
+      pendingAction.current = false;
       setBusy(false);
     }
   };
@@ -610,6 +619,57 @@ export function PrMaintenancePanel({
               The pending design decisions still need explicit direction. In-flight or
               unknown effects must settle first.
             </p>
+            {current.authorization.scope.publicationAuthorized &&
+            current.lifecycle === "active" ? (
+              <>
+                <Field
+                  label="Routine work"
+                  hint="Use the same retained worker for code, tests, docs, CI, generated API reports or straightforward conflicts within the accepted intent. Only design changes need another decision. Metadata refreshes automatically."
+                >
+                  <Textarea
+                    rows={3}
+                    value={routineWork}
+                    disabled={
+                      busy || !view?.canAuthorize || current.decision?.state === "pending"
+                    }
+                    onChange={(_, data) => setRoutineWork(data.value)}
+                  />
+                </Field>
+                <Button
+                  disabled={
+                    busy ||
+                    !view?.canAuthorize ||
+                    !routineWork.trim() ||
+                    current.decision?.state === "pending"
+                  }
+                  onClick={() => {
+                    const direction = routineWork.trim();
+                    if (
+                      !routineRequest.current ||
+                      routineRequest.current.recordId !== current.id ||
+                      routineRequest.current.direction !== direction
+                    )
+                      routineRequest.current = {
+                        recordId: current.id,
+                        direction,
+                        id: crypto.randomUUID(),
+                      };
+                    const requestId = routineRequest.current.id;
+                    void execute(async () => {
+                      await actOnTaskMaintenance(run.id, current, {
+                        action: "work",
+                        requestId,
+                        direction,
+                      });
+                      setRoutineWork("");
+                      routineRequest.current = undefined;
+                    }, "Routine work queued on the retained worker; metadata will refresh automatically.");
+                  }}
+                >
+                  Queue routine work
+                </Button>
+              </>
+            ) : null}
             {current.manualControl && !current.manualControl.endedAt ? (
               <p role="status">
                 Manual supervisor control — unattended maintenance is paused. This is not

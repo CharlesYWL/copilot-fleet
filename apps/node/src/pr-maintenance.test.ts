@@ -1033,4 +1033,29 @@ describe("packaged maintenance resources", () => {
       expect(skill).toContain(phrase);
     }
   });
+
+  it("ships consistent manual freshness, routine scope and safe conflict contracts", () => {
+    const skill = readFileSync(join(assets, "SKILL.md"), "utf8");
+    const contract = readFileSync(join(assets, "helper-contract.md"), "utf8");
+    const ado = readFileSync(join(assets, "ado-contract.md"), "utf8");
+    for (const document of [skill, contract]) {
+      expect(document).toContain("refresh_required");
+      expect(document).toContain("operatorWorkSources");
+      expect(document).toContain("obsolete temporary restrictions");
+      expect(document).toContain("unrelated");
+      expect(document).toContain("conflictResolution:true");
+      expect(document).toContain("generated");
+    }
+    for (const document of [skill, contract, ado]) {
+      expect(document).toMatch(/never.*(?:merge the PR|PR completion)/i);
+      expect(document).toMatch(/ambiguous/);
+      expect(document).toMatch(/API.report.*(?:design|semantics)/i);
+    }
+    const prompt = withMaintenanceResources("wake", [
+      { name: "fleet", url: "http://localhost/mcp", headers: [] },
+    ]);
+    expect(prompt).toContain("operatorWorkSources");
+    expect(prompt).toContain("only genuine design changes or ambiguous intent");
+    expect(prompt).toContain("Never merge the PR");
+  });
 });

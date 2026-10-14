@@ -185,6 +185,14 @@ export function toHostObservation(result, input, attemptedAt = new Date().toISOS
       evidence: check.evidence,
     });
   }
+  if (observation.mergeability === "conflicting") {
+    observation.sources.push({
+      id: "merge-conflict",
+      revision: `${headSha}:${baseSha}`,
+      groupKey: "merge-conflict",
+      evidence: `${identity.url}; provider reports conflicting HEAD ${headSha} and base ${baseSha}. Preserve accepted semantics and user work; ambiguous conflict choices require a design decision.`,
+    });
+  }
   if (
     (reviewRule?.requiresStatusChecks && reviewRule.requiresStrictStatusChecks) ||
     snapshot.rules.some(

@@ -1,5 +1,5 @@
 import Fastify from "fastify";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -37,6 +37,7 @@ const { fixtureInput, observeFixture } = await import(fixtureUrl.href);
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const close of cleanup.splice(0)) await close();
+  vi.useRealTimers();
 });
 
 async function setup(provider: "github" | "azure-devops" = "github", dbPath?: string) {
@@ -220,23 +221,25 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
 }
 
 describe("authenticated PR maintenance controls", () => {
-  async function continuationFixture(dbPath?: string) {
+  async function continuationFixture(dbPath?: string, cachedEvidence = true) {
     const f = await setup("github", dbPath);
     const held = f.hold();
-    const record = f.store.prMaintenance.checkpoint(f.leadId, held.id, held.version, {
-      kind: "observation",
-      observation: {
-        attemptedAt: new Date().toISOString(),
-        complete: true,
-        identity: held.identity,
-        headSha: "a".repeat(40),
-        baseSha: "b".repeat(40),
-        state: "open",
-        snapshotId: "current",
-        fingerprint: "current",
-        evidence: "Complete fixture provider observation",
-      },
-    });
+    const record = cachedEvidence
+      ? f.store.prMaintenance.checkpoint(f.leadId, held.id, held.version, {
+          kind: "observation",
+          observation: {
+            attemptedAt: new Date().toISOString(),
+            complete: true,
+            identity: held.identity,
+            headSha: "a".repeat(40),
+            baseSha: "b".repeat(40),
+            state: "open",
+            snapshotId: "current",
+            fingerprint: "current",
+            evidence: "Complete fixture provider observation",
+          },
+        })
+      : held;
     const payload = {
       approved: false,
       note: "Keep the existing contract; repair and verify within the existing grant.",
@@ -257,6 +260,111 @@ describe("authenticated PR maintenance controls", () => {
       });
     return { ...f, record, payload, review };
   }
+
+  it("accepts Direct and continue at the exact observed stale age without making heartbeat evidence fresh", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-10-13T20:37:34.401Z");
+    const f = await continuationFixture();
+    vi.setSystemTime("2026-10-13T21:10:03.953Z");
+    expect(
+      Date.now() -
+        Date.parse(f.record.observationHostAt ?? f.record.observation!.attemptedAt),
+    ).toBe(1_949_552);
+
+    const response = await f.review();
+    expect(response.statusCode, response.body).toBe(202);
+    const accepted = f.store.prMaintenance.get(f.record.id)!;
+    expect(accepted.observation).toEqual(f.record.observation);
+    expect(accepted.observationHostAt).toBe(f.record.observationHostAt);
+    expect(accepted.authorization).toEqual(f.record.authorization);
+    expect(accepted.counters).toEqual(f.record.counters);
+    expect(accepted.renewedAt).toBe(f.record.renewedAt);
+    expect(accepted.continuation).toMatchObject({
+      state: "checking",
+      evidenceState: "refresh_required",
+      operatorId: "real-browser-principal",
+    });
+    expect(f.store.prMaintenance.pendingContinuationWakes()).toHaveLength(1);
+    expect(() =>
+      f.store.prMaintenance.checkpoint(f.leadId, accepted.id, accepted.version, {
+        kind: "prepare_batch",
+        batch: {
+          id: "unattended-stale-batch",
+          kind: "repair",
+          headSha: "a".repeat(40),
+          sources: [
+            { id: "thread", revision: "1", groupKey: "bug", evidence: "fixture" },
+          ],
+          prompt: "Repair within the accepted design",
+          scope: "Keep the existing contract",
+          reservedMutations: 1,
+        },
+      }),
+    ).toThrow(/fresh|stale|current/i);
+  });
+
+  it("accepts authenticated continuation with no cached provider observation", async () => {
+    const f = await continuationFixture(undefined, false);
+    expect(f.record.observation).toBeUndefined();
+    const response = await f.review();
+    expect(response.statusCode, response.body).toBe(202);
+    const saved = f.store.prMaintenance.get(f.record.id)!;
+    expect(saved.observation).toBeUndefined();
+    expect(saved.continuation).toMatchObject({
+      state: "checking",
+      evidenceState: "refresh_required",
+      headSha: f.record.decision!.headSha,
+    });
+    expect(f.store.prMaintenance.pendingContinuationWakes()).toHaveLength(1);
+  });
+
+  it("queues an authenticated routine work item without provider feedback, renewal or another design decision", async () => {
+    const f = await setup();
+    const enabled = await f.authorize();
+    expect(enabled.statusCode, enabled.body).toBe(200);
+    const before = f.store.prMaintenance.list({ taskId: f.run.id }).records[0]!;
+    const requestId = randomUUID();
+    const direction =
+      "Regenerate the API report from the accepted implementation; preserve public API semantics.";
+    const payload = {
+      action: "update",
+      recordId: before.id,
+      expectedVersion: before.version,
+      operation: { action: "work", requestId, direction },
+    };
+    const send = (headers: Record<string, string> = { "fixture-browser": "yes" }) =>
+      f.app.inject({
+        method: "POST",
+        url: `/api/runs/${f.run.id}/pr-maintenance`,
+        headers,
+        payload,
+      });
+    const response = await send();
+    expect(response.statusCode, response.body).toBe(202);
+    const accepted = f.store.prMaintenance.get(before.id)!;
+    expect(accepted).toMatchObject({
+      workerSessionId: f.worker.id,
+      generation: before.generation,
+      authorization: before.authorization,
+      counters: before.counters,
+      renewedAt: before.renewedAt,
+      workRequests: [
+        {
+          id: requestId,
+          direction,
+          operatorId: "real-browser-principal",
+          state: "pending",
+        },
+      ],
+      continuation: { state: "checking", evidenceState: "refresh_required" },
+    });
+    expect(accepted.decision).toBeUndefined();
+    expect((await send()).statusCode).toBe(202);
+    expect(f.store.prMaintenance.get(before.id)).toEqual(accepted);
+    expect(f.store.prMaintenance.pendingContinuationWakes()).toHaveLength(1);
+    expect((await send({ "fixture-node": "yes" })).statusCode).toBe(403);
+    expect(f.store.prMaintenance.get(before.id)).toEqual(accepted);
+  });
 
   it("atomically persists authenticated direction and bounded continuation across restart without renewing authority", async () => {
     const directory = mkdtempSync(join(tmpdir(), "fleet-continuation-"));
@@ -1045,6 +1153,148 @@ describe("authenticated PR maintenance controls", () => {
       delivery!.delivery.deliveryId,
     );
     expect(store.commands.prompt(delivery!.delivery.deliveryId)?.state).toBe("settled");
+  });
+
+  it.each([
+    { provider: "github", state: "released-review" },
+    { provider: "azure-devops", state: "released-review" },
+    { provider: "github", state: "completed" },
+    { provider: "azure-devops", state: "completed" },
+  ] as const)(
+    "prepares unapproved maintenance for a $provider $state task without accepting it or reviving a released grant",
+    async ({ provider, state }) => {
+      const { app, store, service, run, worker, registration, hold, mcp } =
+        await setup(provider);
+      if (state === "released-review") {
+        const held = hold();
+        const release = await app.inject({
+          method: "POST",
+          url: `/api/runs/${run.id}/pr-maintenance`,
+          headers: { "fixture-browser": "yes" },
+          payload: {
+            action: "update",
+            recordId: held.id,
+            expectedVersion: held.version,
+            operation: {
+              action: "release",
+              reason: "Withdraw this maintenance question; prepare a new bounded grant.",
+              decisionId: held.decision!.id,
+              decisionVersion: held.decision!.version,
+            },
+          },
+        });
+        expect(release.statusCode, release.body).toBe(200);
+        expect(store.prMaintenance.get(held.id)).toMatchObject({
+          ownershipReleasedAt: expect.any(String),
+          decision: { state: "withdrawn" },
+          batches: [],
+          actions: [],
+        });
+        expect(store.getRun(run.id)?.state).toBe("awaiting_human");
+      } else {
+        store.setRunState(run.id, "completed");
+      }
+      const beforeTask = store.getRun(run.id)!;
+      const beforeNotes = store.listRunNotes(run.id);
+      const beforeRecords = store.prMaintenance.list({ taskId: run.id }).records;
+      const sessionCount = store.listSessions().length;
+      const dispatch = vi.spyOn(service, "dispatch");
+      const request = await app.inject({
+        method: "POST",
+        url: `/api/runs/${run.id}/pr-maintenance`,
+        headers: { "fixture-browser": "yes" },
+        payload: { action: "prepare", prUrl: prMaintenanceUrl(registration.identity) },
+      });
+      expect(request.statusCode, request.body).toBe(202);
+      const prepared = await mcp("fleet_prepare_pr_maintenance", {
+        taskId: run.id,
+        workerSessionId: worker.id,
+        prUrl: prMaintenanceUrl(registration.identity),
+        identity: registration.identity,
+        headSha: registration.headSha,
+        observedAt: new Date().toISOString(),
+        method: "provider_mcp",
+        evidence: "Isolated fresh open, mergeable PR with exact source and target refs.",
+        publicationEvidence:
+          "Existing writing intent permits normal source-branch pushes.",
+        verification: registration.scope.verification,
+        eligibilityEvidence: registration.eligibilityEvidence,
+      });
+      expect(prepared.ok, prepared.text).toBe(true);
+      expect(JSON.parse(prepared.text)).toMatchObject({
+        taskId: run.id,
+        status: "awaiting_operator_authorization",
+      });
+      const proposal = store.prMaintenance.getProposal(run.id)!;
+      expect(proposal.registration.workerSessionId).toBe(worker.id);
+      expect(proposal.reauthorization).toBeUndefined();
+      expect(store.prMaintenance.list({ taskId: run.id }).records).toEqual(beforeRecords);
+      expect(
+        store.prMaintenance.list({ taskId: run.id, retainedOnly: true }).records,
+      ).toEqual([]);
+      expect(store.getRun(run.id)).toEqual(beforeTask);
+      expect(store.listRunNotes(run.id)).toEqual(beforeNotes);
+      expect(store.listSessions()).toHaveLength(sessionCount);
+      expect(
+        dispatch.mock.calls.filter(
+          ([, message]) => message.type === "prompt" && message.sessionId === worker.id,
+        ),
+      ).toEqual([]);
+      expect(
+        store.prMaintenance.admission({
+          action: "dispatch",
+          taskId: run.id,
+          sessionId: worker.id,
+          recordId: proposal.id,
+          generation: 1,
+          batchId: "unapproved",
+        }).allowed,
+      ).toBe(false);
+    },
+  );
+
+  it("keeps an unresolved independent design review held across unapproved preparation and separate human authorization", async () => {
+    const { app, store, service, run, registration, mcp } = await setup();
+    service.requestRunReview({
+      runId: run.id,
+      reason: "blocked",
+      note: "Choose the public response schema; no implementation choice is authorized.",
+    });
+    const beforeTask = store.getRun(run.id)!;
+    const beforeNotes = store.listRunNotes(run.id);
+    const dispatch = vi.spyOn(service, "dispatch");
+    const prepared = await mcp("fleet_prepare_pr_maintenance", {
+      taskId: run.id,
+      prUrl: prMaintenanceUrl(registration.identity),
+      identity: registration.identity,
+      headSha: registration.headSha,
+      observedAt: new Date().toISOString(),
+      method: "provider_mcp",
+      evidence: "Current fixture PR metadata, not a design decision.",
+      publicationEvidence: "Existing task publication path, not new API authority.",
+      verification: registration.scope.verification,
+      eligibilityEvidence: registration.eligibilityEvidence,
+    });
+    expect(prepared.ok, prepared.text).toBe(true);
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    const authorized = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload: {
+        action: "authorize_proposal",
+        proposalId: proposal.id,
+        expectedVersion: proposal.version,
+      },
+    });
+    expect(authorized.statusCode, authorized.body).toBe(200);
+    expect(authorized.json()).toMatchObject({
+      lifecycle: "paused",
+      pauseReason: "task_human_hold",
+    });
+    expect(store.getRun(run.id)).toEqual(beforeTask);
+    expect(store.listRunNotes(run.id).slice(0, beforeNotes.length)).toEqual(beforeNotes);
+    expect(dispatch).not.toHaveBeenCalled();
   });
 
   it.each(["github", "azure-devops"] as const)(

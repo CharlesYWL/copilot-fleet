@@ -661,10 +661,12 @@ export const OrchestratorTaskDetail = ({
                     label="Continue already-authorized work after recording this direction"
                   />
                   <p>
-                    This queues fresh checks using the same worker and grant, without
-                    resetting budgets. Independent Stop, access holds and ongoing manual
-                    takeover are not cleared. If a hold prevents continuation, neither
-                    direction nor continuation is saved.
+                    This accepts your direction even if cached PR evidence is missing or
+                    expired, and refreshes metadata automatically using the same worker
+                    and grant. No refresh-and-click-again step or budget reset is needed.
+                    Independent Stop, access holds and ongoing manual takeover are not
+                    cleared. If a hold prevents continuation, neither direction nor
+                    continuation is saved.
                   </p>
                   {maintenanceHold &&
                   maintenance?.effectiveStates?.[maintenanceHold.id] ? (

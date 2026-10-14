@@ -49,6 +49,43 @@ const complete = (value: unknown = snapshot()) => ({
 });
 
 describe("GitHub helper to durable Host observation", () => {
+  it("offers an exact-HEAD/base conflict source without claiming readiness or human authority", () => {
+    const value = { ...snapshot(), mergeable: "CONFLICTING" };
+    const observation = PrMaintenanceObservationSchema.parse(
+      toHostObservation(complete(value), {}),
+    );
+    expect(observation).toMatchObject({
+      complete: true,
+      mergeability: "conflicting",
+      headSha: value.headSha,
+      baseSha: value.baseSha,
+    });
+    expect(observation.sources).toContainEqual({
+      id: "merge-conflict",
+      revision: `${value.headSha}:${value.baseSha}`,
+      groupKey: "merge-conflict",
+      evidence: expect.stringContaining("ambiguous"),
+    });
+    expect(
+      observation.sources.some((entry) => entry.id.startsWith("operator-work:")),
+    ).toBe(false);
+    expect(toHostObservation(complete(), {}).sources).not.toContainEqual(
+      expect.objectContaining({ id: "merge-conflict" }),
+    );
+    expect(
+      toHostObservation(
+        {
+          complete: false,
+          requestsConsumed: 1,
+          elapsedMs: 1,
+          progress: { phase: "failed", pages: 0, verifiedPages: 0, cursor: null },
+          error: { code: "request_failed", message: "No complete read" },
+        },
+        {},
+      ).sources,
+    ).toEqual([]);
+  });
+
   it("preserves draft state rather than implying a ready PR", () => {
     expect(
       toHostObservation(complete({ ...snapshot(), isDraft: true }), {}),
