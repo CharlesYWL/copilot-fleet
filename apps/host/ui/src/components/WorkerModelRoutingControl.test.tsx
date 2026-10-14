@@ -167,6 +167,21 @@ const group = (index: number) =>
   screen.getByRole("group", { name: `Decision model ${index}` });
 
 describe("worker routing settings dialog", () => {
+  it("lays out add actions as separate, left-aligned rows in empty tabs", async () => {
+    saved = { ...saved, providers: [], profiles: [] };
+    await show([]);
+    const model = screen.getByRole("button", { name: "Add decision model" });
+    expect(getComputedStyle(model.parentElement!).display).toBe("grid");
+    expect(getComputedStyle(model).justifySelf).toBe("start");
+    expect(screen.getByText(/No decision models yet/)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Worker profiles" }));
+    const profile = screen.getByRole("button", { name: "Add worker profile" });
+    expect(getComputedStyle(profile.parentElement!).display).toBe("grid");
+    expect(getComputedStyle(profile).justifySelf).toBe("start");
+    expect(screen.getByText(/No profiles yet/)).toBeDefined();
+  });
+
   it("requires a connection test for Route, clears a tested password, and saves without echoing it", async () => {
     await show();
     const mode = screen.getByRole("combobox", { name: "Routing mode" });

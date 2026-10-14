@@ -114,6 +114,7 @@ const useStyles = makeStyles({
     "@media (max-width: 600px)": { gridTemplateColumns: "minmax(0, 1fr)" },
   },
   list: { display: "grid", gap: "12px", padding: 0, margin: 0, listStyleType: "none" },
+  addAction: { justifySelf: "start" },
   editor: {
     minWidth: 0,
     margin: 0,
@@ -599,7 +600,7 @@ export function WorkerModelRoutingControl({
                     </Tab>
                   </TabList>
                   {tab === "providers" ? (
-                    <div>
+                    <div className={styles.list}>
                       <Text>
                         Try tested models in this order. Add a row for each deployment or
                         model, including models on the same provider. A slow primary
@@ -887,6 +888,8 @@ export function WorkerModelRoutingControl({
                         </Text>
                       ) : null}
                       <Button
+                        appearance="primary"
+                        className={styles.addAction}
                         disabled={Boolean(busy) || draft.providers.length >= 8}
                         onClick={() =>
                           setDraft({
@@ -914,7 +917,7 @@ export function WorkerModelRoutingControl({
                     </div>
                   ) : null}
                   {tab === "profiles" ? (
-                    <div>
+                    <div className={styles.list}>
                       <Text>
                         A profile fixes the worker&apos;s Copilot model and effort.
                         Automatic routing uses the checked categories; an explicit profile
@@ -1166,6 +1169,8 @@ export function WorkerModelRoutingControl({
                         </Text>
                       ) : null}
                       <Button
+                        appearance="primary"
+                        className={styles.addAction}
                         disabled={Boolean(busy) || draft.profiles.length >= 20}
                         onClick={addProfile}
                       >
