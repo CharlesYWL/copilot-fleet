@@ -25,6 +25,7 @@ import { orchestratorRoutes } from "./orchestrators.js";
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const close of cleanup.splice(0)) await close();
+  vi.useRealTimers();
 });
 const headSha = "a".repeat(40);
 const source = { id: "thread", revision: "1", groupKey: "bug", evidence: "fixture" };
@@ -443,6 +444,33 @@ describe("trusted supervisor session handoff", () => {
       },
     });
   }
+
+  it.each(["stale", "missing"] as const)(
+    "accepts a real operator one-turn continuation with %s cached evidence",
+    async (evidence) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime("2026-10-13T20:37:34.401Z");
+      const f = await setup("password", true);
+      if (evidence === "stale") observeHandback(f);
+      vi.setSystemTime("2026-10-13T21:10:03.953Z");
+      const before = f.store.prMaintenance.get(f.record.id)!;
+      const response = await f.command("prompt", {
+        prompt: "Regenerate the API report from the accepted code, then hand back.",
+        handback: "after_turn",
+        operationId: randomUUID(),
+      });
+      expect(response.statusCode, response.body).toBe(202);
+      const accepted = f.store.prMaintenance.get(f.record.id)!;
+      expect(accepted.observation).toEqual(before.observation);
+      expect(accepted.authorization).toEqual(before.authorization);
+      expect(accepted.continuation).toMatchObject({
+        state: "handback",
+        evidenceState: "refresh_required",
+        operatorId: expect.any(String),
+      });
+      expect(f.sent.filter((entry) => entry.type === "prompt")).toHaveLength(1);
+    },
+  );
 
   it("hands back only the selected completed turn after quiescence and fresh reconciliation, without renewing its grant", async () => {
     const f = await setup("password", true);

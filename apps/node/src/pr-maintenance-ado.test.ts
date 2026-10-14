@@ -687,6 +687,21 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
       expect(result.observation.mergeability).toBe(
         mergeStatus === "conflicts" ? "conflicting" : "unknown",
       );
+      const conflicts = result.observation.sources.filter(
+        (entry: { id: string }) => entry.id === "merge-conflict",
+      );
+      expect(conflicts).toEqual(
+        mergeStatus === "conflicts"
+          ? [
+              {
+                id: "merge-conflict",
+                revision: `${result.observation.headSha}:${result.observation.baseSha}`,
+                groupKey: "merge-conflict",
+                evidence: expect.stringContaining("ambiguous"),
+              },
+            ]
+          : [],
+      );
     },
   );
 

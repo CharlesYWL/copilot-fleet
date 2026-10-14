@@ -15,6 +15,7 @@ import {
   parsePrMaintenanceUrl,
   prMaintenanceProviderLabel,
   prMaintenanceProgress,
+  prMaintenanceWorkSources,
   prMaintenanceUrl,
   type PrMaintenanceAdmission,
   checkoutLockKey,
@@ -1238,6 +1239,7 @@ export class FleetTools {
         }
         return {
           ...record,
+          operatorWorkSources: prMaintenanceWorkSources(record),
           effectiveState: registry.effectiveState(record),
           serverTime: new Date().toISOString(),
         };
@@ -1277,7 +1279,11 @@ export class FleetTools {
           );
           return {
             serverTime: new Date().toISOString(),
-            record: { ...record, effectiveState: registry.effectiveState(record) },
+            record: {
+              ...record,
+              operatorWorkSources: prMaintenanceWorkSources(record),
+              effectiveState: registry.effectiveState(record),
+            },
             observationAllowance: {
               requests,
               milliseconds: allowance.milliseconds,

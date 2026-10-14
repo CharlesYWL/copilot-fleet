@@ -10,6 +10,7 @@ import {
   commandDigestPayload,
   nextHeartbeat,
   prMaintenanceObservationFresh,
+  prMaintenanceSources,
   prMaintenanceProviderKey,
   isWritingCategory,
   terminalRunStepStates,
@@ -426,8 +427,11 @@ export class PrMaintenanceStore {
       if (bindingReason)
         refuse(bindingReason, "This worker binding cannot be proposed for maintenance.");
       if (
-        !["running", "awaiting_lead", "completed"].includes(task.state) ||
+        !["running", "awaiting_lead", "awaiting_human", "completed"].includes(
+          task.state,
+        ) ||
         worker.stopRequested ||
+        this.hasPendingManualExecution(worker.id) ||
         !(
           worker.state === "idle" ||
           (["completed", "stopped"].includes(worker.state) && worker.agentSessionId)
@@ -442,7 +446,7 @@ export class PrMaintenanceStore {
       )
         refuse(
           "proposal_not_ready",
-          "Settle existing work and task approvals before proposing maintenance.",
+          "Settle existing worker execution before proposing maintenance; preparation does not approve the task or authorize repairs.",
         );
       const previous = this.getProposal(task.id, leadSessionId);
       if (
@@ -974,6 +978,7 @@ export class PrMaintenanceStore {
         incidentCursor: 0,
         incidents: [],
         decisionHistory: [],
+        workRequests: [],
         batches: [],
         findings: [],
         findingAttempts: [],
@@ -1020,6 +1025,25 @@ export class PrMaintenanceStore {
       record.continuation.state = "cancelled";
       record.continuation.reason = reason;
       record.continuation.settledAt = at;
+    }
+    if (
+      (origin.actor === "operator" && reason !== "manual_control") ||
+      [
+        "stopped",
+        "continuation_identity_changed",
+        "remote_identity_changed",
+        "terminal_cancellation_requested",
+      ].includes(reason) ||
+      this.store.getSession(record.workerSessionId)?.stopRequested ||
+      this.store.getSession(record.leadSessionId)?.stopRequested ||
+      this.store.getRun(record.taskId)?.state === "cancelled"
+    ) {
+      for (const request of record.workRequests) {
+        if (request.state !== "pending") continue;
+        request.state = "cancelled";
+        request.settledAt = at;
+        request.reason = reason;
+      }
     }
     if (record.lifecycle === "active") {
       record.lifecycle = "paused";
@@ -1657,6 +1681,7 @@ export class PrMaintenanceStore {
   private assertEligibleContinuation(
     record: PrMaintenanceRegistration,
     manual = false,
+    queuedWork = false,
   ): void {
     this.assertNoPendingPermission(record);
     const task = this.store.getRun(record.taskId);
@@ -1671,22 +1696,6 @@ export class PrMaintenanceStore {
         "repair_authorization_required",
         "Repair authorization is required; continuation grants no permissions.",
       );
-    if (
-      !record.observation?.complete ||
-      !record.lastAttempt?.complete ||
-      record.lastAttempt.failure ||
-      record.observation.state !== "open" ||
-      record.observation.headSha !== record.lastAttempt.headSha ||
-      !prMaintenanceObservationFresh(
-        record.observation,
-        Date.now(),
-        record.observationHostAt,
-      )
-    )
-      refuse(
-        "stale_observation",
-        "Read the current PR HEAD before consenting to continuation.",
-      );
     if (worker?.stopRequested || lead?.stopRequested || task?.state === "cancelled")
       refuse(
         "stopped",
@@ -1696,9 +1705,8 @@ export class PrMaintenanceStore {
       refuse("dismissed", "Restore the retained session before requesting continuation.");
     if (
       task &&
-      ["awaiting_approval", "blocked", "failed", "completed", "aggregating"].includes(
-        task.state,
-      )
+      (["awaiting_approval", "blocked", "failed", "aggregating"].includes(task.state) ||
+        (task.state === "completed" && !queuedWork))
     )
       refuse(
         "task_not_eligible",
@@ -1728,7 +1736,17 @@ export class PrMaintenanceStore {
         "independent_hold",
         "Reconcile the recorded access, identity or effect incident first.",
       );
-    if (prMaintenanceUnsettled(record))
+    if (
+      queuedWork
+        ? record.actions.some((effect) => effect.state === "uncertain") ||
+          record.batches.some(
+            (batch) =>
+              ["uncertain", "reconciling"].includes(batch.state) ||
+              batch.effects.some((effect) => effect.state === "uncertain") ||
+              (batch.stepId && !batch.executionSettled && !outstanding.has(batch.state)),
+          )
+        : prMaintenanceUnsettled(record)
+    )
       refuse(
         "unsettled",
         "Reconcile existing execution and effects before requesting continuation.",
@@ -1768,8 +1786,10 @@ export class PrMaintenanceStore {
     at: string,
     manualCommandId?: string,
   ): void {
-    const headSha = record.observation?.headSha;
-    if (!headSha) refuse("stale_observation", "A pinned PR HEAD is required.");
+    const headSha =
+      record.observation?.headSha ??
+      record.decision?.headSha ??
+      record.authorization.headSha;
     if (record.continuation)
       (record.continuationHistory ??= []).push(record.continuation);
     record.continuation = {
@@ -1779,6 +1799,7 @@ export class PrMaintenanceStore {
       expectedVersion: record.version,
       authorityHash: this.authorityHash(record),
       headSha,
+      evidenceState: "refresh_required",
       state: manualCommandId ? "handback" : "checking",
       ...(manualCommandId ? { manualCommandId } : {}),
     };
@@ -1801,7 +1822,8 @@ export class PrMaintenanceStore {
     return Boolean(
       pinned &&
       (intent.authorityHash !== this.authorityHash(record) ||
-        intent.headSha !== record.observation?.headSha ||
+        (intent.evidenceState === "pinned" &&
+          intent.headSha !== record.observation?.headSha) ||
         this.binding(record)),
     );
   }
@@ -1862,6 +1884,8 @@ export class PrMaintenanceStore {
           true,
         );
         intent.state = "checking";
+        intent.headSha = record.observation.headSha!;
+        intent.evidenceState = "refresh_required";
         delete intent.wakeQueuedAt;
         // Reobserve after the manual turn, not merely after it was requested.
         intent.requestedAt = nowIso();
@@ -2171,6 +2195,20 @@ export class PrMaintenanceStore {
       PrMaintenanceOperatorActionSchema.parse(input);
     const operatorId = actorSchema.parse(actorId);
     return this.store.writeAtomically(() => {
+      if (action.action === "work") {
+        const existing = this.required(id);
+        const prior = existing.workRequests.find(
+          (request) => request.id === action.requestId,
+        );
+        if (prior) {
+          if (prior.operatorId !== operatorId || prior.direction !== action.direction)
+            refuse(
+              "work_conflict",
+              "This request key already identifies different operator work.",
+            );
+          return existing;
+        }
+      }
       const record = this.required(id, undefined, expectedVersion);
       if (record.ownershipReleasedAt)
         refuse("released", "Released maintenance needs explicit new enablement.");
@@ -2220,6 +2258,34 @@ export class PrMaintenanceStore {
         });
         record.ownershipReleasedAt = now;
         record.retentionReleasedBy = operatorId;
+      } else if (action.action === "work") {
+        if (
+          record.lifecycle !== "active" ||
+          (record.manualControl && !record.manualControl.endedAt)
+        )
+          refuse(
+            "independent_hold",
+            "Resume the independent hold or complete manual handback before queuing routine work.",
+          );
+        if (record.decision?.state === "pending")
+          refuse(
+            "wait_for_human",
+            "Direction for the exact pending design decision is required.",
+          );
+        this.assertEligibleContinuation(record, false, true);
+        if (record.workRequests.length >= 100)
+          refuse("work_queue_full", "The retained operator work history is full.");
+        record.workRequests.push({
+          id: action.requestId,
+          operatorId,
+          direction: action.direction,
+          createdAt: now,
+          state: "pending",
+        });
+        if (!prMaintenanceUnsettled(record) && record.continuation?.state !== "checking")
+          this.requestContinuation(record, operatorId, now);
+        delete record.readyFingerprint;
+        record.nextCheckAt = now;
       } else if (action.action === "renew") {
         if (prMaintenanceUnsettled(record))
           refuse(
@@ -2265,8 +2331,10 @@ export class PrMaintenanceStore {
           if (
             action.continueEligible &&
             (record.decision?.state !== "pending" ||
-              record.decision.headSha !== record.observation?.headSha ||
-              record.decision.headSha !== record.lastAttempt?.headSha)
+              (record.observation?.headSha &&
+                record.decision.headSha !== record.observation.headSha) ||
+              (record.lastAttempt?.headSha &&
+                record.decision.headSha !== record.lastAttempt.headSha))
           )
             refuse(
               "decision_conflict",
@@ -2536,6 +2604,11 @@ export class PrMaintenanceStore {
       )
         return denied("unsettled");
       if (
+        ["approve", "advance", "submit", "aggregate"].includes(action.action) &&
+        record.workRequests.some((request) => request.state === "pending")
+      )
+        return denied("pending_operator_work");
+      if (
         ["dispatch", "execute", "prompt", "resume", "publish"].includes(action.action)
       ) {
         if (!record.authorization.scope.publicationAuthorized)
@@ -2579,10 +2652,13 @@ export class PrMaintenanceStore {
           return denied("observation_incomplete");
         if (!record.observation?.complete || batch.headSha !== record.observation.headSha)
           return denied("stale_observation");
+        if (batch.baseSha && batch.baseSha !== record.observation.baseSha)
+          return denied("stale_base");
         if (
           record.continuation?.state === "checking" &&
-          (record.observationHostAt ?? record.observation.attemptedAt) <
-            record.continuation.requestedAt
+          (record.continuation.evidenceState !== "pinned" ||
+            (record.observationHostAt ?? record.observation.attemptedAt) <
+              record.continuation.requestedAt)
         )
           return denied("fresh_observation_required");
         if (
@@ -2599,7 +2675,14 @@ export class PrMaintenanceStore {
         )
           return denied("stale_observation");
         if (record.observation.draft) return denied("draft");
-        if (record.observation.mergeability === "conflicting")
+        if (
+          record.observation.mergeability === "conflicting" &&
+          !(
+            batch.kind === "repair" &&
+            batch.conflictResolution &&
+            batch.baseSha === record.observation.baseSha
+          )
+        )
           return denied("merge_conflict");
         if (record.incidents.some((incident) => !incident.resolvedAt))
           return denied("observation_recovery_required");
@@ -2786,6 +2869,8 @@ export class PrMaintenanceStore {
             "kind",
             "sources",
             "headSha",
+            "baseSha",
+            "conflictResolution",
             "prompt",
             "scope",
             "reservedMutations",
@@ -2829,12 +2914,24 @@ export class PrMaintenanceStore {
           );
         if (
           record.observation.draft ||
-          record.observation.mergeability === "conflicting" ||
+          (record.observation.mergeability === "conflicting" &&
+            !prepared.conflictResolution) ||
           record.incidents.some((incident) => !incident.resolvedAt)
         )
           refuse(
             "observation_blocked",
-            "Drafts, merge conflicts and unresolved observation incidents cannot admit repair or publication.",
+            "Drafts, merge conflicts without an exact planned repair, and unresolved observation incidents cannot admit repair or publication.",
+          );
+        if (
+          (prepared.baseSha && prepared.baseSha !== record.observation.baseSha) ||
+          (prepared.conflictResolution &&
+            (prepared.kind !== "repair" ||
+              !prepared.baseSha ||
+              prepared.baseSha !== record.observation.baseSha))
+        )
+          refuse(
+            "stale_base",
+            "Routine conflict repair requires the exact observed base and HEAD in a repair batch.",
           );
         const keys = new Set<string>();
         for (const source of prepared.sources) {
@@ -2846,16 +2943,17 @@ export class PrMaintenanceStore {
             );
           keys.add(key);
           if (
-            !record.observation.sources.some(
+            !prMaintenanceSources(record).some(
               (entry) =>
                 entry.id === source.id &&
                 entry.revision === source.revision &&
+                entry.groupKey === source.groupKey &&
                 entry.evidence === source.evidence,
             )
           )
             refuse(
               "source_mismatch",
-              "Batch sources must come from the current complete observation.",
+              "Batch sources must match current provider evidence or pending authenticated operator work.",
             );
           const finding = record.findings.find(
             (entry) =>
@@ -2905,6 +3003,9 @@ export class PrMaintenanceStore {
           !record.authorization.scope.publicationAuthorized ||
           record.lifecycle !== "active" ||
           record.decision?.state === "pending" ||
+          (record.continuation?.state === "checking" &&
+            record.continuation.evidenceState !== "pinned") ||
+          record.workRequests.some((request) => request.state === "pending") ||
           prMaintenanceUnsettled(record) ||
           !record.observation?.complete ||
           !record.lastAttempt?.complete ||
@@ -3321,8 +3422,21 @@ export class PrMaintenanceStore {
       record.observationHostAt = hostAttemptedAt;
     else delete record.observationHostAt;
     record.lastSuccessAt = hostAttemptedAt;
+    if (
+      record.continuation?.state === "checking" &&
+      record.continuation.evidenceState === "refresh_required" &&
+      hostAttemptedAt >= record.continuation.requestedAt &&
+      observation.state === "open"
+    ) {
+      record.continuation.headSha = observation.headSha!;
+      record.continuation.evidenceState = "pinned";
+    }
     for (const batch of record.batches) {
-      if (this.neverDispatched(record, batch) && batch.headSha !== observation.headSha)
+      if (
+        this.neverDispatched(record, batch) &&
+        (batch.headSha !== observation.headSha ||
+          (batch.baseSha && batch.baseSha !== observation.baseSha))
+      )
         this.settleBatch(
           record,
           {
@@ -3677,6 +3791,19 @@ export class PrMaintenanceStore {
       );
       if (index < 0) record.findings.push(disposition);
       else record.findings[index] = disposition;
+      if (final && ["addressed", "already_satisfied"].includes(finding.outcome)) {
+        const request = record.workRequests.find(
+          (entry) =>
+            entry.state === "pending" &&
+            finding.source.id === `operator-work:${entry.id}` &&
+            finding.source.revision === entry.id,
+        );
+        if (request) {
+          request.state = "completed";
+          request.batchId = batch.id;
+          request.settledAt = nowIso();
+        }
+      }
     }
     if (update.findings.some((finding) => finding.outcome === "needs_human"))
       this.pause(record, "finding_needs_human");
@@ -3719,6 +3846,11 @@ export class PrMaintenanceStore {
       delete record.readyFingerprint;
       record.nextCheckAt = nowIso();
     }
+    const pendingWork = record.workRequests.find(
+      (request) => request.state === "pending",
+    );
+    if (final && pendingWork && record.lifecycle === "active")
+      this.requestContinuation(record, pendingWork.operatorId, nowIso());
   }
 
   private validateEffects(effects: PrMaintenanceEffect[]): void {
