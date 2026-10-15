@@ -17,7 +17,7 @@ tags:
 **Driver / Approver**: Charles Yin, repository owner; an AI review is advisory<br>
 **Contributors / Informed**: Fleet maintainers and future standalone-skill users<br>
 **Status**: Amended after independent review; implementation and public release not approved<br>
-**Created / Last updated**: 2026-09-21<br>
+**Created / Last updated**: 2026-09-21 / 2026-10-14 (Appendix D, prior-art and tooling notes)<br>
 **Amendment**: Review response to the initial design at `39735164c11bd843fa79ebe2f30ac2599e01fad8`; dispositions in Appendix C<br>
 **Impact**: High: cross-runtime state, authority, and recovery semantics; no Fleet DB migration proposed<br>
 **Decision deadline**: Not set<br>
@@ -62,6 +62,12 @@ protocol limit bounds `helperState`, not an entire observation.
 Detailed decisions and remaining evidence gates are in
 [Tracking open questions](#tracking-open-questions). Prototype IDs are PT1-PT3;
 execution phases retain P0-P5.
+
+**Later proposal (2026-10-14, unreviewed):** [Appendix D](#appendix-d---hybrid-runtime-binding-proposal)
+records a hybrid binding in which both runtimes share a work-order/work-report
+contract, so Fleet keeps dispatching to the same retained worker and standalone
+agents can resume their original session. It raises Q8-Q10 and does not change
+the decisions above.
 
 ## Related documents
 
@@ -161,6 +167,10 @@ stable IDs, versions, expected behaviors, and release thresholds. Add extraction
 cases; do not meet a count floor by silently dropping/replacing a baseline case.
 Any necessary changed expectation requires an explicit reviewed disposition.
 Run three repetitions per advertised agent/model/profile configuration.
+Keep the existing `eval-scenarios.json` and `eval-harness.mjs` as the source of
+truth. If wider tooling compatibility is wanted, add a one-way export to the
+`evals/evals.json` layout used by Anthropic's skill-creator; do not migrate the
+baseline into that format or let the export become a second scenario list.
 
 The existing `coverage` object records evaluation metadata, provenance, repetition
 requirements, and thresholds; it is not a scenario-to-requirement index. P0 must
@@ -424,6 +434,16 @@ practical; do not maintain independent handwritten copies. Normalization and
 cross-field/state-transition rules that JSON Schema cannot express remain
 explicit helper checks with shared fixtures.
 
+Generate the published schemas from the runtime Zod schemas with
+`z.toJSONSchema` (Zod 4). Fleet already depends on Zod 4.4.3; on 2026-10-14 a
+strict object schema generated a Draft 2020-12 document with
+`additionalProperties: false`. Schemas are generated at build time and committed
+or packaged, never generated during a maintenance pass. The public release must
+bundle Zod (or ship only pre-generated schemas plus a bundled validator) so
+installation does not run `npm install`. Generation is lossy for transforms,
+refinements and custom checks; those remain explicit helper checks covered by
+the parity fixtures above, not something the published schema claims to enforce.
+
 Conformance covers two distinct boundaries: (1) the public JSON Schema and its
 runtime validator, and (2) neutral public evidence and Fleet's existing observation
 contract. The second requires semantic differential fixtures for all required
@@ -624,6 +644,18 @@ the old store and produces a structured storage error. Any retry is bounded by
 the same operation/deadline; it never deletes the destination or resets the
 operation identity. Do not advertise NTFS, APFS, ext4, or another filesystem
 merely by naming it; each supported combination needs the crash/recovery evidence.
+
+Off-the-shelf libraries were considered and rejected for this contract (checked
+2026-10-14); record this so reviewers do not reintroduce them:
+
+| Library                   | Why it does not fit                                                                                                                                                                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `write-file-atomic` 8.0.0 | Declares `node: ^22.22.2 \|\| ^24.15.0 \|\| >=26.0.0`, narrower than Fleet's `>=22.5` engine floor. It also covers only temp-write-and-rename, not the lock, receipts or recovery contract, so it would replace a few lines of standard-library code while adding a dependency. |
+| `proper-lockfile`         | Detects stale locks by age and takes them over automatically. Section 5 explicitly forbids automatic stale-lock takeover.                                                                                                                                                   |
+| `steno`, `lowdb`          | Provide atomic writes or a JSON database, but no exclusive single owner, idempotent operation receipts or explicit recovery contract.                                                                                                                                      |
+
+The standard-library design (exclusive lock directory, exclusive temp file,
+flush, tested replacement) remains smaller and matches the contract exactly.
 
 #### Pass ownership versus file locking
 
@@ -915,6 +947,15 @@ branch on wake or rely on a user's personal skill installation. A digest verifie
 the selected artifact, not arbitrary publisher trust. Pin updates are reviewed
 changes, not agent-driven self-updates.
 
+A working packaging model exists in `novotnyllc/babysit-pr` (Apache-2.0): one
+repository ships the same skill with both `.codex-plugin/plugin.json` and
+`.claude-plugin/plugin.json` manifests, and records its source in an `.upstream/`
+JSON file (upstream repository, ref, path and copied commit) maintained by a
+weekly sync workflow. Reuse the shape for this package: one skill directory,
+per-client plugin manifests where a client needs them, and a machine-readable
+provenance pin. Do not copy its update policy: that workflow auto-merges upstream
+changes, whereas Fleet pin updates stay reviewed changes as stated above.
+
 Initial compatibility rules:
 
 - Record policy/contract versions with jobs and runtime bindings. Unknown versions
@@ -974,9 +1015,12 @@ and diagrams establish the architecture, not storage durability or agent parity.
 | Q2                   | Which OS/filesystem combinations and durability level are advertised?                | PT1 must prove replacement/contention/crash and exact-owner recovery, including Windows handle contention. Network/synced roots remain excluded.                                            | Open until evidence; do not assume NTFS/APFS/ext4 support or power-loss durability.                                             |
 | Q3                   | What byte/job/headroom envelope is usable?                                           | 16 MiB is the proposed binding byte budget; 100 is a nominal ceiling. The 1 MiB protocol bound applies to helperState, not complete observations.                                           | PT1 measures actual sizes and freezes reservations/capacity guidance before the full backend; no 100-job capacity promise.      |
 | Q4                   | Must standalone interactive repair ship in v1?                                       | Standalone v1 is explicitly observation/triage/reporting; Fleet repair stays unchanged. Opus supports deferral.                                                                             | Recommendation retained, not silently treated as approval of the original full-maintenance goal; owner scope decision required. |
-| Q5                   | Which public repository/publisher/license and update process own the package?        | No selection yet. Standard license/compatibility metadata and the public-link/provenance sweep now gate packaging.                                                                          | Owner decision before release metadata/package finalization; P5 verifies it before publishing.                                  |
+| Q5                   | Which public repository/publisher/license and update process own the package?        | No selection yet. Standard license/compatibility metadata and the public-link/provenance sweep now gate packaging. Section 10 cites `novotnyllc/babysit-pr` as a working model: one repo, Codex and Claude plugin manifests, `.upstream/` provenance pin. | Owner decision before release metadata/package finalization; P5 verifies it before publishing. Release shape proposed; publisher/license still open. |
 | Q6                   | How thin is the skill entry point without hiding safeguards?                         | Section 2 defines a sub-500-line/sub-5,000-token measured entry point, required safety/profile selection and mandatory reference loading. Roughly 150 lines is a target, not a safety rule. | Design guidance amended; P2 and PT3 must establish effective disclosure and unchanged behavior.                                 |
 | Q7                   | Do active Fleet jobs need live migration on first extraction?                        | Paused/settled compatible cutover is simpler and reversible; Opus agrees. Grants cannot be reinterpreted.                                                                                   | No-live-migration recommendation retained for owner approval.                                                                   |
+| Q8                   | Should standalone state be one store per root or one folder per PR (Appendix D)?    | Per-PR folders are simpler but lose cross-job scan fairness and head-ref uniqueness unless a small index is checked under the lock. Conflicts with the Q1 recommendation.                    | Open; owner decision. Not yet reviewed.                                                                                         |
+| Q9                   | Should work-order/work-report schemas become the shared executor contract?          | Fleet already uses this contract in prose. Validating it in the Host lets both bindings share one handoff and removes hand-written follow-up prompts.                                       | Open; Appendix D proposes validating them inside Fleet first.                                                                   |
+| Q10                  | May standalone dispatch resume the PR's original native agent session?              | Preserves context like Fleet's retained worker. Requires one-writer detection, explicit fallback and a declared permission scope for unattended repair; per-launcher support is unproven. | Open; requires PT3-style evaluation per launcher before support is claimed.                                                     |
 
 The independent review supported the architecture and identified contract gaps.
 Appendix C records the amendment disposition. Follow-up review should prioritize
@@ -1049,7 +1093,7 @@ require separate explicit authorization and bounded test targets.
 | D0    | Review this amendment and Appendix C, obtain owner decisions on Q1-Q7 and finalize supported profile/measurement gates                                         | This document and received Opus review                 | Findings resolved or explicitly accepted; implementation approved. Neither has been claimed by this document.                                       |
 | P0    | Add failing clean-bundle, 40-scenario inventory/expectation, provider differential, public schema/validator, semantic public/Fleet and real MCP-route fixtures | D0                                                     | Current coupling reproduced; baseline cases and actual auth/schema/admission boundaries covered.                                                    |
 | P1    | Implement/prove the narrow JSON-local helper and PT1                                                                                                           | P0                                                     | V2-V7 pass per advertised filesystem, including explicit recovery/Windows contention; byte/reservation/usable-capacity contract measured and fixed. |
-| P2    | Split neutral contracts/readers and common policy; standard metadata, selected-license packaging prerequisites and bounded skill entry point                   | P0                                                     | PT2 and V1/V8-V10/V17 pass; no Fleet dependency, missing mandatory reference or unpublished prerequisite.                                           |
+| P2    | Split neutral contracts/readers and common policy; standard metadata, selected-license packaging prerequisites and bounded skill entry point                   | P0                                                     | PT2 and V1/V8-V10/V17 pass; no Fleet dependency, missing mandatory reference or unpublished prerequisite. Frontmatter conformance uses `skills-ref validate` (agentskills reference tool, Python, CI-only); size/disclosure and manifest consistency stay custom checks. |
 | P3    | Wire Fleet adapter/resource injection to the pinned local bundle; retain Host/MCP/DB/worker paths                                                              | P2                                                     | V11-V13 and existing maintenance/continuity/recovery/retention suites pass through actual API boundaries.                                           |
 | P4    | Run actual standalone observation, compaction/new-conversation and sequential-agent evaluations                                                                | P1, P2                                                 | PT3 and V14/V16 pass for every configuration advertised in release.json.                                                                            |
 | P5    | Verify the previously selected license/publisher, public-artifact provenance and links; publish immutable package and reviewed Fleet pin                       | P3, P4                                                 | V15, compatibility/cutover and rollback rehearsal pass; no late implicit license or support claims.                                                 |
@@ -1148,12 +1192,19 @@ contract and existing accessibility/notification patterns.
 ## Appendix B - Public precedents and what not to copy
 
 The following are source-verified architectural precedents, not dependencies or
-execution-tested integrations for this proposal.
+execution-tested integrations for this proposal. Rows added on 2026-10-14 were
+checked against their public README, manifest or skill file; exceptions are noted
+in the row.
 
 | Reference                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Useful precedent                                                                | Limit / design consequence                                                                                                                                                                                                                                                               |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [Agent Skills specification](https://github.com/agentskills/agentskills/blob/69ef37e9424c0a7ea9dd2293b559e43ec8176379/docs/specification.mdx) and [client integration/trust guidance](https://github.com/agentskills/agentskills/blob/69ef37e9424c0a7ea9dd2293b559e43ec8176379/docs/client-implementation/adding-skills-support.mdx)                                                                                                                                                                                           | Standard content package with instructions/scripts/references                   | Does not supply scheduler, credentials, tool implementation, or portable enforcement.                                                                                                                                                                                                    |
-| [Codex babysit-pr skill](https://github.com/openai/codex/blob/05f39d7346e6b6e1f9c7908ebf96a4353dea87a6/.codex/skills/babysit-pr/SKILL.md) and [watcher](https://github.com/openai/codex/blob/05f39d7346e6b6e1f9c7908ebf96a4353dea87a6/.codex/skills/babysit-pr/scripts/gh_pr_watch.py)                                                                                                                                                                                                                                         | Real PR skill, `--once`/`--watch`, state file, bounded flaky-check retries      | Borrow the single-pass seam, not an attached polling loop or equivalence between "seen" and settled.                                                                                                                                                                                     |
+| [Codex babysit-pr skill](https://github.com/openai/codex/blob/05f39d7346e6b6e1f9c7908ebf96a4353dea87a6/.codex/skills/babysit-pr/SKILL.md) and [watcher](https://github.com/openai/codex/blob/05f39d7346e6b6e1f9c7908ebf96a4353dea87a6/.codex/skills/babysit-pr/scripts/gh_pr_watch.py)                                                                                                                                                                                                                                         | Real PR skill, `--once`/`--watch`, state file, bounded flaky-check retries      | Borrow the single-pass seam, not an attached polling loop or equivalence between "seen" and settled. **Removed upstream** by openai/codex commit `18131270fe82` (2026-09-30); the pinned links still resolve but have no maintained source. See the novotnyllc fork below. |
+| [novotnyllc/babysit-pr](https://github.com/novotnyllc/babysit-pr) (Apache-2.0)                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Maintained fork packaged as Codex and Claude plugins with an `.upstream/` provenance pin and weekly sync workflow | Packaging model for Section 10 and Q5. Its watcher keeps state in the OS temp directory via temp-file-then-`os.replace`, takes no lock, and records seen comment/review IDs; seen is not settled. Its sync workflow auto-merges, which Fleet pins must not.                    |
+| [github/awesome-copilot copilot-pr-autopilot](https://github.com/github/awesome-copilot/tree/main/skills/copilot-pr-autopilot)                                                                                                                                                                                                                                                                                                                                                                                                 | Fix/decline/escalate triage rubric, reply templates and API notes               | Requesting a Copilot review through the API needs Triage or Write permission on the repository. GitHub-only, PowerShell scripts, no durable state; useful as rubric input, not as runtime.                                                                                  |
+| [vaibhavmalik/babysit-pr](https://github.com/vaibhavmalik/babysit-pr) (MIT)                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `[babysit-pr]` prefix on replies so the same thread is not answered twice        | Supports the unique-marker rule, but a text marker is a hint only; recorded provider IDs stay authoritative (Appendix D). Caps at 5 iterations per session and keeps no persistent state.                                                                                   |
+| [ahmadharis/agentskills azure-pr-comments](https://github.com/ahmadharis/agentskills/tree/main/skills/azure-pr-comments) and FtlC-ian ado-pr-review-skill                                                                                                                                                                                                                                                                                                                                                                       | ADO thread list/reply/resolve via `az devops invoke` (`az repos pr` has no thread subcommands) | Comment operations only. No ADO policy, iteration or completeness evidence; Fleet's `ado-snapshot.mjs` already covers far more. The FtlC skill was only skimmed and its upstream path was not re-verified.                                                                   |
+| Cursor built-in autopilot skill                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Priority order conflicts, then comments, then CI; PR text and CI logs are untrusted data; never merges | Same safety posture as this policy. No durable state, receipts or recovery; in-session loop only.                                                                                                                                                                          |
 | [OpenAI gh-fix-ci](https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.curated/gh-fix-ci/SKILL.md), [CI inspection script](https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.curated/gh-fix-ci/scripts/inspect_pr_checks.py), and [gh-address-comments](https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.curated/gh-address-comments/SKILL.md)                                                                   | Procedural instructions plus deterministic evidence helpers for CI and feedback | Interactive GitHub-specific workflows, not persistent scheduling or ADO policy support. Normalize output contracts rather than assuming every script branch returns JSON.                                                                                                                |
 | [Claude Code Ralph setup script](https://github.com/anthropics/claude-code/blob/7974a70773fa229e4cc65aa1b356cc21f5c216c4/plugins/ralph-wiggum/scripts/setup-ralph-loop.sh) and [stop hook](https://github.com/anthropics/claude-code/blob/7974a70773fa229e4cc65aa1b356cc21f5c216c4/plugins/ralph-wiggum/hooks/stop-hook.sh)                                                                                                                                                                                                    | In-session repeat/verify control                                                | Claude hook integration, not durable wake scheduling; default unlimited iteration is not our policy.                                                                                                                                                                                     |
 | [OpenClaw heartbeat](https://github.com/openclaw/openclaw/blob/7b1e6eb6656d95b006c59b574f71f60983476cd7/docs/gateway/heartbeat.md) and [automation persistence/recovery](https://github.com/openclaw/openclaw/blob/7b1e6eb6656d95b006c59b574f71f60983476cd7/docs/automation/cron-jobs/how-it-works.md)                                                                                                                                                                                                                         | Runtime-owned wakeups and persistent automation                                 | Requires its running Gateway; not a service Fleet needs to add.                                                                                                                                                                                                                          |
@@ -1217,3 +1268,266 @@ reserved headroom, artifact/schema mapping parity, actual model/profile behavior
 and the release publisher/license. Do not convert any of these future gates into
 "supported" because a review comment was addressed in prose. All Loop Engineering
 references and the improvement mapping remain in Appendix B.
+
+## Appendix D - Hybrid runtime binding proposal
+
+**Recorded:** 2026-10-14, from an owner design discussion.<br>
+**Status:** Reference proposal only. It has not been reviewed, approved or
+implemented. Where it differs from the main body, the main body remains the
+current design until the owner decides Q8-Q10.
+
+### Motivation
+
+The owner wants two things at once:
+
+1. A portable skill that Copilot, Codex and Claude can use without Fleet.
+2. Fleet's existing behavior of sending repairs back to the **same retained
+   worker session**, which already holds the task context, prior decisions and
+   checkout.
+
+The main body treats standalone use as observation-only and limits the Fleet
+adapter to evidence mapping and existing MCP calls. The hybrid proposal also makes
+the **repair handoff** a portable contract. Each runtime then sends that handoff
+to "the same worker" in its own way.
+
+### Core idea: policy decides, bindings deliver
+
+The skill defines two roles:
+
+- **Lead:** recovers state, observes the PR, finds what changed, triages, plans a
+  batch, and settles results.
+- **Worker:** executes exactly one work order (fix, verify, publish, reply) and
+  returns a work report.
+
+The handoff between them is two versioned JSON contracts in the public package:
+a **work order** and a **work report**. Fleet already uses this contract in prose:
+the immutable batch prompt and per-finding report in the packaged `SKILL.md`
+section "Prepare once, then continue the same worker". The hybrid proposal
+extracts it into schemas both runtimes validate.
+
+```mermaid
+graph TB
+  subgraph Core["Portable prm skill (runtime-neutral)"]
+    POL["SKILL.md<br/>triage policy + pass procedure"]
+    LIB["prm library (pure)<br/>observe, diff, plan-batch, validate-report"]
+    WO["work-order.schema.json"]
+    WR["work-report.schema.json"]
+    WK["references/worker.md<br/>repair + publish contract"]
+  end
+
+  subgraph Ports["Ports each runtime binds"]
+    P1["State store"]
+    P2["Executor"]
+    P3["Authority"]
+    P4["Trigger"]
+  end
+
+  subgraph SA["Standalone binding"]
+    S1["Local per-PR state folder"]
+    S2["Current session, or resumed native session"]
+    S3["init mode, capped by repo config"]
+    S4["User, cron, automation or CI"]
+  end
+
+  subgraph FL["Fleet binding (wrapper)"]
+    F1["Host DB via fleet_get / fleet_checkpoint"]
+    F2["fleet_follow_up to retained worker"]
+    F3["Operator grant in the browser"]
+    F4["Existing wake schedule"]
+  end
+
+  Core --> Ports
+  P1 --- S1
+  P2 --- S2
+  P3 --- S3
+  P4 --- S4
+  P1 --- F1
+  P2 --- F2
+  P3 --- F3
+  P4 --- F4
+```
+
+### Ports
+
+| Port        | Standalone binding                                                              | Fleet binding                                                                                   |
+| ----------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| State store | Local state folder outside the installed skill (layout is open question Q8)     | Host database through `fleet_get_pr_maintenance` and `fleet_checkpoint_pr_maintenance`          |
+| Executor    | The current conversation, or `prm dispatch` resuming the recorded native session | `fleet_follow_up` with the maintenance reference, delivered to the retained worker              |
+| Authority   | Mode chosen at `init` (`observe`, `answer`, `repair`), capped by repo config    | Existing authenticated operator grant; preparation stays repair-only as on `main`               |
+| Trigger     | The user, a scheduler, a Codex automation, a Claude loop or CI                  | Existing heartbeat, completion and recovery wakes                                               |
+
+A pass selects exactly one binding. A missing tool or failed call never switches
+bindings; it produces a blocker.
+
+### Work order and work report
+
+The work order carries everything the current batch prompt must contain:
+
+- Schema version, stable batch ID and generation, and an opaque runtime binding
+  reference.
+- Exact PR identity, repositories, refs and the pinned head/base SHAs.
+- Approved design invariants, criteria, bounded repair scope, and an explicit
+  whole-PR stop rule if the worker discovers a design change.
+- Assigned findings with IDs and source revisions, last verified stage, evidence
+  links, required replies, already-published fixes, and known or uncertain effects.
+- Verification commands and any already-required independent review.
+- Publication rules: check that the remote head still matches the pin, push
+  normally, and never force-push, rebase or merge the PR.
+- Remaining repair, answer and mutation allowances, with "stop and report at the
+  limit".
+
+The work report returns, per finding: `addressed`, `already_satisfied`,
+`needs_human`, `failed`, `superseded` or `incomplete`; last verified stage;
+`verifiedHeadSha`; `publishedCommit`; response IDs; mutation attempts; and next
+action. A report is a claim. The lead records it and confirms it on the next
+complete observation; chat text is never evidence.
+
+### Fleet binding: the wrapper
+
+| Piece               | Location                                                                                          | Responsibility                                                                                                                                                                            |
+| ------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Vendored package    | `apps/node/skills/pr-maintenance/`                                                                | Pinned, digest-checked public release, as in Section 10                                                                                                                                   |
+| Binding instructions | New `runtime-fleet.md`, injected by `withMaintenanceResources` in `apps/node/src/agents.ts`       | Selects the `fleet` profile; maps state verbs to the existing MCP tools and the executor to `fleet_follow_up`; forbids local state                                                         |
+| Host adapter        | New module beside `apps/host/src/pr-maintenance-store.ts`                                         | Imports the same `prm` library. Validates the work order at checkpoint, renders it into the immutable follow-up prompt, and validates the work report before settlement                   |
+| Observation mapping | Same adapter                                                                                      | Neutral observation to `PrMaintenanceObservationSchema` with the Section 3/7 parity rules; unrepresentable facts block                                                                     |
+| Worker contract     | Rendered prompt references `worker.md`                                                            | One repair/verify/publish/report contract for both runtimes                                                                                                                               |
+
+The Host, not the lead, renders the prompt from structured fields. That removes
+the model from assembling the immutable prompt by hand and lets the Host validate
+the same contract the standalone skill uses.
+
+Unchanged: authentication, grants, generations, the single outstanding batch,
+admission, effect reconciliation, operator-only lifecycle actions, and all
+existing holds.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Wake as Fleet wake
+  participant Lead as Orchestrator (lead)
+  participant Prm as prm library
+  participant Host as Fleet Host (MCP + DB)
+  participant Worker as Retained worker session
+  participant PR as GitHub / ADO
+
+  Wake->>Lead: heartbeat or completion wake
+  Lead->>Host: fleet_get_pr_maintenance(takeDue)
+  Host-->>Lead: record, last snapshot, budgets, holds
+  Lead->>Prm: observe(pins) via helper
+  Prm->>PR: read-only snapshot
+  Lead->>Prm: diff(last, current)
+  Prm-->>Lead: new obligations only
+  Lead->>Lead: triage per SKILL.md policy
+  Lead->>Prm: plan-batch(findings, pins, budgets)
+  Prm-->>Lead: work order (immutable)
+  Lead->>Host: fleet_checkpoint (prepared batch = work order)
+  Lead->>Host: fleet_follow_up(maintenance ref)
+  Host->>Worker: prompt rendered from work order + worker.md
+  Worker->>PR: fix, verify, push (pins checked)
+  Worker-->>Host: work report
+  Host->>Wake: completion wake
+  Wake->>Lead: next turn
+  Lead->>Prm: validate-report(order, report)
+  Lead->>Host: fleet_checkpoint (settle batch and effects)
+```
+
+### Standalone binding
+
+How a normal coding agent uses the skill depends on how it was started:
+
+| Started as                                     | Lead                        | Worker (executor)                                                                                              |
+| ---------------------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Interactive ("maintain PR #123" in a chat)     | The current conversation    | The same conversation, usually the one that wrote the PR. It confirms with the user before any push or reply. |
+| Scheduled (cron, automation, loop or CI)       | A short headless run        | `prm dispatch` resumes the PR's recorded native session with the work order; fallback per the rules below     |
+| Inside Fleet                                   | The Fleet orchestrator      | The Fleet retained worker; the agent only follows `worker.md`                                                  |
+
+`prm init <pr-url> --mode <mode> --executor resume` records the PR identity and
+refs, the mode after the repo cap, the **native session ID and launcher** of the
+current conversation, and the checkout path. That recorded session becomes the
+standalone equivalent of the retained worker.
+
+Proposed commands: `init`, `begin`, `observe`, `diff`, `plan-batch`, `dispatch`,
+`report`, `end`, `status`, `pause`, `resume`, `unlock` (`unlock` is a human-only
+recovery action, consistent with Section 5).
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Cron as Trigger (cron / automation)
+  participant Lead as Headless lead run
+  participant Prm as prm.mjs
+  participant State as PR state folder
+  participant Worker as Original session (resumed)
+  participant PR as GitHub / ADO
+
+  Cron->>Lead: run one prm pass for the PR
+  Lead->>Prm: begin
+  Prm->>State: take lock, reconcile ledger
+  Lead->>Prm: observe + diff
+  Prm->>PR: read-only snapshot
+  Prm-->>Lead: new obligations only
+  alt nothing new
+    Lead->>Prm: end (waiting, next check)
+  else repair or reply needed and allowed
+    Lead->>Lead: triage per SKILL.md
+    Lead->>Prm: plan-batch
+    Prm->>State: save work order (intent)
+    Lead->>Prm: dispatch
+    Prm->>Worker: resume session with work order
+    Worker->>PR: fix, verify, push or reply
+    Worker-->>Prm: work report
+    Prm->>State: validate report, save receipts
+    Lead->>Prm: end (acted / needs_human / ready)
+  end
+```
+
+Resume support checked on one Windows machine on 2026-10-14: Copilot CLI
+documents `-r/--resume` together with `-p/--prompt`, and Claude Code documents
+`--resume` with `-p/--print`. Codex was not installed and was not checked. Each
+advertised launcher still needs PT3-style evaluation before support is claimed.
+
+### Safety rules specific to the hybrid binding
+
+- **One writer per session.** `dispatch` resumes a session only while holding the
+  PR lock. Resuming a session that is open elsewhere creates a second process on
+  the same conversation and checkout. The skill must detect an attached session or
+  require the user to mark it detached; otherwise it reports busy.
+- **Fallback is explicit.** If the session is missing, belongs to another machine
+  or user, or the launcher cannot resume, `dispatch` either starts a fresh executor
+  with the same work order (when the mode allows) or returns `needs_human`.
+- **Unattended repair needs a declared permission scope.** A resumed headless
+  session runs without a human, so unattended `repair` requires an explicit
+  tool-permission scope or sandbox chosen at `init`. Without it, scheduled passes
+  only answer or report, and code repair waits for an interactive turn.
+- **Fleet rules win.** The wrapper must never let the portable policy weaken a
+  Fleet check (fresh evidence, head pins, holds, one outstanding batch).
+- **Versions are pinned.** Work orders and reports carry a schema version; unknown
+  versions are refused, never coerced.
+
+Lessons from the internal Signet PR-review service, recorded for both bindings:
+
+- Identify the skill's own posts only by recorded provider IDs written at post
+  time. Text markers misclassified human reviews in Signet.
+- When any budget is exhausted, clear the skill's own blocking review or request
+  and hand off once. Signet left permanent blocks when independent caps interacted.
+- Classify authentication failures before network failures. Signet retried
+  misclassified 401s and tripped its circuit breaker fleet-wide.
+
+### Differences from the main body
+
+| Topic             | Main body                                        | Hybrid proposal                                                                                         |
+| ----------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| Standalone repair | Deferred; observation-only v1 (Q4)               | Defines the executor contract now; interactive repair is the first enabled step, unattended stays gated |
+| Standalone state  | One authoritative store per root (Q1)            | Sketch used per-PR folders plus ledger; loses cross-job fairness and head-ref uniqueness without an index (Q8) |
+| Fleet adapter     | Evidence mapping plus existing MCP tools         | Also validates the work order and report and renders the follow-up prompt in the Host                   |
+| Executor          | None for standalone                              | Current session or resumed native session                                                               |
+| Repo-level cap    | Not specified                                    | Optional repo config file caps the mode; invalid config means observe-only                              |
+| Change detection  | Not specified                                    | `diff` passes only new or changed obligations to the model to reduce idle cost                          |
+
+### Suggested first step
+
+Extract `work-order.schema.json` and `work-report.schema.json` from the current
+packaged `SKILL.md` batch requirements. Validate them inside Fleet at
+`fleet_checkpoint_pr_maintenance` and `fleet_follow_up`, before any public package
+exists, and confirm the existing evaluation scenarios still pass. This fixes the
+shared contract with no new runtime and no change to Fleet authority.
