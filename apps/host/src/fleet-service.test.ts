@@ -1006,6 +1006,84 @@ describe("durable session notifications", () => {
     ).toBe("resolved");
   });
 
+  it("withdraws the request itself so a rebooted Node's session is not held hostage", () => {
+    const { store, service, session } = world();
+    service.handleEvent(event(session.id, 1, "permission", { requestId: "request-1" }));
+    expect(store.listPermissionEvents(session.id).map((entry) => entry.type)).toEqual([
+      "permission",
+    ]);
+
+    service.disconnectNode(session.nodeId, "rebooted");
+    service.reconcile(session.nodeId, []);
+
+    expect(store.getSession(session.id)?.state).toBe("failed");
+    const [withdrawal] = store.listPermissionEvents(session.id);
+    expect(withdrawal).toMatchObject({
+      type: "permission_result",
+      sequence: 2,
+      payload: { requestId: "request-1", outcome: "withdrawn" },
+    });
+    expect(service.snapshot().permissionEvents).toEqual([withdrawal]);
+
+    // Idempotent across heartbeats.
+    service.reconcile(session.nodeId, []);
+    expect(store.maxEventSequence(session.id)).toBe(2);
+  });
+
+  it("leaves requests of a session its Node still runs untouched", () => {
+    const { store, service, session } = world();
+    service.handleEvent(event(session.id, 1, "permission", { requestId: "request-1" }));
+    service.disconnectNode(session.nodeId, "dropped");
+    service.reconcile(session.nodeId, [session.id]);
+
+    expect(store.getSession(session.id)?.state).toBe("idle");
+    expect(store.listPermissionEvents(session.id).map((entry) => entry.type)).toEqual([
+      "permission",
+    ]);
+  });
+
+  it("withdraws a stale request on Resume and re-attaches the session", () => {
+    const { store, service, session, wire } = world();
+    service.handleEvent(
+      event(session.id, 1, "agent_session", { agentSessionId: "agent-1" }),
+    );
+    service.handleEvent(event(session.id, 2, "permission", { requestId: "request-1" }));
+    // Ended before this Host knew to withdraw requests, and not yet reconciled.
+    store.transitionSession(
+      session.id,
+      "failed",
+      "Node reconnected without this session",
+    );
+
+    const resumed = service.resumeSession(session.id);
+
+    expect(resumed.ok).toBe(true);
+    expect(store.listPermissionEvents(session.id)).toMatchObject([
+      { type: "permission_result", sequence: 3, payload: { outcome: "withdrawn" } },
+    ]);
+    expect(wire.sent.at(-1)?.command).toMatchObject({
+      type: "resume_session",
+      sessionId: session.id,
+    });
+  });
+
+  it("heals a session that already ended with a request open when the Node reconciles", () => {
+    const { store, service, session } = world();
+    service.handleEvent(event(session.id, 1, "permission", { requestId: "request-1" }));
+    // The state this Host was left in before it learned to withdraw requests.
+    store.transitionSession(
+      session.id,
+      "failed",
+      "Node reconnected without this session",
+    );
+
+    service.reconcile(session.nodeId, []);
+
+    expect(store.listPermissionEvents(session.id)).toMatchObject([
+      { type: "permission_result", payload: { outcome: "withdrawn" } },
+    ]);
+  });
+
   it("persists stale old-attempt events but ignores them until the current retry finishes", () => {
     const { store, service, session, run, step, staleCreatedAt } = workerWorld(2);
     store.updateNotificationPreference(session.id, session.id, true);

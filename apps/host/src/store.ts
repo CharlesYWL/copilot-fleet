@@ -6316,6 +6316,36 @@ export class FleetStore {
     return index.latestEvents();
   }
 
+  /**
+   * Answers every request still open in a conversation whose agent is gone.
+   *
+   * Callers decide the agent is gone; this only writes the answers, each at the
+   * next sequence number. See `FleetService.withdrawOrphanedPermissions`.
+   */
+  withdrawPendingPermissions(
+    sessionId: string,
+    at = new Date().toISOString(),
+  ): SessionEvent[] {
+    return this.transactionIfNeeded(() =>
+      this.listPermissionEvents(sessionId)
+        .filter((event) => event.type === "permission")
+        .flatMap((request) => {
+          const requestId = eventPayload(request, "permission")?.requestId;
+          if (!requestId) return [];
+          const sequence = this.maxEventSequence(sessionId) + 1;
+          const withdrawal: SessionEvent = {
+            eventId: `permission-withdrawn:${sessionId}:${sequence}`,
+            sessionId,
+            sequence,
+            type: "permission_result",
+            payload: { requestId, outcome: "withdrawn" },
+            createdAt: at,
+          };
+          return this.appendEvent(withdrawal).stored ? [withdrawal] : [];
+        }),
+    );
+  }
+
   hasEventAfter(
     sessionId: string,
     sequence: number,

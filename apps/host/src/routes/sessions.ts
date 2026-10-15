@@ -414,6 +414,14 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     const input = PermissionResponseSchema.parse(request.body);
     const session = store.getSession(id);
     if (!session) return reply.code(404).send({ error: "Session not found" });
+    // The agent that asked is gone; nothing on the Node can take the answer.
+    if (terminalSessionStates.has(session.state)) {
+      if (store.getNode(session.nodeId)?.online) service.withdrawOrphanedPermissions(id);
+      return reply.code(409).send({
+        error:
+          "This session has ended, so its permission request was withdrawn. Resume the session to continue.",
+      });
+    }
     const dispatched = service.dispatch(session.nodeId, {
       type: "permission_response",
       sessionId: id,
