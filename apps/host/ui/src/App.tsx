@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Toast,
   ToastBody,
+  ToastFooter,
   ToastTitle,
+  ToastTrigger,
   Toaster,
+  Button,
   makeStyles,
   mergeClasses,
   shorthands,
@@ -23,7 +26,7 @@ import {
   type WorkerResumeOutcome,
   type WorkerResumeRequest,
 } from "@fleet/protocol";
-import { api, useFleet, type Notify } from "./hooks/useFleet";
+import { api, useFleet, type Notify, type SessionRecoveryHandler } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
 import { useNotificationDelivery } from "./hooks/useNotificationDelivery";
 import { useNotificationPreference } from "./hooks/useNotificationPreference";
@@ -235,6 +238,49 @@ export function App() {
     [addAppNotification, dispatchToast],
   );
 
+  /**
+   * `useFleet` is created before the catalog operations, and the operation this
+   * needs (resynchronize a Node) is one of them, so it is reached through a ref
+   * that is filled in once they exist.
+   */
+  const resyncSession = useRef<(sessionId: string) => Promise<boolean>>(
+    async () => false,
+  );
+  const handleSessionRecovery = useCallback<SessionRecoveryHandler>(
+    ({ sessionId, message }) => {
+      addAppNotification(message, "error");
+      dispatchToast(
+        <Toast>
+          <ToastTitle
+            action={
+              <ToastTrigger>
+                <Button
+                  size="small"
+                  appearance="transparent"
+                  aria-label="Reconcile now"
+                  onClick={() => void resyncSession.current(sessionId)}
+                >
+                  Reconcile now
+                </Button>
+              </ToastTrigger>
+            }
+          >
+            {message}
+          </ToastTitle>
+          <ToastFooter>
+            <ToastTrigger>
+              <Button size="small" appearance="subtle" aria-label="Dismiss">
+                Dismiss
+              </Button>
+            </ToastTrigger>
+          </ToastFooter>
+        </Toast>,
+        { intent: "error", position: "bottom-end", timeout: 15_000 },
+      );
+    },
+    [addAppNotification, dispatchToast],
+  );
+
   const {
     snapshot,
     snapshotRevision,
@@ -257,7 +303,7 @@ export function App() {
     markAllNotificationsRead,
     dismissAllNotifications,
     dismissNotification,
-  } = useFleet(notify);
+  } = useFleet(notify, handleSessionRecovery);
   const maintenanceApprovals = snapshot.prMaintenanceApprovals ?? noMaintenanceApprovals;
   const resumeRequests = snapshot.workerResumeRequests ?? noResumeRequests;
   /** A "Resume now" approval to show now, even one put off with "Review later". */
@@ -292,6 +338,14 @@ export function App() {
     [notify, request],
   );
   const catalog = useCatalogOperations({ request, refresh, notify });
+  const reconcileSession = useCallback(
+    (sessionId: string) => {
+      const nodeId = snapshot.sessions.find((session) => session.id === sessionId)?.nodeId;
+      return nodeId ? catalog.resyncNodeConsole(nodeId) : Promise.resolve(false);
+    },
+    [catalog, snapshot.sessions],
+  );
+  resyncSession.current = reconcileSession;
   const [view, setView] = useState<AppView>("session");
   const [orchestratorViewMode, setOrchestratorViewMode] =
     useState<OrchestratorViewMode>("stage");
@@ -1572,6 +1626,7 @@ export function App() {
                           <SessionMessageQueue
                             key={activeSession.id}
                             session={activeSession}
+                            onReconcile={reconcileSession}
                           />
                         }
                         node={snapshot.nodes.find(
@@ -1692,7 +1747,11 @@ export function App() {
             session={activeSession}
             messageQueue={
               focusOpen ? (
-                <SessionMessageQueue key={activeSession.id} session={activeSession} />
+                <SessionMessageQueue
+                  key={activeSession.id}
+                  session={activeSession}
+                  onReconcile={reconcileSession}
+                />
               ) : undefined
             }
             node={snapshot.nodes.find((node) => node.id === activeSession.nodeId)}

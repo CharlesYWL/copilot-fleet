@@ -9,6 +9,7 @@ import {
   TRANSCRIPT_PAGE_LIMIT,
   TRANSCRIPT_PAGE_MAX,
   type CommandOutputEvent,
+  type ConsoleRecovery,
   type HostUpdateStatus,
   type MarkAllNotificationsReadResponse,
   type Notification,
@@ -34,6 +35,14 @@ export type Notify = (
   message: string,
   intent?: "error" | "success" | "warning" | "info",
 ) => void;
+
+/** A refusal the operator can fix from the notice itself. */
+export type SessionRecoveryNotice = {
+  sessionId: string;
+  message: string;
+  recovery: ConsoleRecovery;
+};
+export type SessionRecoveryHandler = (notice: SessionRecoveryNotice) => void;
 
 export type LiveNotificationUpdate = {
   sequence: number;
@@ -119,7 +128,7 @@ function watchHostUpdate(updateId: string | undefined): void {
   }
 }
 
-export function useFleet(notify: Notify) {
+export function useFleet(notify: Notify, onSessionRecovery?: SessionRecoveryHandler) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [snapshotRevision, setSnapshotRevision] = useState(0);
   const [liveNotificationUpdates, setLiveNotificationUpdates] = useState<
@@ -174,6 +183,8 @@ export function useFleet(notify: Notify) {
   // re-creates its notify callback.
   const notifyRef = useRef(notify);
   notifyRef.current = notify;
+  const sessionRecoveryRef = useRef(onSessionRecovery);
+  sessionRecoveryRef.current = onSessionRecovery;
 
   const report = useCallback((reason: unknown) => {
     notifyRef.current(errorMessage(reason), "error");
@@ -867,6 +878,17 @@ export function useFleet(notify: Notify) {
           // The session is fine; the command was refused. Saying so is the
           // whole point — a prompt dropped in silence is indistinguishable
           // from an agent that has stopped responding.
+          //
+          // A refusal that names a recovery is handed to the app, which can
+          // offer the fix on the toast; without a handler it is the plain text.
+          if (message.recovery && sessionRecoveryRef.current) {
+            sessionRecoveryRef.current({
+              sessionId: message.sessionId,
+              message: message.message,
+              recovery: message.recovery,
+            });
+            return;
+          }
           notifyRef.current(message.message, "error");
           return;
         }

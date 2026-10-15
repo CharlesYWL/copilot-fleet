@@ -25,6 +25,8 @@ export type CatalogOperations = {
     options?: { stopSessions?: boolean },
   ) => Promise<UpdateRefusal | undefined>;
   updateAllNodes: () => Promise<boolean>;
+  /** Asks a Node to redo its session-console synchronization without restarting. */
+  resyncNodeConsole: (nodeId: string) => Promise<boolean>;
   createWorkspace: (name: string, description: string) => Promise<boolean>;
   updateWorkspace: (
     workspaceId: string,
@@ -107,6 +109,16 @@ export function useCatalogOperations({
       },
       updateAllNodes: async () =>
         (await request("/api/nodes/update", { method: "POST" })).ok,
+      // A refusal is already toasted by `request`; only success needs saying.
+      // The Node's new state arrives over the usual socket, so no re-read.
+      resyncNodeConsole: async (nodeId) => {
+        const result = await request(`/api/nodes/${nodeId}/console-resync`, {
+          method: "POST",
+        });
+        if (result.ok)
+          notify("Asked the Node to resynchronize its session history", "success");
+        return result.ok;
+      },
       createWorkspace: (name, description) =>
         write("/api/workspaces", json({ name, description }, "POST")),
       updateWorkspace: (workspaceId, name, description) =>

@@ -98,6 +98,7 @@ import {
   PlacementRepositoryCapabilitySchema,
   WorkspaceResultSchema,
   resolveWorkspaceMode,
+  type ConsoleRecovery,
   type ExecutionBinding,
   type ManagedWorktree,
   type ManagedWorktreePolicy,
@@ -498,6 +499,8 @@ export type QueuedSessionMessage = {
   afterSequence: number;
   deliveryKey: string;
   error: string;
+  /** Set when the Node refused this message for a cause the operator can fix. */
+  recovery?: ConsoleRecovery | undefined;
   digest: string;
 };
 

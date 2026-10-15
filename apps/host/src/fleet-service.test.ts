@@ -7,6 +7,7 @@ import {
   HOST_URL_SYNC_CAPABILITY,
   NODE_NAME_SYNC_CAPABILITY,
   SELF_UPDATE_CAPABILITY,
+  SESSION_CONSOLE_RESYNC_CAPABILITY,
   type Notification,
   type RunRole,
   type SessionEvent,
@@ -1409,6 +1410,53 @@ describe("requestUpdate", () => {
     enroll("unknown", [SELF_UPDATE_CAPABILITY], "");
 
     expect(service.staleNodeIds()).toEqual([stale.nodeId]);
+  });
+});
+
+describe("requestConsoleResync", () => {
+  it("asks a capable node to resynchronize its session console", () => {
+    const { service, enroll } = setup();
+    const node = enroll("devbox", ["copilot-acp", SESSION_CONSOLE_RESYNC_CAPABILITY]);
+
+    expect(service.requestConsoleResync(node.nodeId)).toEqual({ started: true });
+    expect(node.sent.map((frame) => frame.type)).toEqual(["session_console_resync"]);
+  });
+
+  it("refuses a node whose build cannot resynchronize on request", () => {
+    // The frame is not in that agent's copy of the message union, so sending it
+    // would close the socket instead of reconciling anything.
+    const { service, enroll } = setup();
+    const older = enroll("older", ["copilot-acp"]);
+
+    const result = service.requestConsoleResync(older.nodeId);
+    expect(result.started).toBe(false);
+    expect(result.reason).toContain("older");
+    expect(older.sent).toEqual([]);
+  });
+
+  it("reports an unknown node and an offline node distinctly", () => {
+    const { service, enroll } = setup();
+    const node = enroll("devbox", ["copilot-acp", SESSION_CONSOLE_RESYNC_CAPABILITY]);
+
+    expect(service.requestConsoleResync("missing")).toEqual({
+      started: false,
+      reason: "Unknown node",
+    });
+    service.disconnectNode(node.nodeId, "Connection lost");
+    const offline = service.requestConsoleResync(node.nodeId);
+    expect(offline.started).toBe(false);
+    expect(offline.reason).toContain("offline");
+  });
+
+  it("is still delivered while the node's history is synchronizing", () => {
+    // The point of the button is to unstick exactly that state, so the Host's
+    // synchronization gate on new work must not swallow it.
+    const { service, enroll } = setup();
+    const node = enroll("devbox", ["copilot-acp", SESSION_CONSOLE_RESYNC_CAPABILITY]);
+    vi.spyOn(service.console, "blocked").mockReturnValue(true);
+
+    expect(service.requestConsoleResync(node.nodeId)).toEqual({ started: true });
+    expect(node.sent.map((frame) => frame.type)).toEqual(["session_console_resync"]);
   });
 });
 

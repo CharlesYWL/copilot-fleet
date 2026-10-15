@@ -6,12 +6,14 @@ import { NodeHealth, HEALTH_STALE_AFTER_MS } from "./NodeHealth";
 import { NodesPanel } from "./NodesPanel";
 import { SettingsActivityContext } from "../hooks/useSettingsActivity";
 
+const resyncNodeConsole = vi.fn();
 vi.mock("../hooks/useCatalog", () => ({
   useCatalog: () => ({
     renameNode: vi.fn(),
     deleteNode: vi.fn(),
     updateNode: vi.fn(),
     updateAllNodes: vi.fn(),
+    resyncNodeConsole,
   }),
 }));
 vi.mock("./ConnectNodeCard", () => ({ ConnectNodeCard: () => null }));

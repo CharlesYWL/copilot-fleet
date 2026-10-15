@@ -23,6 +23,7 @@ import {
 } from "@fluentui/react-components";
 import {
   ArrowSync20Regular,
+  ArrowSyncCircle20Regular,
   Checkmark20Regular,
   Delete20Regular,
   Dismiss20Regular,
@@ -30,6 +31,7 @@ import {
 } from "@fluentui/react-icons";
 import {
   nodeUpdateState,
+  SESSION_CONSOLE_RESYNC_CAPABILITY,
   type FleetNode,
   type FleetSession,
   type NodeUpdateStage,
@@ -193,7 +195,8 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
     const timer = setInterval(() => setNow(Date.now()), 10_000);
     return () => clearInterval(timer);
   }, [active]);
-  const { renameNode, deleteNode, updateNode, updateAllNodes } = useCatalog();
+  const { renameNode, deleteNode, updateNode, updateAllNodes, resyncNodeConsole } =
+    useCatalog();
   /** The node whose update is waiting on a decision about its live sessions. */
   const [blocked, setBlocked] = useState<{
     node: FleetNode;
@@ -274,6 +277,7 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
                 onRename={renameNode}
                 onDelete={deleteNode}
                 onUpdate={startUpdate}
+                onResync={resyncNodeConsole}
               />
             ))}
           </TableBody>
@@ -342,6 +346,7 @@ type NodeRowProps = {
   onRename: (nodeId: string, name: string) => Promise<boolean>;
   onDelete: (nodeId: string) => Promise<boolean>;
   onUpdate: (node: FleetNode) => Promise<void>;
+  onResync: (nodeId: string) => Promise<boolean>;
 };
 
 const NodeRow = ({
@@ -352,6 +357,7 @@ const NodeRow = ({
   onRename,
   onDelete,
   onUpdate,
+  onResync,
 }: NodeRowProps) => {
   const styles = useStyles();
   const [draft, setDraft] = useState<string>();
@@ -460,6 +466,17 @@ const NodeRow = ({
               />
             )
           )}
+          {node.online &&
+            node.capabilities.includes(SESSION_CONSOLE_RESYNC_CAPABILITY) && (
+              <Button
+                appearance="subtle"
+                size="small"
+                icon={<ArrowSyncCircle20Regular />}
+                aria-label={`Reconcile session history on ${node.name}`}
+                title="Reconcile now: replay session history and control this Node recorded while disconnected"
+                onClick={() => void onResync(node.id)}
+              />
+            )}
           {draft === undefined && (
             <Button
               appearance="subtle"

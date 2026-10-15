@@ -17,6 +17,7 @@ import {
   type ConsoleAction,
   type ConsoleGrant,
   type ConsoleOperation,
+  type ConsoleRecovery,
   type ConsoleRequest,
   type ConsoleResponse,
   type ConsoleSessionView,
@@ -33,6 +34,7 @@ import {
   ReplayBudgetError,
   type SessionJournal,
   type LocalSessionOperation,
+  type LocalSessionRecord,
 } from "./session-journal.js";
 import type { SessionFileReader } from "./session-files.js";
 
@@ -1045,6 +1047,37 @@ export class NodeSessionConsole {
     return next;
   }
 
+  /**
+   * Why Host work for a session must wait, or undefined when it may proceed.
+   * Each cause has its own message so the operator can tell a connection that
+   * is still synchronizing from local control the Host has not yet seen.
+   *
+   * `recovery` is set only where asking the Node to resynchronize can clear the
+   * cause: local control ahead of the Host, or a console left in conflict by a
+   * failed sync. A console that is already synchronizing just needs time, and
+   * one that is offline cannot be reached to resynchronize at all.
+   */
+  private hostWorkBlocker(
+    entry: LocalSessionRecord | undefined,
+    hostEpoch: number | undefined,
+  ): { error: string; recovery?: ConsoleRecovery } | undefined {
+    if (this.supported && this.status !== "online")
+      return {
+        error: `Node session console is ${this.status}${this.detail ? `: ${this.detail}` : ""}. Host work resumes once it is online and synchronized.`,
+        ...(this.status === "conflict" ? { recovery: "console_resync" as const } : {}),
+      };
+    if (!entry || entry.controlEpoch <= (hostEpoch ?? 0)) return undefined;
+    const unsyncedControl = Math.max(
+      0,
+      entry.controlEpoch - entry.acknowledgedControlEpoch,
+    );
+    const unsyncedEvents = Math.max(0, entry.highWater - entry.acknowledgedSequence);
+    return {
+      error: `Local control on this Node is ahead of the Host (Node control epoch ${entry.controlEpoch}, Host epoch ${hostEpoch ?? 0}; ${unsyncedControl} local control change(s) and ${unsyncedEvents} event(s) not yet synchronized). Reconcile the Node so it can replay them to the Host.`,
+      recovery: "console_resync",
+    };
+  }
+
   hostCommand(command: NodeCommand, epoch?: number): Promise<CommandResult> {
     return this.exclusive(command.sessionId, async () => {
       const safety = ["stop", "cancel", "permission_response"].includes(command.type);
@@ -1056,16 +1089,13 @@ export class NodeSessionConsole {
           error: UNAVAILABLE_SESSION_DETAIL,
         };
       const entry = this.journal.get(command.sessionId);
-      if (
-        !safety &&
-        ((this.supported && this.status !== "online") ||
-          (entry && entry.controlEpoch > (epoch ?? 0)))
-      )
+      const blocker = safety ? undefined : this.hostWorkBlocker(entry, epoch);
+      if (blocker)
         return {
           commandId: command.commandId,
           ok: false,
           fatal: false,
-          error: "Local session control/history must reconcile before Host work",
+          ...blocker,
         };
       if (command.type === "resume_session" && entry)
         command = {
