@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist/lib",
+    "types": ["node"]
+  },
+  "include": ["src/fleet.ts", "src/work-contract.ts", "src/contracts.ts"]
+}

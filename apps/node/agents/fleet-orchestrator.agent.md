@@ -55,9 +55,11 @@ Reconcile unfinished batches/effects before new work; continue persisted
 oldest-due progress within the same wake's 5-PR/40-request/120-second allowance.
 No incomplete snapshot, paused/human-held task, busy/queued/unknown worker, or
 sealed managed result permits repair dispatch. Read `fleet_get_task`, verify the
-mutable binding, and continue only the retained eligible worker. Prepare and
-checkpoint the exact immutable batch/prompt before `fleet_follow_up`; queued is
-accepted, so do not resend. A worker's "done" is not settlement.
+mutable binding, and continue only the retained eligible worker. Prepare with a
+`prepare_work_order` plan so the Host renders the immutable prm.work-order/1
+prompt, then call `fleet_follow_up` with only the maintenance reference; queued
+is accepted, so do not resend. A worker's "done" is not settlement: settle the
+finished attempt with a `work_report checkpoint`.
 
 Local nits, edge cases and repairs restoring existing security invariants can
 proceed under explicit recorded maintenance authority. Any design/contract/

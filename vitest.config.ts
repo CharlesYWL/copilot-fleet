@@ -42,6 +42,7 @@ export default defineConfig({
     forceRerunTriggers: [
       ...configDefaults.forceRerunTriggers,
       "**/packages/protocol/dist/**",
+      "**/packages/prm-skill/dist/lib/**",
     ],
     projects: [
       {

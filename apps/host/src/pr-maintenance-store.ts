@@ -2862,9 +2862,17 @@ export class PrMaintenanceStore {
     expectedVersion: number,
     input: z.input<typeof PrMaintenanceCheckpointSchema>,
     wakeId?: string,
+    workOrder?: Record<string, unknown>,
   ): PrMaintenanceRegistration {
     const checkpoint: PrMaintenanceCheckpoint =
       PrMaintenanceCheckpointSchema.parse(input);
+    if (checkpoint.kind === "prepare_work_order" || checkpoint.kind === "work_report")
+      refuse(
+        "work_order_translation_required",
+        "Work-order checkpoints are translated by the lead tool into prepare_batch or batch settlement.",
+      );
+    if (workOrder && checkpoint.kind !== "prepare_batch")
+      refuse("invalid_work_order", "Only a prepared batch can carry a work order.");
     return this.store.writeAtomically(() => {
       const record = this.required(id, leadSessionId, expectedVersion);
       if (record.ownershipReleasedAt)
@@ -3008,6 +3016,7 @@ export class PrMaintenanceStore {
         const now = nowIso();
         record.batches.push({
           ...prepared,
+          ...(workOrder ? { workOrder } : {}),
           generation: record.generation,
           authorizationId: record.authorization.id,
           state: "prepared",

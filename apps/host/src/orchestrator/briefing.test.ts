@@ -290,7 +290,8 @@ describe("what the orchestrator is told", () => {
     for (const text of [agentFile, orchestratorBriefing("nodes")]) {
       const normalized = text.replace(/\s+/g, " ");
       expect(normalized).toContain("whole PR");
-      expect(normalized).toContain("immutable batch/prompt");
+      expect(normalized).toContain("immutable prm.work-order/1 prompt");
+      expect(normalized).toContain("work_report checkpoint");
       expect(normalized).toContain("Send back");
       expect(normalized).toContain("named external reviewers");
     }

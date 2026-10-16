@@ -669,6 +669,8 @@ export const PrMaintenanceBatchSchema = PrMaintenancePreparedBatchSchema.extend(
   generation: z.number().int().positive(),
   authorizationId: id,
   state: PrMaintenanceBatchStateSchema,
+  /** Present when the Host rendered `prompt` from a prm.work-order/1. */
+  workOrder: z.record(z.string(), z.unknown()).optional(),
   findings: z.array(PrMaintenanceFindingSchema).max(100).default([]),
   effects: z.array(PrMaintenanceEffectSchema).max(200).default([]),
   stepId: id.optional(),
@@ -744,6 +746,51 @@ export const PrMaintenanceCheckpointSchema = z.discriminatedUnion("kind", [
   z
     .object({ kind: z.literal("prepare_batch"), batch: PrMaintenancePreparedBatchSchema })
     .strict(),
+  z
+    .object({
+      kind: z.literal("prepare_work_order"),
+      plan: z
+        .object({
+          batchId: id,
+          summary: text,
+          conflictResolution: z.boolean().default(false),
+          reservedMutations: z.number().int().min(0).max(1_000),
+          findings: z
+            .array(
+              z
+                .object({
+                  sourceId: id,
+                  revision: id,
+                  task: z.enum(["repair", "answer"]),
+                  instructions: text,
+                })
+                .strict(),
+            )
+            .min(1)
+            .max(50),
+        })
+        .strict(),
+    })
+    .strict()
+    .describe(
+      "Preferred preparation: the Host renders the immutable prm.work-order/1 worker prompt from current sources and the grant; dispatch it with fleet_follow_up using only the maintenance reference.",
+    ),
+  z
+    .object({
+      kind: z.literal("work_report"),
+      batchId: id,
+      generation: z.number().int().positive(),
+      report: z
+        .unknown()
+        .optional()
+        .describe(
+          "prm.work-report/1 object. Omit it to have the Host read the worker's tagged <prm-work-report> from the settled attempt.",
+        ),
+    })
+    .strict()
+    .describe(
+      "Settle a work-order batch from the worker's prm.work-report/1 after its attempt completed. The Host validates it against the stored work order and applies the normal settlement guards.",
+    ),
   z
     .object({
       kind: z.literal("batch"),

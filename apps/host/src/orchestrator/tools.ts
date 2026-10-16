@@ -14,9 +14,12 @@ import {
   parsePrMaintenanceUrl,
   prMaintenanceProviderLabel,
   prMaintenanceProgress,
+  prMaintenanceSources,
   prMaintenanceWorkSources,
   prMaintenanceUrl,
   type PrMaintenanceAdmission,
+  type PrMaintenanceCheckpoint,
+  type PrMaintenanceRegistration,
   checkoutLockKey,
   type WorkspaceMode,
   isChatsWorkspace,
@@ -41,6 +44,15 @@ import {
   type WorkerRoutingReceipt,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
+import {
+  FleetPlanSchema,
+  WorkContractError,
+  WorkOrderSchema,
+  WorkReportSchema,
+  extractWorkReport,
+  fleetSettlement,
+  fleetWorkOrder,
+} from "@fleet/prm-skill/fleet";
 import { reservedSessionCount } from "../session-policy.js";
 import {
   DISPATCH_GUIDANCE,
@@ -531,10 +543,12 @@ export const FollowUpSchema = SessionRefSchema.extend({
   prompt: z
     .string()
     .min(1)
+    .optional()
     .describe(
       "The next revision's deliverable, scope, necessary changed decisions and observable acceptance. " +
         "Link authoritative context, distinguish history from current observations, and let the worker " +
-        "choose investigation, implementation and commands. Preserve existing authorization limits.",
+        "choose investigation, implementation and commands. Preserve existing authorization limits. " +
+        "Omit it for a maintenance batch: the Host sends the batch's stored prompt.",
     ),
   maintenance: z
     .object({
@@ -545,7 +559,7 @@ export const FollowUpSchema = SessionRefSchema.extend({
     .strict()
     .optional()
     .describe(
-      "Link this turn to the exact prepared PR-maintenance batch. The prompt must match its persisted prompt byte for byte.",
+      "Link this turn to the exact prepared PR-maintenance batch. A supplied prompt must match its persisted prompt byte for byte; omit the prompt to send the persisted one.",
     ),
 });
 
@@ -1371,6 +1385,21 @@ export class FleetTools {
             input.checkpoint.observation,
           );
         }
+        if (input.checkpoint.kind === "prepare_work_order") {
+          this.requireMaintenanceVisit(input.recordId, true);
+          return this.prepareWorkOrder(
+            input.recordId,
+            input.expectedVersion,
+            input.checkpoint,
+          );
+        }
+        if (input.checkpoint.kind === "work_report") {
+          return this.settleWorkReport(
+            input.recordId,
+            input.expectedVersion,
+            input.checkpoint,
+          );
+        }
         if (input.checkpoint.kind === "prepare_batch") {
           this.requireMaintenanceVisit(input.recordId, true);
         }
@@ -1421,6 +1450,142 @@ export class FleetTools {
       this.service.publishSnapshot();
       return record;
     });
+  }
+
+  /** Render the immutable worker prompt from a prm work order, then prepare it normally. */
+  private prepareWorkOrder(
+    recordId: string,
+    expectedVersion: number,
+    checkpoint: Extract<PrMaintenanceCheckpoint, { kind: "prepare_work_order" }>,
+  ): PrMaintenanceRegistration {
+    const registry = this.store.prMaintenance;
+    const record = registry.get(recordId, this.leadSessionId);
+    if (!record)
+      throw new PrMaintenanceError("not_found", "No such maintenance registration.");
+    const prior = record.batches.find((batch) => batch.id === checkpoint.plan.batchId);
+    if (prior?.workOrder) return record;
+    const { workOrder, batch } = this.workContract(() =>
+      fleetWorkOrder({
+        record,
+        sources: prMaintenanceSources(record),
+        plan: FleetPlanSchema.parse(checkpoint.plan),
+        createdAt: new Date().toISOString(),
+      }),
+    );
+    return registry.checkpoint(
+      this.leadSessionId,
+      recordId,
+      expectedVersion,
+      { kind: "prepare_batch", batch },
+      this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId,
+      workOrder,
+    );
+  }
+
+  /**
+   * Settle a work-order batch from the worker's prm.work-report/1. The report
+   * is a claim: Fleet's existing settlement still requires the correlated
+   * terminal RunStep, known effect evidence and allowance accounting.
+   */
+  private settleWorkReport(
+    recordId: string,
+    expectedVersion: number,
+    checkpoint: Extract<PrMaintenanceCheckpoint, { kind: "work_report" }>,
+  ): PrMaintenanceRegistration {
+    const registry = this.store.prMaintenance;
+    const record = registry.get(recordId, this.leadSessionId);
+    const batch = record?.batches.find((entry) => entry.id === checkpoint.batchId);
+    if (!record || !batch)
+      throw new PrMaintenanceError("batch_not_found", "No such maintenance batch.");
+    if (!batch.workOrder)
+      throw new PrMaintenanceError(
+        "not_a_work_order",
+        "This batch was prepared with a hand-written prompt; settle it with a batch checkpoint.",
+      );
+    const workOrder = this.workContract(() => WorkOrderSchema.parse(batch.workOrder));
+    let rawReport = checkpoint.report;
+    if (rawReport === undefined) {
+      const step = batch.stepId ? this.store.getRunStep(batch.stepId) : undefined;
+      if (!step)
+        throw new PrMaintenanceError(
+          "execution_unsettled",
+          "The batch has no accepted attempt to read a report from.",
+        );
+      const extracted = extractWorkReport(
+        workerOutput(
+          this.store.listEventsAfter(record.workerSessionId, step.eventSeqFrom),
+        ),
+      );
+      if ("error" in extracted)
+        throw new PrMaintenanceError(
+          "report_missing",
+          `${extracted.error} Supply the report explicitly or settle the batch as reconciling with evidence.`,
+        );
+      rawReport = extracted.report;
+    }
+    const report = this.workContract(() => WorkReportSchema.parse(rawReport));
+    const settlement = this.workContract(() =>
+      fleetSettlement({
+        batch,
+        workOrder,
+        report,
+        workerActor: `fleet-worker:${record.workerSessionId}`,
+      }),
+    );
+    const base = {
+      kind: "batch" as const,
+      batchId: batch.id,
+      generation: checkpoint.generation,
+      findings: settlement.findings,
+      effects: settlement.effects,
+      executionSettled: true,
+      evidence: settlement.evidence,
+      usedMutations: settlement.usedMutations,
+      published: settlement.published,
+    };
+    const wakeId = this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId;
+    let current = record;
+    let version = expectedVersion;
+    if (batch.state === "accepted" && settlement.state !== "uncertain") {
+      current = registry.checkpoint(
+        this.leadSessionId,
+        recordId,
+        version,
+        { ...base, state: "reconciling", usedMutations: undefined },
+        wakeId,
+      );
+      version = current.version;
+    }
+    if (settlement.needsHuman && current.decision?.state !== "pending")
+      throw new PrMaintenanceError(
+        "human_decision_required",
+        "The worker reported needs_human. Escalate with maintenance-aware fleet_escalate first, then submit this report again.",
+      );
+    return registry.checkpoint(
+      this.leadSessionId,
+      recordId,
+      version,
+      { ...base, state: settlement.state },
+      wakeId,
+    );
+  }
+
+  private workContract<T>(action: () => T): T {
+    try {
+      return action();
+    } catch (error) {
+      if (error instanceof WorkContractError)
+        throw new PrMaintenanceError(error.code, error.message);
+      if (error instanceof z.ZodError)
+        throw new PrMaintenanceError(
+          "invalid_work_contract",
+          error.issues
+            .slice(0, 5)
+            .map((issue) => `${issue.path.join(".") || "$"}: ${issue.message}`)
+            .join("; "),
+        );
+      throw error;
+    }
   }
 
   /** Every task this orchestrator is running, newest last. */
@@ -2962,17 +3127,19 @@ export class FleetTools {
     }
     const run = this.store.getRun(step.runId);
     if (!run) return refuse("That worker's task record is no longer available.");
+    let prompt = input.prompt;
     if (input.maintenance) {
       const reference = input.maintenance;
       const record = this.store.prMaintenance.get(reference.recordId, this.leadSessionId);
       const batch = record?.batches.find((entry) => entry.id === reference.batchId);
+      prompt ??= batch?.prompt;
       if (
         !record ||
         record.taskId !== run.id ||
         record.workerSessionId !== owned.id ||
         record.generation !== reference.generation ||
         !batch ||
-        batch.prompt !== input.prompt
+        batch.prompt !== prompt
       ) {
         return refuse(
           "The maintenance generation, worker, task and exact prepared prompt must match.",
@@ -2999,10 +3166,14 @@ export class FleetTools {
       ...(input.maintenance ?? {}),
     });
     if (maintenance) return maintenance;
+    if (!prompt)
+      return refuse(
+        "A prompt is required unless this follow-up names a prepared maintenance batch.",
+      );
     const next = this.continuation(run, step, owned);
     if (
       (next.action === "queued" || next.action === "in_flight") &&
-      step.prompt === input.prompt
+      step.prompt === prompt
     ) {
       return ok(
         `${next.reason} No duplicate was sent. Task: ${run.id}; session: ${owned.id}.`,
@@ -3019,7 +3190,7 @@ export class FleetTools {
           {
             stepKey: step.stepKey,
             title: step.title,
-            prompt: input.prompt,
+            prompt,
             category: step.category,
             dependsOn: step.dependsOn,
             placementId: step.placementId || owned.placementId,
@@ -3038,7 +3209,7 @@ export class FleetTools {
             input.maintenance.batchId,
             retried.id,
             retried.attempts,
-            input.prompt,
+            prompt,
           );
         }
       });
