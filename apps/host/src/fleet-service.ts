@@ -14,6 +14,7 @@ import {
   NODE_NAME_SYNC_CAPABILITY,
   ORCHESTRATOR_STOP_REASON,
   SELF_UPDATE_CAPABILITY,
+  SESSION_CONSOLE_RESYNC_CAPABILITY,
   canTransition,
   canTransitionRun,
   canTransitionRunStep,
@@ -51,6 +52,7 @@ import {
   type SessionState,
   type Snapshot,
   type ExecutionBinding,
+  type ConsoleRecovery,
   SessionPermissions,
   sessionActor,
   type SessionActor,
@@ -2134,6 +2136,32 @@ export class FleetService {
     return { started: true };
   }
 
+  /**
+   * Asks a Node to redo its session-console synchronization, the same work it
+   * does on connect, without restarting it.
+   *
+   * Used to clear "local control ahead of Host": the Node replays what it
+   * recorded while the Host could not hear it. It cannot resolve a genuine
+   * conflict, so a Node that still disagrees afterwards keeps reporting why.
+   */
+  requestConsoleResync(nodeId: string): { started: boolean; reason?: string } {
+    const node = this.store.getNode(nodeId);
+    if (!node) return { started: false, reason: "Unknown node" };
+    if (!node.capabilities.includes(SESSION_CONSOLE_RESYNC_CAPABILITY)) {
+      return {
+        started: false,
+        reason: `${node.name} runs a build that cannot resynchronize on request; update it first`,
+      };
+    }
+    const socket = this.nodeSockets.get(nodeId);
+    if (!socket || socket.readyState !== socket.OPEN) {
+      return { started: false, reason: `${node.name} is offline` };
+    }
+    this.send(socket, HostToNodeMessageSchema.parse({ type: "session_console_resync" }));
+    this.log.info({ nodeId }, "Asked node to resynchronize its session console");
+    return { started: true };
+  }
+
   /** Every Node that is behind this Host and can be told to catch up. */
   staleNodeIds(): string[] {
     return this.store
@@ -3128,8 +3156,44 @@ export class FleetService {
    * The alternative was silence, and silence is what made a refused prompt
    * indistinguishable from an agent that had stopped answering.
    */
-  reportSessionNotice(sessionId: string, message: string): void {
-    this.broadcast({ type: "session_notice", sessionId, message });
+  reportSessionNotice(
+    sessionId: string,
+    message: string,
+    recovery?: ConsoleRecovery,
+  ): void {
+    this.broadcast({
+      type: "session_notice",
+      sessionId,
+      message,
+      ...(recovery ? { recovery } : {}),
+    });
+  }
+
+  /**
+   * Fails the queued message a Node just refused, and says how to fix it.
+   *
+   * A refusal for a recoverable cause (the Node's session console needs to
+   * reconcile) leaves the operator's message `sending` with nothing to settle
+   * it, because the Node never accepted it. Marking it failed with the recovery
+   * puts a button on the message itself instead of leaving it to look stuck.
+   * Only a refusal that names a recovery is handled here; every other refusal
+   * keeps its existing behaviour.
+   */
+  markQueuedRefusal(
+    sessionId: string,
+    commandId: string,
+    recovery: ConsoleRecovery | undefined,
+  ): void {
+    if (!recovery) return;
+    if (this.store.getSessionDispatchAttempt(sessionId)?.commandId !== commandId) return;
+    const message = this.store.queuedMessages(sessionId, "sending")[0];
+    if (!message) return;
+    this.store.saveQueuedMessage({
+      ...message,
+      state: "failed",
+      recovery,
+      error: "The Node refused this message until its session history is reconciled.",
+    });
   }
 
   /**

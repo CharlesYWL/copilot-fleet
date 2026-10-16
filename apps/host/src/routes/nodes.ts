@@ -69,6 +69,22 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
   });
 
   /**
+   * Asks a Node to redo its session-console synchronization without restarting.
+   *
+   * It replays what the Node recorded while the Host could not hear it, which
+   * clears "local control ahead of Host". A refusal carries its reason so the
+   * browser can show it.
+   */
+  app.post("/api/nodes/:id/console-resync", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getNode(id)) return reply.code(404).send({ error: "Unknown node" });
+    const result = service.requestConsoleResync(id);
+    if (!result.started)
+      return reply.code(409).send({ error: result.reason ?? "Resync refused" });
+    return { started: true };
+  });
+
+  /**
    * The Host's half of a bound enrolment: prove who this Host is.
    *
    * Reachable without a credential, because a machine that has not enrolled

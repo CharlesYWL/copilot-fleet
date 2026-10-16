@@ -1466,6 +1466,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         if (sessionConsoleSupported) sessionConsole?.update(frame.value.message);
         return;
       }
+      if (frame.value.type === "session_console_resync") {
+        // The Host asked for the same synchronization a reconnect performs, so an
+        // operator can clear "local control ahead of Host" without restarting
+        // this Node. `connected` supersedes any run already in progress.
+        if (sessionConsoleSupported)
+          void finishSessionReconnect().catch((error: unknown) =>
+            warn(`Session console resync failed: ${errorMessage(error)}`),
+          );
+        return;
+      }
       if (frame.value.type === "session_console_queue") {
         if (!sessionConsoleSupported) return;
         const request = frame.value;
@@ -1683,6 +1693,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           sessionId: command.sessionId,
           ok: result.ok,
           fatal: result.fatal ?? true,
+          ...(result.recovery ? { recovery: result.recovery } : {}),
           ...(result.executionBinding
             ? { executionBinding: result.executionBinding }
             : {}),

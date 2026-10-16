@@ -160,6 +160,9 @@ export class SessionMessages {
           canCancel: editable,
           canSendNow: canSend && editable,
           detail: message.error || (!editable ? "Waiting for delivery confirmation" : ""),
+          ...(message.state === "failed" && message.recovery
+            ? { recovery: message.recovery }
+            : {}),
         },
       ];
     });
@@ -307,6 +310,7 @@ export class SessionMessages {
             state: "pending",
             priority: Date.now(),
             error: "",
+            recovery: undefined,
             deliveryKey:
               record.state === "failed"
                 ? `operator-queue:${randomUUID()}`

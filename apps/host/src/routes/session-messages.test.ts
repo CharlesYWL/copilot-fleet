@@ -108,6 +108,38 @@ async function setup(lead = false) {
 }
 
 describe("session message queue", () => {
+  it("offers reconcile on a message the Node refused until its history is reconciled", async () => {
+    const f = await setup();
+    await f.submit("Needs the Node to catch up");
+    f.event(1, "state", { state: "idle" });
+    f.service.messages.tick();
+    const prompt = f.sent.find((command) => command.type === "prompt")!;
+    expect(prompt).toBeDefined();
+
+    f.service.markQueuedRefusal(f.session.id, prompt.commandId!, "console_resync");
+
+    const [refused] = await f.list();
+    expect(refused).toMatchObject({ state: "failed", recovery: "console_resync" });
+    expect(refused!.detail).toContain("reconciled");
+    // Send now is the retry the Reconcile button performs, and it clears the flag.
+    expect((await f.action(refused!.id, "send-now")).statusCode).toBe(202);
+    expect((await f.list())[0]).not.toHaveProperty("recovery");
+  });
+
+  it("leaves a refusal without a recovery, or for another command, as it was", async () => {
+    const f = await setup();
+    await f.submit("Delivered normally");
+    f.event(1, "state", { state: "idle" });
+    f.service.messages.tick();
+    const prompt = f.sent.find((command) => command.type === "prompt")!;
+
+    f.service.markQueuedRefusal(f.session.id, prompt.commandId!, undefined);
+    f.service.markQueuedRefusal(f.session.id, "some-other-command", "console_resync");
+
+    expect((await f.list())[0]).toMatchObject({ state: "sending" });
+    expect((await f.list())[0]).not.toHaveProperty("recovery");
+  });
+
   it("preserves pre-console operator idempotency digests across upgrades", async () => {
     const f = await setup();
     const id = randomUUID();

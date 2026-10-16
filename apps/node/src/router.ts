@@ -12,6 +12,7 @@ import {
   type SessionEvent,
   type StartupConfig,
   type ContextTier,
+  type ConsoleRecovery,
   type ExecutionBinding,
   WorktreeConflict,
 } from "@fleet/protocol";
@@ -41,6 +42,8 @@ export type CommandResult = {
   error?: string;
   /** False when the command was refused but the session is still healthy. */
   fatal?: boolean;
+  /** A fix the operator can start from the refusal, when there is one. */
+  recovery?: ConsoleRecovery;
   executionBinding?: ExecutionBinding;
 };
 

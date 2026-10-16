@@ -66,6 +66,7 @@ const catalog = {
   deleteNode: vi.fn(),
   updateNode: vi.fn(),
   updateAllNodes: vi.fn(),
+  resyncNodeConsole: vi.fn(),
 };
 
 const show = (

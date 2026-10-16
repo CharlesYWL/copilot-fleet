@@ -641,7 +641,8 @@ export function registerNodeGateway(
               // unless what it refused was the launch, which leaves no session
               // behind to re-announce.
               const reason = message.error ?? "Node refused the command";
-              service.reportSessionNotice(message.sessionId, reason);
+              service.reportSessionNotice(message.sessionId, reason, message.recovery);
+              service.markQueuedRefusal(message.sessionId, message.commandId, message.recovery);
               service.settleRefusedLaunch(message.sessionId, message.commandId, reason);
             }
           }

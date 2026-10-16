@@ -1096,6 +1096,18 @@ export { SessionActorSchema, sessionActor, sessionActorId } from "./session-acto
 export type { SessionActor } from "./session-actor.js";
 
 export const SESSION_CONSOLE_CAPABILITY = "session-console-v1";
+
+/**
+ * A fix the operator can start from the refusal itself.
+ *
+ * `console_resync` means the Node refused Host work because its local session
+ * history or control is not reconciled with the Host; asking it to
+ * resynchronize (`session_console_resync`) is the remedy, and the refusal may
+ * simply be retried afterwards. A closed enum so a new remedy is a deliberate
+ * protocol change rather than a string a browser guesses at.
+ */
+export const ConsoleRecoverySchema = z.enum(["console_resync"]);
+export type ConsoleRecovery = z.infer<typeof ConsoleRecoverySchema>;
 export const CONSOLE_REPLAY_MAX_BYTES = 64 * 1024 * 1024;
 export const ConsoleStatusSchema = z.enum(["online", "offline", "syncing", "conflict"]);
 export type ConsoleStatus = z.infer<typeof ConsoleStatusSchema>;
@@ -1461,6 +1473,13 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
      * Nodes never set this, so the default preserves their behaviour.
      */
     fatal: z.boolean().default(true),
+    /**
+     * A recovery the operator can start for this refusal, when there is one.
+     *
+     * Optional on purpose: a Host that predates it drops the field, and an older
+     * Node never sends it, so the plain `error` text remains the whole story.
+     */
+    recovery: ConsoleRecoverySchema.optional(),
   }),
   z.object({
     type: z.literal("session_cleanup_result"),
@@ -1494,6 +1513,7 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
 
 export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("session_console_resync") }),
   z.object({
     type: z.literal("session_console_queue"),
     sessionId: z.string().min(1),
@@ -1691,6 +1711,16 @@ export const SESSION_RETENTION_CAPABILITY = "session-retention";
 
 /** A Node that retains reconnect batches until `outbox_flush_ack`. */
 export const OUTBOX_ACK_CAPABILITY = "outbox-ack";
+
+/**
+ * A Node that re-runs session-console synchronization when sent
+ * `session_console_resync`, without dropping its Host connection.
+ *
+ * The Host checks this first: an older Node validates every frame against its
+ * own copy of {@link HostToNodeMessageSchema} and hangs up on a type it does
+ * not recognise.
+ */
+export const SESSION_CONSOLE_RESYNC_CAPABILITY = "session-console-resync";
 
 /**
  * A Node that reports the agent's slash commands and pickers, and accepts
@@ -2370,6 +2400,8 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("session_notice"),
     sessionId: z.string().min(1),
     message: z.string().min(1),
+    /** Set when the operator can fix the refusal from here; see {@link ConsoleRecoverySchema}. */
+    recovery: ConsoleRecoverySchema.optional(),
   }),
   /**
    * One run after any change to it.
@@ -2916,6 +2948,8 @@ export const PendingSessionMessageSchema = z.object({
   canCancel: z.boolean(),
   canSendNow: z.boolean(),
   detail: z.string(),
+  /** Set on a failed message the operator can unblock by reconciling the Node. */
+  recovery: ConsoleRecoverySchema.optional(),
 });
 export type PendingSessionMessage = z.infer<typeof PendingSessionMessageSchema>;
 

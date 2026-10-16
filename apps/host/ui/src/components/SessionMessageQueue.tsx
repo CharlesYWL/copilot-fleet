@@ -44,9 +44,16 @@ const useStyles = makeStyles({
 export function SessionMessageQueue({
   session,
   disabled = false,
+  onReconcile,
 }: {
   session: FleetSession;
   disabled?: boolean;
+  /**
+   * Asks the session's Node to reconcile its session history, resolving true
+   * when it was accepted. Left out where no Host is in reach (the Node's own
+   * page), which hides the button rather than offering one that cannot work.
+   */
+  onReconcile?: (sessionId: string) => Promise<boolean>;
 }) {
   const styles = useStyles();
   const [messages, setMessages] = useState<PendingSessionMessage[]>([]);
@@ -107,6 +114,33 @@ export function SessionMessageQueue({
     }
   };
 
+  /**
+   * Reconciles the Node, then sends the refused message again.
+   *
+   * The Host answers a resync request as soon as the Node has been asked, not
+   * when it has finished, so the retry is the same Send now an operator would
+   * press next. If the Node is still catching up the Host refuses again and the
+   * button simply reappears, rather than this loop retrying in the background.
+   */
+  const handleReconcile = async (message: PendingSessionMessage) => {
+    if (!onReconcile || busy.current || disabled) return;
+    busy.current = true;
+    setPending(message.id);
+    setActionError("");
+    try {
+      if (!(await onReconcile(session.id))) return;
+      await api(`${path}/${encodeURIComponent(message.id)}/send-now`, {
+        method: "POST",
+      });
+      await refresh.current();
+    } catch (reason) {
+      setActionError(errorMessage(reason));
+    } finally {
+      busy.current = false;
+      setPending("");
+    }
+  };
+
   if (!messages.length && !error && !actionError) return null;
   return (
     <div className={styles.root}>
@@ -134,6 +168,18 @@ export function SessionMessageQueue({
                   </p>
                 ))}
                 <div className={styles.actions}>
+                  {message.recovery === "console_resync" && onReconcile ? (
+                    <Button
+                      size="small"
+                      appearance="primary"
+                      disabled={disabled || !!pending}
+                      aria-label="Reconcile now"
+                      title="Reconcile this Node's session history with the Host, then send this message again"
+                      onClick={() => void handleReconcile(message)}
+                    >
+                      Reconcile now
+                    </Button>
+                  ) : null}
                   <Button
                     size="small"
                     disabled={disabled || !!pending || !message.canSendNow}

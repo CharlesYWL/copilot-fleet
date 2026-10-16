@@ -305,6 +305,45 @@ describe("shared online and offline Node session control", () => {
       expect(premature).toEqual([]);
     },
   );
+  it("clears 'local control ahead of Host' when the Node resynchronizes without reconnecting", async () => {
+    const f = await fixture();
+    const id = await f.create();
+    await f.settled(id);
+    const operationId = randomUUID();
+    f.journal.acceptOperation({
+      id: operationId,
+      sessionId: id,
+      action: "prompt",
+      payload: {
+        action: "prompt",
+        operationId,
+        prompt: "Typed on the Node",
+        attachments: [],
+      },
+    });
+    f.journal.settleOperation(operationId, "settled");
+    const hostEpoch = () => f.store.sessionConsole.get(id)!.controlEpoch;
+    const fromHost = (): NodeCommand => ({
+      type: "prompt",
+      sessionId: id,
+      commandId: randomUUID(),
+      prompt: "Typed in the Host",
+      attachments: [],
+    });
+
+    const refused = await f.controller.hostCommand(fromHost(), hostEpoch());
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toContain("ahead of the Host");
+
+    // What `session_console_resync` runs on the Node.
+    await f.controller.connected(true);
+    await f.settled(id);
+
+    expect(hostEpoch()).toBe(1);
+    await expect(
+      f.controller.hostCommand(fromHost(), hostEpoch()),
+    ).resolves.toMatchObject({ ok: true });
+  });
   it("publishes durable live output from multiple sessions without waiting for earlier ACKs", async () => {
     // Online delivery must flush the producer burst, not wait for the offline batching timer.
     const f = await fixture(true, 60_000);
