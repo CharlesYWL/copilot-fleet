@@ -1,0 +1,25 @@
+{
+  "name": "@fleet/prm-skill",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Portable PR-maintenance skill (prm): durable JSON state, bounded provider reads, work orders and work reports for any coding agent.",
+  "type": "module",
+  "exports": {
+    "./fleet": {
+      "types": "./dist/lib/fleet.d.ts",
+      "default": "./dist/lib/fleet.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.lib.json && node build.mjs",
+    "build:lib": "tsc -p tsconfig.lib.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.0.17"
+  },
+  "devDependencies": {
+    "@fleet/protocol": "*",
+    "esbuild": "^0.27.7"
+  }
+}

@@ -1994,6 +1994,321 @@ describe("PR maintenance orchestration", () => {
     },
   );
 
+  describe("prm work-order wrapper", () => {
+    const sourceId = source.id;
+    const plan = (
+      overrides: Record<string, unknown> = {},
+    ): Parameters<FleetTools["checkpointPrMaintenance"]>[0]["checkpoint"] =>
+      ({
+        kind: "prepare_work_order",
+        plan: {
+          batchId: "wo-1",
+          summary: "Add the missing null check.",
+          conflictResolution: false,
+          reservedMutations: 3,
+          findings: [
+            {
+              sourceId,
+              revision: source.revision,
+              task: "repair",
+              instructions: "Return early on null input and add a regression test.",
+            },
+          ],
+          ...overrides,
+        },
+      }) as Parameters<FleetTools["checkpointPrMaintenance"]>[0]["checkpoint"];
+    const checkpoint = (
+      recordId: string,
+      update: Parameters<FleetTools["checkpointPrMaintenance"]>[0]["checkpoint"],
+    ) =>
+      tools.checkpointPrMaintenance({
+        recordId,
+        expectedVersion: world.store.prMaintenance.get(recordId)!.version,
+        checkpoint: update,
+      });
+    const workerSays = (sessionId: string, text: string) => {
+      const sequence = world.store.maxEventSequence(sessionId) + 1;
+      world.store.appendEvent({
+        eventId: `report-${sequence}`,
+        sessionId,
+        sequence,
+        type: "agent_text",
+        payload: { text },
+        createdAt: new Date().toISOString(),
+      });
+    };
+    const report = (overrides: Record<string, unknown> = {}) => ({
+      schema: "prm.work-report/1",
+      batchId: "wo-1",
+      summary: "Verified the existing guard covers the null input.",
+      mutationAttempts: 0,
+      findings: [
+        {
+          sourceId,
+          revision: source.revision,
+          outcome: "already_satisfied",
+          stage: "verified",
+          verifiedHeadSha: headSha,
+          evidence: ["Regression suite passed at the current head."],
+        },
+      ],
+      effects: [],
+      ...overrides,
+    });
+    const dispatchAndComplete = (recordId: string, workerId: string, stepId: string) => {
+      const sent = tools.followUp({
+        sessionId: workerId,
+        maintenance: { recordId, generation: 1, batchId: "wo-1" },
+      });
+      expect(sent.ok, sent.text).toBe(true);
+      world.store.updateRunStep(stepId, { state: "running" });
+    };
+    const settleStep = (stepId: string, runId: string, workerId: string) => {
+      completionReceipt(workerId);
+      world.service.settleOrchestrationStep({
+        runId,
+        stepId,
+        state: "succeeded",
+        output: "Worker turn complete.",
+      });
+    };
+
+    it("renders the immutable worker prompt from current sources and the grant", () => {
+      const { record, worker } = setup();
+      const prepared = checkpoint(record.id, plan());
+      expect(prepared.ok, prepared.text).toBe(true);
+      const batch = world.store.prMaintenance.get(record.id)!.batches[0]!;
+      expect(batch).toMatchObject({
+        id: "wo-1",
+        kind: "repair",
+        sources: [source],
+        headSha,
+        reservedMutations: 3,
+        workOrder: {
+          schema: "prm.work-order/1",
+          batchId: "wo-1",
+          permissions: {
+            modifyCode: true,
+            push: true,
+            reply: false,
+            resolveThreads: false,
+          },
+          baseline: record.authorization.scope.baseline,
+          verification: [record.authorization.scope.verification],
+        },
+      });
+      expect(batch.prompt).toContain("prm.work-order/1");
+      expect(batch.prompt).toContain("<prm-work-report>");
+      expect(batch.prompt).toContain(source.evidence);
+      // Retrying the same plan is idempotent; the stored prompt is never rebuilt.
+      expect(checkpoint(record.id, plan()).ok).toBe(true);
+      expect(world.store.prMaintenance.get(record.id)!.batches).toHaveLength(1);
+      const sent = tools.followUp({
+        sessionId: worker.id,
+        maintenance: {
+          recordId: record.id,
+          generation: record.generation,
+          batchId: "wo-1",
+        },
+      });
+      expect(sent.ok, sent.text).toBe(true);
+      expect(world.store.prMaintenance.get(record.id)!.batches[0]!.state).toBe(
+        "accepted",
+      );
+      expect(world.store.getRunStepBySession(worker.id)!.prompt).toBe(batch.prompt);
+    });
+
+    it("refuses plans that invent sources or exceed the grant", () => {
+      const { record } = setup();
+      const invented = checkpoint(
+        record.id,
+        plan({
+          findings: [
+            {
+              sourceId: "thread-9",
+              revision: "rev-9",
+              task: "repair",
+              instructions: "x",
+            },
+          ],
+        }),
+      );
+      expect(invented.ok).toBe(false);
+      expect(invented.text).toContain("source_mismatch");
+      const answer = checkpoint(
+        record.id,
+        plan({
+          findings: [
+            {
+              sourceId,
+              revision: source.revision,
+              task: "answer",
+              instructions: "Reply.",
+            },
+          ],
+        }),
+      );
+      expect(answer.ok).toBe(false);
+      expect(answer.text).toContain("reply_not_authorized");
+      expect(world.store.prMaintenance.get(record.id)!.batches).toEqual([]);
+    });
+
+    it("still requires a prompt for ordinary follow-ups", () => {
+      const { worker } = setup();
+      const result = tools.followUp({ sessionId: worker.id });
+      expect(result.ok).toBe(false);
+    });
+
+    it("settles from the worker's tagged report through the existing guards", () => {
+      const { record, worker, step } = setup();
+      expect(checkpoint(record.id, plan()).ok).toBe(true);
+      dispatchAndComplete(record.id, worker.id, step.id);
+      const early = checkpoint(record.id, {
+        kind: "work_report",
+        batchId: "wo-1",
+        generation: 1,
+        report: report(),
+      });
+      expect(early.ok).toBe(false);
+      expect(early.text).toContain("execution_unsettled");
+      workerSays(
+        worker.id,
+        `Done.\n<prm-work-report>\n${JSON.stringify(report())}\n</prm-work-report>\n`,
+      );
+      settleStep(step.id, step.runId, worker.id);
+      const settled = checkpoint(record.id, {
+        kind: "work_report",
+        batchId: "wo-1",
+        generation: 1,
+      });
+      expect(settled.ok, settled.text).toBe(true);
+      const batch = world.store.prMaintenance.get(record.id)!.batches[0]!;
+      expect(batch).toMatchObject({
+        state: "succeeded",
+        executionSettled: true,
+        published: false,
+        findings: [
+          {
+            source,
+            outcome: "already_satisfied",
+            stage: "verified",
+            verifiedHeadSha: headSha,
+            responseRequired: false,
+          },
+        ],
+      });
+      expect(
+        checkpoint(record.id, {
+          kind: "ready",
+          fingerprint: "actionable-1",
+          evidence: "ok",
+        }).ok,
+      ).toBe(true);
+    });
+
+    it("rejects reports that do not match the work order", () => {
+      const { record, worker, step } = setup();
+      expect(checkpoint(record.id, plan()).ok).toBe(true);
+      dispatchAndComplete(record.id, worker.id, step.id);
+      settleStep(step.id, step.runId, worker.id);
+      const before = world.store.prMaintenance.get(record.id)!.batches[0];
+      const missing = checkpoint(record.id, {
+        kind: "work_report",
+        batchId: "wo-1",
+        generation: 1,
+      });
+      expect(missing.ok).toBe(false);
+      expect(missing.text).toContain("report_missing");
+      const wrongRevision = checkpoint(record.id, {
+        kind: "work_report",
+        batchId: "wo-1",
+        generation: 1,
+        report: report({
+          findings: [
+            {
+              sourceId,
+              revision: "other",
+              outcome: "already_satisfied",
+              stage: "verified",
+              verifiedHeadSha: headSha,
+            },
+          ],
+        }),
+      });
+      expect(wrongRevision.ok).toBe(false);
+      expect(wrongRevision.text).toContain("invalid_report");
+      const unpublished = checkpoint(record.id, {
+        kind: "work_report",
+        batchId: "wo-1",
+        generation: 1,
+        report: report({
+          findings: [
+            {
+              sourceId,
+              revision: source.revision,
+              outcome: "addressed",
+              stage: "verified",
+              verifiedHeadSha: headSha,
+            },
+          ],
+        }),
+      });
+      expect(unpublished.ok).toBe(false);
+      expect(unpublished.text).toContain("published");
+      expect(world.store.prMaintenance.get(record.id)!.batches[0]).toEqual(before);
+    });
+
+    it("keeps an unconfirmed push uncertain instead of settling it", () => {
+      const { record, worker, step } = setup();
+      expect(checkpoint(record.id, plan()).ok).toBe(true);
+      dispatchAndComplete(record.id, worker.id, step.id);
+      settleStep(step.id, step.runId, worker.id);
+      const uncertain = checkpoint(record.id, {
+        kind: "work_report",
+        batchId: "wo-1",
+        generation: 1,
+        report: report({
+          mutationAttempts: 1,
+          findings: [
+            {
+              sourceId,
+              revision: source.revision,
+              outcome: "incomplete",
+              stage: "committed",
+              verifiedHeadSha: headSha,
+              nextAction: "Confirm whether the push reached the PR head.",
+            },
+          ],
+          effects: [{ kind: "push", state: "uncertain" }],
+        }),
+      });
+      expect(uncertain.ok, uncertain.text).toBe(true);
+      const batch = world.store.prMaintenance.get(record.id)!.batches[0]!;
+      expect(batch.state).toBe("uncertain");
+      expect(batch.effects).toMatchObject([{ kind: "push", state: "uncertain" }]);
+      expect(
+        tools.checkpointPrMaintenance({
+          recordId: record.id,
+          expectedVersion: world.store.prMaintenance.get(record.id)!.version,
+          checkpoint: plan({ batchId: "wo-2" }),
+        }).ok,
+      ).toBe(false);
+    });
+
+    it("leaves hand-written prepare_batch batches on their existing settlement path", () => {
+      const { record } = setup();
+      prepare(record.id);
+      const result = checkpoint(record.id, {
+        kind: "work_report",
+        batchId: "batch-1",
+        generation: 1,
+        report: report({ batchId: "batch-1" }),
+      });
+      expect(result.ok).toBe(false);
+      expect(result.text).toContain("not_a_work_order");
+    });
+  });
+
   it("moves the PR heartbeat with a transferred task", () => {
     const { run, record } = setup(false, "github", false);
     const lead = world.store.getSession(world.leadId)!;

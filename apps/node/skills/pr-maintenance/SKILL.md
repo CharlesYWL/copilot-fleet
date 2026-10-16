@@ -395,26 +395,18 @@ allowance is reusable only when no HTTP request was sent (`usedAttempts: 0`).
 ## Prepare once, then continue the same worker
 
 Reserve at most one outstanding batch (`prepared`, `accepted`, `reconciling`, `uncertain`).
-Before `fleet_follow_up`, call `fleet_checkpoint_pr_maintenance` with record/version, generation, stable batch ID,
-exact source revisions and underlying finding groups, observed head/base SHAs, scope, reserved allowances,
-and the **complete immutable follow-up prompt**. Include all of:
+**Prepare with a work order.** Call `fleet_checkpoint_pr_maintenance` with
+`checkpoint: {kind: "prepare_work_order", plan}`, where `plan` is
+`{batchId, summary, conflictResolution?, reservedMutations, findings: [{sourceId, revision, task: "repair"|"answer", instructions}]}`.
+Use each finding's exact `id`/`revision` from the current observation or `operatorWorkSources`; group semantically
+identical problems in one batch. The Host builds a `prm.work-order/1` from the record (PR identity, pinned
+head/base, grant scope and permissions, verification, previous dispositions, remaining allowances) and renders the
+**complete immutable follow-up prompt** itself, including the worker contract and the `prm.work-report/1` format.
+You write triage and instructions, not prompt text. Retrying the same `batchId` returns the stored batch.
+A legacy `prepare_batch` with a hand-written prompt is still accepted but should not be used for new work.
 
-1. Exact PR identity/repositories/refs, task/worker/binding, generation/batch ID.
-2. Approved design/invariants, criteria, bounded repair scope, and explicit
-   whole-PR stop/escalation if the worker discovers a design change.
-3. Assigned findings with IDs/revisions, last verified stage, evidence links,
-   required replies, already-published fixes, and known/uncertain effects.
-4. Verification commands/required observations, any already-required exact-candidate review, and publication/continuation rules below.
-5. Remaining repair/answer/mutation allowances; stop and report at the limit.
-6. Requested per-finding report: `addressed`, `already_satisfied`, `needs_human`,
-   `failed`, `superseded`, or `incomplete`; last verified stage, verification and
-   repair/published SHA, response obligations/IDs, mutation attempts, next action.
-   Use `verifiedHeadSha` for the code actually checked; historical
-   `publishedCommit` is not a new push. A known new publication invalidates
-   pre-publication readiness and requires a fresh complete helper observation.
-
-Then use `fleet_follow_up` with that exact prompt and `maintenance: {recordId, generation, batchId}`.
-The Host atomically links the accepted attempt. End the lead turn after dispatch. Do not dispatch an empty worker
+Then call `fleet_follow_up` with only `maintenance: {recordId, generation, batchId}` (omit `prompt`; the Host sends
+the stored one). The Host atomically links the accepted attempt. End the lead turn after dispatch. Do not dispatch an empty worker
 turn merely to wait for CI/review or check a PR. New feedback while accepted stays pending; never overwrite the prompt.
 While the accepted turn runs, `takeDue` does not offer that PR; completion requests the next check. Routine checks
 otherwise follow the Host's orchestrator heartbeat schedule; an empty claim is not a reason to poll.
@@ -426,6 +418,14 @@ refunds its reservation once and cancels the exact pending step. A refresh-requi
 observed HEAD; an already-pinned continuation still rejects HEAD drift. Drafts, unplanned conflicts, unresolved incidents
 and observations older than 30 minutes still refuse execution, including heartbeat actions. Dispatched/uncertain execution and unsettled effects still
 prevent late receipts from promoting observations or reviving work.
+
+**Settle from the work report.** After the Host records the attempt's terminal RunStep, call
+`fleet_checkpoint_pr_maintenance` with `checkpoint: {kind: "work_report", batchId, generation}`. The Host reads the
+worker's tagged `<prm-work-report>` from that attempt (or pass `report` explicitly), validates it against the stored
+work order, maps findings/effects and settles through the normal guards: correlated quiescent RunStep, known effect
+evidence, allowance accounting, and publication detection. Rejected or missing reports leave the batch unchanged;
+reconcile from provider evidence rather than inventing one. A report is a claim: the next complete observation confirms it.
+`needs_human` findings require maintenance-aware `fleet_escalate` first. Unconfirmed writes stay `uncertain`.
 
 For routine conflicts, recheck exact remote refs and the clean maintained checkout. Stop on user work, existing merge/rebase, unrelated history or unclear semantics; never reset, stash, delete or guess.
 Merge the pinned target into the source branch (not the PR), preserve accepted behavior, verify and push normally after final HEAD/base checks. Base drift needs a fresh plan; genuinely ambiguous conflicts need one concise design decision.
@@ -456,11 +456,11 @@ for ordinary push to the **explicit head repository and ref**, verify the remote
 Resolve only evidenced fixed/already-satisfied findings when allowed; resolution does not satisfy reviewer approval.
 Keep sensitive security evidence out of public replies. Return provider IDs, actor/content identity, batch markers
 and tool evidence. For Azure DevOps use original PR thread/comment IDs and packaged ADO guidance, not GitHub APIs.
-Carry provider, organization, project/repository GUIDs and current iteration/SHAs in the worker's immutable prompt.
+The Host's work order already carries provider, organization, project/repository GUIDs and current SHAs.
 Never set reviewer votes, approve policies, enable auto-complete, abandon or complete a PR. Replies/resolutions,
 named reviewer requests and CI retries still require their exact operator grant; this guidance adds no authorization.
 
-A finished worker turn is not a finished batch. Reconcile each finding/effect against receipts/current remote evidence.
+A finished worker turn is not a finished batch. Settle it with `work_report`; the next complete observation confirms it.
 A pushed fix with failed reply is `incomplete` at reply stage, not a reason to reimplement/re-push. Unknown execution
 or effects stay outstanding. Only evidenced addressed/already-satisfied findings count complete. `partial`, `failed`,
 `cancelled`, and `superseded` release the slot only after all accepted execution/effects are known and settled.

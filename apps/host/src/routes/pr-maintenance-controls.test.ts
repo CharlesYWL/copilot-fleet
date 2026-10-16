@@ -969,6 +969,140 @@ describe("authenticated PR maintenance controls", () => {
     expect(Buffer.byteLength(JSON.stringify(helper))).toBe(154_748);
   });
 
+  it("runs the prm work-order wrapper end to end over the authenticated MCP route", async () => {
+    const { store, service, leadId, worker, registration, authorize, mcp } =
+      await setup("azure-devops");
+    expect((await authorize()).statusCode).toBe(200);
+    let record = store.prMaintenance.list().records[0]!;
+    service.dispatch(store.getSession(leadId)!.nodeId, {
+      type: "prompt",
+      sessionId: leadId,
+      prompt: "Fixture maintenance wake",
+      attachments: [],
+    });
+    const claim = JSON.parse(
+      (await mcp("fleet_get_pr_maintenance", { takeDue: true })).text,
+    );
+    const helper = await observeFixture(
+      fixtureInput(new Date().toISOString(), claim.observationAllowance.requests),
+    );
+    const saved = await mcp("fleet_checkpoint_pr_maintenance", {
+      recordId: record.id,
+      expectedVersion: record.version,
+      checkpoint: { kind: "observation", observation: helper.observation },
+    });
+    expect(saved.ok, saved.text).toBe(true);
+    record = JSON.parse(saved.text);
+    const [first, second] = record.observation!.sources;
+    const plan = {
+      batchId: "wo-ado-1",
+      summary: "Fix the two routine review findings.",
+      reservedMutations: 1,
+      findings: [first!, second!].map((source) => ({
+        sourceId: source.id,
+        revision: source.revision,
+        task: "repair",
+        instructions: "Apply the smallest fix inside the accepted contract and verify.",
+      })),
+    };
+    const prepared = await mcp("fleet_checkpoint_pr_maintenance", {
+      recordId: record.id,
+      expectedVersion: record.version,
+      checkpoint: { kind: "prepare_work_order", plan },
+    });
+    expect(prepared.ok, prepared.text).toBe(true);
+    record = store.prMaintenance.get(record.id)!;
+    const batch = record.batches[0]!;
+    expect(batch.workOrder).toMatchObject({
+      schema: "prm.work-order/1",
+      pr: {
+        provider: "azure-devops",
+        headSha: registration.headSha,
+        headRef: registration.identity.headRef,
+      },
+      permissions: { push: true, reply: false, resolveThreads: false },
+    });
+    expect(batch.sources).toEqual([first, second]);
+    const accepted = await mcp("fleet_follow_up", {
+      sessionId: worker.id,
+      maintenance: {
+        recordId: record.id,
+        generation: record.generation,
+        batchId: batch.id,
+      },
+    });
+    expect(accepted.ok, accepted.text).toBe(true);
+    record = store.prMaintenance.get(record.id)!;
+    const step = store.getRunStep(record.batches[0]!.stepId!)!;
+    expect(step.prompt).toBe(batch.prompt);
+    store.updateRunStep(step.id, { state: "running" });
+    const published = "c".repeat(40);
+    const report = {
+      schema: "prm.work-report/1",
+      batchId: batch.id,
+      summary: "Fixed both findings and pushed normally.",
+      mutationAttempts: 1,
+      findings: [first!, second!].map((source) => ({
+        sourceId: source.id,
+        revision: source.revision,
+        outcome: "addressed",
+        stage: "published",
+        verifiedHeadSha: published,
+        publishedCommit: published,
+        evidence: ["Focused verification passed at the pushed commit."],
+      })),
+      effects: [{ kind: "push", state: "known", commit: published }],
+    };
+    let sequence = store.maxEventSequence(worker.id);
+    for (const [type, payload] of [
+      [
+        "agent_text",
+        { text: `<prm-work-report>\n${JSON.stringify(report)}\n</prm-work-report>` },
+      ],
+      ["turn_complete", {}],
+      ["state", { state: "idle" }],
+    ] as const)
+      store.appendEvent({
+        eventId: `wrapper-${++sequence}`,
+        sessionId: worker.id,
+        sequence,
+        type,
+        payload,
+        createdAt: new Date().toISOString(),
+      });
+    service.settleOrchestrationStep({
+      runId: step.runId,
+      stepId: step.id,
+      state: "succeeded",
+      output: "Worker turn complete.",
+    });
+    record = store.prMaintenance.get(record.id)!;
+    const settled = await mcp("fleet_checkpoint_pr_maintenance", {
+      recordId: record.id,
+      expectedVersion: record.version,
+      checkpoint: {
+        kind: "work_report",
+        batchId: batch.id,
+        generation: record.generation,
+      },
+    });
+    expect(settled.ok, settled.text).toBe(true);
+    record = store.prMaintenance.get(record.id)!;
+    expect(record.batches[0]).toMatchObject({
+      state: "succeeded",
+      published: true,
+      executionSettled: true,
+      effects: [{ kind: "push", state: "known", providerId: published }],
+    });
+    // A new publication requires fresh evidence before readiness.
+    expect(record.lastAttempt).toBeUndefined();
+    expect(record.findings.map((finding) => finding.outcome)).toEqual([
+      "addressed",
+      "addressed",
+    ]);
+    expect(record.counters.mutationAttempts).toBe(1);
+  });
+
   it("runs claimed helper failure through the real MCP recovery seam without admitting repairs", async () => {
     const { store, service, leadId, registration, authorize, mcp } =
       await setup("azure-devops");

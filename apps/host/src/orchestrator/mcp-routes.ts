@@ -600,7 +600,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     {
       title: "Checkpoint PR maintenance facts",
       description:
-        "Persist observations, helper fallback errors, prepared batches, settlement or readiness with an optimistic version. For fallback, error is the STRING 'code: message' from result.error.code and result.error.message (not the helper error object), and observation is the unchanged original result.observation with its real timestamp. Correcting a rejected shape does not authorize another helper call. Claim a bounded visit, then reserve alternate_attempt with incidentId, stable resolutionId, source/method/evidenceRef and request budget BEFORE alternate provider I/O. Submit fresh structured alternate_observation with the same resolutionId; partial stays partial. At most 3 attempts/incident; no credential changes or hold bypass. Checkpointing cannot authorize, broaden scope or transfer ownership. A worker completion is not batch settlement.",
+        "Persist observations, helper fallback errors, prepared batches, settlement or readiness with an optimistic version. Prepare new work with kind prepare_work_order (the Host renders the prm.work-order/1 worker prompt) and settle it with kind work_report after the attempt completes. For fallback, error is the STRING 'code: message' from result.error.code and result.error.message (not the helper error object), and observation is the unchanged original result.observation with its real timestamp. Correcting a rejected shape does not authorize another helper call. Claim a bounded visit, then reserve alternate_attempt with incidentId, stable resolutionId, source/method/evidenceRef and request budget BEFORE alternate provider I/O. Submit fresh structured alternate_observation with the same resolutionId; partial stays partial. At most 3 attempts/incident; no credential changes or hold bypass. Checkpointing cannot authorize, broaden scope or transfer ownership. A worker completion is not batch settlement.",
       inputSchema: CheckpointPrMaintenanceSchema.shape,
     },
     guard("fleet_checkpoint_pr_maintenance", CheckpointPrMaintenanceSchema, (input) =>
@@ -618,7 +618,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "Use the sessionId from fleet_list_work or fleet_get_task. A closed task must first be reopened with fleet_reopen_task.",
         "Accepted follow-ups are persisted and scheduled; queued means accepted, not failed. Repeating the same pending follow-up does not resend it; a different prompt cannot overwrite it.",
         "Busy, stopping or offline is not a reason to replace a worker. Use fleet_start_work only for genuinely different work or a confirmed non-resumable conversation.",
-        "For registered PR maintenance, supply its recordId/generation/batchId in maintenance and the byte-identical prepared prompt. Acceptance binds the same step/attempt atomically; omitted metadata cannot bypass a hold.",
+        "For registered PR maintenance, supply its recordId/generation/batchId in maintenance and omit prompt (the Host sends the stored prepared prompt; a supplied prompt must match it byte for byte). Acceptance binds the same step/attempt atomically; omitted metadata cannot bypass a hold.",
       ].join(" "),
       inputSchema: FollowUpSchema.shape,
     },

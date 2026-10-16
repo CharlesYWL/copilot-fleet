@@ -1026,7 +1026,9 @@ describe("packaged maintenance resources", () => {
     expect(skill).toMatch(/^---\r?\nname: pr-maintenance\r?\ndescription:/);
     for (const phrase of [
       "whole PR",
-      "immutable follow-up prompt",
+      "complete immutable follow-up prompt",
+      "prepare_work_order",
+      "work_report",
       "Never merge",
       "not** model evaluations",
     ]) {
