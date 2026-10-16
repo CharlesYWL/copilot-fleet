@@ -14,6 +14,23 @@ export const workerModelRoutingRoutes: FastifyPluginAsync<{
     return routing.view();
   });
 
+  /** What the decision model was asked and answered, newest first, for debugging. */
+  app.get("/api/worker-model-routing/calls", async (request, reply) => {
+    if (!requireNodeOperator(auth, request, reply, false)) return;
+    const query = z
+      .object({
+        limit: z.coerce.number().int().min(1).max(500).default(50),
+        runId: z.string().min(1).max(100).optional(),
+      })
+      .parse(request.query);
+    return {
+      calls: routing.calls({
+        limit: query.limit,
+        ...(query.runId ? { runId: query.runId } : {}),
+      }),
+    };
+  });
+
   app.put(
     "/api/worker-model-routing",
     { bodyLimit: 64 * 1024 },

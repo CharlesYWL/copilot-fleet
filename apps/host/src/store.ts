@@ -397,6 +397,39 @@ export const MUTUAL_AUTH_REQUIRED_SETTING = "node.mutualAuthentication.required"
 export const MAX_SECURITY_AUDIT_ROWS = 10_000;
 
 /**
+ * Newest-first retention for the routing debug log.
+ *
+ * Each row keeps the sanitized request the decision model saw, so the cap is
+ * what bounds the space it can take.
+ */
+export const MAX_WORKER_ROUTING_CALLS = 2_000;
+
+export type WorkerRoutingCallInput = {
+  id: string;
+  runId: string;
+  category: string;
+  receipt: WorkerRoutingReceipt;
+  /** The exact state and questions sent to the decision model, without credentials. */
+  request?: unknown;
+};
+
+export type WorkerRoutingCallRecord = {
+  id: string;
+  sequence: number;
+  createdAt: string;
+  runId: string;
+  category: string;
+  mode: string;
+  policyRevision: number;
+  source: string;
+  profileId: string;
+  fallbackReason: string;
+  durationMs: number;
+  request: unknown;
+  receipt: WorkerRoutingReceipt;
+};
+
+/**
  * A sanitised reason, never a request body or a provider's output.
  *
  * The audit is readable by every administrator, so anything copied into it is
@@ -846,6 +879,25 @@ export class FleetStore {
       );
       CREATE INDEX IF NOT EXISTS idx_security_audit_sequence
         ON security_audit(sequence);
+      CREATE TABLE IF NOT EXISTS worker_routing_calls (
+        id TEXT PRIMARY KEY,
+        sequence INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        run_id TEXT NOT NULL DEFAULT '',
+        category TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        profile_id TEXT NOT NULL DEFAULT '',
+        fallback_reason TEXT NOT NULL DEFAULT '',
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        request TEXT NOT NULL DEFAULT '',
+        receipt TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_worker_routing_calls_sequence
+        ON worker_routing_calls(sequence);
+      CREATE INDEX IF NOT EXISTS idx_worker_routing_calls_run
+        ON worker_routing_calls(run_id);
       CREATE TABLE IF NOT EXISTS enrollment_grants (
         id TEXT PRIMARY KEY,
         token_hash TEXT NOT NULL UNIQUE,
@@ -2446,7 +2498,7 @@ export class FleetStore {
     this.prMaintenance.importBackup(undefined);
     this.resumeRequests.clear();
     this.db.exec(
-      "DELETE FROM managed_api_requests; DELETE FROM session_dispatch_attempts; DELETE FROM session_turn_completions; DELETE FROM session_transition_intents; DELETE FROM notification_preferences; DELETE FROM notifications; DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes",
+      "DELETE FROM managed_api_requests; DELETE FROM session_dispatch_attempts; DELETE FROM session_turn_completions; DELETE FROM session_transition_intents; DELETE FROM notification_preferences; DELETE FROM notifications; DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM worker_routing_calls; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes",
     );
     /*
      * Settings are replaced wholesale except the ones that decide who may
@@ -3531,6 +3583,82 @@ export class FleetStore {
         sequence - MAX_SECURITY_AUDIT_ROWS,
       );
     });
+  }
+
+  /**
+   * Keeps what the decision model was asked and what it answered, for debugging.
+   *
+   * Appended and trimmed in one commit, like the security log. The request is
+   * the sanitized state and questions only; credentials never reach it. The
+   * receipt already carries the probabilities, attempts and fallback reason.
+   */
+  recordWorkerRoutingCall(entry: WorkerRoutingCallInput): void {
+    const receipt = WorkerRoutingReceiptSchema.parse(entry.receipt);
+    this.transaction(() => {
+      const highest = this.statement(
+        "SELECT COALESCE(MAX(sequence),0) AS top FROM worker_routing_calls",
+      ).get() as Row | undefined;
+      const sequence = Number(highest?.top ?? 0) + 1;
+      this.statement(
+        `INSERT INTO worker_routing_calls
+           (id,sequence,created_at,run_id,category,mode,policy_revision,source,profile_id,fallback_reason,duration_ms,request,receipt)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        entry.id,
+        sequence,
+        receipt.createdAt,
+        entry.runId,
+        entry.category,
+        receipt.mode,
+        receipt.policyRevision,
+        receipt.source,
+        receipt.profileId ?? "",
+        receipt.fallbackReason ?? "",
+        Math.round(receipt.durationMs),
+        entry.request === undefined ? "" : JSON.stringify(entry.request),
+        JSON.stringify(receipt),
+      );
+      this.statement("DELETE FROM worker_routing_calls WHERE sequence<=?").run(
+        sequence - MAX_WORKER_ROUTING_CALLS,
+      );
+    });
+  }
+
+  listWorkerRoutingCalls(
+    options: { limit?: number; runId?: string } = {},
+  ): WorkerRoutingCallRecord[] {
+    const limit = Math.min(500, Math.max(1, Math.floor(options.limit ?? 50)));
+    const rows = (
+      options.runId
+        ? this.statement(
+            "SELECT * FROM worker_routing_calls WHERE run_id=? ORDER BY sequence DESC LIMIT ?",
+          ).all(options.runId, limit)
+        : this.statement(
+            "SELECT * FROM worker_routing_calls ORDER BY sequence DESC LIMIT ?",
+          ).all(limit)
+    ) as Row[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      sequence: Number(row.sequence),
+      createdAt: String(row.created_at),
+      runId: String(row.run_id),
+      category: String(row.category),
+      mode: String(row.mode),
+      policyRevision: Number(row.policy_revision),
+      source: String(row.source),
+      profileId: String(row.profile_id),
+      fallbackReason: String(row.fallback_reason),
+      durationMs: Number(row.duration_ms),
+      request: row.request ? JSON.parse(String(row.request)) : undefined,
+      receipt: WorkerRoutingReceiptSchema.parse(JSON.parse(String(row.receipt))),
+    }));
+  }
+
+  countWorkerRoutingCalls(): number {
+    const row = this.statement(
+      "SELECT COUNT(*) AS total FROM worker_routing_calls",
+    ).get() as Row | undefined;
+    return Number(row?.total ?? 0);
   }
 
   listSecurityAudit(limit: number): SecurityAuditRecord[] {
@@ -5846,6 +5974,7 @@ export class FleetStore {
       this.statement("DELETE FROM run_notes WHERE run_id=?").run(id);
       this.statement("DELETE FROM run_steps WHERE run_id=?").run(id);
       this.statement("DELETE FROM runs WHERE id=?").run(id);
+      this.statement("DELETE FROM worker_routing_calls WHERE run_id=?").run(id);
       return true;
     });
   }

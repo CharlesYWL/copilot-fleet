@@ -61,6 +61,7 @@ import { CommandConflict } from "../command-execution-store.js";
 import { PrMaintenanceError } from "../pr-maintenance-store.js";
 import { WorkerResumeConflict } from "../worker-resume-store.js";
 import { WorkerRoutingSettingsError } from "../worker-model-routing.js";
+import { routingTaskContext } from "../routing-brief.js";
 
 /** The kinds of work an orchestrator can ask for, and what each one means. */
 export { WORKER_CATEGORIES, ProposeWorkerRoutingPolicySchema } from "@fleet/protocol";
@@ -2456,7 +2457,10 @@ export class FleetTools {
     const epoch = this.store.getSetting("workerModelRouting.epoch");
     let routing: WorkerRoutingReceipt | undefined;
     try {
-      routing = await routingService.decide(input);
+      routing = await routingService.decide(
+        { ...input, taskContext: routingTaskContext(admission.run) },
+        { runId: admission.run.id },
+      );
     } catch (error) {
       if (error instanceof WorkerRoutingSettingsError) return refuse(error.message);
       throw error;

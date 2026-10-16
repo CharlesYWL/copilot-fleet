@@ -444,7 +444,17 @@ Older Nodes can ignore the optional fallback field and retain their existing
 best-effort startup behavior; update Nodes for paired fallback support.
 
 Task details show the profile, policy revision, source, provider attempts and
-**requested/predicted versus running** settings. Snapshot-enabled workers keep
+**requested/predicted versus running** settings. The decision model is not
+given the worker's full brief. It reads a cleaned copy of the title,
+deliverable, scope and verification (commit hashes, ids, file paths and links
+become short placeholders, and each field is capped) together with the task's
+name, objective and current phase from the task record. The worker itself still
+receives its original brief. Each decision is also kept, newest first and capped
+at 2,000 rows, with the exact cleaned request the model saw, its probabilities,
+the attempts and any fallback reason. Operators can read it at
+`GET /api/worker-model-routing/calls` (optional `runId` and `limit`); it is
+cleared when a task is deleted or a backup is restored and is never included in
+a backup. Snapshot-enabled workers keep
 their own observed model/effort through follow-up, reconnect and conversation
 rollover, including explicit session-picker changes. The decision provider is
 never called again for that worker.

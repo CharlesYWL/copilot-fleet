@@ -170,6 +170,53 @@ describe("new-worker routing through admission and dispatch", () => {
     expect(JSON.stringify(h.commands)).not.toContain("private-integration-fixture-key");
   });
 
+  it("gives the decision model the task's objective and phase from the database, and records the call against the run", async () => {
+    const h = await setup();
+    const run = h.store.createRun({
+      workspaceId: h.store.getSession(h.leadId)!.workspaceId,
+      name: "S07 authoring",
+      objective: "Deliver one independently reviewed draft PR for S07",
+      phases: ["Inspect", "Implement and verify", "Review and publish"],
+    });
+    h.store.updateRun(run.id, {
+      leadSessionId: h.leadId,
+      state: "running",
+      phaseIndex: 1,
+    });
+    const result = await h.tools.startRoutedWork({
+      ...input,
+      task: run.id,
+      deliverable: "A patch for 8536a1fcd0de149d659af95cd6a94abf8d348441",
+      scope: "Only C:\\repo\\src\\recovery",
+    });
+    expect(result.ok, result.text).toBe(true);
+    const payload = h.evaluate.mock.calls[0]?.[2];
+    expect(payload?.state.task).toEqual({
+      name: "S07 authoring",
+      objective: "Deliver one independently reviewed draft PR for S07",
+      phase: "2 of 3: Implement and verify",
+      plan: "Inspect → Implement and verify → Review and publish",
+    });
+    expect(payload?.state.deliverable).toBe("A patch for <hash>");
+    expect(payload?.state.scope).toBe("Only <path>");
+    // The worker still receives the original brief, untouched.
+    const start = h.commands.find((command) => command.type === "start_session");
+    if (start?.type !== "start_session") throw new Error("Worker was not started");
+    expect(start.prompt).toContain("8536a1fcd0de149d659af95cd6a94abf8d348441");
+    expect(start.prompt).toContain("C:\\repo\\src\\recovery");
+
+    const [call] = h.store.listWorkerRoutingCalls({ runId: run.id });
+    expect(call).toMatchObject({
+      runId: run.id,
+      category: "implement",
+      source: "decision",
+      profileId: "ordinary",
+    });
+    expect(call?.request).toMatchObject({
+      state: { task: { name: "S07 authoring" } },
+    });
+  });
+
   it("keeps Off behavior and ignores profile hints without creating snapshots", async () => {
     const h = await setup("off");
     const result = await h.tools.startRoutedWork({
@@ -392,5 +439,35 @@ describe("effective selection continuity and backup", () => {
     expect(restored.getWorkerModelRouting().mode).toBe("off");
     expect(restored.getSetting("workerModelRouting.providerState")).toBe("{}");
     expect(JSON.stringify(backup)).not.toContain("private-integration-fixture-key");
+  });
+
+  it("keeps the debug record out of backups and clears it on restore and when its task is deleted", async () => {
+    const h = await setup();
+    await h.tools.startRoutedWork(input);
+    const runId = h.store.listRuns()[0]!.id;
+    expect(h.store.listWorkerRoutingCalls({ runId })).toHaveLength(1);
+    expect(
+      JSON.stringify(h.store.exportHostBackup({ enrollmentToken: "" })),
+    ).not.toContain("worker_routing_calls");
+    const restored = new FleetStore(":memory:");
+    cleanups.push(() => restored.close());
+    restored.recordWorkerRoutingCall({
+      id: "stale",
+      runId: "old",
+      category: "implement",
+      receipt: h.store.listWorkerRoutingCalls()[0]!.receipt,
+    });
+    restored.replaceHostBackup(h.store.exportHostBackup({ enrollmentToken: "" }));
+    expect(restored.countWorkerRoutingCalls()).toBe(0);
+
+    h.store.recordWorkerRoutingCall({
+      id: "other",
+      runId: "another-task",
+      category: "implement",
+      receipt: h.store.listWorkerRoutingCalls()[0]!.receipt,
+    });
+    h.store.deleteRun(runId);
+    expect(h.store.listWorkerRoutingCalls({ runId })).toEqual([]);
+    expect(h.store.listWorkerRoutingCalls({ runId: "another-task" })).toHaveLength(1);
   });
 });

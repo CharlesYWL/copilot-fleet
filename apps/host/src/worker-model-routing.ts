@@ -22,6 +22,7 @@ import {
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
 import { savePrivateJson } from "./private-config.js";
+import { prepareRoutingBrief } from "./routing-brief.js";
 import { securePrivateDirectory } from "./data-permissions.js";
 import {
   DECISION_REQUEST_BYTES,
@@ -586,6 +587,48 @@ export class WorkerModelRoutingService {
 
   async decide(
     brief: RoutingBrief & { profile?: string | undefined },
+    context: { runId?: string | undefined } = {},
+  ): Promise<WorkerRoutingReceipt | undefined> {
+    // The decision model reads the cleaned brief; the worker's prompt is built elsewhere.
+    const prepared = prepareRoutingBrief(brief);
+    const sent: { request?: unknown } = {};
+    const receipt = await this.choose(brief.profile, prepared, sent);
+    if (receipt) this.recordCall(receipt, prepared.category, context.runId, sent.request);
+    return receipt;
+  }
+
+  /** Recent decision-model calls for debugging: the sanitized request and the receipt. */
+  calls(options: { limit?: number; runId?: string } = {}) {
+    return this.store.listWorkerRoutingCalls(options);
+  }
+
+  /** A failure here must never hold up or refuse a dispatch. */
+  private recordCall(
+    receipt: WorkerRoutingReceipt,
+    category: string,
+    runId: string | undefined,
+    request: unknown,
+  ): void {
+    try {
+      this.store.recordWorkerRoutingCall({
+        id: randomUUID(),
+        runId: runId ?? "",
+        category,
+        receipt,
+        request,
+      });
+    } catch (error) {
+      this.log.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "Could not record the worker routing call",
+      );
+    }
+  }
+
+  private async choose(
+    requestedProfile: string | undefined,
+    brief: RoutingBrief,
+    sent: { request?: unknown },
   ): Promise<WorkerRoutingReceipt | undefined> {
     const configuration = this.store.getWorkerModelRouting();
     if (configuration.mode === "off") return undefined;
@@ -617,28 +660,31 @@ export class WorkerModelRoutingService {
       receipt.durationMs = this.now() - started;
       return receipt;
     };
-    if (brief.profile && brief.profile !== "auto") {
-      const profile = configuration.profiles.find((entry) => entry.id === brief.profile);
-      if (!profile)
+    if (requestedProfile && requestedProfile !== "auto") {
+      const explicit = configuration.profiles.find(
+        (entry) => entry.id === requestedProfile,
+      );
+      if (!explicit)
         throw new WorkerRoutingSettingsError(
           400,
           "unknown_profile",
-          `Unknown profile "${brief.profile}". Available IDs: ${configuration.profiles.map((entry) => entry.id).join(", ") || "none"}.`,
+          `Unknown profile "${requestedProfile}". Available IDs: ${configuration.profiles.map((entry) => entry.id).join(", ") || "none"}.`,
         );
-      return select(profile, "explicit");
+      return select(explicit, "explicit");
     }
     const candidates = configuration.profiles;
     if (!candidates.length) {
       receipt.fallbackReason = "no_candidates";
       return receipt;
     }
+    // What the model is asked, minus the deployment name that differs per provider.
+    const payload = decisionPayload("", brief, candidates);
+    sent.request = { state: payload.state, questions: payload.questions };
     const states = this.providerState();
     const providers = configuration.providers.filter((provider) =>
       this.ready(provider, states),
     );
-    const baseBytes = Buffer.byteLength(
-      JSON.stringify(decisionPayload("", brief, candidates)),
-    );
+    const baseBytes = Buffer.byteLength(JSON.stringify(payload));
     const modelBytes = Math.max(
       0,
       ...configuration.providers.map(
