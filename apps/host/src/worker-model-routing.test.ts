@@ -17,11 +17,12 @@ import { fleet } from "./orchestrator/fleet-harness.js";
 import {
   DECISION_REQUEST_BYTES,
   DecisionProviderError,
-  decisionPayload,
   type DecisionPayload,
   type RoutingBrief,
 } from "./decision-provider.js";
+import { ROUTING_FIELD_LIMITS } from "./routing-brief.js";
 import { WorkerModelRoutingService } from "./worker-model-routing.js";
+import { MAX_WORKER_ROUTING_CALLS } from "./store.js";
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -593,13 +594,20 @@ describe("ordered decision-model fallback", () => {
     expect(h.evaluate.mock.calls.map(([provider]) => provider.id)).toEqual(["secondary"]);
   });
 
-  it("does not call a provider for oversized UTF-8 input or an empty profile list", async () => {
+  it("clips an oversized brief and still routes it, and handles an empty profile list", async () => {
     const h = await setup();
     await h.configure();
-    expect(
-      (await h.routing.decide({ ...brief, deliverable: "é".repeat(17_000) }))
-        ?.fallbackReason,
-    ).toBe("over_size");
+    const result = await h.routing.decide({ ...brief, deliverable: "é".repeat(17_000) });
+    expect(result?.source).toBe("decision");
+    expect(h.evaluate).toHaveBeenCalledTimes(1);
+    const sent = h.evaluate.mock.calls[0]![2];
+    expect(sent.state.deliverable.length).toBeLessThanOrEqual(
+      ROUTING_FIELD_LIMITS.deliverable,
+    );
+    expect(Buffer.byteLength(JSON.stringify(sent))).toBeLessThanOrEqual(
+      DECISION_REQUEST_BYTES,
+    );
+    h.evaluate.mockClear();
     await h.configure([connection("primary")], "route", []);
     expect(
       (await h.routing.decide({ ...brief, category: "explore" }))?.fallbackReason,
@@ -632,26 +640,135 @@ describe("ordered decision-model fallback", () => {
     );
   });
 
-  it("accepts an exact 32 KiB request and defaults at one byte over the limit", async () => {
+  it("sends the decision model a cleaned brief with the task context and records the call", async () => {
     const h = await setup();
     await h.configure();
-    const empty = { ...brief, deliverable: "" };
-    const bytes = Buffer.byteLength(
-      JSON.stringify(decisionPayload(connection("primary").model, empty, profiles)),
+    const result = await h.routing.decide(
+      {
+        ...brief,
+        title: "Review 8536a1fcd0de149d659af95cd6a94abf8d348441",
+        scope: "Read C:\\Users\\someone\\.copilot\\session-state\\files\\HANDOFF.md only",
+        taskContext: {
+          name: "S07 authoring",
+          objective: "Deliver one reviewed PR",
+          phase: "3 of 3: Review and publish",
+          plan: "Inspect → Implement → Review and publish",
+        },
+      },
+      { runId: "run-1" },
     );
-    const exact = { ...brief, deliverable: "a".repeat(DECISION_REQUEST_BYTES - bytes) };
+    expect(result?.source).toBe("decision");
+    const payload = h.evaluate.mock.calls[0]?.[2];
+    expect(payload?.state).toMatchObject({
+      category: "implement",
+      title: "Review <hash>",
+      scope: "Read <path> only",
+      task: {
+        name: "S07 authoring",
+        objective: "Deliver one reviewed PR",
+        phase: "3 of 3: Review and publish",
+      },
+    });
+    expect(JSON.stringify(payload)).not.toContain("8536a1fc");
+    expect(JSON.stringify(payload)).not.toContain("someone");
+
+    const [call] = h.store.listWorkerRoutingCalls({ runId: "run-1" });
+    expect(call).toMatchObject({
+      runId: "run-1",
+      category: "implement",
+      source: "decision",
+      profileId: "ordinary",
+      mode: "route",
+    });
+    expect(call?.request).toEqual({
+      state: payload?.state,
+      questions: payload?.questions,
+    });
+    expect(call?.receipt.attempts).toHaveLength(1);
+    expect(JSON.stringify(call)).not.toContain("private-fixture-key");
+  });
+
+  it("records fallbacks and explicit picks, but nothing while routing is off", async () => {
+    const h = await setup();
+    await h.configure();
+    h.evaluate.mockRejectedValueOnce(new DecisionProviderError("provider_error", 500));
+    await h.routing.decide(brief, { runId: "run-fallback" });
+    await h.routing.decide({ ...brief, profile: "deep" }, { runId: "run-explicit" });
+    const calls = h.store.listWorkerRoutingCalls();
     expect(
-      Buffer.byteLength(
-        JSON.stringify(decisionPayload(connection("primary").model, exact, profiles)),
-      ),
-    ).toBe(DECISION_REQUEST_BYTES);
-    expect((await h.routing.decide(exact))?.source).toBe("decision");
-    h.evaluate.mockClear();
-    expect(
-      (await h.routing.decide({ ...exact, deliverable: `${exact.deliverable}a` }))
-        ?.fallbackReason,
-    ).toBe("over_size");
+      calls.map((entry) => [entry.runId, entry.source, entry.fallbackReason]),
+    ).toEqual([
+      ["run-explicit", "explicit", ""],
+      ["run-fallback", "fallback", "provider_error"],
+    ]);
+    expect(calls[1]?.receipt.attempts[0]).toMatchObject({ code: "provider_error" });
+    // An explicit pick never reaches the provider, so there is no request to keep.
+    expect(calls[0]?.request).toBeUndefined();
+
+    await h.configure([connection("primary")], "off");
+    expect(await h.routing.decide(brief, { runId: "run-off" })).toBeUndefined();
+    expect(h.store.listWorkerRoutingCalls({ runId: "run-off" })).toEqual([]);
+  });
+
+  it("never lets a failed debug write hold up or refuse a dispatch", async () => {
+    const h = await setup();
+    await h.configure();
+    vi.spyOn(h.store, "recordWorkerRoutingCall").mockImplementation(() => {
+      throw new Error("disk full");
+    });
+    const result = await h.routing.decide(brief, { runId: "run-x" });
+    expect(result?.source).toBe("decision");
+  });
+
+  it("keeps only the newest debug rows", async () => {
+    const h = await setup();
+    await h.configure();
+    for (let index = 0; index < MAX_WORKER_ROUTING_CALLS + 5; index++)
+      h.store.recordWorkerRoutingCall({
+        id: `call-${index}`,
+        runId: "run-cap",
+        category: "implement",
+        receipt: {
+          version: 1,
+          mode: "route",
+          source: "fallback",
+          policyRevision: 1,
+          createdAt: new Date().toISOString(),
+          durationMs: 1,
+          attempts: [],
+          fallbackReason: "timeout",
+        },
+      });
+    const kept = h.store.listWorkerRoutingCalls({ runId: "run-cap", limit: 500 });
+    expect(kept[0]?.id).toBe(`call-${MAX_WORKER_ROUTING_CALLS + 4}`);
+    expect(h.store.countWorkerRoutingCalls()).toBe(MAX_WORKER_ROUTING_CALLS);
+  });
+
+  it("keeps the 32 KiB backstop for text that grows when encoded, without calling the provider", async () => {
+    const h = await setup();
+    await h.configure();
+    // A control character becomes six bytes in JSON, so a brief that fits every
+    // field cap can still exceed the request limit.
+    const expanding = "\u0001".repeat(5_000);
+    const result = await h.routing.decide({
+      ...brief,
+      title: expanding,
+      deliverable: expanding,
+      scope: expanding,
+      verify: expanding,
+      taskContext: {
+        name: expanding,
+        objective: expanding,
+        phase: expanding,
+        plan: expanding,
+      },
+    });
+    expect(result?.fallbackReason).toBe("over_size");
     expect(h.evaluate).not.toHaveBeenCalled();
+    expect(h.store.listWorkerRoutingCalls()[0]).toMatchObject({
+      source: "fallback",
+      fallbackReason: "over_size",
+    });
   });
 
   it("freezes defaults and the profile policy, and discards late decisions after disable", async () => {

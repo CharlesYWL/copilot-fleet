@@ -101,6 +101,7 @@ describe("decision settings operator boundary", () => {
     const h = await setup();
     for (const [method, url, payload] of [
       ["GET", "/api/worker-model-routing", undefined],
+      ["GET", "/api/worker-model-routing/calls", undefined],
       ["POST", "/api/worker-model-routing/test", draft],
       ["PUT", "/api/worker-model-routing", update()],
     ] as const) {
@@ -115,6 +116,54 @@ describe("decision settings operator boundary", () => {
     }
     expect(h.evaluate).not.toHaveBeenCalled();
     expect(h.routing.view().providers).toHaveLength(0);
+  });
+
+  it("lets an operator read the decision debug record, newest first, and nothing else may", async () => {
+    const h = await setup();
+    const receipt = (profileId: string) => ({
+      version: 1 as const,
+      mode: "route" as const,
+      source: "decision" as const,
+      policyRevision: 1,
+      createdAt: new Date().toISOString(),
+      durationMs: 5,
+      profileId,
+      attempts: [],
+    });
+    h.store.recordWorkerRoutingCall({
+      id: "a",
+      runId: "run-1",
+      category: "implement",
+      receipt: receipt("one"),
+      request: { state: { title: "first" } },
+    });
+    h.store.recordWorkerRoutingCall({
+      id: "b",
+      runId: "run-2",
+      category: "explore",
+      receipt: receipt("two"),
+    });
+    const all = await h.app.inject({
+      method: "GET",
+      url: "/api/worker-model-routing/calls",
+      headers: { "fixture-admin": "fresh" },
+    });
+    expect(all.statusCode).toBe(200);
+    expect(all.json().calls.map((call: { id: string }) => call.id)).toEqual(["b", "a"]);
+    const one = await h.app.inject({
+      method: "GET",
+      url: "/api/worker-model-routing/calls?runId=run-1&limit=5",
+      headers: { "fixture-admin": "fresh" },
+    });
+    expect(one.json().calls).toMatchObject([
+      { id: "a", request: { state: { title: "first" } } },
+    ]);
+    const invalid = await h.app.inject({
+      method: "GET",
+      url: "/api/worker-model-routing/calls?limit=0",
+      headers: { "fixture-admin": "fresh" },
+    });
+    expect(invalid.statusCode).toBeGreaterThanOrEqual(400);
   });
 
   it("allows an authenticated operator to save repeatedly without recent reauthentication or key disclosure", async () => {
