@@ -59,7 +59,7 @@ Files: `apps/host/ui/src/components/TunnelPanel.tsx`, a focused Corp direct card
 - [x] Run focused baseline and regression tests, then `npm run lint`, formatting checks, type checks, tests and build. Distinguish pre-existing/environment failures from introduced failures and do not claim tests passed without output.
 - [x] Review security boundaries, secrets, policy revocation, forwarding origin guards, restore behavior, lingering listeners and task persistence. Fix findings and rerun affected checks.
 - [x] Document setup, firewall privileges, interactive vs login startup, IP changes and certificate renewal; provide a real Host/Node manual checklist in the PR.
-- [ ] Commit only feature files, push `feat/corp-direct` to private `origin`, and create a PR against `main` in `charlesyin_microsoft/copilot-fleet`. Do not push to public upstream, merge, or deploy.
+- [x] Commit only feature files, push `feat/corp-direct` to private `origin`, and create a PR against `main` in `charlesyin_microsoft/copilot-fleet`. Do not push to public upstream, merge, or deploy. Delivered as private draft [PR #91](https://github.com/charlesyin_microsoft/copilot-fleet/pull/91); deployment and manual rollout remain pending by design.
 
 ## Validation record
 
