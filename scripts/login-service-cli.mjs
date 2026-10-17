@@ -38,7 +38,9 @@ export const HELP = `Windows login startup (not signed-out boot)
 Run install once before start; start does not install tasks.
 Install builds and starts by default. Options: --no-build, --no-start, --start-mode login.
 Use your normal Windows account. Expired gh login is renewed in this terminal.
-Copilot and Dev Tunnels still require their own login.
+Copilot requires its own login. Dev Tunnels login is needed only in Dev Tunnels mode.
+Corp direct uses --corp-direct plus --host-ca from the Connect card; its saved private
+origin and public CA are reused at login without a tunnel or certificate-store change.
 Pass the Host's Connect-card flags to enroll and start in one command.
 Enrollment secrets are used in memory during setup, never saved in the scheduled task.
 Stop manual Host/Node instances first. No passwords, token files, or elevation required.

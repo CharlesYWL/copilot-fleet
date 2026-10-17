@@ -287,6 +287,54 @@ const retainedAgent: AgentCatalogModule.CatalogEntry = {
   markdown: "Fixture orchestrator",
 };
 
+it("recreates a saved Corp direct helper on login-like startup and preserves canonical trust", async () => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "stale-environment-tunnel");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const { loadSettings, saveSettings } = await import("./settings.js");
+  const directModule = await import("./corp-direct.js");
+  const { TEST_TLS_CERTIFICATE } =
+    await import("../../../packages/protocol/dist/test-tls-fixture.js");
+  const connection = {
+    hostUrl: "https://10.0.5.136:8787",
+    caCertificate: TEST_TLS_CERTIFICATE,
+  };
+  vi.mocked(loadSettings).mockResolvedValueOnce({
+    ...settingsFromEnv({}),
+    corpDirect: connection,
+  });
+  const stop = vi.fn(async () => {});
+  const start = vi
+    .spyOn(directModule, "startCorpDirectForward")
+    .mockResolvedValue({ url: "http://127.0.0.1:19001", stop });
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  try {
+    expect(start).toHaveBeenCalledWith(connection);
+    expect(configOptions.getSettings()).toMatchObject({
+      hostUrl: "http://127.0.0.1:19001",
+      corpDirect: connection,
+    });
+    expect(saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ corpDirect: connection }),
+    );
+    await expect(
+      configOptions.applySettings({
+        ...configOptions.getSettings(),
+        hostUrl: "https://10.0.5.137:8787",
+      }),
+    ).rejects.toThrow(/new generated Node command/);
+  } finally {
+    await runtime.shutdown();
+    expect(stop).toHaveBeenCalledOnce();
+    for (const listener of process.listeners("exit"))
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+  }
+});
+
 it.each([false, true])(
   "sends legacy hello when catalog refresh fails (previous catalog: %s)",
   async (hasCatalog) => {

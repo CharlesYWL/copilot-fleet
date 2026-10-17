@@ -108,7 +108,9 @@ finds.
 ### Reach it from anywhere
 
 Turn on Dev Tunnels, Cloudflare, Tailscale Funnel, or ngrok from Settings. Use
-Microsoft sign-in to control who can operate the fleet.
+Microsoft sign-in to control who can operate the fleet. Verified Microsoft
+corporate administrators can instead use [Corp direct](docs/corp-direct.md)
+for private-IP HTTPS/WSS between reachable Windows Dev Boxes, without Dev Tunnels.
 
 [Sign-in and remote access →](docs/guide/sign-in-and-access.md)
 
@@ -151,7 +153,8 @@ sign-in for local or private-tunnel use only.
 
 **3. Connect a machine.** In **Settings → Nodes**, choose **Generate a connect
 command** and run it from a Fleet checkout on that machine. For a remote
-machine, enable a tunnel in **Settings → Tunnel** first.
+machine, enable an available remote-access provider in **Settings → Tunnel** first.
+Corp direct requires an approved private source scope and the one-time Host firewall setup.
 
 **4. Add a workspace.** In **Settings → Workspaces**, create a workspace and add
 a placement: an existing folder on that Node.

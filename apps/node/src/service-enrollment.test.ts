@@ -15,6 +15,7 @@ import { type EnsuredCredentials } from "./enrollment.js";
 import { acquireInstanceLock } from "./instance-lock.js";
 import { prepareNodeService, serviceRuntimeArgs } from "./service-enrollment.js";
 import { loadSettings } from "./settings.js";
+import { TEST_TLS_CERTIFICATE } from "../../../packages/protocol/dist/test-tls-fixture.js";
 
 vi.mock("dotenv", () => ({ config: vi.fn() }));
 const previous = { ...process.env };
@@ -85,6 +86,59 @@ describe("service runtime arguments", () => {
 });
 
 describe("one-command service enrollment", () => {
+  it("persists direct private-IP trust and recreates it for service setup without the original grant", async () => {
+    process.env.FLEET_DEVTUNNEL_ID = "stale-environment-tunnel";
+    const stop = vi.fn(async () => {});
+    const connectDirect = vi.fn(async () => ({ url: "http://127.0.0.1:19001", stop }));
+    const connectTunnel = vi.fn();
+    const identity = { ...keyed(), hostUrl: "http://127.0.0.1:19001" };
+    const enroll = vi.fn(async (): Promise<EnsuredCredentials> => ({
+      credentials: identity,
+      persist: true,
+    }));
+    const directArgs = [
+      ...nodeArgs.filter((argument) => !argument.startsWith("--url=")),
+      "--corp-direct=https://10.0.5.136:8787",
+      `--host-ca=${Buffer.from(TEST_TLS_CERTIFICATE).toString("base64")}`,
+    ];
+    const first = await prepareNodeService(directArgs, {
+      verifyContext: async () => {},
+      enroll,
+      connectDirect,
+      connectTunnel,
+    });
+    expect(first.runtimeArgs).toEqual([]);
+    expect(connectTunnel).not.toHaveBeenCalled();
+    expect(enroll).toHaveBeenCalledWith(
+      expect.objectContaining({
+        settings: expect.objectContaining({ hostUrl: "http://127.0.0.1:19001" }),
+      }),
+    );
+    expect((await loadSettings()).corpDirect).toEqual({
+      hostUrl: "https://10.0.5.136:8787",
+      caCertificate: TEST_TLS_CERTIFICATE,
+    });
+    expect(
+      await readFile(join(configDirectory(), "settings.json"), "utf8"),
+    ).not.toContain(grant);
+    expect(stop).toHaveBeenCalledOnce();
+    connectDirect.mockClear();
+    const second = await prepareNodeService([], {
+      existingNode: true,
+      verifyContext: async () => {},
+      enroll,
+      connectDirect,
+      connectTunnel,
+    });
+    expect(second.runtimeArgs).toEqual([]);
+    expect(connectDirect).toHaveBeenCalledWith({
+      hostUrl: "https://10.0.5.136:8787",
+      caCertificate: TEST_TLS_CERTIFICATE,
+    });
+    expect(connectTunnel).not.toHaveBeenCalled();
+    expect(stop).toHaveBeenCalledTimes(2);
+  });
+
   it("authenticates the actual task context before enrolling and saves only durable state", async () => {
     const identity = keyed();
     const events: string[] = [];

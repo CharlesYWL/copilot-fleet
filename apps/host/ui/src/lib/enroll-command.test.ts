@@ -35,6 +35,49 @@ describe("keyEnrollCommand", () => {
     expect(command).toContain(`--enrollment-grant="${GRANT}"`);
   });
 
+  it("generates interactive and service Corp direct commands with explicit public trust", () => {
+    const ca = "-----BEGIN CERTIFICATE-----\nYWJjZA==\n-----END CERTIFICATE-----";
+    const fields = {
+      hostUrl: "https://10.0.5.136:8787",
+      hostId: "host-1",
+      hostFingerprint: FINGERPRINT,
+      enrollmentGrant: GRANT,
+      corpDirectCa: ca,
+    };
+    const interactive = keyEnrollCommand(fields);
+    const service = keyEnrollCommand(fields, "service");
+    expect(interactive).toContain(
+      'npm run node -- --corp-direct="https://10.0.5.136:8787"',
+    );
+    expect(service).toContain(
+      'npm run service -- node --corp-direct="https://10.0.5.136:8787"',
+    );
+    for (const command of [interactive, service]) {
+      expect(command).toContain(`--host-ca="${btoa(ca)}"`);
+      expect(command).toContain(`--host-fingerprint="${FINGERPRINT}"`);
+      expect(command).toContain(`--enrollment-grant="${GRANT}"`);
+      expect(command).not.toContain("--devtunnel");
+      expect(command).not.toContain("devtunnel user login");
+      expect(command).not.toContain("NODE_TLS_REJECT_UNAUTHORIZED");
+    }
+  });
+
+  it("rejects nonprivate or shell-interpolated Corp direct URLs", () => {
+    const fields = {
+      hostId: "host-1",
+      hostFingerprint: FINGERPRINT,
+      enrollmentGrant: GRANT,
+      corpDirectCa: "-----BEGIN CERTIFICATE-----\nYWJjZA==\n-----END CERTIFICATE-----",
+    };
+    for (const hostUrl of [
+      "https://example.com",
+      "http://10.0.5.136",
+      "https://10.0.5.136/$(whoami)",
+    ]) {
+      expect(() => keyEnrollCommand({ ...fields, hostUrl })).toThrow(/private/i);
+    }
+  });
+
   it("never carries the fleet-wide token, which it replaces", () => {
     expect(command).not.toContain("--token");
     expect(command).not.toContain(TOKEN);

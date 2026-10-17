@@ -54,6 +54,25 @@ describe("argvForRestart", () => {
 });
 
 describe("parseNodeArgs", () => {
+  it("parses explicit Corp direct trust and drops those persisted flags on self-restart", () => {
+    const argv = [
+      "--corp-direct=https://10.0.5.136:8787",
+      "--host-ca=YWJjZA==",
+      "--config-port=9100",
+    ];
+    expect(parseNodeArgs(argv).env).toMatchObject({
+      FLEET_CORP_DIRECT_URL: "https://10.0.5.136:8787",
+      FLEET_HOST_CA: "YWJjZA==",
+    });
+    expect(argvForRestart(argv)).toEqual(["--config-port=9100"]);
+    expect(() => parseNodeArgs(["--corp-direct=https://10.0.5.136"])).toThrow(/together/);
+    expect(() => parseNodeArgs(["--host-ca=YWJjZA=="])).toThrow(/together/);
+    expect(() => parseNodeArgs([...argv, "--devtunnel=other"])).toThrow(/not both/);
+    expect(() => parseNodeArgs([...argv, "--url=https://other.example"])).toThrow(
+      /not both/,
+    );
+  });
+
   it("returns nothing to override for an empty command line", () => {
     expect(parseNodeArgs([])).toEqual({ wantsHelp: false, env: {} });
   });

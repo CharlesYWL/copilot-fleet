@@ -255,6 +255,47 @@ describe("ConnectNodeCard", () => {
       expect(navigator.clipboard.writeText).toHaveBeenCalledWith(service.textContent),
     );
   });
+  it("offers Corp direct npm node and service commands without tunnel login", async () => {
+    const ca = "-----BEGIN CERTIFICATE-----\nYWJjZA==\n-----END CERTIFICATE-----";
+    const directEnrollment = {
+      ...enrollment,
+      hostUrl: "https://10.0.5.136:8787",
+      tunnelId: undefined,
+      corpDirectCa: ca,
+    };
+    const directGrant = {
+      ...grant,
+      command: {
+        ...grant.command,
+        hostUrl: "https://10.0.5.136:8787",
+        tunnelId: undefined,
+        corpDirectCa: ca,
+      },
+    };
+    host({
+      "POST /api/enrollment-grants": () => answer(directGrant, 201),
+      "/api/enrollment": () => answer(directEnrollment),
+    });
+    show();
+    fireEvent.click(
+      await screen.findByRole("button", { name: /generate a connect command/i }),
+    );
+    const interactive = await screen.findByLabelText("npm node command");
+    const service = screen.getByLabelText("npm service command");
+    expect(interactive.textContent).toContain(
+      'npm run node -- --corp-direct="https://10.0.5.136:8787"',
+    );
+    expect(service.textContent).toContain(
+      'npm run service -- node --corp-direct="https://10.0.5.136:8787"',
+    );
+    expect(interactive.textContent).toContain(`--host-ca="${btoa(ca)}"`);
+    expect(screen.queryByText(/devtunnel user login/i)).toBeNull();
+    expect(screen.getByLabelText("Host URL the node should dial")).toHaveProperty(
+      "readOnly",
+      true,
+    );
+  });
+
   it("says why a private tunnel needs the machine signed in first", async () => {
     host();
     show();

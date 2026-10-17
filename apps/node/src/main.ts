@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { mkdir, open, rm, stat } from "node:fs/promises";
 import WebSocket from "ws";
 import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
+import { startCorpDirectForward, type CorpDirectForward } from "./corp-direct.js";
 import { ensureGithubAuth } from "./github-auth.js";
 import {
   HostHandshakeFrameSchema,
@@ -223,7 +224,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * close over `settings` at construction time.
    */
   let onTunnelUrlChanged: (url: string) => void = () => {};
-  const devTunnelId = env.FLEET_DEVTUNNEL_ID;
+  let settings = await loadSettings(env, settingsOverridesFromEnv(flags.env));
+  let corpForward: CorpDirectForward | undefined;
+  const devTunnelId = settings.corpDirect ? undefined : env.FLEET_DEVTUNNEL_ID;
   /**
    * Which addresses this node is willing to dial, for the whole run.
    *
@@ -234,7 +237,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * into killing the forward. Fixed here rather than inferred per dial so the
    * rule cannot change under a reconnect.
    */
-  const tunnelMode: TunnelMode = devTunnelId ? "devtunnel" : "direct";
+  let tunnelMode: TunnelMode = settings.corpDirect
+    ? "corp-direct"
+    : devTunnelId
+      ? "devtunnel"
+      : "direct";
   if (devTunnelId) {
     log(`Connecting to dev tunnel ${devTunnelId}`);
     devTunnel = await connectDevTunnel(devTunnelId, {
@@ -251,7 +258,6 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     process.once("exit", () => devTunnel?.stop());
   }
 
-  let settings = await loadSettings(env, settingsOverridesFromEnv(flags.env));
   if (devTunnel) {
     settings = endpointsBehindLocalForward(settings, devTunnel.url);
   }
@@ -291,6 +297,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   log(`  name        ${settings.nodeName}`);
   log(`  host        ${settings.hostUrl}`);
   if (devTunnelId) log(`  route       dev tunnel ${devTunnelId} (exclusive)`);
+  if (settings.corpDirect)
+    log(`  route       Corp direct ${settings.corpDirect.hostUrl} (verified TLS)`);
   log(`  agent       ${mockAgent ? "mock" : "copilot --acp"}`);
   log(`  permissions ${mockAgent ? "n/a" : "per session (Host decides)"}`);
   log(`  capacity    ${settings.maxSessions} concurrent sessions`);
@@ -361,7 +369,23 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   const releaseInstanceLock = instanceLock.release;
   process.once("exit", () => releaseInstanceLock());
 
-  let credentials = await ensureCredentials();
+  let credentials: Credentials;
+  try {
+    if (settings.corpDirect) {
+      corpForward = await startCorpDirectForward(settings.corpDirect);
+      settings = endpointsBehindLocalForward(settings, corpForward.url);
+    }
+    credentials = await ensureCredentials();
+    if (settings.corpDirect) await saveSettings(settings);
+  } catch (error) {
+    try {
+      await corpForward?.stop();
+      devTunnel?.stop();
+    } finally {
+      releaseInstanceLock();
+    }
+    throw error;
+  }
   /**
    * The address this attempt is dialing.
    *
@@ -804,6 +828,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     next: Settings,
     { operatorEdit = true }: { operatorEdit?: boolean } = {},
   ): Promise<void> {
+    if (operatorEdit && settings.corpDirect && next.hostUrl !== settings.hostUrl) {
+      throw new Error(
+        "Corp direct address/trust changes require a new generated Node command. Stop this Node and restart it with that command.",
+      );
+    }
     const previous = settings;
     const changes = Object.fromEntries(
       Object.entries(next).filter(
@@ -871,15 +900,34 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         "Backup import aborted: sessions could not be safely stopped and quarantined.",
       );
     }
-    await updateSettings(async () => {
-      const restored = SettingsSchema.parse(archive.settings);
-      restored.commandPermissionRules = await validateCommandPermissionRules(
-        restored.commandPermissionRules,
-      );
-      credentials = archive.credentials;
-      await saveCredentials(credentials);
-      return restored;
-    });
+    let restoredSettings = SettingsSchema.parse(archive.settings);
+    const nextForward = restoredSettings.corpDirect
+      ? await startCorpDirectForward(restoredSettings.corpDirect)
+      : undefined;
+    if (nextForward)
+      restoredSettings = endpointsBehindLocalForward(restoredSettings, nextForward.url);
+    else if (devTunnel)
+      restoredSettings = endpointsBehindLocalForward(restoredSettings, devTunnel.url);
+    try {
+      await updateSettings(async () => {
+        restoredSettings.commandPermissionRules = await validateCommandPermissionRules(
+          restoredSettings.commandPermissionRules,
+        );
+        credentials = archive.credentials;
+        await saveCredentials(credentials);
+        return restoredSettings;
+      });
+    } catch (error) {
+      await nextForward?.stop();
+      throw error;
+    }
+    await corpForward?.stop();
+    corpForward = nextForward;
+    if (nextForward) {
+      devTunnel?.stop();
+      devTunnel = undefined;
+    }
+    tunnelMode = nextForward ? "corp-direct" : devTunnel ? "devtunnel" : "direct";
     router.setMaxSessions(settings.maxSessions);
     if (factory instanceof AcpAgentFactory) {
       factory.configure(
@@ -960,7 +1008,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // a Microsoft login it cannot answer, and it would then be unreachable for
     // a correction. Keeping the address means a node whose mode changes later
     // still knows where the Host lives.
-    if (!dialableInMode(hostUrl, tunnelMode)) {
+    if (tunnelMode === "corp-direct" || !dialableInMode(hostUrl, tunnelMode)) {
       await persistEndpoints(recordHostUrl(settings, hostUrl));
       log(
         `Host announced ${hostUrl}; noted it, but this node reaches the Host over its own ${tunnelMode} route and stays on ${settings.hostUrl}`,
@@ -1963,6 +2011,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         () => commands.cancelAll("Node shutdown requested."),
         () => socket?.close(),
         () => router.stopAll(),
+        () => corpForward?.stop(),
+        () => devTunnel?.stop(),
       ]) {
         try {
           await close();

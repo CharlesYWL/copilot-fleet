@@ -127,7 +127,16 @@ export function shouldAdoptTunnelId(
   return Boolean(reported) && reported !== current;
 }
 
+export type BuiltInTunnel = {
+  start: () => Promise<string>;
+  stop: () => Promise<void>;
+  activeUrl: () => string | undefined;
+  supported: () => boolean;
+  error?: () => string | undefined;
+};
+
 type TunnelManagerOptions = {
+  builtIn?: Partial<Record<TunnelProvider, BuiltInTunnel>>;
   /**
    * The provider rule in force, read on every decision rather than once: it
    * changes under a running Host when sign-in is skipped or a Microsoft
@@ -189,8 +198,10 @@ export class TunnelManager {
   private generation = 0;
   private stopping: Promise<void> | undefined;
   private readonly policy: () => TunnelPolicyKind;
+  private readonly builtIn: TunnelManagerOptions["builtIn"];
 
   constructor(options: TunnelManagerOptions) {
+    this.builtIn = options.builtIn;
     this.policy = options.policy ?? (() => "open");
     this.target = parseLocalTarget(options.localTarget);
     this.onEnabledCleared = options.onEnabledCleared;
@@ -250,7 +261,9 @@ export class TunnelManager {
         id: spec.id,
         label: spec.label,
         binary: spec.binary,
-        binaryPresent: await this.probe.present(spec),
+        binaryPresent: spec.builtIn
+          ? (this.builtIn?.[spec.id]?.supported() ?? false)
+          : await this.probe.present(spec),
         installHint: spec.installHint,
         setupSteps: spec.setupSteps,
         docsUrl: spec.docsUrl,
@@ -265,6 +278,8 @@ export class TunnelManager {
   /** Live tunnel URL when online; otherwise undefined so callers use fallbacks. */
   activeTunnelUrl(): string | undefined {
     if (!this.eligible()) return undefined;
+    if (providerSpecs[this.provider].builtIn)
+      return this.builtIn?.[this.provider]?.activeUrl();
     const external = this.ownExternal();
     if (external) return external.url;
     return this.status === "on" ? this.tunnelUrl : undefined;
@@ -279,6 +294,19 @@ export class TunnelManager {
 
   /** This provider's live state, without the shared provider catalog. */
   state(): TunnelState {
+    if (providerSpecs[this.provider].builtIn) {
+      const driver = this.builtIn?.[this.provider];
+      const error = driver?.error?.() ?? this.error;
+      const url = this.eligible() ? driver?.activeUrl() : undefined;
+      return {
+        provider: this.provider,
+        enabled: this.wantEnabled,
+        status: error ? "error" : this.status,
+        error: error ?? null,
+        external: false,
+        ...(url ? { url } : {}),
+      };
+    }
     const refused = this.refusedExternal();
     if (refused) {
       return {
@@ -337,11 +365,17 @@ export class TunnelManager {
   private async start(): Promise<void> {
     if (this.stopping) await this.stopping;
     if (!this.wantEnabled) return;
-    if (this.status === "on" || this.status === "starting") return;
+    const spec = providerSpecs[this.provider];
+    const driver = this.builtIn?.[this.provider];
+    if (this.status === "starting") return;
+    if (
+      this.status === "on" &&
+      (!spec.builtIn || (driver?.activeUrl() && !driver.error?.()))
+    )
+      return;
     this.cancelRestart();
     const generation = this.generation;
 
-    const spec = providerSpecs[this.provider];
     /*
      * Checked here rather than only in `POST /api/tunnel`, because the route is
      * one of three ways a tunnel comes up. The settings row an operator enabled
@@ -353,6 +387,30 @@ export class TunnelManager {
      */
     this.assertEligible();
     this.status = "starting";
+    if (spec.builtIn) {
+      this.error = undefined;
+      try {
+        if (!driver?.supported())
+          throw new Error(
+            "This built-in private TLS provider requires Windows certificate support.",
+          );
+        if (driver.error?.()) await driver.stop();
+        const url = await driver.start();
+        if (generation !== this.generation) return;
+        this.assertEligible();
+        this.tunnelUrl = url;
+        this.status = "on";
+        this.restartAttempt = 0;
+      } catch (error) {
+        if (generation !== this.generation) return;
+        if (!this.eligible()) await driver?.stop();
+        this.status = "error";
+        this.error = errorMessage(error);
+        if (this.wantEnabled) this.scheduleRestart();
+        throw error;
+      }
+      return;
+    }
     const present = await this.probe.present(spec);
     if (generation !== this.generation) return;
     if (!present) {
@@ -498,6 +556,19 @@ export class TunnelManager {
     this.wantEnabled = false;
     this.cancelRestart();
     this.restartAttempt = 0;
+    if (providerSpecs[this.provider].builtIn) {
+      this.status = "stopping";
+      this.stopping = this.builtIn?.[this.provider]?.stop() ?? Promise.resolve();
+      try {
+        await this.stopping;
+      } finally {
+        this.stopping = undefined;
+        this.status = "off";
+        this.tunnelUrl = undefined;
+        this.error = undefined;
+      }
+      return;
+    }
     const child = this.child;
     this.child = undefined;
     if (!child) {
@@ -540,7 +611,15 @@ export class TunnelManager {
    * as refused by `state()` instead.
    */
   async stopIfRefused(): Promise<boolean> {
-    if (this.eligible()) return false;
+    if (this.eligible()) {
+      const error = this.builtIn?.[this.provider]?.error?.();
+      if (error && this.wantEnabled && this.status !== "starting" && !this.restartTimer) {
+        this.status = "error";
+        this.error = error;
+        this.scheduleRestart();
+      }
+      return false;
+    }
     if (this.readExternal()?.provider === this.provider) return false;
     const live =
       this.wantEnabled ||

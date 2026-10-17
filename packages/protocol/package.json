@@ -19,6 +19,10 @@
       "types": "./dist/node-auth.d.ts",
       "default": "./dist/node-auth.js"
     },
+    "./http-relay": {
+      "types": "./dist/http-relay.d.ts",
+      "default": "./dist/http-relay.js"
+    },
     "./updater": {
       "types": "./dist/updater.d.ts",
       "default": "./dist/updater.js"

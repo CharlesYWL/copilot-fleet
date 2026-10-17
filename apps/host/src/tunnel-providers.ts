@@ -26,6 +26,8 @@ async function tolerateConflict(work: Promise<unknown>): Promise<void> {
 
 export type ProviderSpec = {
   id: TunnelProvider;
+  /** Served by the Host itself instead of an external CLI. */
+  builtIn?: boolean;
   label: string;
   /** Binary that must exist on PATH. */
   binary: string;
@@ -130,6 +132,32 @@ export const DEVTUNNEL_INSPECT_URL_RE =
 export const DEVTUNNEL_ID_RE = /(?<=for tunnel:\s)[a-z0-9-]+\.[a-z0-9]+/i;
 
 export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
+  "corp-direct": {
+    id: "corp-direct",
+    label: "Corp direct (private IP)",
+    builtIn: true,
+    binary: "Fleet built-in TLS",
+    versionArgs: [],
+    args: () => [],
+    extractUrl: () => undefined,
+    installHint:
+      "Built into Fleet on Windows; configure the private listener and allowed sources.",
+    setupSteps: [
+      "Sign in as a verified Microsoft corporate administrator.",
+      "Choose a private Host IPv4 address, port and an approved worker source scope.",
+      "Enable Corp direct, then run its scoped firewall command in Administrator PowerShell on the Host.",
+      "Generate an interactive Node or Windows login-start service command under Nodes. Public CA trust is included; private keys stay on the Host.",
+    ],
+    docsUrl:
+      "https://learn.microsoft.com/en-us/azure/dev-box/concept-dev-box-network-requirements",
+    caveat:
+      "Private network reachability and firewall approval are your responsibility. No external tunnel or Windows trust-store installation is used.",
+    nodeDialable: false,
+    externalScheme: "https",
+    access: "private-network",
+    controlPlaneEligible: true,
+    microsoftCorpApproved: true,
+  },
   cloudflare: {
     id: "cloudflare",
     label: "Cloudflare",
@@ -282,7 +310,10 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
   },
 };
 
-export const providerList: ProviderSpec[] = Object.values(providerSpecs);
+export const providerList: ProviderSpec[] = [
+  ...Object.values(providerSpecs).filter((spec) => spec.id !== "corp-direct"),
+  providerSpecs["corp-direct"],
+];
 
 export function extractTunnelUrl(
   text: string,

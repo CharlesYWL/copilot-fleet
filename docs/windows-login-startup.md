@@ -7,14 +7,17 @@ existing interactive account and credentials. This is not signed-out boot startu
 
 Use normal PowerShell in an updated Fleet checkout with Node.js, GitHub CLI, and
 Copilot installed. Sign in to Copilot first; missing or expired GitHub CLI
-credentials can be renewed inline. Private-tunnel Nodes also need
-`devtunnel user login`. Stop existing manual instances before switching launch
+credentials can be renewed inline. Dev Tunnels Nodes also need
+`devtunnel user login`; Corp direct Nodes do not. Stop existing manual instances before switching launch
 modes; the installer never terminates them for you.
 
 The Host's **Nodes > Connect a machine** card displays both commands with separate
 Copy buttons: `npm run start:node` for a terminal, and `npm run service -- node`
-for login startup. Both use the same one-use grant for one machine; run either,
+for login startup. Corp direct's foreground variant uses `npm run node` and includes explicit public certificate trust; its service variant still uses `npm run service -- node`.
+Both use the same one-use grant for one machine; run either,
 not both. The service variant installs dependencies and lets the installer build.
+
+For **Corp direct (private IP)**, use the complete generated `--corp-direct` and `--host-ca` flag pair. The private HTTPS origin and public CA are saved separately from the Node's temporary loopback helper. Each login recreates that helper and verifies the remote certificate; no Dev Tunnels process, Windows trust import, elevation, or original enrollment grant is needed. A deliberate `--devtunnel`/`--url` mode change clears the saved direct route. See [Corp direct setup and manual acceptance](corp-direct.md).
 
 ```powershell
 # New Node: use the real values from the Connect card.

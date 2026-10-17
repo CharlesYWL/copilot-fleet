@@ -7,7 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
-import { errorMessage } from "@fleet/protocol";
+import { errorMessage, isPrivateIpv4 } from "@fleet/protocol";
 import {
   forgetLauncherEnvironment,
   gitRevision,
@@ -87,6 +87,7 @@ import {
 } from "./self-update.js";
 import { FleetStore } from "./store.js";
 import { TunnelSupervisor } from "./tunnel.js";
+import { CorpDirectAccess, CORP_DIRECT_CONFIG_SETTING } from "./corp-direct.js";
 import { resolveTunnelPolicyKind } from "./tunnel-policy.js";
 import { recordingLogStream } from "./log-stream.js";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
@@ -198,7 +199,20 @@ export async function buildServer(
   /** Bound once the local agent listener exists; auth resets can fire before then. */
   let reconcileLocalAgent: () => Promise<unknown> = async () => undefined;
 
+  const corpDirect = new CorpDirectAccess({
+    store,
+    upstream: `http://127.0.0.1:${listenPort}`,
+    hostId: () => hostIdentity.identity().hostId,
+    canRun: () => !auth.noAuthEnabled() && auth.microsoftCorpAdministered(),
+    localBindHost: () => process.env.HOST ?? "127.0.0.1",
+    protect: () =>
+      secureHostDataFiles(databasePath, {
+        ...defaultSecureDataDeps((message) => app.log.warn(message)),
+        production: true,
+      }),
+  });
   const tunnel: TunnelSupervisor = new TunnelSupervisor({
+    builtIn: { "corp-direct": corpDirect },
     policy: () =>
       resolveTunnelPolicyKind({
         noAuth: auth.noAuthEnabled(),
@@ -365,8 +379,24 @@ export async function buildServer(
    * reach it, and a catastrophic thing to push to a live node, which would
    * follow it into a login it cannot answer and go silent.
    */
-  const broadcastHostUrl = () =>
-    resolveEnrollmentHostUrl(tunnel.broadcastTunnelUrl(), fallbackPublicUrl());
+  const broadcastHostUrl = () => {
+    const url = resolveEnrollmentHostUrl(
+      tunnel.broadcastTunnelUrl(),
+      fallbackPublicUrl(),
+    );
+    // Even an old configured fallback must not bypass opt-in certificate trust
+    // or move existing Nodes to a private listener with a changed port/address.
+    if (store.getSetting(CORP_DIRECT_CONFIG_SETTING)) {
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol === "https:" && isPrivateIpv4(parsed.hostname))
+          return `http://127.0.0.1:${listenPort}`;
+      } catch {
+        /* The normal URL guard rejects an invalid fallback. */
+      }
+    }
+    return url;
+  };
 
   // Nodes reached over a path that outlives a tunnel rotation — a LAN address,
   // a named tunnel — are told where the Host moved to, so they follow it
@@ -432,6 +462,7 @@ export async function buildServer(
   await app.register(systemRoutes, {
     service,
     tunnel,
+    corpDirect,
     version: VERSION,
     enrollment,
     auth,
