@@ -308,7 +308,7 @@ describe("TunnelPanel for a Microsoft corporate account", () => {
     vi.restoreAllMocks();
   });
 
-  it("offers the built-in direct configuration and posts its explicit scope", async () => {
+  it("offers the built-in direct configuration without a worker source list", async () => {
     const direct: TunnelInfo = {
       ...corp,
       policy: { kind: "microsoft-corp", allowedProviders: ["devtunnel", "corp-direct"] },
@@ -329,9 +329,7 @@ describe("TunnelPanel for a Microsoft corporate account", () => {
     vi.stubGlobal("fetch", fetchMock);
     show();
     const card = await screen.findByRole("region", { name: "Corp direct (private IP)" });
-    fireEvent.change(within(card).getByLabelText("Allowed worker IPs or CIDRs"), {
-      target: { value: "10.0.18.236" },
-    });
+    expect(within(card).queryByLabelText("Allowed worker IPs or CIDRs")).toBeNull();
     fireEvent.click(within(card).getByRole("switch", { name: /corp direct/i }));
     await waitFor(() => {
       const posted = fetchMock.mock.calls.find(([, init]) => init?.method === "POST");
@@ -339,7 +337,7 @@ describe("TunnelPanel for a Microsoft corporate account", () => {
         enabled: true,
         provider: "corp-direct",
         primary: true,
-        corpDirect: { hostIp: "10.0.5.136", port: 8787, allowedSources: ["10.0.18.236"] },
+        corpDirect: { hostIp: "10.0.5.136", port: 8787 },
       });
     });
   });

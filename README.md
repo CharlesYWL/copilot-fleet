@@ -154,7 +154,7 @@ sign-in for local or private-tunnel use only.
 **3. Connect a machine.** In **Settings → Nodes**, choose **Generate a connect
 command** and run it from a Fleet checkout on that machine. For a remote
 machine, enable an available remote-access provider in **Settings → Tunnel** first.
-Corp direct requires an approved private source scope and the one-time Host firewall setup.
+Corp direct requires network/firewall approval and the one-time Host firewall setup; worker source IPs do not need to be listed.
 
 **4. Add a workspace.** In **Settings → Workspaces**, create a workspace and add
 a placement: an existing folder on that Node.

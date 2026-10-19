@@ -39,7 +39,7 @@ const show = (overrides: Partial<Parameters<typeof CorpDirectCard>[0]> = {}) => 
 
 afterEach(() => vi.restoreAllMocks());
 describe("Corp direct settings", () => {
-  it("uses the detected private IP and port 8787 but requires explicit worker sources", async () => {
+  it("enables the detected private IP and port 8787 without worker source configuration", async () => {
     const setEnabled = show();
     expect(screen.getByLabelText("Host private IPv4 address")).toHaveProperty(
       "value",
@@ -49,38 +49,35 @@ describe("Corp direct settings", () => {
       "value",
       "8787",
     );
-    fireEvent.click(screen.getByRole("switch", { name: /corp direct/i }));
-    expect(setEnabled).not.toHaveBeenCalled();
-    expect(await screen.findByText(/add at least one allowed worker/i)).toBeTruthy();
-  });
-
-  it("validates and submits an explicit private source scope", async () => {
-    const setEnabled = show();
-    fireEvent.change(screen.getByLabelText("Allowed worker IPs or CIDRs"), {
-      target: { value: "10.0.18.236, 10.0.20.0/24" },
-    });
+    expect(screen.queryByLabelText("Allowed worker IPs or CIDRs")).toBeNull();
     fireEvent.click(screen.getByRole("switch", { name: /corp direct/i }));
     await waitFor(() =>
       expect(setEnabled).toHaveBeenCalledWith(
         true,
-        {
-          hostIp: "10.0.5.136",
-          port: 8787,
-          allowedSources: ["10.0.18.236", "10.0.20.0/24"],
-        },
+        { hostIp: "10.0.5.136", port: 8787 },
         true,
       ),
     );
   });
 
-  it("refuses public addresses and broad source ranges", async () => {
+  it("validates the private Host address before enabling", async () => {
     const setEnabled = show();
-    fireEvent.change(screen.getByLabelText("Allowed worker IPs or CIDRs"), {
-      target: { value: "0.0.0.0/0" },
+    fireEvent.change(screen.getByLabelText("Host private IPv4 address"), {
+      target: { value: "8.8.8.8" },
     });
     fireEvent.click(screen.getByRole("switch", { name: /corp direct/i }));
     expect(setEnabled).not.toHaveBeenCalled();
-    expect(await screen.findByText(/entirely within RFC1918/i)).toBeTruthy();
+    expect(await screen.findByText(/RFC1918 private IPv4/i)).toBeTruthy();
+  });
+
+  it("rejects an invalid HTTPS port before enabling", async () => {
+    const setEnabled = show();
+    fireEvent.change(screen.getByLabelText("Corp direct HTTPS port"), {
+      target: { value: "65536" },
+    });
+    fireEvent.click(screen.getByRole("switch", { name: /corp direct/i }));
+    expect(setEnabled).not.toHaveBeenCalled();
+    expect(await screen.findByText(/65535/)).toBeTruthy();
   });
 
   it("shows the live endpoint and one-time Host firewall instructions", () => {
@@ -90,7 +87,6 @@ describe("Corp direct settings", () => {
         configuration: {
           hostIp: "10.0.5.136",
           port: 8787,
-          allowedSources: ["10.0.18.236"],
         },
         firewallCommand: "New-NetFirewallRule -LocalPort 8787",
       },

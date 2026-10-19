@@ -1,6 +1,8 @@
 # Corp Direct Implementation Plan
 
 > **For agentic workers:** Execute bounded tasks in the approved isolated worktree. Use test-first implementation, review changed code, and verify results before committing.
+>
+> **2026-10-19 revision:** Charles approved removing the worker IP/CIDR list and using `RemoteAddress Any`. The original source-filtering items below are historical; the dated revision record at the end supersedes them.
 
 **Goal:** Add corporate-only private-IP HTTPS/WSS access with generated interactive and login-start enrollment commands.
 
@@ -69,3 +71,11 @@ Files: `apps/host/ui/src/components/TunnelPanel.tsx`, a focused Corp direct card
 - The complete regression run finished: **6,016 passed, 7 failed, 5 skipped**. It is not reported as green. Baseline checks reproduced the Hermes error-message assertion, the missing Windows `TMPDIR` assumption, and two Windows supervisor start-expiry/restriction failures. The temporary-directory test passed with `TMPDIR` set to the existing Windows temp directory. The command-permission end-to-end and silent-job timeout failures passed on isolated reruns. The remote-access notification test had a baseline effect-timing race; the touched test now waits for its notification and passed in the final 272-test run.
 - Direct code review found and fixed post-start listener retry and request-relative redirect handling; both fixes were demonstrated with failing-then-passing tests. Two independent background review attempts could not return results because their connections stalled; no independent-review success is claimed.
 - Production deployment, firewall changes, service reconfiguration, reboot, actual two-box agent sessions, cross-region access and long-duration stability remain the explicit manual rollout checks in `docs/corp-direct.md`.
+
+## 2026-10-19: remove worker source configuration
+
+- Charles confirmed `Any` reachable source rather than automatic RFC1918 source filtering. Removed the worker-IP/CIDR UI, source validation and runtime source-IP filter. Host address validation and all authentication checks remain enforced.
+- The generated firewall rule now uses `-RemoteAddress Any`, still scoped to the exact private Host IP, HTTPS port and executable. Its existing rule name is preserved, so rerunning the command replaces the older source-limited rule without duplicate rules. No live firewall policy or service was changed during implementation.
+- Old `allowedSources` fields are ignored by configuration and backup parsing. Existing CA material and Node identities are retained; existing Corp direct workers do not need re-enrollment or a code update for this Host-only change.
+- Final affected acceptance/regression run: **274 tests passed in 21 files**, including enabling with only address/port, legacy settings/backup migration, private HTTPS/WSS with a previously excluding source list, and unauthorized API access refusal despite valid public CA trust. Test-first checks failed before implementation and passed afterward.
+- `npm run lint`, `npm run typecheck`, `npm run build`, changed-file Prettier checks and `git diff --check` passed. The older full-suite/baseline results above remain historical; the entire suite was not rerun for this scoped update.

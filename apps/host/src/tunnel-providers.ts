@@ -144,7 +144,7 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
       "Built into Fleet on Windows; configure the private listener and allowed sources.",
     setupSteps: [
       "Sign in as a verified Microsoft corporate administrator.",
-      "Choose a private Host IPv4 address, port and an approved worker source scope.",
+      "Choose a private Host IPv4 address and HTTPS port.",
       "Enable Corp direct, then run its scoped firewall command in Administrator PowerShell on the Host.",
       "Generate an interactive Node or Windows login-start service command under Nodes. Public CA trust is included; private keys stay on the Host.",
     ],

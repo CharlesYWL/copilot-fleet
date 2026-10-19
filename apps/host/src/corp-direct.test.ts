@@ -38,17 +38,15 @@ const fixture = () => {
 const configuration = {
   hostIp: "10.0.5.136",
   port: 8787,
-  allowedSources: ["10.0.18.236"],
 };
 
 describe("Corp direct Host configuration", () => {
-  it("requires an assigned private address, an explicit source scope and corporate ownership", () => {
+  it("requires an assigned private Host address and corporate ownership, without worker source configuration", () => {
     const f = fixture();
     expect(() => f.access.configure({ ...configuration, hostIp: "8.8.8.8" })).toThrow();
     expect(() => f.access.configure({ ...configuration, hostIp: "10.0.5.137" })).toThrow(
       /not assigned/,
     );
-    expect(() => f.access.configure({ ...configuration, allowedSources: [] })).toThrow();
     f.access.configure(configuration);
     expect(JSON.parse(f.values.get(CORP_DIRECT_CONFIG_SETTING)!)).toEqual(configuration);
     f.revoke();
@@ -74,7 +72,22 @@ describe("Corp direct Host configuration", () => {
     expect(info.caCertificate).toBe(TEST_TLS_CERTIFICATE);
     expect(JSON.stringify(info)).not.toContain("synthetic-private");
     expect(info.firewallCommand).toContain("-LocalPort 8787");
-    expect(info.firewallCommand).toContain("10.0.18.236");
+    expect(info.firewallCommand).toContain("-RemoteAddress Any");
+    expect(info.firewallCommand).toContain("-LocalAddress '10.0.5.136'");
+    expect(info.firewallCommand).not.toContain("10.0.18.236");
+  });
+
+  it("ignores a saved source list without changing the existing authority", () => {
+    const f = fixture();
+    f.values.set(
+      CORP_DIRECT_CONFIG_SETTING,
+      JSON.stringify({ ...configuration, allowedSources: ["192.168.255.254"] }),
+    );
+    f.values.set(CORP_DIRECT_INITIALIZED_SETTING, "1");
+    expect(f.access.configuration()).toEqual(configuration);
+    expect(f.access.info().firewallCommand).toContain("-RemoteAddress Any");
+    expect(f.values.get(CORP_DIRECT_INITIALIZED_SETTING)).toBe("1");
+    expect(f.issue).not.toHaveBeenCalled();
   });
 
   it("fails rather than silently replacing a lost private authority", async () => {
@@ -92,6 +105,6 @@ describe("Corp direct Host configuration", () => {
     );
     expect(command).toContain("-Program 'C:\\User''s $tools`\\node.exe'");
     expect(command).not.toContain("0.0.0.0");
-    expect(command).not.toContain("-RemoteAddress Any");
+    expect(command).toContain("-RemoteAddress Any");
   });
 });

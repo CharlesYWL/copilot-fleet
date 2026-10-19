@@ -17,28 +17,10 @@ export const isPrivateIpv4 = (value: string): boolean => {
   return address !== undefined && privateNumber(address);
 };
 
-/** The entire range must fit RFC1918, not merely the address before the slash. */
-export const isPrivateSource = (value: string): boolean => {
-  const [address, prefix, extra] = value.split("/");
-  if (!address || extra !== undefined || !isPrivateIpv4(address)) return false;
-  if (prefix === undefined) return true;
-  if (!/^(?:0|[1-9]\d?)$/.test(prefix) || Number(prefix) > 32) return false;
-  const size = 2 ** (32 - Number(prefix));
-  const first = Math.floor(ipv4Number(address)! / size) * size;
-  return privateNumber(first) && privateNumber(first + size - 1);
-};
-
 export const PrivateIpv4Schema = z
   .string()
   .trim()
   .refine(isPrivateIpv4, "Choose an RFC1918 private IPv4 address");
-export const PrivateSourceSchema = z
-  .string()
-  .trim()
-  .refine(
-    isPrivateSource,
-    "Use a private IPv4 address or a CIDR entirely within RFC1918",
-  );
 export const PublicCaCertificateSchema = z
   .string()
   .max(16_384)
@@ -50,10 +32,10 @@ export const PublicCaCertificateSchema = z
     "Expected one public CA certificate in PEM format",
   );
 
+/** Old allowedSources fields are stripped, including from persisted backups. */
 export const CorpDirectConfigSchema = z.object({
   hostIp: PrivateIpv4Schema,
   port: z.number().int().min(1).max(65535).default(8787),
-  allowedSources: z.array(PrivateSourceSchema).min(1).max(64),
 });
 export type CorpDirectConfig = z.infer<typeof CorpDirectConfigSchema>;
 

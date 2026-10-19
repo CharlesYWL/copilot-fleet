@@ -3,7 +3,6 @@ import {
   CorpDirectConfigSchema,
   CorpDirectConnectionSchema,
   isPrivateIpv4,
-  isPrivateSource,
 } from "./corp-direct.js";
 
 describe("Corp direct private network configuration", () => {
@@ -24,53 +23,29 @@ describe("Corp direct private network configuration", () => {
       expect(isPrivateIpv4(ip)).toBe(false);
   });
 
-  it("requires each allowed source range to remain entirely private", () => {
-    for (const source of [
-      "10.0.18.236",
-      "10.0.0.0/17",
-      "172.16.0.0/12",
-      "192.168.0.0/16",
-      "10.0.5.136/32",
-    ])
-      expect(isPrivateSource(source)).toBe(true);
-    for (const source of [
-      "Any",
-      "LocalSubnet",
-      "0.0.0.0/0",
-      "10.0.0.0/7",
-      "172.16.0.0/11",
-      "192.168.0.0/15",
-      "10.0.0.0/33",
-      "10.0.0.0/01",
-      "10.0.0.0/",
-    ])
-      expect(isPrivateSource(source)).toBe(false);
+  it("defaults to port 8787 without requiring worker source addresses", () => {
+    expect(CorpDirectConfigSchema.parse({ hostIp: "10.0.5.136" })).toEqual({
+      hostIp: "10.0.5.136",
+      port: 8787,
+    });
+    expect(CorpDirectConfigSchema.safeParse({ hostIp: "8.8.8.8" }).success).toBe(false);
+    for (const port of [0, 65536, 1.5]) {
+      expect(
+        CorpDirectConfigSchema.safeParse({ hostIp: "10.0.5.136", port }).success,
+      ).toBe(false);
+    }
   });
 
-  it("defaults to port 8787 and requires an explicit nonempty source scope", () => {
-    expect(
-      CorpDirectConfigSchema.parse({
-        hostIp: "10.0.5.136",
-        allowedSources: ["10.0.18.236"],
-      }).port,
-    ).toBe(8787);
-    expect(
-      CorpDirectConfigSchema.safeParse({
-        hostIp: "8.8.8.8",
-        allowedSources: ["10.0.18.236"],
-      }).success,
-    ).toBe(false);
-    expect(
-      CorpDirectConfigSchema.safeParse({ hostIp: "10.0.5.136", allowedSources: [] })
-        .success,
-    ).toBe(false);
-    expect(
-      CorpDirectConfigSchema.safeParse({
-        hostIp: "10.0.5.136",
-        port: 0,
-        allowedSources: ["10.0.18.236"],
-      }).success,
-    ).toBe(false);
+  it("discards legacy source allowlists rather than retaining a hidden restriction", () => {
+    for (const allowedSources of [["10.0.18.236"], [], ["0.0.0.0/0"]]) {
+      expect(
+        CorpDirectConfigSchema.parse({
+          hostIp: "10.0.5.136",
+          port: 8787,
+          allowedSources,
+        }),
+      ).toEqual({ hostIp: "10.0.5.136", port: 8787 });
+    }
   });
 
   it("accepts only an HTTPS private-IP origin and public certificate PEM", () => {

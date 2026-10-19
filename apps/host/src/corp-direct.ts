@@ -1,4 +1,3 @@
-import { BlockList } from "node:net";
 import { networkInterfaces } from "node:os";
 import type { Server as HttpsServer } from "node:https";
 import { X509Certificate } from "node:crypto";
@@ -39,10 +38,10 @@ export const corpDirectFirewallCommand = (
   const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
   const name = `CopilotFleet-CorpDirect-${configuration.hostIp}-${configuration.port}`;
   return [
-    `# Run on the Host in Administrator PowerShell, only for an approved source scope.`,
+    `# Run on the Host in Administrator PowerShell, only if permitted by your network policy.`,
     `$ruleName = ${quote(name)}`,
     `Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule`,
-    `New-NetFirewallRule -Name $ruleName -DisplayName 'Copilot Fleet Corp direct' -Direction Inbound -Action Allow -Protocol TCP -LocalAddress ${quote(configuration.hostIp)} -LocalPort ${configuration.port} -RemoteAddress @(${configuration.allowedSources.map(quote).join(", ")}) -Program ${quote(nodePath)} -Profile Any`,
+    `New-NetFirewallRule -Name $ruleName -DisplayName 'Copilot Fleet Corp direct' -Direction Inbound -Action Allow -Protocol TCP -LocalAddress ${quote(configuration.hostIp)} -LocalPort ${configuration.port} -RemoteAddress Any -Program ${quote(nodePath)} -Profile Any`,
     `# To remove later: Remove-NetFirewallRule -Name $ruleName`,
   ].join("\n");
 };
@@ -215,7 +214,7 @@ export class CorpDirectAccess {
     const configuration = this.configuration();
     if (!configuration)
       throw new Error(
-        "Configure a private Host IP, port and allowed worker sources before enabling Corp direct.",
+        "Configure a private Host IP and HTTPS port before enabling Corp direct.",
       );
     this.validateAddress(configuration);
     if (this.url && this.relay) return this.url;
@@ -225,12 +224,6 @@ export class CorpDirectAccess {
     const material = await this.ensureMaterial(configuration, generation);
     if (generation !== this.generation || !this.options.canRun())
       throw new Error("Corp direct startup was cancelled.");
-    const allowed = new BlockList();
-    for (const source of configuration.allowedSources) {
-      const [address, prefix] = source.split("/");
-      if (prefix === undefined) allowed.addAddress(address!, "ipv4");
-      else allowed.addSubnet(address!, Number(prefix), "ipv4");
-    }
     const origin = `https://${configuration.hostIp}:${configuration.port}`;
     const acceptedHosts = new Set([
       `${configuration.hostIp}:${configuration.port}`,
@@ -239,12 +232,7 @@ export class CorpDirectAccess {
     const relay = createHttpRelay({
       upstream: this.options.upstream,
       tls: { pfx: Buffer.from(material.serverPfx, "base64"), passphrase: "" },
-      allowPeer: (address) => {
-        const ipv4 = address.replace(/^::ffff:/, "");
-        return (
-          this.options.canRun() && isPrivateIpv4(ipv4) && allowed.check(ipv4, "ipv4")
-        );
-      },
+      allowPeer: () => this.options.canRun(),
       allowRequest: (request) =>
         this.options.canRun() &&
         acceptedHosts.has(request.headers.host ?? "") &&

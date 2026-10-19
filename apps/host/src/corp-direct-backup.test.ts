@@ -30,7 +30,6 @@ const setup = () => {
 const configuration = {
   hostIp: "10.0.5.136",
   port: 8787,
-  allowedSources: ["10.0.18.236"],
 };
 const material = {
   hostId: "synthetic-host",
@@ -89,6 +88,27 @@ describe("Corp direct security backup", () => {
     });
     expect(receiving.getSetting(CORP_DIRECT_CONFIG_SETTING)).toBe(
       JSON.stringify(configuration),
+    );
+    expect(JSON.parse(receiving.getSetting(CORP_DIRECT_MATERIAL_SETTING)!)).toEqual(
+      material,
+    );
+    expect(receiving.getSetting(CORP_DIRECT_INITIALIZED_SETTING)).toBe("1");
+  });
+
+  it("restores an older source-scoped backup without preserving its allowlist or rotating the CA", () => {
+    const source = setup();
+    seedDirect(source);
+    source.setSetting(
+      CORP_DIRECT_CONFIG_SETTING,
+      JSON.stringify({ ...configuration, allowedSources: ["10.0.18.236"] }),
+    );
+    const receiving = setup();
+    receiving.importPortableBackup({
+      data: portableData(source),
+      security: source.exportSecurityBackup(),
+    });
+    expect(JSON.parse(receiving.getSetting(CORP_DIRECT_CONFIG_SETTING)!)).toEqual(
+      configuration,
     );
     expect(JSON.parse(receiving.getSetting(CORP_DIRECT_MATERIAL_SETTING)!)).toEqual(
       material,

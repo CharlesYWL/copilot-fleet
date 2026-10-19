@@ -13,7 +13,11 @@ import {
   EnrollNodeSchema,
   MUTUAL_AUTH_PROTOCOL,
 } from "../packages/protocol/src/index.js";
-import { CorpDirectAccess, privateHostAddresses } from "../apps/host/src/corp-direct.js";
+import {
+  CorpDirectAccess,
+  CORP_DIRECT_CONFIG_SETTING,
+  privateHostAddresses,
+} from "../apps/host/src/corp-direct.js";
 import { FleetStore } from "../apps/host/src/store.js";
 import { HostIdentityService } from "../apps/host/src/auth/host-identity.js";
 import { EnrollmentGrants } from "../apps/host/src/auth/enrollment-grants.js";
@@ -93,12 +97,24 @@ describe.skipIf(process.platform !== "win32" || !hostIp)(
       direct.configure({
         hostIp: hostIp!,
         port: address.port,
-        allowedSources: [hostIp!],
       });
+      // A previous per-worker restriction must not survive invisibly on upgrade.
+      store.setSetting(
+        CORP_DIRECT_CONFIG_SETTING,
+        JSON.stringify({
+          hostIp,
+          port: address.port,
+          allowedSources: [
+            hostIp === "10.255.255.254" ? "192.168.255.254" : "10.255.255.254",
+          ],
+        }),
+      );
       let forward: Awaited<ReturnType<typeof startCorpDirectForward>> | undefined;
       try {
         const remote = await direct.start();
         expect(new URL(remote).port).toBe(String(address.port));
+        expect(direct.info().configuration).toEqual({ hostIp, port: address.port });
+        expect(direct.info().firewallCommand).toContain("-RemoteAddress Any");
         const caCertificate = direct.info().caCertificate!;
         await expect(requestTls(`${remote}/mcp`)).rejects.toThrow();
         expect(
@@ -261,12 +277,17 @@ describe.skipIf(process.platform !== "win32" || !hostIp)(
           {
             provider: "corp-direct",
             enabled: true,
-            corpDirect: { hostIp, port: free.port, allowedSources: [hostIp] },
+            corpDirect: { hostIp, port: free.port },
           },
           csrf,
         );
         expect(setup.statusCode).toBe(200);
         expect(setup.json().primary).toBe("corp-direct");
+        expect(setup.json().corpDirect.configuration).toEqual({
+          hostIp,
+          port: free.port,
+        });
+        expect(setup.json().corpDirect.firewallCommand).toContain("-RemoteAddress Any");
         expect(JSON.stringify(setup.json())).not.toContain("authorityPfx");
         const issued = await request("POST", "/api/enrollment-grants", {}, csrf);
         expect(issued.statusCode).toBe(201);
@@ -277,6 +298,8 @@ describe.skipIf(process.platform !== "win32" || !hostIp)(
           hostUrl: command.hostUrl,
           caCertificate: command.corpDirectCa,
         });
+        // Network reachability and the public CA do not grant operator access.
+        expect((await fetch(`${forward.url}/api/nodes`)).status).toBe(401);
         const enrolled = await enrollWithGrant({
           hostUrl: forward.url,
           hostId: command.hostId,

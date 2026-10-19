@@ -9,7 +9,6 @@ import {
   Spinner,
   Switch,
   Text,
-  Textarea,
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
@@ -56,7 +55,7 @@ const useStyles = makeStyles({
   },
 });
 
-type Draft = { hostIp: string; port: string; sources: string };
+type Draft = { hostIp: string; port: string };
 type Props = {
   info: CorpDirectInfo;
   state: TunnelState;
@@ -78,7 +77,6 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
   const values = draft ?? {
     hostIp: info.configuration?.hostIp ?? info.addresses[0] ?? "",
     port: String(info.configuration?.port ?? 8787),
-    sources: info.configuration?.allowedSources.join(", ") ?? "",
   };
   const online = state.status === "on" && Boolean(state.url);
   const switching = busy || state.status === "starting" || state.status === "stopping";
@@ -94,15 +92,9 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
       await onSetEnabled(false);
       return;
     }
-    const allowedSources = values.sources.split(/[\s,]+/).filter(Boolean);
-    if (allowedSources.length === 0) {
-      setValidationError("Add at least one allowed worker IP address or private CIDR.");
-      return;
-    }
     const parsed = CorpDirectConfigSchema.safeParse({
       hostIp: values.hostIp,
       port: Number(values.port),
-      allowedSources,
     });
     if (!parsed.success) {
       setValidationError(
@@ -176,19 +168,6 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
           />
         </Field>
       </div>
-      <Field
-        label="Allowed worker IPs or CIDRs"
-        required
-        hint="Comma- or whitespace-separated private addresses/ranges. Use only the source scope approved for your network."
-      >
-        <Textarea
-          aria-label="Allowed worker IPs or CIDRs"
-          value={values.sources}
-          disabled={locked}
-          resize="vertical"
-          onChange={(_event, data) => handleEdit("sources", data.value)}
-        />
-      </Field>
       <Text className={styles.caption}>
         Detected private addresses: {info.addresses.join(", ") || "none"}. Switch off
         before editing. An address change requires an explicit update and new Node
@@ -244,8 +223,9 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
           <Text weight="semibold">One-time Host firewall setup</Text>
           <Text className={styles.caption}>
             Run this on the Host in Administrator PowerShell only if permitted by your
-            network policy. Fleet and the Node login-start task remain unelevated.
-            Existing broader firewall rules still apply.
+            network policy. Fleet and the Node login-start task remain unelevated. The
+            rule allows any reachable source on this Host IP and port; Fleet
+            authentication remains required. Existing broader firewall rules still apply.
           </Text>
           <pre className={styles.code}>{info.firewallCommand}</pre>
           <CopyButton

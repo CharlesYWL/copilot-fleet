@@ -418,7 +418,7 @@ export const TunnelPanel = () => {
             <MessageBarTitle>Microsoft corporate account</MessageBarTitle>
             This Host is administered by an @microsoft.com account, so it only offers
             corporate-account remote access: {corpAllowed || "none"}. Corp direct still
-            requires approval for your network's source scope and firewall configuration.
+            requires approval for your network and firewall configuration.
             {corpHidden &&
               ` Public tunnel providers (${corpHidden}) are hidden and the Host refuses to start them, so this corp machine is never published to the internet by accident.`}
           </MessageBarBody>
