@@ -8,6 +8,7 @@ import { integrationBranchSettings } from "./integration-branch.js";
 import { isDeepStrictEqual } from "node:util";
 import {
   AgentKindSchema,
+  CorpDirectSecuritySchema,
   AgentParamsSchema,
   LOCAL_AGENT_DEFAULT_PORT,
   LocalAgentConfigSchema,
@@ -466,6 +467,9 @@ export const PRESERVED_SETTING_KEYS = [
   "host.identity.privateKey",
   "host.identity.publicKey",
   "host.identity.fingerprint",
+  "host.corpDirect.configuration",
+  "host.corpDirect.material",
+  "host.corpDirect.initialized",
   "node.mutualAuthentication.required",
 ] as const;
 
@@ -2915,7 +2919,24 @@ export class FleetStore {
       secretHash: String(row.secret_hash ?? ""),
       publicKey: String(row.public_key ?? ""),
     }));
+    let corpDirect: SecurityBackupPayload["corpDirect"];
+    const directConfiguration = setting("host.corpDirect.configuration");
+    if (directConfiguration) {
+      try {
+        const rawMaterial = setting("host.corpDirect.material");
+        corpDirect = CorpDirectSecuritySchema.parse({
+          configuration: JSON.parse(directConfiguration),
+          ...(rawMaterial ? { material: JSON.parse(rawMaterial) } : {}),
+          initialized: setting("host.corpDirect.initialized") === "1",
+        });
+      } catch {
+        throw new Error(
+          "Stored Corp direct security material could not be exported; private contents were withheld.",
+        );
+      }
+    }
     return SecurityBackupPayloadSchema.parse({
+      ...(corpDirect ? { corpDirect } : {}),
       version: 1,
       enrollmentToken: setting("enrollment.token"),
       auth: {
@@ -3114,6 +3135,18 @@ export class FleetStore {
       this.setSetting("host.identity.publicKey", security.hostIdentity.publicKey);
       this.setSetting("host.identity.fingerprint", security.hostIdentity.fingerprint);
     }
+    this.setSetting(
+      "host.corpDirect.configuration",
+      security.corpDirect ? JSON.stringify(security.corpDirect.configuration) : "",
+    );
+    this.setSetting(
+      "host.corpDirect.material",
+      security.corpDirect?.material ? JSON.stringify(security.corpDirect.material) : "",
+    );
+    this.setSetting(
+      "host.corpDirect.initialized",
+      security.corpDirect?.initialized || security.corpDirect?.material ? "1" : "0",
+    );
     // Applied over the nodes the data half just restored, so a machine that
     // still has its `node.json` reconnects without being re-enrolled. Both
     // proofs travel: a fleet mid-migration has machines of each kind, and the

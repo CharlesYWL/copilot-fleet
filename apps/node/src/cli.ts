@@ -116,6 +116,24 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
     },
   },
   {
+    names: ["--corp-direct"],
+    spec: {
+      env: "FLEET_CORP_DIRECT_URL",
+      placeholder: "<https-private-ip-url>",
+      help: "Connect directly over verified private-IP TLS (use with --host-ca)",
+      persisted: true,
+    },
+  },
+  {
+    names: ["--host-ca"],
+    spec: {
+      env: "FLEET_HOST_CA",
+      placeholder: "<base64-public-certificate>",
+      help: "Public TLS trust certificate from the Host's Corp direct command",
+      persisted: true,
+    },
+  },
+  {
     names: ["--devtunnel"],
     spec: {
       env: "FLEET_DEVTUNNEL_ID",
@@ -225,6 +243,19 @@ export function parseNodeArgs(argv: readonly string[]): CliOverrides {
     index += 1;
   }
 
+  if (!wantsHelp) {
+    const direct = env.FLEET_CORP_DIRECT_URL !== undefined;
+    const trust = env.FLEET_HOST_CA !== undefined;
+    if (direct !== trust) throw new CliError("Use --corp-direct and --host-ca together.");
+    if (
+      direct &&
+      (env.FLEET_DEVTUNNEL_ID !== undefined || env.FLEET_HOST_URL !== undefined)
+    ) {
+      throw new CliError(
+        "Choose --corp-direct or --devtunnel/--url, not both connection modes.",
+      );
+    }
+  }
   return { wantsHelp, env };
 }
 

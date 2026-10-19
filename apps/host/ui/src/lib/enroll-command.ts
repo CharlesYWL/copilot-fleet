@@ -1,3 +1,5 @@
+import { CorpDirectConnectionSchema } from "@fleet/protocol";
+
 /** Loopback and wildcard addresses resolve to the wrong box on a remote node. */
 export function isLocalOnlyHostUrl(hostUrl: string): boolean {
   return /^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0|\[?::1\]?)(:|\/|$)/.test(
@@ -68,6 +70,8 @@ export type ConnectCommandFields = {
   hostFingerprint: string;
   enrollmentGrant: string;
   tunnelId?: string | undefined;
+  /** Public CA pinned out of band for the private-IP TLS connection. */
+  corpDirectCa?: string | undefined;
 };
 
 /**
@@ -88,8 +92,16 @@ export function keyEnrollCommand(
   fields: ConnectCommandFields,
   mode: NodeLaunchMode = "direct",
 ): string {
+  const corpDirect = fields.corpDirectCa
+    ? CorpDirectConnectionSchema.parse({
+        hostUrl: fields.hostUrl,
+        caCertificate: fields.corpDirectCa,
+      })
+    : undefined;
   const flags = [
-    dialFlag(fields.hostUrl, fields.tunnelId),
+    corpDirect
+      ? `--corp-direct="${corpDirect.hostUrl}" --host-ca="${btoa(corpDirect.caCertificate)}"`
+      : dialFlag(fields.hostUrl, fields.tunnelId),
     `--host-id="${fields.hostId}"`,
     `--host-fingerprint="${fields.hostFingerprint}"`,
     `--enrollment-grant="${fields.enrollmentGrant}"`,
@@ -97,7 +109,9 @@ export function keyEnrollCommand(
   if (mode === "service") {
     return ["npm install", `npm run service -- node ${flags}`].join("\n");
   }
-  return ["npm install", "npm run build:node", `npm run start:node -- ${flags}`].join(
-    "\n",
-  );
+  return [
+    "npm install",
+    "npm run build:node",
+    `npm run ${corpDirect ? "node" : "start:node"} -- ${flags}`,
+  ].join("\n");
 }

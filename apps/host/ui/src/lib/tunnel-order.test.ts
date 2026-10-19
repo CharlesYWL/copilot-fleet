@@ -148,6 +148,31 @@ describe("visibleTunnelProviders", () => {
     ).toEqual(ids(providers));
   });
 
+  it("hides idle Corp direct from public-account and no-auth policies", () => {
+    const withDirect = [
+      ...providers,
+      { ...spec("corp-direct", true), access: "private-network" as const },
+    ];
+    for (const policy of [
+      undefined,
+      { kind: "open" as const, allowedProviders: ["devtunnel" as const] },
+      { kind: "private-only" as const, allowedProviders: ["devtunnel" as const] },
+    ]) {
+      expect(
+        ids(visibleTunnelProviders(withDirect, policy, () => undefined)),
+      ).not.toContain("corp-direct");
+    }
+    expect(
+      ids(
+        visibleTunnelProviders(
+          withDirect,
+          { kind: "microsoft-corp", allowedProviders: ["devtunnel", "corp-direct"] },
+          () => undefined,
+        ),
+      ),
+    ).toContain("corp-direct");
+  });
+
   it("hides every provider a corp Host refuses", () => {
     expect(ids(visibleTunnelProviders(providers, corp, () => undefined))).toEqual([
       "devtunnel",

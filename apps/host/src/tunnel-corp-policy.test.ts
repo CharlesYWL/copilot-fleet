@@ -94,7 +94,7 @@ describe("tunnel policy rules", () => {
   it("offers only Microsoft-approved providers to a corp Host", () => {
     expect(describeTunnelPolicy("microsoft-corp")).toEqual({
       kind: "microsoft-corp",
-      allowedProviders: ["devtunnel"],
+      allowedProviders: ["devtunnel", "corp-direct"],
     });
     for (const provider of ["cloudflare", "tailscale", "ngrok", "bore"] as const) {
       expect(tunnelProviderAllowed("microsoft-corp", provider)).toBe(false);
@@ -103,7 +103,9 @@ describe("tunnel policy rules", () => {
 
   it("offers every HTTPS provider to anybody else", () => {
     expect(describeTunnelPolicy("open").allowedProviders).toEqual(
-      providerList.filter((spec) => spec.controlPlaneEligible).map((spec) => spec.id),
+      providerList
+        .filter((spec) => spec.controlPlaneEligible && spec.id !== "corp-direct")
+        .map((spec) => spec.id),
     );
     expect(describeTunnelPolicy("open").allowedProviders).toContain("cloudflare");
     expect(tunnelProviderAllowed("open", "bore")).toBe(false);
@@ -113,7 +115,9 @@ describe("tunnel policy rules", () => {
     const approved = providerList
       .filter((spec) => spec.microsoftCorpApproved)
       .map((spec) => spec.id);
-    expect(approved).toEqual(["devtunnel"]);
+    expect(approved).toEqual(["devtunnel", "corp-direct"]);
+    expect(tunnelProviderAllowed("open", "corp-direct")).toBe(false);
+    expect(tunnelProviderAllowed("private-only", "corp-direct")).toBe(false);
   });
 
   it("explains a corp refusal in terms of the account and the approved option", () => {
@@ -140,11 +144,11 @@ describe("a Host administered by a Microsoft corporate account", () => {
     const info = await supervisor.info("http://127.0.0.1:8787");
     expect(info.policy).toEqual({
       kind: "microsoft-corp",
-      allowedProviders: ["devtunnel"],
+      allowedProviders: ["devtunnel", "corp-direct"],
     });
     expect(
       info.providers.filter((spec) => spec.controlPlaneEligible).map((spec) => spec.id),
-    ).toEqual(["devtunnel"]);
+    ).toEqual(["devtunnel", "corp-direct"]);
   });
 
   it("still runs Dev Tunnels", async () => {

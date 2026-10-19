@@ -33,6 +33,7 @@ import { useMessageNotification } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { orderTunnelProviders, visibleTunnelProviders } from "../lib/tunnel-order";
 import { CopyButton } from "./CopyButton";
+import { CorpDirectCard } from "./CorpDirectCard";
 
 const useStyles = makeStyles({
   panel: {
@@ -334,10 +335,10 @@ const TunnelSummary = ({ info }: { info: TunnelInfo }) => {
     <MessageBar intent={online.length > 0 ? "success" : "info"}>
       <MessageBarBody>
         {online.length === 0
-          ? "No tunnel is running. Nodes are told "
-          : `${online.length} tunnel${online.length === 1 ? "" : "s"} online. Nodes are told `}
+          ? "No remote access provider is running. New Nodes are told "
+          : `${online.length} remote access provider${online.length === 1 ? "" : "s"} online. New Nodes are told `}
         <code className={styles.mono}>{info.publicUrl}</code>
-        {info.primary ? "." : " — the configured fallback, since no tunnel is serving."}
+        {info.primary ? "." : " — the configured fallback, since no provider is serving."}
       </MessageBarBody>
     </MessageBar>
   );
@@ -399,14 +400,15 @@ export const TunnelPanel = () => {
   return (
     <div className={styles.panel}>
       <div>
-        <Title3 as="h1">Remote access tunnels</Title3>
+        <Title3 as="h1">Remote access</Title3>
         <br />
         <Text className={styles.caption}>
-          The tunnel marked for enrollment is the address handed to new nodes. With
-          Microsoft sign-in enabled, Fleet separately checks who may operate it, and
-          multiple HTTPS providers can run together. Without Microsoft sign-in, anyone who
-          can reach the Host can operate it: keep the listener on loopback and use private
-          Dev Tunnels, never anonymous tunnel access.
+          The provider marked for enrollment supplies the address and connection command
+          handed to new nodes. Corp direct uses a private-IP HTTPS listener without an
+          external tunnel. Existing HTTPS tunnel providers can run independently. With
+          Microsoft sign-in enabled, Fleet separately checks who may operate it. Without
+          Microsoft sign-in, anyone who can reach the Host can operate it: keep the
+          listener on loopback and use private Dev Tunnels, never anonymous tunnel access.
         </Text>
       </div>
 
@@ -415,7 +417,8 @@ export const TunnelPanel = () => {
           <MessageBarBody>
             <MessageBarTitle>Microsoft corporate account</MessageBarTitle>
             This Host is administered by an @microsoft.com account, so it only offers
-            Microsoft-approved remote access: {corpAllowed || "none"}.
+            corporate-account remote access: {corpAllowed || "none"}. Corp direct still
+            requires approval for your network and firewall configuration.
             {corpHidden &&
               ` Public tunnel providers (${corpHidden}) are hidden and the Host refuses to start them, so this corp machine is never published to the internet by accident.`}
           </MessageBarBody>
@@ -435,18 +438,31 @@ export const TunnelPanel = () => {
 
       <TunnelSummary info={info} />
 
-      {ordered.map((spec) => (
-        <ProviderCard
-          key={spec.id}
-          spec={spec}
-          state={stateFor(spec.id)}
-          isPrimary={info.primary === spec.id}
-          busy={busy === spec.id}
-          policyKind={policyKind}
-          onToggle={(enabled) => void setEnabled(spec.id, enabled)}
-          onMakePrimary={() => void setEnabled(spec.id, true, true)}
-        />
-      ))}
+      {ordered.map((spec) =>
+        spec.id === "corp-direct" && info.corpDirect ? (
+          <CorpDirectCard
+            key={spec.id}
+            info={info.corpDirect}
+            state={stateFor(spec.id)}
+            isPrimary={info.primary === spec.id}
+            busy={busy === spec.id}
+            onSetEnabled={(enabled, configuration, primary) =>
+              setEnabled(spec.id, enabled, primary, configuration)
+            }
+          />
+        ) : (
+          <ProviderCard
+            key={spec.id}
+            spec={spec}
+            state={stateFor(spec.id)}
+            isPrimary={info.primary === spec.id}
+            busy={busy === spec.id}
+            policyKind={policyKind}
+            onToggle={(enabled) => void setEnabled(spec.id, enabled)}
+            onMakePrimary={() => void setEnabled(spec.id, true, true)}
+          />
+        ),
+      )}
     </div>
   );
 };

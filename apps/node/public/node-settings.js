@@ -16,6 +16,7 @@ export const initNodeSettings = () => {
 
   const showSettings = (settings) => {
     for (const key of fields) $(key).value = settings[key];
+    $("hostUrl").readOnly = Boolean(settings.corpDirect);
   };
 
   const setEditing = (value) => {
@@ -33,9 +34,13 @@ export const initNodeSettings = () => {
       setEditing(false);
     }
     const fallbacks = data.settings.knownHostUrls || [];
-    $("hostUrlFallbacks").textContent = fallbacks.length
-      ? "Falls back to " + fallbacks.join(", ") + " if this address stops answering."
-      : "";
+    $("hostUrlFallbacks").textContent = data.settings.corpDirect
+      ? "Corp direct to " +
+        data.settings.corpDirect.hostUrl +
+        " over verified TLS. The loopback helper is recreated on startup; use a new Host-generated command to change the private address or trust."
+      : fallbacks.length
+        ? "Falls back to " + fallbacks.join(", ") + " if this address stops answering."
+        : "";
     const status = data.status;
     $("dot").className = "dot " + (status.connected ? "on" : "off");
     $("conn").textContent = status.connected ? "Connected to Host" : "Not connected";

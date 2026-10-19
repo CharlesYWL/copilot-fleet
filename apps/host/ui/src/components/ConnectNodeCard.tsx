@@ -151,11 +151,22 @@ export const ConnectNodeCard = () => {
 
   // Until the field is touched it tracks the polled value, so a rotated tunnel
   // URL reaches the command without wiping out whatever was typed over it.
-  const hostUrl = editedUrl ?? grant?.command.hostUrl ?? enrollment?.hostUrl ?? "";
+  const corpDirectCa = grant ? grant.command.corpDirectCa : enrollment?.corpDirectCa;
+  const corpDirect = Boolean(corpDirectCa);
+  const hostUrl = corpDirect
+    ? (grant?.command.hostUrl ?? enrollment?.hostUrl ?? "")
+    : (editedUrl ?? grant?.command.hostUrl ?? enrollment?.hostUrl ?? "");
 
   if (!enrollment) return null;
 
   const devTunnel = isDevTunnelUrl(hostUrl);
+  const methods = corpDirect
+    ? launchMethods.map((method) =>
+        method.mode === "direct"
+          ? { ...method, label: "npm node", invocation: "npm run node" }
+          : method,
+      )
+    : launchMethods;
 
   const issue = async () => {
     setBusy(true);
@@ -187,10 +198,22 @@ export const ConnectNodeCard = () => {
       <Field label="Host URL the node should dial" className={styles.urlField}>
         <Input
           value={hostUrl}
+          readOnly={corpDirect}
           onChange={(_, data) => setEditedUrl(data.value)}
           aria-label="Host URL the node should dial"
         />
       </Field>
+
+      {corpDirect && (
+        <MessageBar intent="info">
+          <MessageBarBody>
+            Corp direct uses the Host's private IP over verified HTTPS/WSS. No Dev Tunnels
+            login is needed. The command includes only the public certificate authority;
+            private keys remain on the Host. To change this address, update Corp direct in
+            remote access settings and generate a new command.
+          </MessageBarBody>
+        </MessageBar>
+      )}
 
       {devTunnel && (
         <MessageBar intent="info">
@@ -230,8 +253,8 @@ export const ConnectNodeCard = () => {
             {busy ? "Creating…" : "Generate a connect command"}
           </Button>
           <Text className={styles.caption}>
-            Includes npm start and npm service commands. One machine, one use, fifteen
-            minutes.
+            Includes {corpDirect ? "npm node" : "npm start"} and npm service commands. One
+            machine, one use, fifteen minutes.
           </Text>
         </div>
       ) : (
@@ -241,7 +264,7 @@ export const ConnectNodeCard = () => {
             Both options use the same one-use grant for one machine. Copy the launch
             method you want; you do not need to run both.
           </Text>
-          {launchMethods.map((method) => {
+          {methods.map((method) => {
             const command = keyEnrollCommand({ ...grant.command, hostUrl }, method.mode);
             return (
               <section

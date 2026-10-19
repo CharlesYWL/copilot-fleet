@@ -5,6 +5,7 @@ import { catalogSummary, readAgentCatalog } from "./agent-catalog.js";
 import { parseNodeArgs } from "./cli.js";
 import { configDirectory, loadCredentials, saveCredentials } from "./config.js";
 import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
+import { startCorpDirectForward, type CorpDirectForward } from "./corp-direct.js";
 import { ensureNodeCredentials, keyEnrollmentTuple } from "./enrollment.js";
 import { endpointsBehindLocalForward } from "./host-endpoints.js";
 import { acquireInstanceLock } from "./instance-lock.js";
@@ -57,6 +58,7 @@ export async function prepareNodeService(
     verifyContext: (settings: Settings) => Promise<void>;
     enroll?: typeof ensureNodeCredentials;
     connectTunnel?: typeof connectDevTunnel;
+    connectDirect?: typeof startCorpDirectForward;
   },
 ): Promise<PreparedService> {
   loadEnv({ path: envFilePath(), quiet: true });
@@ -92,8 +94,14 @@ export async function prepareNodeService(
   const lock = acquireInstanceLock(configDirectory());
   if (!lock.ok) throw new Error(`${lock.reason}. Stop that Node before installing.`);
   let tunnel: DevTunnelConnection | undefined;
+  let direct: CorpDirectForward | undefined;
   try {
-    if (env.FLEET_DEVTUNNEL_ID) {
+    if (settings.corpDirect) {
+      direct = await (options.connectDirect ?? startCorpDirectForward)(
+        settings.corpDirect,
+      );
+      settings = endpointsBehindLocalForward(settings, direct.url);
+    } else if (env.FLEET_DEVTUNNEL_ID) {
       tunnel = await (options.connectTunnel ?? connectDevTunnel)(env.FLEET_DEVTUNNEL_ID, {
         log: () => {},
         warn: () => {},
@@ -136,7 +144,11 @@ export async function prepareNodeService(
     // eslint-disable-next-line preserve-caught-error
     throw new Error(message);
   } finally {
-    tunnel?.stop();
-    lock.release();
+    try {
+      tunnel?.stop();
+      await direct?.stop();
+    } finally {
+      lock.release();
+    }
   }
 }

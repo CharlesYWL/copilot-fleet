@@ -24,6 +24,8 @@ export type Enrollment = {
   enrollmentToken?: string;
   /** Present for providers whose public URL does not encode the tunnel id. */
   tunnelId?: string;
+  /** Public trust anchor for the primary Corp direct endpoint. */
+  corpDirectCa?: string;
 };
 
 /**

@@ -30,8 +30,13 @@ export function visibleTunnelProviders(
   policy: TunnelPolicy | undefined,
   stateFor: (provider: TunnelProviderInfo["id"]) => TunnelState | undefined,
 ): TunnelProviderInfo[] {
-  if (policy?.kind !== "microsoft-corp") return [...providers];
-  return providers.filter((spec) => {
+  const visible = providers.filter((spec) => {
+    if (spec.id !== "corp-direct" || policy?.kind === "microsoft-corp") return true;
+    const state = stateFor(spec.id);
+    return isLive(state) || Boolean(state?.external);
+  });
+  if (policy?.kind !== "microsoft-corp") return visible;
+  return visible.filter((spec) => {
     if (policy.allowedProviders.includes(spec.id)) return true;
     const state = stateFor(spec.id);
     return isLive(state) || Boolean(state?.external);

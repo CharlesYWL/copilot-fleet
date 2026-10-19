@@ -13,7 +13,7 @@ export type HostEndpoints = { hostUrl: string; knownHostUrls: string[] };
  * means the node dials the Host's address itself — a LAN address, a named
  * Cloudflare tunnel, anything that answers without a local helper process.
  */
-export type TunnelMode = "devtunnel" | "direct";
+export type TunnelMode = "devtunnel" | "direct" | "corp-direct";
 
 function hostnameOf(url: string): string | undefined {
   try {
@@ -82,7 +82,7 @@ export function dialableInMode(url: string, mode: TunnelMode): boolean {
   // Ahead of the mode question, because an address nothing may be sent over is
   // not an address either mode can use.
   if (!isConfidentialHostUrl(url)) return false;
-  return mode === "devtunnel" ? isLoopbackUrl(url) : !isLoginWalledTunnelUrl(url);
+  return mode !== "direct" ? isLoopbackUrl(url) : !isLoginWalledTunnelUrl(url);
 }
 
 /**
@@ -108,7 +108,7 @@ export function hostUrlCandidates(
   // reported. Ports it used to bind are as dead as any other stale address and
   // refuse a dial just as fast, so rotating onto them would put the recycler
   // back on the clock this mode exists to take it off.
-  return mode === "devtunnel" ? reachable.slice(0, 1) : reachable;
+  return mode !== "direct" ? reachable.slice(0, 1) : reachable;
 }
 
 /**

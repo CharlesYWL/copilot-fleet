@@ -1,5 +1,10 @@
 import { useCallback, useState } from "react";
-import { errorMessage, type TunnelInfo, type TunnelProvider } from "@fleet/protocol";
+import {
+  errorMessage,
+  type CorpDirectConfig,
+  type TunnelInfo,
+  type TunnelProvider,
+} from "@fleet/protocol";
 import { api } from "./useFleet";
 import { useMessageNotification } from "./useAppNotifications";
 import { useSettingsPolling } from "./useSettingsActivity";
@@ -13,6 +18,7 @@ export type TunnelControls = {
     provider: TunnelProvider,
     enabled: boolean,
     primary?: boolean,
+    corpDirect?: CorpDirectConfig,
   ) => Promise<void>;
 };
 
@@ -46,7 +52,12 @@ export function useTunnel(intervalMs = 2_000): TunnelControls {
   useSettingsPolling(refresh, intervalMs);
 
   const setEnabled = useCallback(
-    async (provider: TunnelProvider, enabled: boolean, primary?: boolean) => {
+    async (
+      provider: TunnelProvider,
+      enabled: boolean,
+      primary?: boolean,
+      corpDirect?: CorpDirectConfig,
+    ) => {
       setBusy(provider);
       setError(undefined);
       try {
@@ -57,6 +68,7 @@ export function useTunnel(intervalMs = 2_000): TunnelControls {
               enabled,
               provider,
               ...(primary === undefined ? {} : { primary }),
+              ...(corpDirect === undefined ? {} : { corpDirect }),
             }),
           }),
         );

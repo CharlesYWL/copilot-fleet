@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import {
   ConnectCommandSchema,
   HOST_BACKUP_KIND,
@@ -22,6 +22,7 @@ import type { FleetStore } from "../store.js";
 const MutualNodeAuthenticationSchema = z.object({ required: z.boolean() });
 import { isTransferableHostUrl } from "../host-url.js";
 import type { TunnelSupervisor } from "../tunnel.js";
+import type { CorpDirectAccess } from "../corp-direct.js";
 import { ineligibleProviderMessage } from "../tunnel-policy.js";
 import type { EnrollmentGrants } from "../auth/enrollment-grants.js";
 import type { HostIdentityService } from "../auth/host-identity.js";
@@ -51,6 +52,7 @@ function heartbeatDefaults(store: FleetStore, nowMs = Date.now()) {
 export type SystemRouteOptions = {
   service: FleetService;
   tunnel: TunnelSupervisor;
+  corpDirect?: CorpDirectAccess;
   version: string;
   enrollment: LegacyEnrollment;
   auth: FleetAuth;
@@ -69,6 +71,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
   {
     service,
     tunnel,
+    corpDirect,
     version,
     enrollment,
     auth,
@@ -80,6 +83,21 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
   },
 ) => {
   const { store } = service;
+  const directCa = () =>
+    tunnel.primary === "corp-direct" && corpDirect?.activeUrl() === enrollmentHostUrl()
+      ? corpDirect?.info().caCertificate
+      : undefined;
+  const describeTunnel = async (request: FastifyRequest) => {
+    const info = await tunnel.info(fallbackPublicUrl());
+    const canManage = auth.agencyAvailableFor(request.fleetSession);
+    return {
+      ...info,
+      providers: info.providers.filter((spec) => spec.id !== "corp-direct" || canManage),
+      ...(corpDirect && canManage
+        ? { corpDirect: { ...corpDirect.info(), canManage: true } }
+        : {}),
+    };
+  };
 
   app.get("/api/health", async () => ({ ok: true, version }));
 
@@ -115,6 +133,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       ...(legacyToken ? { enrollmentToken: legacyToken } : {}),
       nodeAuthentication: store.nodeAuthenticationSummary(),
       mutualAuthenticationRequired,
+      ...(directCa() ? { corpDirectCa: directCa() } : {}),
       ...(tunnelId ? { tunnelId } : {}),
     };
   });
@@ -128,6 +147,11 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
   app.post("/api/enrollment-grants", async (request, reply) => {
     const actor = requireNodeOperator(auth, request, reply, false);
     if (!actor) return reply;
+    if (directCa() && !auth.agencyAvailableFor(request.fleetSession))
+      return reply.code(403).send({
+        error:
+          "Corp direct connect commands require a verified Microsoft corporate administrator.",
+      });
     const host = identity.identity();
     const issued = grants.create(actor.actorId);
     auth.audit({
@@ -146,6 +170,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
         hostId: host.hostId,
         hostFingerprint: host.fingerprint,
         enrollmentGrant: issued.grant,
+        ...(directCa() ? { corpDirectCa: directCa() } : {}),
         ...(tunnelId ? { tunnelId } : {}),
       }),
     });
@@ -379,11 +404,36 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     return result;
   });
 
-  app.get("/api/tunnel", async () => tunnel.info(fallbackPublicUrl()));
+  app.get("/api/tunnel", async (request) => describeTunnel(request));
 
   app.post("/api/tunnel", async (request, reply) => {
     const input = UpdateTunnelSchema.parse(request.body);
     const provider = input.provider ?? store.getTunnelProvider();
+    if (input.corpDirect && provider !== "corp-direct")
+      return reply
+        .code(400)
+        .send({ error: "Corp direct configuration must name the corp-direct provider." });
+    if (provider === "corp-direct" && (input.enabled || input.corpDirect)) {
+      if (!corpDirect || !auth.agencyAvailableFor(request.fleetSession))
+        return reply.code(403).send({
+          error:
+            "Corp direct requires a verified Microsoft corporate administrator signed in with Microsoft.",
+        });
+      if (input.corpDirect) {
+        const changed =
+          JSON.stringify(corpDirect.configuration()) !== JSON.stringify(input.corpDirect);
+        if (
+          changed &&
+          (await tunnel.info(fallbackPublicUrl())).tunnels.some(
+            (entry) => entry.provider === provider && entry.enabled,
+          )
+        )
+          return reply
+            .code(409)
+            .send({ error: "Switch Corp direct off before editing its configuration." });
+        if (changed) corpDirect.configure(input.corpDirect);
+      }
+    }
     /*
      * A provider with no TLS is not a door the console may stand behind, and
      * a Host a Microsoft corporate account administers only runs approved
@@ -395,7 +445,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     if (input.enabled && !policy.allowedProviders.includes(provider)) {
       return reply.code(400).send({
         error: ineligibleProviderMessage(provider, policy.kind),
-        tunnel: await tunnel.info(fallbackPublicUrl()),
+        tunnel: await describeTunnel(request),
       });
     }
     // Providers run side by side, so switching one never implies switching the
@@ -406,9 +456,9 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     } catch (error) {
       return reply.code(503).send({
         error: errorMessage(error, "Tunnel failed to start"),
-        tunnel: await tunnel.info(fallbackPublicUrl()),
+        tunnel: await describeTunnel(request),
       });
     }
-    return tunnel.info(fallbackPublicUrl());
+    return describeTunnel(request);
   });
 };

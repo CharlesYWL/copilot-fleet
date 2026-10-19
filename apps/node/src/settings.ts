@@ -3,7 +3,12 @@ import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { CommandPermissionRuleSchema, ContextTierSchema } from "@fleet/protocol";
+import {
+  CommandPermissionRuleSchema,
+  ContextTierSchema,
+  CorpDirectConnectionSchema,
+} from "@fleet/protocol";
+import { corpDirectFromEnv } from "./corp-direct.js";
 import { configDirectory } from "./config.js";
 import { DEFAULT_COMMAND_PERMISSION_RULES } from "./command-permissions.js";
 
@@ -13,6 +18,8 @@ import { DEFAULT_COMMAND_PERMISSION_RULES } from "./command-permissions.js";
  */
 export const SettingsSchema = z.object({
   hostUrl: z.string().url(),
+  /** Canonical remote origin/trust survives ephemeral loopback helper ports. */
+  corpDirect: CorpDirectConnectionSchema.optional(),
   nodeName: z.string().min(1).max(120),
   maxSessions: z.number().int().min(1).max(64),
   /** Empty means "find `copilot` on PATH". */
@@ -53,6 +60,7 @@ export type Settings = z.infer<typeof SettingsSchema>;
  * The ordinary settings form must not erase them or restore removed defaults.
  */
 export const EditableSettingsSchema = SettingsSchema.omit({
+  corpDirect: true,
   knownHostUrls: true,
   commandPermissionRules: true,
   commandPermissionRevision: true,
@@ -92,8 +100,10 @@ export const DEFAULT_MAX_SESSIONS = 10;
  * both — see {@link settingsOverridesFromEnv}.
  */
 export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): Settings {
+  const corpDirect = corpDirectFromEnv(env);
   return SettingsSchema.parse({
-    hostUrl: env.FLEET_HOST_URL ?? "http://127.0.0.1:8787",
+    ...(corpDirect ? { corpDirect } : {}),
+    hostUrl: corpDirect?.hostUrl ?? env.FLEET_HOST_URL ?? "http://127.0.0.1:8787",
     nodeName: env.FLEET_NODE_NAME ?? hostname(),
     maxSessions: Number(env.FLEET_MAX_SESSIONS ?? DEFAULT_MAX_SESSIONS),
     copilotCommand: env.FLEET_COPILOT_COMMAND ?? "",
@@ -130,6 +140,14 @@ export function settingsOverridesFromEnv(env: NodeJS.ProcessEnv): Partial<Settin
     // naming the field. Quietly dropping it would start the node on a window
     // the operator did not ask for and say nothing.
     overrides.contextTier = env.FLEET_CONTEXT_TIER as Settings["contextTier"];
+  }
+  if (env.FLEET_CORP_DIRECT_URL !== undefined || env.FLEET_HOST_CA !== undefined) {
+    const corpDirect = corpDirectFromEnv(env)!;
+    overrides.corpDirect = corpDirect;
+    overrides.hostUrl = corpDirect.hostUrl;
+  } else if (env.FLEET_HOST_URL !== undefined || env.FLEET_DEVTUNNEL_ID !== undefined) {
+    // A deliberate mode change must not retain the previous Host's trust route.
+    overrides.corpDirect = undefined;
   }
   return overrides;
 }

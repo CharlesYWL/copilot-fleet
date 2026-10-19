@@ -1,5 +1,14 @@
 import { z } from "zod";
 import {
+  CorpDirectConfigSchema,
+  CorpDirectConnectionSchema,
+  CorpDirectInfoSchema,
+  PublicCaCertificateSchema,
+} from "./corp-direct.js";
+export * from "./corp-direct.js";
+import { CorpDirectSecuritySchema } from "./corp-direct-security.js";
+export * from "./corp-direct-security.js";
+import {
   ExecutionBindingSchema,
   ManagedWorktreePolicySchema,
   ManagedWorktreeSchema,
@@ -2670,6 +2679,8 @@ export const ConnectCommandSchema = z
     /** `<grant-id>.<grant-secret>`, one Node, fifteen minutes, one use. */
     enrollmentGrant: z.string().min(3).max(400),
     tunnelId: z.string().max(200).optional(),
+    /** Public CA only; copied out of band with the enrollment grant. */
+    corpDirectCa: PublicCaCertificateSchema.optional(),
   })
   .strip();
 export type ConnectCommand = z.infer<typeof ConnectCommandSchema>;
@@ -2973,6 +2984,7 @@ export const tunnelProviders = [
   "ngrok",
   "bore",
   "devtunnel",
+  "corp-direct",
 ] as const;
 export const TunnelProviderSchema = z.enum(tunnelProviders);
 export type TunnelProvider = z.infer<typeof TunnelProviderSchema>;
@@ -2987,7 +2999,11 @@ export type TunnelStatus = z.infer<typeof TunnelStatusSchema>;
  * reaches nothing. `public` means the URL is the whole address: it lands on
  * Fleet's own sign-in page, which is a defence, but a thinner one.
  */
-export const tunnelAccessKinds = ["creator-private", "public"] as const;
+export const tunnelAccessKinds = [
+  "creator-private",
+  "public",
+  "private-network",
+] as const;
 export const TunnelAccessSchema = z.enum(tunnelAccessKinds);
 export type TunnelAccess = z.infer<typeof TunnelAccessSchema>;
 
@@ -3093,6 +3109,8 @@ export const TunnelInfoSchema = z.object({
   tunnelId: z.string().optional(),
   /** The provider rule in force; absent from older Hosts, which means `open`. */
   policy: TunnelPolicySchema.optional(),
+  /** Built-in private listener setup; never contains private certificate keys. */
+  corpDirect: CorpDirectInfoSchema.optional(),
 });
 export type TunnelInfo = z.infer<typeof TunnelInfoSchema>;
 
@@ -3102,6 +3120,8 @@ export const UpdateTunnelSchema = z.object({
   provider: TunnelProviderSchema.optional(),
   /** Make this provider the one enrollment advertises. */
   primary: z.boolean().optional(),
+  /** Configuration is validated even when the provider is currently disabled. */
+  corpDirect: CorpDirectConfigSchema.optional(),
 });
 
 /**
@@ -3431,6 +3451,8 @@ export const SecurityBackupPayloadSchema = z.object({
   leadTokenKey: z.string().min(1).max(200),
   /** Absent until the Host has an identity key pair of its own to move. */
   hostIdentity: SecurityBackupHostIdentitySchema.optional(),
+  /** Private TLS material is permitted only inside this encrypted security payload. */
+  corpDirect: CorpDirectSecuritySchema.optional(),
   administrators: z.array(SecurityBackupAdministratorSchema).max(100),
   nodeAuth: z.array(SecurityBackupNodeAuthSchema).max(1_000).default([]),
 });
@@ -3500,6 +3522,7 @@ export type NodeBackupCredentials = z.infer<typeof NodeBackupCredentialsSchema>;
 
 export const NodeBackupSettingsSchema = z.object({
   hostUrl: z.string().url(),
+  corpDirect: CorpDirectConnectionSchema.optional(),
   nodeName: z.string().min(1).max(120),
   maxSessions: z.number().int().min(1).max(64),
   copilotCommand: z.string(),

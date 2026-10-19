@@ -222,7 +222,9 @@ describe("TunnelPanel policy", () => {
     const card = await screen.findByRole("region", { name: "Dev Tunnels" });
     fireEvent.click(within(card).getByRole("switch"));
     expect(await screen.findByText("Tunnel change refused")).toBeTruthy();
-    expect(notify).toHaveBeenCalledExactlyOnceWith("Tunnel change refused", "error");
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledExactlyOnceWith("Tunnel change refused", "error"),
+    );
   });
 
   it("reports a rejected URL copy without an unhandled promise or copied value", async () => {
@@ -304,6 +306,40 @@ describe("TunnelPanel for a Microsoft corporate account", () => {
     forgetCsrfToken();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("offers the built-in direct configuration without a worker source list", async () => {
+    const direct: TunnelInfo = {
+      ...corp,
+      policy: { kind: "microsoft-corp", allowedProviders: ["devtunnel", "corp-direct"] },
+      providers: [
+        ...catalog,
+        spec("corp-direct", {
+          label: "Corp direct (private IP)",
+          access: "private-network",
+          binary: "built-in",
+        }),
+      ],
+      corpDirect: { supported: true, addresses: ["10.0.5.136"], configuration: null },
+    };
+    const fetchMock = vi.fn(async (input: URL | RequestInfo, _init?: RequestInit) => {
+      if (String(input).includes("/api/auth/csrf")) return answer({ csrfToken: "proof" });
+      return answer(direct);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    show();
+    const card = await screen.findByRole("region", { name: "Corp direct (private IP)" });
+    expect(within(card).queryByLabelText("Allowed worker IPs or CIDRs")).toBeNull();
+    fireEvent.click(within(card).getByRole("switch", { name: /corp direct/i }));
+    await waitFor(() => {
+      const posted = fetchMock.mock.calls.find(([, init]) => init?.method === "POST");
+      expect(JSON.parse(String(posted?.[1]?.body))).toEqual({
+        enabled: true,
+        provider: "corp-direct",
+        primary: true,
+        corpDirect: { hostIp: "10.0.5.136", port: 8787 },
+      });
+    });
   });
 
   it("offers only Dev Tunnels and says why the rest are gone", async () => {

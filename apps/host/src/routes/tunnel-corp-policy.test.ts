@@ -115,7 +115,7 @@ async function claimAs(identity: EntraIdentity) {
 
 describe("tunnel providers for Microsoft corporate accounts", () => {
   it(
-    "offers and starts only Dev Tunnels once an @microsoft.com account owns the Host",
+    "offers Dev Tunnels and Corp direct once a verified corporate account owns the Host",
     async () => {
       const host = await claimAs({
         tenantId: MICROSOFT_CORP_TENANT_ID,
@@ -126,7 +126,7 @@ describe("tunnel providers for Microsoft corporate accounts", () => {
       const info = await host.info();
       expect(info.policy).toEqual({
         kind: "microsoft-corp",
-        allowedProviders: ["devtunnel"],
+        allowedProviders: ["devtunnel", "corp-direct"],
       });
 
       for (const provider of ["cloudflare", "ngrok", "tailscale"]) {
@@ -139,6 +139,9 @@ describe("tunnel providers for Microsoft corporate accounts", () => {
       expect((await host.toggle("cloudflare", false)).statusCode).toBe(200);
       expect((await host.toggle("devtunnel", true)).statusCode).toBe(200);
       expect(start).toHaveBeenCalledWith("devtunnel", true, true);
+      expect(info.providers.some((provider) => provider.id === "corp-direct")).toBe(true);
+      expect((await host.toggle("corp-direct", true)).statusCode).toBe(200);
+      expect(start).toHaveBeenCalledWith("corp-direct", true, true);
     },
     SLOW_INTEGRATION_MS,
   );
@@ -158,6 +161,10 @@ describe("tunnel providers for Microsoft corporate accounts", () => {
       });
       const info = await host.info();
       expect(info.policy?.kind).toBe("open");
+      expect(info.providers.some((provider) => provider.id === "corp-direct")).toBe(
+        false,
+      );
+      expect((await host.toggle("corp-direct", true)).statusCode).toBe(403);
       expect(info.policy?.allowedProviders).toEqual(
         expect.arrayContaining(["cloudflare", "tailscale", "ngrok", "devtunnel"]),
       );

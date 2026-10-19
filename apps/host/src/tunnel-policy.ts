@@ -1,18 +1,9 @@
 import type { TunnelPolicy, TunnelPolicyKind, TunnelProvider } from "@fleet/protocol";
 import { providerList, providerSpecs } from "./tunnel-providers.js";
 
-/*
- * Extension point for corpnet-direct connectivity between Dev Boxes.
- *
- * That route needs no tunnel: the Host listens on its corpnet address and Nodes
- * dial it directly (today's `FLEET_PUBLIC_URL` / `--url`, which this policy
- * leaves alone). When the panel offers it, it should be one more catalog entry
- * with `microsoftCorpApproved: true`: the corp policy, the route's refusal and
- * the panel all read the published allow-list, so none of them needs a special
- * case. What it will need of its own is a scheme decision in
- * `auth/external-scheme.ts`, because a corpnet name is neither loopback nor a
- * published HTTPS tunnel, and so today grants no session.
- */
+/* Corp direct is a built-in private TLS listener in the same remote-access
+ * catalog. Corporate eligibility is enforced here and again by its authenticated
+ * setup route; the provider never opts into no-auth or public-account policies. */
 
 /** What the Host knows that decides which providers it may run. */
 export type TunnelPolicyContext = {
@@ -48,6 +39,7 @@ export function tunnelProviderAllowed(
   const spec = providerSpecs[provider];
   // A provider with no TLS is refused under every policy.
   if (!spec.controlPlaneEligible) return false;
+  if (provider === "corp-direct") return kind === "microsoft-corp";
   switch (kind) {
     case "open":
       return true;
@@ -80,6 +72,8 @@ export function ineligibleProviderMessage(
   kind: TunnelPolicyKind = "open",
 ): string {
   const spec = providerSpecs[provider];
+  if (provider === "corp-direct")
+    return "Corp direct requires Microsoft sign-in and a verified Microsoft corporate administrator. It is unavailable for public-account or no-auth Hosts.";
   if (spec.controlPlaneEligible && kind === "private-only") {
     return `${spec.label} is public. Without Microsoft sign-in, use private Dev Tunnels or keep the Host local.`;
   }
