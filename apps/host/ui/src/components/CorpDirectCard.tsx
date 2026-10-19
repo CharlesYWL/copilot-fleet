@@ -14,6 +14,7 @@ import {
 } from "@fluentui/react-components";
 import {
   CorpDirectConfigSchema,
+  CORP_DIRECT_REGION_WARNING,
   type CorpDirectConfig,
   type CorpDirectInfo,
   type TunnelState,
@@ -122,7 +123,7 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
           <Badge appearance="outline">Private network</Badge>
           {isPrimary && (
             <Badge appearance="filled" color="brand">
-              Used for enrollment
+              Default for enrollment
             </Badge>
           )}
         </div>
@@ -139,6 +140,9 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
         or external relay is used. Available only to verified Microsoft corporate
         administrators.
       </Text>
+      <MessageBar intent="warning">
+        <MessageBarBody>{CORP_DIRECT_REGION_WARNING}</MessageBarBody>
+      </MessageBar>
       {!info.supported && (
         <MessageBar intent="info">
           <MessageBarBody>
@@ -213,7 +217,7 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
               appearance="subtle"
               onClick={() => void onSetEnabled(true, undefined, true)}
             >
-              Use for enrollment
+              Make default
             </Button>
           )}
         </div>

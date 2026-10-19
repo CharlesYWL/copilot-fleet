@@ -75,6 +75,61 @@ import {
   PrMaintenanceTaskStatusSchema,
 } from "./pr-maintenance.js";
 
+export const tunnelProviders = [
+  "cloudflare",
+  "tailscale",
+  "ngrok",
+  "bore",
+  "devtunnel",
+  "corp-direct",
+] as const;
+export const TunnelProviderSchema = z.enum(tunnelProviders);
+export type TunnelProvider = z.infer<typeof TunnelProviderSchema>;
+export const NodeConnectionProviderSchema = z.enum([...tunnelProviders, "direct"]);
+export type NodeConnectionProvider = z.infer<typeof NodeConnectionProviderSchema>;
+export const nodeConnectionLabels: Record<NodeConnectionProvider, string> = {
+  "corp-direct": "Corp direct (private IP)",
+  devtunnel: "Dev Tunnels",
+  cloudflare: "Cloudflare",
+  tailscale: "Tailscale Funnel",
+  ngrok: "ngrok",
+  bore: "bore",
+  direct: "Direct / local",
+};
+
+/** Diagnostic origins never include URL credentials, paths or query secrets. */
+const connectionOrigin = z
+  .string()
+  .max(2048)
+  .url()
+  .refine((value) => {
+    try {
+      const url = new URL(value);
+      return ["http:", "https:"].includes(url.protocol) && url.origin === value;
+    } catch {
+      return false;
+    }
+  }, "Expected an HTTP(S) origin without credentials, a path or query parameters");
+
+/** Reported only after authentication; informational, never an authorization rule. */
+export const NodeConnectionSchema = z.object({
+  provider: NodeConnectionProviderSchema,
+  hostUrl: connectionOrigin.optional(),
+});
+export type NodeConnection = z.infer<typeof NodeConnectionSchema>;
+
+export const EnrollmentConnectionOptionSchema = z.object({
+  provider: NodeConnectionProviderSchema,
+  label: z.string().min(1).max(200),
+  hostUrl: z.string().max(2048).url(),
+  tunnelId: z.string().min(1).max(200).optional(),
+  corpDirectCa: PublicCaCertificateSchema.optional(),
+});
+export type EnrollmentConnectionOption = z.infer<typeof EnrollmentConnectionOptionSchema>;
+export const CreateEnrollmentGrantSchema = z.object({
+  provider: NodeConnectionProviderSchema.optional(),
+});
+
 /** Local startup events consumed by the service CLI, independent of log formatting. */
 export const CONFIG_UI_EVENT_MARKER = "FLEET_CONFIG_UI ";
 const configPort = z.number().int().min(1).max(65535);
@@ -280,6 +335,8 @@ export const NodeSchema = z.object({
   homeDir: z.string().default(""),
   /** Ephemeral telemetry; older Nodes and restored archives need not carry it. */
   health: NodeHealthSchema.optional(),
+  /** Last successfully authenticated connection, if this Host can identify it. */
+  connection: NodeConnectionSchema.optional(),
   /**
    * How this machine proves it is itself.
    *
@@ -1321,6 +1378,7 @@ const nodeInventoryShape = {
   version: z.string().min(1),
   revision: z.string().default(""),
   capabilities: z.array(z.string()),
+  connection: NodeConnectionSchema.optional(),
   commandExecution: CommandReadinessSchema.optional(),
   agents: z.array(NodeAgentSchema).default([]),
   agentKinds: z.array(DetectedAgentSchema).optional(),
@@ -2673,6 +2731,7 @@ export function parseAuthError(
  */
 export const ConnectCommandSchema = z
   .object({
+    provider: NodeConnectionProviderSchema.optional(),
     hostUrl: z.string().url().max(2048),
     hostId: z.string().min(1).max(200),
     hostFingerprint: sha256Hex,
@@ -2978,17 +3037,6 @@ export const SetSessionConfigSchema = z.object({
   value: z.string().max(500),
 });
 
-export const tunnelProviders = [
-  "cloudflare",
-  "tailscale",
-  "ngrok",
-  "bore",
-  "devtunnel",
-  "corp-direct",
-] as const;
-export const TunnelProviderSchema = z.enum(tunnelProviders);
-export type TunnelProvider = z.infer<typeof TunnelProviderSchema>;
-
 export const TunnelStatusSchema = z.enum(["off", "starting", "on", "stopping", "error"]);
 export type TunnelStatus = z.infer<typeof TunnelStatusSchema>;
 
@@ -3071,9 +3119,8 @@ export type TunnelState = z.infer<typeof TunnelStateSchema>;
  * - `private-only`: Fleet sign-in was skipped, so only a provider that demands
  *   its own login (private Dev Tunnels) may stand in front of the Host.
  * - `microsoft-corp`: a Microsoft corporate account administers this Host, so
- *   only Microsoft-approved remote access is offered. Today that is Dev Tunnels;
- *   corpnet-direct connectivity between Dev Boxes is meant to join the same
- *   allow-list rather than become a second rule.
+ *   only the existing Microsoft corporate remote-access providers are offered:
+ *   private Dev Tunnels and the explicitly configured Corp direct listener.
  */
 export const tunnelPolicyKinds = ["open", "private-only", "microsoft-corp"] as const;
 export const TunnelPolicyKindSchema = z.enum(tunnelPolicyKinds);

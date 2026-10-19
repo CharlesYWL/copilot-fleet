@@ -1,4 +1,4 @@
-import { CorpDirectConnectionSchema } from "@fleet/protocol";
+import { CorpDirectConnectionSchema, type NodeConnectionProvider } from "@fleet/protocol";
 
 /** Loopback and wildcard addresses resolve to the wrong box on a remote node. */
 export function isLocalOnlyHostUrl(hostUrl: string): boolean {
@@ -57,14 +57,15 @@ export function enrollCommand(
  * dev tunnel needs no second terminal and no transcribed port number — and it
  * must never be handed the private URL, which it cannot authenticate to.
  */
-function dialFlag(hostUrl: string, tunnelId?: string): string {
-  return isDevTunnelUrl(hostUrl)
+function dialFlag(hostUrl: string, tunnelId?: string, privateTunnel = false): string {
+  return privateTunnel || isDevTunnelUrl(hostUrl)
     ? `--devtunnel="${tunnelId ?? "<tunnel-id>"}"`
     : `--url="${hostUrl}"`;
 }
 
 /** What the Connect card needs to print a key-based command. */
 export type ConnectCommandFields = {
+  provider?: NodeConnectionProvider | undefined;
   hostUrl: string;
   hostId: string;
   hostFingerprint: string;
@@ -92,6 +93,11 @@ export function keyEnrollCommand(
   fields: ConnectCommandFields,
   mode: NodeLaunchMode = "direct",
 ): string {
+  const privateTunnel = fields.provider === "devtunnel";
+  if (privateTunnel && !fields.tunnelId)
+    throw new Error(
+      "The Dev Tunnels tunnel ID is not ready. Generate a new command once it is online.",
+    );
   const corpDirect = fields.corpDirectCa
     ? CorpDirectConnectionSchema.parse({
         hostUrl: fields.hostUrl,
@@ -101,7 +107,7 @@ export function keyEnrollCommand(
   const flags = [
     corpDirect
       ? `--corp-direct="${corpDirect.hostUrl}" --host-ca="${btoa(corpDirect.caCertificate)}"`
-      : dialFlag(fields.hostUrl, fields.tunnelId),
+      : dialFlag(fields.hostUrl, fields.tunnelId, privateTunnel),
     `--host-id="${fields.hostId}"`,
     `--host-fingerprint="${fields.hostFingerprint}"`,
     `--enrollment-grant="${fields.enrollmentGrant}"`,

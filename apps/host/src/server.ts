@@ -592,7 +592,10 @@ export async function buildServer(
   });
 
   registerBrowserGateway(app, { service, auth, registry: browsers });
-  registerNodeGateway(app, service, { identity: hostIdentity });
+  registerNodeGateway(app, service, {
+    identity: hostIdentity,
+    endpoints: () => tunnel.allTunnelEndpoints(),
+  });
   const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs, (stalledMs) =>
     app.log.warn(
       { stalledMs },

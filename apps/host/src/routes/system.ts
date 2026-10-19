@@ -1,6 +1,10 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import {
   ConnectCommandSchema,
+  CreateEnrollmentGrantSchema,
+  EnrollmentConnectionOptionSchema,
+  nodeConnectionLabels,
+  type EnrollmentConnectionOption,
   HOST_BACKUP_KIND,
   HostBackupSchema,
   NODE_BACKUP_KIND,
@@ -84,9 +88,51 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
 ) => {
   const { store } = service;
   const directCa = () =>
-    tunnel.primary === "corp-direct" && corpDirect?.activeUrl() === enrollmentHostUrl()
+    corpDirect?.activeUrl() === enrollmentHostUrl()
       ? corpDirect?.info().caCertificate
       : undefined;
+  const connectionOptions = (request: FastifyRequest): EnrollmentConnectionOption[] => {
+    const policy = tunnel.policy();
+    const canUseCorpDirect = auth.agencyAvailableFor(request.fleetSession);
+    const connections = tunnel.enrollmentEndpoints().flatMap((endpoint) => {
+      if (!policy.allowedProviders.includes(endpoint.provider)) return [];
+      if (endpoint.provider === "corp-direct") {
+        if (!canUseCorpDirect || corpDirect?.activeUrl() !== endpoint.url) return [];
+        const caCertificate = corpDirect.info().caCertificate;
+        if (!caCertificate) return [];
+        return [
+          EnrollmentConnectionOptionSchema.parse({
+            provider: endpoint.provider,
+            label: nodeConnectionLabels[endpoint.provider],
+            hostUrl: endpoint.url,
+            corpDirectCa: caCertificate,
+          }),
+        ];
+      }
+      if (endpoint.provider === "devtunnel" && !endpoint.tunnelId) return [];
+      return [
+        EnrollmentConnectionOptionSchema.parse({
+          provider: endpoint.provider,
+          label: nodeConnectionLabels[endpoint.provider],
+          hostUrl: endpoint.url,
+          ...(endpoint.provider === "devtunnel" ? { tunnelId: endpoint.tunnelId } : {}),
+        }),
+      ];
+    });
+    if (!connections.length)
+      return [
+        EnrollmentConnectionOptionSchema.parse({
+          provider: "direct",
+          label: "Configured Host URL",
+          hostUrl: fallbackPublicUrl(),
+        }),
+      ];
+    const defaultUrl = enrollmentHostUrl();
+    return connections.sort(
+      (left, right) =>
+        Number(right.hostUrl === defaultUrl) - Number(left.hostUrl === defaultUrl),
+    );
+  };
   const describeTunnel = async (request: FastifyRequest) => {
     const info = await tunnel.info(fallbackPublicUrl());
     const canManage = auth.agencyAvailableFor(request.fleetSession);
@@ -112,7 +158,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
    * sign for the matching key, which is what makes a relay merely a relay. The
    * fleet-wide token is still here for machines that predate Node keys.
    */
-  app.get("/api/enrollment", async () => {
+  app.get("/api/enrollment", async (request) => {
     const tunnelId = tunnel.activeTunnelId();
     const host = identity.identity();
     const mutualAuthenticationRequired = store.mutualNodeAuthenticationRequired();
@@ -130,6 +176,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       hostId: host.hostId,
       hostFingerprint: host.fingerprint,
       hostPublicKey: host.publicKey,
+      connections: connectionOptions(request),
       ...(legacyToken ? { enrollmentToken: legacyToken } : {}),
       nodeAuthentication: store.nodeAuthenticationSummary(),
       mutualAuthenticationRequired,
@@ -147,10 +194,31 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
   app.post("/api/enrollment-grants", async (request, reply) => {
     const actor = requireNodeOperator(auth, request, reply, false);
     if (!actor) return reply;
-    if (directCa() && !auth.agencyAvailableFor(request.fleetSession))
+    const input = CreateEnrollmentGrantSchema.parse(request.body ?? {});
+    const corporate = auth.agencyAvailableFor(request.fleetSession);
+    if (
+      (input.provider === "corp-direct" || (!input.provider && directCa())) &&
+      !corporate
+    )
       return reply.code(403).send({
         error:
           "Corp direct connect commands require a verified Microsoft corporate administrator.",
+      });
+    if (
+      input.provider &&
+      input.provider !== "direct" &&
+      !tunnel.policy().allowedProviders.includes(input.provider)
+    )
+      return reply
+        .code(403)
+        .send({ error: "This connection provider is not permitted for this Host." });
+    const selected = input.provider
+      ? connectionOptions(request).find((option) => option.provider === input.provider)
+      : undefined;
+    if (input.provider && !selected)
+      return reply.code(409).send({
+        error:
+          "This connection provider is not online or ready. Enable it in Remote access, then generate a new command.",
       });
     const host = identity.identity();
     const issued = grants.create(actor.actorId);
@@ -160,17 +228,19 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       targetId: issued.id,
       outcome: "allowed",
     });
-    const tunnelId = tunnel.activeTunnelId();
+    const tunnelId = selected ? selected.tunnelId : tunnel.activeTunnelId();
+    const caCertificate = selected ? selected.corpDirectCa : directCa();
     return reply.code(201).send({
       id: issued.id,
       grant: issued.grant,
       expiresAt: issued.expiresAt,
       command: ConnectCommandSchema.parse({
-        hostUrl: enrollmentHostUrl(),
+        ...(selected ? { provider: selected.provider } : {}),
+        hostUrl: selected?.hostUrl ?? enrollmentHostUrl(),
         hostId: host.hostId,
         hostFingerprint: host.fingerprint,
         enrollmentGrant: issued.grant,
-        ...(directCa() ? { corpDirectCa: directCa() } : {}),
+        ...(caCertificate ? { corpDirectCa: caCertificate } : {}),
         ...(tunnelId ? { tunnelId } : {}),
       }),
     });

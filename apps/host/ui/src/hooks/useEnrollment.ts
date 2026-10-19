@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { errorMessage } from "@fleet/protocol";
+import { errorMessage, type EnrollmentConnectionOption } from "@fleet/protocol";
 import { api } from "./useFleet";
 import { useMessageNotification } from "./useAppNotifications";
 import { useSettingsPolling } from "./useSettingsActivity";
@@ -26,6 +26,8 @@ export type Enrollment = {
   tunnelId?: string;
   /** Public trust anchor for the primary Corp direct endpoint. */
   corpDirectCa?: string;
+  /** Explicit per-provider choices; absent when connected to an older Host. */
+  connections?: EnrollmentConnectionOption[];
 };
 
 /**

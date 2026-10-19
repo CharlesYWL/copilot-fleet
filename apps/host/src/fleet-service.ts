@@ -35,6 +35,7 @@ import {
   type McpHttpServer,
   type NodeCommand,
   type NodeHealth,
+  type NodeConnection,
   type NodeUpdateStage,
   type Notification,
   type Placement,
@@ -209,6 +210,7 @@ export class FleetService {
   private readonly browserSockets = new Set<WebSocket>();
   /** Latest observations only: no history, database writes, or backup telemetry. */
   private readonly nodeHealth = new Map<string, NodeHealth>();
+  private readonly nodeConnections = new Map<string, NodeConnection>();
   /**
    * Nodes told to update that have not yet reported how it went.
    *
@@ -405,12 +407,18 @@ export class FleetService {
   }
 
   listNodes(): FleetNode[] {
-    return this.store.listNodes().map((node) => this.withNodeHealth(node));
+    return this.store.listNodes().map((node) => this.withNodeTelemetry(node));
   }
 
-  private withNodeHealth(node: FleetNode): FleetNode {
+  private withNodeTelemetry(node: FleetNode): FleetNode {
     const health = this.nodeHealth.get(node.id);
-    return health ? { ...node, health } : node;
+    const connection = this.nodeConnections.get(node.id);
+    if (!health && !connection) return node;
+    return {
+      ...node,
+      ...(health ? { health } : {}),
+      ...(connection ? { connection } : {}),
+    };
   }
 
   get hostRevision(): string {
@@ -431,10 +439,12 @@ export class FleetService {
     return this.nodeSockets.get(nodeId);
   }
 
-  attachNode(nodeId: string, socket: NodeLink): void {
+  attachNode(nodeId: string, socket: NodeLink, connection?: NodeConnection): void {
     this.console.detach(nodeId);
     this.sessionRetention.nodeDisconnected(nodeId);
     this.nodeHealth.delete(nodeId);
+    if (connection) this.nodeConnections.set(nodeId, connection);
+    else this.nodeConnections.delete(nodeId);
     this.nodeSockets.set(nodeId, socket);
     this.linkNodes.set(socket, nodeId);
   }
@@ -444,6 +454,7 @@ export class FleetService {
     this.commands.nodeDisconnected(nodeId);
     this.files.nodeDisconnected(nodeId);
     this.nodeHealth.delete(nodeId);
+    this.nodeConnections.delete(nodeId);
     const socket = this.nodeSockets.get(nodeId);
     if (!socket) return;
     this.nodeSockets.delete(nodeId);
@@ -459,6 +470,7 @@ export class FleetService {
    */
   evictAllNodes(code: number, reason: string): void {
     this.nodeHealth.clear();
+    this.nodeConnections.clear();
     for (const [nodeId, socket] of [...this.nodeSockets.entries()]) {
       this.commands.nodeDisconnected(nodeId);
       this.files.nodeDisconnected(nodeId);
@@ -585,7 +597,7 @@ export class FleetService {
   }
 
   publishNode(node: FleetNode): void {
-    this.broadcast({ type: "node", node: this.withNodeHealth(node) });
+    this.broadcast({ type: "node", node: this.withNodeTelemetry(node) });
   }
 
   publishSession(session: FleetSession): void {

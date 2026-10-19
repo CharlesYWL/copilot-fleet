@@ -1,5 +1,8 @@
 import { z } from "zod";
 
+export const CORP_DIRECT_REGION_WARNING =
+  "Cross-region private-IP access is not guaranteed. Use another enabled connection method if this Dev Box network path is unavailable.";
+
 const ipv4Number = (value: string): number | undefined => {
   if (!/^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/.test(value)) return undefined;
   const parts = value.split(".").map(Number);

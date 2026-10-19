@@ -221,7 +221,7 @@ const ProviderCard = ({
             <ProviderHelpDialog spec={spec} />
             {isPrimary && (
               <Badge appearance="filled" color="brand">
-                Used for enrollment
+                Default for enrollment
               </Badge>
             )}
             {spec.access === "creator-private" && spec.controlPlaneEligible && (
@@ -303,7 +303,7 @@ const ProviderCard = ({
           <CopyButton text={url} size="small" showText />
           {!isPrimary && (
             <Button size="small" appearance="subtle" onClick={onMakePrimary}>
-              Use for enrollment
+              Make default
             </Button>
           )}
         </div>
@@ -336,7 +336,7 @@ const TunnelSummary = ({ info }: { info: TunnelInfo }) => {
       <MessageBarBody>
         {online.length === 0
           ? "No remote access provider is running. New Nodes are told "
-          : `${online.length} remote access provider${online.length === 1 ? "" : "s"} online. New Nodes are told `}
+          : `${online.length} remote access provider${online.length === 1 ? "" : "s"} online. Default enrollment address: `}
         <code className={styles.mono}>{info.publicUrl}</code>
         {info.primary ? "." : " — the configured fallback, since no provider is serving."}
       </MessageBarBody>
@@ -403,12 +403,13 @@ export const TunnelPanel = () => {
         <Title3 as="h1">Remote access</Title3>
         <br />
         <Text className={styles.caption}>
-          The provider marked for enrollment supplies the address and connection command
-          handed to new nodes. Corp direct uses a private-IP HTTPS listener without an
-          external tunnel. Existing HTTPS tunnel providers can run independently. With
-          Microsoft sign-in enabled, Fleet separately checks who may operate it. Without
-          Microsoft sign-in, anyone who can reach the Host can operate it: keep the
-          listener on loopback and use private Dev Tunnels, never anonymous tunnel access.
+          All online providers offer separate connection commands under Nodes. The default
+          supplies the address for requests that do not select a provider. Corp direct
+          uses a private-IP HTTPS listener, and HTTPS tunnel providers can run alongside
+          it. With Microsoft sign-in enabled, Fleet separately checks who may operate it.
+          Without Microsoft sign-in, anyone who can reach the Host can operate it: keep
+          the listener on loopback and use private Dev Tunnels, never anonymous tunnel
+          access.
         </Text>
       </div>
 

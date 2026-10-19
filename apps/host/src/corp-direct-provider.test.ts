@@ -3,7 +3,7 @@ import { BinaryProbe, TunnelSupervisor } from "./tunnel.js";
 import { tunnelProviderAllowed } from "./tunnel-policy.js";
 import type { TunnelPolicyKind } from "@fleet/protocol";
 
-const fixture = () => {
+const fixture = (external?: { provider: "devtunnel"; url: string; tunnelId: string }) => {
   let kind: TunnelPolicyKind = "microsoft-corp";
   let url: string | undefined;
   let error: string | undefined;
@@ -29,7 +29,7 @@ const fixture = () => {
         error: () => error,
       },
     },
-    readExternal: () => undefined,
+    readExternal: () => external,
     probe: new BinaryProbe(async () => false),
     setTimer: (callback) => {
       timers.push(callback);
@@ -77,6 +77,38 @@ describe("built-in corporate private access provider", () => {
     }
     expect(f.stop).toHaveBeenCalled();
     expect(f.supervisor.activeTunnelUrl()).toBeUndefined();
+  });
+
+  it("lists independent corporate enrollment endpoints without changing the default", async () => {
+    const f = fixture({
+      provider: "devtunnel",
+      url: "https://fleet-route.usw2.devtunnels.ms",
+      tunnelId: "fleet-route.usw2",
+    });
+    try {
+      await f.supervisor.setEnabled("corp-direct", true);
+      expect(f.supervisor.enrollmentEndpoints()).toEqual([
+        {
+          provider: "devtunnel",
+          url: "https://fleet-route.usw2.devtunnels.ms",
+          tunnelId: "fleet-route.usw2",
+        },
+        { provider: "corp-direct", url: "https://10.0.5.136:8787" },
+      ]);
+      expect(f.supervisor.primary).toBe("corp-direct");
+      expect(f.start).toHaveBeenCalledOnce();
+      expect(f.stop).not.toHaveBeenCalled();
+      await f.supervisor.setEnabled("corp-direct", false);
+      expect(f.supervisor.enrollmentEndpoints()).toEqual([
+        {
+          provider: "devtunnel",
+          url: "https://fleet-route.usw2.devtunnels.ms",
+          tunnelId: "fleet-route.usw2",
+        },
+      ]);
+    } finally {
+      await f.supervisor.stop();
+    }
   });
 
   it("immediately stops trusting the URL and closes it when corporate policy is lost", async () => {
