@@ -49,7 +49,7 @@
 - [x] Build shared packages, run affected service/UI/protocol regressions, then lint, type checks, changed-file Prettier and production builds.
 - [x] Review trust/eligibility boundaries, one-use grant handling, stale endpoint resets, telemetry accuracy, compatibility and live-data isolation.
 - [x] Record fresh test results and pre-existing failures accurately. The previous full-suite baseline issues remain documented; do not imply a fresh full-suite pass without running one.
-- [ ] Commit only feature files, push `feat/multi-route-enrollment` to private `origin`, and open a PR against `main` in `charlesyin_microsoft/copilot-fleet`.
+- [x] Commit only feature files, push `feat/multi-route-enrollment` to private `origin`, and open a PR against `main` in `charlesyin_microsoft/copilot-fleet`. Delivered as [PR #92](https://github.com/charlesyin_microsoft/copilot-fleet/pull/92); the small MCP test timing correction is isolated in its own commit.
 
 ## Validation record
 
