@@ -1,7 +1,11 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
-import type { TunnelAccess, TunnelProvider } from "@fleet/protocol";
+import {
+  nodeConnectionLabels,
+  type TunnelAccess,
+  type TunnelProvider,
+} from "@fleet/protocol";
 
 const execFileAsync = promisify(execFile);
 
@@ -134,14 +138,14 @@ export const DEVTUNNEL_ID_RE = /(?<=for tunnel:\s)[a-z0-9-]+\.[a-z0-9]+/i;
 export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
   "corp-direct": {
     id: "corp-direct",
-    label: "Corp direct (private IP)",
+    label: nodeConnectionLabels["corp-direct"],
     builtIn: true,
     binary: "Fleet built-in TLS",
     versionArgs: [],
     args: () => [],
     extractUrl: () => undefined,
     installHint:
-      "Built into Fleet on Windows; configure the private listener and allowed sources.",
+      "Built into Fleet on Windows; configure the private Host IP and HTTPS port.",
     setupSteps: [
       "Sign in as a verified Microsoft corporate administrator.",
       "Choose a private Host IPv4 address and HTTPS port.",
@@ -160,7 +164,7 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
   },
   cloudflare: {
     id: "cloudflare",
-    label: "Cloudflare",
+    label: nodeConnectionLabels.cloudflare,
     binary: "cloudflared",
     versionArgs: ["--version"],
     args: (target) => ["tunnel", "--url", target.url, "--no-autoupdate"],
@@ -181,7 +185,7 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
   },
   tailscale: {
     id: "tailscale",
-    label: "Tailscale Funnel",
+    label: nodeConnectionLabels.tailscale,
     binary: "tailscale",
     versionArgs: ["version"],
     args: (target) => ["funnel", String(target.port)],
@@ -201,7 +205,7 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
   },
   ngrok: {
     id: "ngrok",
-    label: "ngrok",
+    label: nodeConnectionLabels.ngrok,
     binary: "ngrok",
     versionArgs: ["version"],
     // `--log stdout` keeps the URL in a pipe-friendly stream instead of the TUI.
@@ -222,7 +226,7 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
   },
   bore: {
     id: "bore",
-    label: "bore",
+    label: nodeConnectionLabels.bore,
     binary: "bore",
     versionArgs: ["--version"],
     args: (target) => [
@@ -256,7 +260,7 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
   },
   devtunnel: {
     id: "devtunnel",
-    label: "Dev Tunnels",
+    label: nodeConnectionLabels.devtunnel,
     binary: "devtunnel",
     versionArgs: ["--version"],
     // Hosting a named tunnel keeps the URL stable across restarts, which is

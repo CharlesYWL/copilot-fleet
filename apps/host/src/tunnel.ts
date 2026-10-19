@@ -834,6 +834,21 @@ export class TunnelSupervisor {
     return this.primaryManager()?.activeTunnelId();
   }
 
+  /** Live per-provider addresses for explicit enrollment, independent of the default. */
+  enrollmentEndpoints(): {
+    provider: TunnelProvider;
+    url: string;
+    tunnelId?: string;
+  }[] {
+    return providerList.flatMap(({ id: provider }) => {
+      const manager = this.manager(provider);
+      const url = manager.activeTunnelUrl();
+      if (!url) return [];
+      const tunnelId = manager.activeTunnelId();
+      return [{ provider, url, ...(tunnelId ? { tunnelId } : {}) }];
+    });
+  }
+
   /**
    * Every address a tunnel is currently serving this Host at.
    *

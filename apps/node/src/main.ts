@@ -1378,6 +1378,13 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         agentKinds: advertisedAgentKinds,
         maxSessions: settings.maxSessions,
         homeDir: homedir(),
+        connection:
+          tunnelMode === "devtunnel"
+            ? { provider: "devtunnel" as const }
+            : {
+                provider: tunnelMode,
+                hostUrl: new URL(settings.corpDirect?.hostUrl ?? dialUrl).origin,
+              },
         name: settings.nodeName,
         // What the Host last told us it has. A difference from `name` is an
         // operator edit here; a difference from the Host's row means the Host

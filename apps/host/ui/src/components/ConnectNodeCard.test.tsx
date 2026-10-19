@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { ConnectNodeCard } from "./ConnectNodeCard";
 import { forgetCsrfToken } from "../lib/auth";
@@ -79,6 +79,7 @@ describe("ConnectNodeCard", () => {
     forgetCsrfToken();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it("mints nothing until an administrator asks for a machine to be added", async () => {
@@ -294,6 +295,195 @@ describe("ConnectNodeCard", () => {
       "readOnly",
       true,
     );
+  });
+
+  it("offers independent Corp direct and Dev Tunnels cards and requests only the selected provider", async () => {
+    const ca = "-----BEGIN CERTIFICATE-----\nYWJjZA==\n-----END CERTIFICATE-----";
+    const options = [
+      {
+        provider: "corp-direct",
+        label: "Corp direct (private IP)",
+        hostUrl: "https://10.0.5.136:8787",
+        corpDirectCa: ca,
+      },
+      {
+        provider: "devtunnel",
+        label: "Dev Tunnels",
+        hostUrl: enrollment.hostUrl,
+        tunnelId: enrollment.tunnelId,
+      },
+    ];
+    const fetchMock = vi.fn(async (input: URL | RequestInfo, init?: RequestInit) => {
+      if (String(input).includes("/api/auth/csrf")) return answer({ csrfToken: "proof" });
+      if (init?.method === "POST") {
+        const provider = JSON.parse(String(init.body)).provider;
+        const selected = options.find((entry) => entry.provider === provider)!;
+        return answer(
+          {
+            ...grant,
+            grant: `grant-${provider}`,
+            command: {
+              hostId: enrollment.hostId,
+              hostFingerprint: enrollment.hostFingerprint,
+              enrollmentGrant: `grant-${provider}`,
+              hostUrl: selected.hostUrl,
+              ...(selected.corpDirectCa ? { corpDirectCa: selected.corpDirectCa } : {}),
+              ...(selected.tunnelId ? { tunnelId: selected.tunnelId } : {}),
+            },
+          },
+          201,
+        );
+      }
+      return answer({ ...enrollment, connections: options });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    show();
+    const direct = await screen.findByRole("region", {
+      name: "Connect via Corp direct (private IP)",
+    });
+    const tunnel = screen.getByRole("region", { name: "Connect via Dev Tunnels" });
+    expect(
+      fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toHaveLength(0);
+    expect(within(direct).getByText(/cross-region.*not guaranteed/i)).toBeTruthy();
+    fireEvent.click(
+      within(direct).getByRole("button", { name: /generate a connect command/i }),
+    );
+    expect(
+      (await within(direct).findByLabelText("npm node command")).textContent,
+    ).toContain('--corp-direct="https://10.0.5.136:8787"');
+    expect(within(direct).getByLabelText("npm service command").textContent).toContain(
+      `--host-ca="${btoa(ca)}"`,
+    );
+    expect(within(tunnel).queryByLabelText("npm service command")).toBeNull();
+    fireEvent.click(
+      within(tunnel).getByRole("button", { name: /generate a connect command/i }),
+    );
+    const tunnelCommand = await within(tunnel).findByLabelText("npm service command");
+    expect(tunnelCommand.textContent).toContain('--devtunnel="fleet-abc.usw2"');
+    expect(tunnelCommand.textContent).not.toContain("--host-ca");
+    expect(tunnelCommand.textContent).not.toContain("--corp-direct");
+    const posts = fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(posts.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+      { provider: "corp-direct" },
+      { provider: "devtunnel" },
+    ]);
+    fireEvent.click(
+      within(tunnel).getByRole("button", { name: "Copy npm service command" }),
+    );
+    await waitFor(() =>
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+        tunnelCommand.textContent,
+      ),
+    );
+  });
+
+  it("shows separate public provider choices without a private trust anchor", async () => {
+    host({
+      "/api/enrollment": () =>
+        answer({
+          ...enrollment,
+          connections: [
+            {
+              provider: "cloudflare",
+              label: "Cloudflare",
+              hostUrl: "https://fleet.trycloudflare.com",
+            },
+            { provider: "ngrok", label: "ngrok", hostUrl: "https://fleet.ngrok.app" },
+          ],
+        }),
+    });
+    show();
+    const cloudflare = await screen.findByRole("region", {
+      name: "Connect via Cloudflare",
+    });
+    const ngrok = screen.getByRole("region", { name: "Connect via ngrok" });
+    expect(
+      within(cloudflare).getByLabelText("Host URL the node should dial"),
+    ).toHaveProperty("value", "https://fleet.trycloudflare.com");
+    expect(within(ngrok).getByLabelText("Host URL the node should dial")).toHaveProperty(
+      "value",
+      "https://fleet.ngrok.app",
+    );
+    expect(within(ngrok).getByLabelText("Host URL the node should dial")).toHaveProperty(
+      "readOnly",
+      true,
+    );
+  });
+
+  it("drops only the changed provider's visible grant when its endpoint rotates", async () => {
+    vi.useFakeTimers();
+    const ca = "-----BEGIN CERTIFICATE-----\nYWJjZA==\n-----END CERTIFICATE-----";
+    let connections = [
+      {
+        provider: "corp-direct",
+        label: "Corp direct (private IP)",
+        hostUrl: "https://10.0.5.136:8787",
+        corpDirectCa: ca,
+      },
+      {
+        provider: "devtunnel",
+        label: "Dev Tunnels",
+        hostUrl: enrollment.hostUrl,
+        tunnelId: enrollment.tunnelId,
+      },
+    ];
+    const fetchMock = vi.fn(async (input: URL | RequestInfo, init?: RequestInit) => {
+      if (String(input).includes("/api/auth/csrf")) return answer({ csrfToken: "proof" });
+      if (init?.method === "POST") {
+        const provider = JSON.parse(String(init.body)).provider;
+        const selected = connections.find((entry) => entry.provider === provider)!;
+        return answer(
+          {
+            ...grant,
+            command: {
+              hostId: enrollment.hostId,
+              hostFingerprint: enrollment.hostFingerprint,
+              enrollmentGrant: `grant-${provider}`,
+              hostUrl: selected.hostUrl,
+              ...(selected.corpDirectCa ? { corpDirectCa: selected.corpDirectCa } : {}),
+              ...(selected.tunnelId ? { tunnelId: selected.tunnelId } : {}),
+            },
+          },
+          201,
+        );
+      }
+      return answer({ ...enrollment, connections });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await act(async () => {
+      show();
+    });
+    for (const label of ["Corp direct (private IP)", "Dev Tunnels"]) {
+      await act(async () =>
+        fireEvent.click(
+          within(screen.getByRole("region", { name: `Connect via ${label}` })).getByRole(
+            "button",
+            { name: /generate a connect command/i },
+          ),
+        ),
+      );
+    }
+    expect(screen.getAllByLabelText("npm service command")).toHaveLength(2);
+    connections = connections.map((option) =>
+      option.provider === "corp-direct"
+        ? { ...option, hostUrl: "https://10.0.5.137:8787" }
+        : option,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(
+      within(
+        screen.getByRole("region", { name: "Connect via Corp direct (private IP)" }),
+      ).queryByLabelText("npm service command"),
+    ).toBeNull();
+    expect(
+      within(
+        screen.getByRole("region", { name: "Connect via Dev Tunnels" }),
+      ).getByLabelText("npm service command"),
+    ).toBeTruthy();
+    expect(
+      fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toHaveLength(2);
   });
 
   it("says why a private tunnel needs the machine signed in first", async () => {

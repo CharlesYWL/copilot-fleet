@@ -19,7 +19,13 @@ import {
 import type { AuthenticatedChannel } from "@fleet/protocol/node-auth";
 import { heartbeatSessionsBelongTo, nodeMessageOwnership } from "../node-messages.js";
 import type { FleetService, NodeLink } from "../fleet-service.js";
-import type { FleetNode, NodeReady, NodeToHostMessage } from "@fleet/protocol";
+import type {
+  FleetNode,
+  NodeReady,
+  NodeToHostMessage,
+  TunnelProvider,
+} from "@fleet/protocol";
+import { resolveNodeConnection } from "../node-connection.js";
 import type { HostIdentityService } from "../auth/host-identity.js";
 import { HostChannelHandshake, SealedNodeLink } from "./node-channel.js";
 
@@ -68,7 +74,10 @@ function settleNodeName(
 /** What a Node says about itself, whichever protocol carried it here. */
 type NodeInventory = Omit<NodeReady, "type">;
 
-export type NodeGatewayOptions = { identity: HostIdentityService };
+export type NodeGatewayOptions = {
+  identity: HostIdentityService;
+  endpoints?: () => readonly { provider: TunnelProvider; url: string | undefined }[];
+};
 
 /**
  * The Node-facing WebSocket: authenticate, then relay events and heartbeats.
@@ -99,9 +108,9 @@ export type NodeGatewayOptions = { identity: HostIdentityService };
 export function registerNodeGateway(
   app: FastifyInstance,
   service: FleetService,
-  { identity }: NodeGatewayOptions,
+  { identity, endpoints }: NodeGatewayOptions,
 ): void {
-  app.get("/ws/node", { websocket: true }, (socket: WebSocket) => {
+  app.get("/ws/node", { websocket: true }, (socket: WebSocket, request) => {
     let authenticatedNodeId: string | undefined;
     let awaitingOutboxFlush = false;
     let acknowledgeOutbox = false;
@@ -205,7 +214,15 @@ export function registerNodeGateway(
           "Execution stopped when the Node connection was superseded",
         );
       }
-      service.attachNode(nodeId, input.link);
+      service.attachNode(
+        nodeId,
+        input.link,
+        resolveNodeConnection(
+          inventory.connection,
+          request.headers.host,
+          endpoints?.() ?? [],
+        ),
+      );
       const sessionConsole =
         input.link instanceof SealedNodeLink &&
         inventory.capabilities.includes(SESSION_CONSOLE_CAPABILITY);
@@ -642,7 +659,11 @@ export function registerNodeGateway(
               // behind to re-announce.
               const reason = message.error ?? "Node refused the command";
               service.reportSessionNotice(message.sessionId, reason, message.recovery);
-              service.markQueuedRefusal(message.sessionId, message.commandId, message.recovery);
+              service.markQueuedRefusal(
+                message.sessionId,
+                message.commandId,
+                message.recovery,
+              );
               service.settleRefusedLaunch(message.sessionId, message.commandId, reason);
             }
           }

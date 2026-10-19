@@ -19,13 +19,25 @@ The default port is **8787**. Fleet keeps its existing HTTP listener on `127.0.0
 3. Review the detected Host IPv4 address and HTTPS port (8787 by default). The Host address must be currently assigned and RFC1918. There is no worker IP/CIDR field or source-IP filter.
 4. Enable the provider. Fleet creates and protects a persistent Host-specific private certificate authority and an IP-name server certificate. It starts the listener under the normal user account; no firewall rule is installed automatically.
 5. If your network policy permits it, copy the generated **Host firewall command** into Administrator PowerShell on the Host. The rule names the exact local address/port and Node executable, with `-RemoteAddress Any`; any source that can route to that endpoint may attempt a connection, and Fleet's existing authentication still controls access. This is a one-time setup operation; Fleet itself remains unelevated. Review effective Windows Firewall policy because other allow/block rules can still apply.
-6. Mark Corp direct **Used for enrollment** if it is not already selected. Enabling it does not silently move existing Nodes or disable Dev Tunnels.
+6. The **Default for enrollment** provider supplies the single default address used by older tools. Under **Nodes → Connect a machine**, each online, permitted provider has its own command section, so you can choose Corp direct without changing that default. Enabling Corp direct does not move existing Nodes or disable Dev Tunnels.
 
 Only the public CA certificate is included in API responses and connect commands. Private CA and server material remain in the protected Host database. Native issuance uses a separately access-restricted temporary directory, removes it after the helper exits, and never writes private bundles to PowerShell output streams or command-line arguments. The CA survives ordinary restarts, and server certificates renew using that same CA so renewal does not require copying a new trust anchor to every Node.
 
 ## Connect a Node
 
-On the Host, open **Nodes → Connect a machine** and generate a fresh command. A grant is single-use and expires after fifteen minutes. Copy **one** launch method, not both.
+On the Host, open **Nodes → Connect a machine**, choose the **Corp direct (private IP)** section, and generate a fresh command. A grant is single-use and expires after fifteen minutes. Copy **one** launch method, not both. Each other online, permitted provider has its own section and independent grant; choosing one does not change the Host default.
+
+### Mixed private-IP and tunnel workers
+
+Keep Corp direct enabled for workers with a verified private-network path. Enable **Dev Tunnels** alongside it for workers that cannot reach that address, then generate their commands from the Dev Tunnels section. This does not change the route used by existing Corp direct Nodes. Each Node runs one selected connection mode; it does not need both helpers.
+
+Cross-region private-IP access is **not guaranteed**. Our West US 3 to West US 2 test failed even though basic TCP probes succeeded; that does not establish a platform-wide restriction, and a matching region alone does not guarantee connectivity. Routing, pool/network isolation and network policy require separate validation. Corporate laptop browser access is a separate network/trust question; use the Host-local browser until it is approved and configured.
+
+Microsoft corporate Hosts retain their existing Corp direct/Dev Tunnels restriction. Noncorporate Hosts can expose command sections for multiple permitted HTTPS providers at once. The default provider remains available for older single-address callers; there is no need to switch it to generate a provider-specific command.
+
+Stop a worker's existing process or task before deliberately changing its mode. Use the full newly generated command for that provider. A Dev Tunnels worker needs `devtunnel user login` in its own user context; the explicit `--devtunnel` mode clears a previously saved Corp direct route. Existing Host-key pinning, Node identity and the normal enrollment/reuse checks remain enforced.
+
+The Nodes table's **Connection** column shows reported or recognized connection methods, with **Last known** for offline values and **Unknown** when an older Node's route cannot be identified reliably. Update/reconnect workers for full reporting; these optional inventory fields do not require re-enrollment. The metadata is runtime-only and resets on Host restart or identity replacement.
 
 ### Foreground
 

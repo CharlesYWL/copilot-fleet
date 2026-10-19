@@ -31,6 +31,7 @@ import {
 } from "@fluentui/react-icons";
 import {
   nodeUpdateState,
+  nodeConnectionLabels,
   SESSION_CONSOLE_RESYNC_CAPABILITY,
   type FleetNode,
   type FleetSession,
@@ -82,7 +83,7 @@ const useStyles = makeStyles({
   table: {
     tableLayout: "fixed",
     width: "100%",
-    minWidth: "960px",
+    minWidth: "1140px",
   },
   statusCell: {
     display: "flex",
@@ -122,12 +123,13 @@ const useStyles = makeStyles({
   },
   colStatus: { width: "96px" },
   colName: { width: "auto" },
+  colConnection: { width: "180px" },
   colPlatform: { width: "110px" },
   colCapacity: { width: "76px" },
   colHealth: { width: "296px" },
   colVersion: { width: "150px" },
   colActions: { width: "104px" },
-  versionCell: {
+  detailCell: {
     display: "flex",
     flexDirection: "column",
     alignItems: "flex-start",
@@ -259,6 +261,9 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
             <TableRow>
               <TableHeaderCell className={styles.colStatus}>Status</TableHeaderCell>
               <TableHeaderCell className={styles.colName}>Name</TableHeaderCell>
+              <TableHeaderCell className={styles.colConnection}>
+                Connection
+              </TableHeaderCell>
               <TableHeaderCell className={styles.colPlatform}>Platform</TableHeaderCell>
               <TableHeaderCell className={styles.colCapacity}>Capacity</TableHeaderCell>
               <TableHeaderCell className={styles.colHealth}>Health</TableHeaderCell>
@@ -421,6 +426,27 @@ const NodeRow = ({
           </span>
         )}
       </TableCell>
+      <TableCell className={styles.colConnection}>
+        <span
+          className={styles.detailCell}
+          aria-label={`Connection for ${node.name}`}
+          title={
+            node.connection?.hostUrl ??
+            (node.connection
+              ? "Reported connection transport"
+              : "Update and reconnect this Node to report its connection method")
+          }
+        >
+          <Text>
+            {node.connection ? nodeConnectionLabels[node.connection.provider] : "Unknown"}
+          </Text>
+          {!node.online && node.connection && (
+            <Text size={100} className={styles.caption}>
+              Last known
+            </Text>
+          )}
+        </span>
+      </TableCell>
       <TableCell className={styles.colPlatform}>
         {node.os} / {node.arch}
       </TableCell>
@@ -431,7 +457,7 @@ const NodeRow = ({
         <NodeHealth node={node} now={now} />
       </TableCell>
       <TableCell className={styles.colVersion}>
-        <span className={styles.versionCell} title={progress?.detail || label.hint}>
+        <span className={styles.detailCell} title={progress?.detail || label.hint}>
           <Badge
             appearance="tint"
             size="small"

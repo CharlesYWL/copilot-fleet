@@ -477,7 +477,11 @@ describe("node gateway mutual authentication", () => {
 
   it("carries the Node's inventory sealed, and welcomes it back", async () => {
     const { keys, receipt } = await enrollNode();
-    const { socket, channel } = await handshake({ nodeId: receipt.nodeId, keys });
+    const { socket, channel } = await handshake({
+      nodeId: receipt.nodeId,
+      keys,
+      inventory: { connection: { provider: "devtunnel" } },
+    });
     channel.open((await nextFrame(socket)) as unknown as AuthenticatedEnvelope);
 
     const nodes = (
@@ -490,6 +494,7 @@ describe("node gateway mutual authentication", () => {
     const row = nodes.find((node) => node.id === receipt.nodeId);
     expect(row?.online).toBe(true);
     expect(row?.capabilities).toContain("copilot-acp");
+    expect(row).toMatchObject({ connection: { provider: "devtunnel" } });
     socket.close();
   });
 

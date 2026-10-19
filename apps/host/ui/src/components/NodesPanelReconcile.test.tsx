@@ -48,6 +48,37 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("Nodes panel connection route", () => {
+  it.each([
+    ["corp-direct", "Corp direct (private IP)"],
+    ["devtunnel", "Dev Tunnels"],
+    ["cloudflare", "Cloudflare"],
+    ["ngrok", "ngrok"],
+    ["direct", "Direct / local"],
+  ] as const)("shows %s in its own connection column", (provider, label) => {
+    show({ ...node, connection: { provider } });
+    expect(screen.getByRole("columnheader", { name: "Connection" })).toBeTruthy();
+    expect(screen.getByLabelText("Connection for alpha").textContent).toContain(label);
+  });
+
+  it("identifies unavailable metadata without guessing", () => {
+    show();
+    expect(screen.getByLabelText("Connection for alpha").textContent).toContain(
+      "Unknown",
+    );
+  });
+
+  it("distinguishes an offline last-known connection", () => {
+    show({ ...node, online: false, connection: { provider: "devtunnel" } });
+    expect(screen.getByLabelText("Connection for alpha").textContent).toContain(
+      "Dev Tunnels",
+    );
+    expect(screen.getByLabelText("Connection for alpha").textContent).toContain(
+      "Last known",
+    );
+  });
+});
+
 describe("Nodes panel session-history reconcile action", () => {
   it("asks the Host to resynchronize that Node when clicked", () => {
     show();

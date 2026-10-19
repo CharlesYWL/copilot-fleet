@@ -120,13 +120,10 @@ describe("Host MCP forwarding dialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Done" }));
     expect(await screen.findByText("Shared: figma")).toBeTruthy();
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(
-      JSON.parse(
-        screen
-          .getByRole("button", { name: "Choose MCPs…" })
-          .getAttribute("data-tabster")!,
-      ),
-    ).toMatchObject({ restorer: { type: 1 } });
+    const restoredTrigger = await screen.findByRole("button", { name: "Choose MCPs…" });
+    expect(JSON.parse(restoredTrigger.getAttribute("data-tabster")!)).toMatchObject({
+      restorer: { type: 1 },
+    });
   });
 
   it("saves only the selected MCP with a revision, CSRF, and reauthentication support", async () => {

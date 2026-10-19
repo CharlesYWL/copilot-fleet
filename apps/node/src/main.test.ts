@@ -287,6 +287,81 @@ const retainedAgent: AgentCatalogModule.CatalogEntry = {
   markdown: "Fixture orchestrator",
 };
 
+it.each(["corp-direct", "devtunnel", "direct"] as const)(
+  "reports the actual %s connection without publishing the helper's loopback port",
+  async (mode) => {
+    vi.useFakeTimers();
+    vi.stubEnv("FLEET_MOCK_AGENT", "1");
+    vi.stubEnv("FLEET_DEVTUNNEL_ID", mode === "devtunnel" ? "fleet-route.usw2" : "");
+    vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const { loadSettings } = await import("./settings.js");
+    const { loadCredentials } = await import("./config.js");
+    const { TEST_TLS_CERTIFICATE } =
+      await import("../../../packages/protocol/dist/test-tls-fixture.js");
+    const saved = {
+      ...settingsFromEnv({}),
+      hostUrl: "https://fleet.ngrok.app",
+      ...(mode === "corp-direct"
+        ? {
+            corpDirect: {
+              hostUrl: "https://10.0.5.136:8787",
+              caCertificate: TEST_TLS_CERTIFICATE,
+            },
+          }
+        : {}),
+    };
+    vi.mocked(loadSettings).mockResolvedValueOnce(saved);
+    vi.mocked(loadCredentials).mockResolvedValueOnce({
+      hostUrl: credentials.hostUrl,
+      nodeId: credentials.nodeId,
+      name: credentials.name,
+      authProtocol: "legacy-secret",
+      secret: "synthetic-route-secret",
+    });
+    if (mode === "corp-direct") {
+      const direct = await import("./corp-direct.js");
+      vi.spyOn(direct, "startCorpDirectForward").mockResolvedValue({
+        url: "http://127.0.0.1:19001",
+        stop: vi.fn(async () => {}),
+      });
+    }
+    if (mode === "devtunnel") {
+      const dev = await import("./devtunnel.js");
+      vi.spyOn(dev, "connectDevTunnel").mockResolvedValue({
+        url: "http://127.0.0.1:19002",
+        stop: vi.fn(),
+        recycle: vi.fn(),
+        rebuildNow: vi.fn(),
+      });
+    }
+    const exits = process.listeners("exit");
+    const { main } = await import("./main.js");
+    const runtime = await main([]);
+    try {
+      await sockets[0]!.open();
+      const expected =
+        mode === "devtunnel"
+          ? { provider: "devtunnel" }
+          : {
+              provider: mode,
+              hostUrl:
+                mode === "corp-direct"
+                  ? "https://10.0.5.136:8787"
+                  : "https://fleet.ngrok.app",
+            };
+      expect(JSON.parse(sockets[0]!.send.mock.calls[0]![0])).toMatchObject({
+        type: "hello",
+        connection: expected,
+      });
+    } finally {
+      await runtime.shutdown();
+      for (const listener of process.listeners("exit"))
+        if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  },
+);
+
 it("recreates a saved Corp direct helper on login-like startup and preserves canonical trust", async () => {
   vi.useFakeTimers();
   vi.stubEnv("FLEET_MOCK_AGENT", "1");
@@ -723,6 +798,7 @@ it.each([
       const ready = open(2);
       expect(ready).toMatchObject({
         type: "ready",
+        connection: { provider: "direct", hostUrl: "http://127.0.0.1:8787" },
         agents: [{ name: retainedAgent.name, description: retainedAgent.description }],
         capabilities: expect.arrayContaining([
           OUTBOX_ACK_CAPABILITY,

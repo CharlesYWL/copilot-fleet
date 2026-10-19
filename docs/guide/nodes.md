@@ -4,14 +4,43 @@
 
 Enroll machines, start them at Windows sign-in, and manage each Node's local settings.
 
+## Choose a connection for each Node
+
+Enable one or more permitted providers under **Settings → Tunnel / Remote access**.
+They run independently. Under **Nodes → Connect a machine**, each online provider
+has a separate section and Generate button, with foreground and Windows login-start
+commands. Generating a command for one provider does not change the Host default.
+Each section generates its own one-use grant; copy one launch method for one worker.
+
+Microsoft corporate Hosts can offer Corp direct and private Dev Tunnels together.
+Other Hosts retain their existing permitted HTTPS providers, including concurrent
+public-provider choices. Plain-HTTP providers remain refused.
+
+Use **Corp direct (private IP)** for workers that can reach the private Host endpoint.
+Cross-region private-IP connectivity is not guaranteed: region/pool routing and policy
+must support the actual pair. Choose another enabled method, such as Dev Tunnels,
+when that path is unavailable. Matching region or project names alone do not prove
+reachability. See [Corp direct setup](../corp-direct.md).
+
+The Nodes table's **Connection** column shows the last successfully authenticated
+connection method. New Nodes report their transport; the Host recognizes ordinary
+public routes by their actual dial origin and can infer some older routes from a known
+ingress hostname. Older, unidentifiable connections show **Unknown** rather than a guess.
+Update and reconnect Nodes for reliable reporting, especially for Dev Tunnels.
+**Last known** marks an offline Node's previous route. This telemetry is runtime-only;
+a Host restart or identity restore clears it until a Node reconnects. It is diagnostic
+information, not an authorization rule or proof of network reachability.
+
 ## Windows login startup
 
 Start automatically **after signing into Windows**, using your current account
-and existing GitHub/Copilot/Dev Tunnels credentials. In **Nodes > Connect a
-machine**, copy the **npm run service -- node** command block to use a
+and existing GitHub/Copilot credentials, plus Dev Tunnels sign-in only when using
+that provider. In the chosen provider's **Nodes > Connect a machine** section,
+copy the **npm run service -- node** command block to use a
 command that builds, enrolls, and starts the Node without a foreground
 connect/Ctrl+C step. The **npm run start:node** block keeps the existing direct
-launch. Both blocks are shown together, each with its own Copy button.
+launch; Corp direct's foreground block uses **npm run node**. Both launch methods
+are shown together within each section, each with its own Copy button.
 
 ```powershell
 npm run service -- node --devtunnel="<tunnel-id>" --host-id="<host-id>" --host-fingerprint="<sha256>" --enrollment-grant="<id.secret>"

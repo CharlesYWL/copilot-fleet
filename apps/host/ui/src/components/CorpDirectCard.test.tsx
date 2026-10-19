@@ -100,7 +100,8 @@ describe("Corp direct settings", () => {
       "disabled",
       true,
     );
-    expect(screen.getByText("Used for enrollment")).toBeTruthy();
+    expect(screen.getByText("Default for enrollment")).toBeTruthy();
+    expect(screen.getByText(/cross-region.*not guaranteed/i)).toBeTruthy();
   });
 
   it("can disable the listener without resubmitting configuration", async () => {

@@ -104,6 +104,26 @@ describe("keyEnrollCommand", () => {
     expect(tunnelled).toContain(`--host-fingerprint="${FINGERPRINT}"`);
   });
 
+  it("uses an explicitly selected Dev Tunnels provider even when the URL does not identify it", () => {
+    const fields = {
+      provider: "devtunnel" as const,
+      hostUrl: "https://custom-fleet.example.com",
+      hostId: "host-1",
+      hostFingerprint: FINGERPRINT,
+      enrollmentGrant: GRANT,
+      tunnelId: TUNNEL_ID,
+    };
+    for (const mode of ["direct", "service"] as const) {
+      const command = keyEnrollCommand(fields, mode);
+      expect(command).toContain(`--devtunnel="${TUNNEL_ID}"`);
+      expect(command).not.toContain("--url=");
+      expect(command).not.toContain("--host-ca=");
+    }
+    expect(() => keyEnrollCommand({ ...fields, tunnelId: undefined })).toThrow(
+      /tunnel ID/i,
+    );
+  });
+
   it("offers a single service setup command without a foreground connect/stop step", () => {
     const service = keyEnrollCommand(
       {

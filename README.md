@@ -151,10 +151,15 @@ npm run start:host
 Host printed to its console. Sign in with Microsoft, or continue without
 sign-in for local or private-tunnel use only.
 
-**3. Connect a machine.** In **Settings → Nodes**, choose **Generate a connect
-command** and run it from a Fleet checkout on that machine. For a remote
-machine, enable an available remote-access provider in **Settings → Tunnel** first.
-Corp direct requires network/firewall approval and the one-time Host firewall setup; worker source IPs do not need to be listed.
+**3. Connect a machine.** Enable one or more permitted providers in
+**Settings → Tunnel / Remote access**, then choose the appropriate provider's
+section under **Settings → Nodes → Connect a machine**. Generate a command and
+run it from a Fleet checkout on that worker. Providers can run side by side:
+use Corp direct for reachable private networks and Dev Tunnels for workers
+that cannot reach that private address. The Nodes table shows the connection
+method reported on each successful connection.
+Corp direct requires network/firewall approval and its one-time Host firewall setup;
+cross-region private-IP access is not guaranteed.
 
 **4. Add a workspace.** In **Settings → Workspaces**, create a workspace and add
 a placement: an existing folder on that Node.
