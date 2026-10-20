@@ -30,6 +30,7 @@ import {
   ChevronDown20Regular,
   ChevronRight20Regular,
   Delete20Regular,
+  DataUsage20Regular,
   Chat20Regular,
   Flow16Regular,
   Flow20Regular,
@@ -1096,6 +1097,7 @@ export const Sidebar = ({
         <Button
           appearance={view === "usage" ? "secondary" : "subtle"}
           className={styles.navButton}
+          icon={<DataUsage20Regular aria-hidden="true" />}
           aria-current={view === "usage" ? "page" : undefined}
           onClick={() => onSelectView("usage")}
         >

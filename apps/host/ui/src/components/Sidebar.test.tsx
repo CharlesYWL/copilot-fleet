@@ -121,6 +121,16 @@ const placement: Placement = {
 };
 
 describe("Sidebar drag handles", () => {
+  it("shows a decorative usage icon while preserving navigation and the active-page label", () => {
+    const onSelectView = vi.fn();
+    show([placement], [], { view: "usage", onSelectView });
+    const usage = screen.getByRole("button", { name: "Usage" });
+    expect(usage.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    expect(usage.getAttribute("aria-current")).toBe("page");
+    fireEvent.click(usage);
+    expect(onSelectView).toHaveBeenCalledExactlyOnceWith("usage");
+  });
+
   it("marks the node row draggable, since that row is a placement", () => {
     // Fluent's TreeItemLayout has to forward native props to the DOM for this
     // to work at all; if it ever stops, dragging silently does nothing.
