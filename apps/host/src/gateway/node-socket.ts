@@ -8,6 +8,7 @@ import {
   NodeProofSchema,
   NodeToHostMessageSchema,
   OUTBOX_ACK_CAPABILITY,
+  USAGE_SNAPSHOTS_CAPABILITY,
   SESSION_CONSOLE_CAPABILITY,
   SUPERSEDED_CLOSE_CODE,
   WorktreeConflict,
@@ -223,6 +224,9 @@ export function registerNodeGateway(
           endpoints?.() ?? [],
         ),
       );
+      const usageSnapshots =
+        input.link instanceof SealedNodeLink &&
+        inventory.capabilities.includes(USAGE_SNAPSHOTS_CAPABILITY);
       const sessionConsole =
         input.link instanceof SealedNodeLink &&
         inventory.capabilities.includes(SESSION_CONSOLE_CAPABILITY);
@@ -284,6 +288,7 @@ export function registerNodeGateway(
       const commandSupport = service.commands.nodeReady(nodeId, inventory);
       service.send(input.link, {
         type: "welcome",
+        ...(usageSnapshots ? { usageSnapshots: true } : {}),
         ...(sessionConsole ? { sessionConsole: true } : {}),
         nodeId,
         reconcileAfterOutbox: awaitingOutboxFlush,
@@ -307,6 +312,20 @@ export function registerNodeGateway(
         if (service.nodeSocket(nodeId) !== input.link) return;
         const message = input.read(String(raw));
         if (!message) return;
+        if (message.type === "usage_snapshots") {
+          if (!usageSnapshots) {
+            socket.close(1008, "Usage snapshots were not negotiated");
+            return;
+          }
+          try {
+            const throughSequence = service.store.usage.ingest(nodeId, message.snapshots);
+            service.send(input.link, { type: "usage_ack", throughSequence });
+          } catch (error) {
+            app.log.warn({ nodeId, err: error }, "Rejected usage snapshots");
+            socket.close(1008, "Usage snapshot identity or ownership mismatch");
+          }
+          return;
+        }
         if (message.type === "session_console_request") {
           if (!sessionConsole) {
             socket.close(1008, "Session console was not negotiated");

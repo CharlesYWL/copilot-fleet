@@ -2,6 +2,8 @@ import { open } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { SessionAccounting } from "@fleet/protocol";
+import { accountingTokens } from "./usage-totals.js";
 
 const CHECKPOINT_TYPE = "session.usage_checkpoint";
 const TURN_END_TYPE = "assistant.turn_end";
@@ -57,6 +59,7 @@ export class SessionCreditReader {
   private identity: Pick<Stats, "dev" | "ino" | "birthtimeMs"> | undefined;
   private offset = 0;
   private credits: number | undefined;
+  private currentAccounting: SessionAccounting | undefined;
   private lineLength = 0;
   private oversized = false;
   private lineType: string | undefined;
@@ -70,7 +73,7 @@ export class SessionCreditReader {
   private loopGeneration = 0;
 
   constructor(
-    agentSessionId: string,
+    private readonly agentSessionId: string,
     copilotHome = process.env.COPILOT_HOME || join(homedir(), ".copilot"),
   ) {
     if (
@@ -82,6 +85,10 @@ export class SessionCreditReader {
       throw new Error("Invalid Copilot session id: expected one safe path component");
     }
     this.path = join(copilotHome, "session-state", agentSessionId, "events.jsonl");
+  }
+
+  get accounting(): SessionAccounting | undefined {
+    return this.currentAccounting;
   }
 
   /** The agent loop as of the last line read. */
@@ -196,7 +203,7 @@ export class SessionCreditReader {
 
   private finishLine(): void {
     const type = this.lineType;
-    const checkpoint = type === CHECKPOINT_TYPE;
+    const checkpoint = type === CHECKPOINT_TYPE || type === "session.shutdown";
     const oversized = this.oversized;
     const line =
       checkpoint && !oversized
@@ -216,15 +223,33 @@ export class SessionCreditReader {
     } catch {
       throw invalidCheckpoint("malformed JSON");
     }
-    if (!isRecord(event) || event.type !== CHECKPOINT_TYPE) return;
+    if (
+      !isRecord(event) ||
+      (event.type !== CHECKPOINT_TYPE && event.type !== "session.shutdown")
+    )
+      return;
     if (event.data === undefined) return;
     if (!isRecord(event.data)) throw invalidCheckpoint("data must be an object");
-    if (!Object.hasOwn(event.data, "totalNanoAiu")) return;
     const nanoAiu = event.data.totalNanoAiu;
-    if (typeof nanoAiu !== "number" || !Number.isSafeInteger(nanoAiu) || nanoAiu < 0) {
-      throw invalidCheckpoint("totalNanoAiu must be a non-negative safe integer");
+    if (Object.hasOwn(event.data, "totalNanoAiu")) {
+      if (typeof nanoAiu !== "number" || !Number.isSafeInteger(nanoAiu) || nanoAiu < 0)
+        throw invalidCheckpoint("totalNanoAiu must be a non-negative safe integer");
+      this.credits = nanoAiu / 1e9;
     }
-    this.credits = nanoAiu / 1e9;
+    const tokens = accountingTokens(event.data);
+    if (nanoAiu === undefined && !tokens) return;
+    const timestamp =
+      typeof event.timestamp === "string" ? Date.parse(event.timestamp) : NaN;
+    this.currentAccounting = {
+      nativeSessionId: this.agentSessionId,
+      counterId: this.agentSessionId,
+      source: event.type === CHECKPOINT_TYPE ? "copilot-checkpoint" : "copilot-shutdown",
+      observedAt: Number.isFinite(timestamp)
+        ? new Date(timestamp).toISOString()
+        : new Date().toISOString(),
+      ...(typeof nanoAiu === "number" ? { aiCredits: nanoAiu / 1e9 } : {}),
+      ...tokens,
+    };
   }
 
   /**
@@ -262,6 +287,7 @@ export class SessionCreditReader {
     this.identity = undefined;
     this.offset = 0;
     this.credits = undefined;
+    this.currentAccounting = undefined;
     this.loopPhase = undefined;
     this.loopGeneration += 1;
     this.resetLine();

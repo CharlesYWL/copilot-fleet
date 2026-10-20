@@ -26,7 +26,12 @@ import {
   type WorkerResumeOutcome,
   type WorkerResumeRequest,
 } from "@fleet/protocol";
-import { api, useFleet, type Notify, type SessionRecoveryHandler } from "./hooks/useFleet";
+import {
+  api,
+  useFleet,
+  type Notify,
+  type SessionRecoveryHandler,
+} from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
 import { useNotificationDelivery } from "./hooks/useNotificationDelivery";
 import { useNotificationPreference } from "./hooks/useNotificationPreference";
@@ -49,6 +54,7 @@ import {
   type DraftsBySession,
   type SessionDraft,
 } from "./lib/session-drafts";
+import { UsagePage } from "./components/UsagePage";
 import { EmptySessions } from "./components/EmptySessions";
 import { AgentBulkStopDialog } from "./components/AgentBulkStopDialog";
 import { ManageFavoritesDialog } from "./components/ManageFavoritesDialog";
@@ -102,7 +108,7 @@ const noResumeRequests: WorkerResumeRequest[] = [];
  * is what the old `layout === "grid" → view = "session"` line did.
  */
 export type AppView =
-  "session" | "overview" | "orchestrator" | "orchestrator-task" | "settings";
+  "session" | "overview" | "orchestrator" | "orchestrator-task" | "settings" | "usage";
 
 /**
  * Where a conversation was opened from, so leaving it goes back there.
@@ -340,7 +346,9 @@ export function App() {
   const catalog = useCatalogOperations({ request, refresh, notify });
   const reconcileSession = useCallback(
     (sessionId: string) => {
-      const nodeId = snapshot.sessions.find((session) => session.id === sessionId)?.nodeId;
+      const nodeId = snapshot.sessions.find(
+        (session) => session.id === sessionId,
+      )?.nodeId;
       return nodeId ? catalog.resyncNodeConsole(nodeId) : Promise.resolve(false);
     },
     [catalog, snapshot.sessions],
@@ -1450,6 +1458,7 @@ export function App() {
                 />
               </div>
 
+              {view === "usage" && <UsagePage />}
               {view === "orchestrator" &&
                 (orchestrator ? (
                   <OrchestratorPage

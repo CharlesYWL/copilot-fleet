@@ -9,6 +9,12 @@ export * from "./corp-direct.js";
 import { CorpDirectSecuritySchema } from "./corp-direct-security.js";
 export * from "./corp-direct-security.js";
 import {
+  SessionAccountingSchema,
+  UsageSnapshotBatchSchema,
+  UsageBackupSchema,
+} from "./usage.js";
+export * from "./usage.js";
+import {
   ExecutionBindingSchema,
   ManagedWorktreePolicySchema,
   ManagedWorktreeSchema,
@@ -485,6 +491,7 @@ export type ContextUsage = z.infer<typeof ContextUsageSchema>;
 
 /** Latest session-local readings; unavailable metrics stay absent, not zero. */
 export const SessionUsageSchema = z.object({
+  accounting: SessionAccountingSchema.optional(),
   aiCredits: z.number().nonnegative().nullable().optional(),
   /** ACP's pre-response input usage and prompt budget, not the full model window. */
   contextTokens: z.number().int().nonnegative().nullable().optional(),
@@ -1461,6 +1468,7 @@ export const NodeReadySchema = z.object({
 export type NodeReady = z.infer<typeof NodeReadySchema>;
 
 export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("usage_snapshots"), snapshots: UsageSnapshotBatchSchema }),
   z.object({
     type: z.literal("session_console_request"),
     requestId: z.string().uuid(),
@@ -1580,6 +1588,10 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
 
 export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("usage_ack"),
+    throughSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  }),
   z.object({ type: z.literal("session_console_resync") }),
   z.object({
     type: z.literal("session_console_queue"),
@@ -1625,6 +1637,7 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("welcome"),
+    usageSnapshots: z.boolean().optional(),
     sessionConsole: z.boolean().optional(),
     nodeId: z.string().min(1),
     commandExecutions: z.boolean().default(false),
@@ -3332,6 +3345,7 @@ const hostBackupDataShape = {
   sessions: z.array(HostBackupSessionSchema),
   events: z.array(SessionEventSchema),
   commandExecutionData: CommandExecutionBackupSchema.optional(),
+  usageData: UsageBackupSchema.optional(),
   /**
    * Defaulted, or every archive written before orchestration existed stops
    * importing — the one failure mode a backup format may not have.

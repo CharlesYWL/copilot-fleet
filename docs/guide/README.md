@@ -21,7 +21,8 @@ you need a specific surface.
 Deeper design records: [ARCHITECTURE.md](../../ARCHITECTURE.md),
 [orchestration lifecycle](../orchestration-lifecycle.md),
 [managed worktree isolation](../managed-worktree-isolation.md),
-[Node session console](../node-session-console.md), and
+[Node session console](../node-session-console.md),
+[session usage snapshots](../session-usage-design.md), and
 [Windows login startup](../windows-login-startup.md).
 
 ## Feature map
@@ -56,6 +57,7 @@ Deeper design records: [ARCHITECTURE.md](../../ARCHITECTURE.md),
 - **Continue a worker from its VM:** [shared Node chat and offline continuation](nodes.md#shared-worker-chat-and-offline-continuation),
   [feature and implementation guide](../node-session-console.md), and
   [live/reconnect sequence diagrams](../node-session-streaming.html).
+- **Review consumption:** [AI credits and token usage](usage.md), including live session snapshots, machine/task/day filters, and shared Orchestrator usage.
 - **Monitor and organize active work:**
   [rows that fold themselves away](using-fleet.md#rows-that-fold-themselves-away),
   [drag ordering and filing](using-fleet.md#ordering-and-filing-by-dragging), and

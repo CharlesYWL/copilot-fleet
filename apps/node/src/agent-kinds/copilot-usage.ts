@@ -1,11 +1,17 @@
 import type * as acp from "@agentclientprotocol/sdk";
-import { errorMessage } from "@fleet/protocol";
+import { errorMessage, usageAmountKeys, type SessionAccounting } from "@fleet/protocol";
+import { readNativeTokenTotals } from "../usage-totals.js";
 import { acpContextUsage, parseContextUsage } from "../context-usage.js";
 import { SessionCreditReader } from "../session-credits.js";
 import type { UsageContext, UsageReporter } from "./types.js";
 
 export class CopilotUsageReporter implements UsageReporter {
   private reader: SessionCreditReader | undefined;
+  private nativeSessionId = "";
+  private baseline = false;
+  private startedAt: string | undefined;
+  private hasDatabaseTokens = false;
+  private readonly accountingSignatures = new Map<string, string>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private reading: Promise<void> | undefined;
   private creditError: string | undefined;
@@ -16,9 +22,13 @@ export class CopilotUsageReporter implements UsageReporter {
 
   constructor(private readonly context: UsageContext) {}
 
-  async start(sessionId: string, reset = false): Promise<void> {
+  async start(sessionId: string, reset = false, resumed = false): Promise<void> {
     this.close();
     await this.reading;
+    if (this.nativeSessionId !== sessionId) this.hasDatabaseTokens = false;
+    this.nativeSessionId = sessionId;
+    this.baseline = resumed;
+    this.startedAt = resumed ? undefined : new Date().toISOString();
     this.context.assertActive();
     this.reader = new SessionCreditReader(sessionId);
     if (reset) {
@@ -46,6 +56,28 @@ export class CopilotUsageReporter implements UsageReporter {
         if (this.context.aborted()) return;
         this.creditError = undefined;
         if (aiCredits !== undefined) this.context.report({ aiCredits });
+        const totals = readNativeTokenTotals("copilot", this.nativeSessionId);
+        if (totals) this.hasDatabaseTokens = true;
+        const native = reader.accounting;
+        if (native) {
+          if (!this.hasDatabaseTokens) this.publishAccounting(native);
+          else if (native.aiCredits !== undefined)
+            this.publishAccounting({
+              nativeSessionId: native.nativeSessionId,
+              counterId: native.counterId,
+              source: native.source,
+              observedAt: native.observedAt,
+              aiCredits: native.aiCredits,
+            });
+        }
+        if (totals)
+          this.publishAccounting({
+            nativeSessionId: this.nativeSessionId,
+            counterId: this.nativeSessionId,
+            source: "copilot-session-totals",
+            observedAt: new Date().toISOString(),
+            ...totals,
+          });
         this.context.agentLoop?.(reader.loop);
       })
       .catch((error: unknown) => {
@@ -59,6 +91,20 @@ export class CopilotUsageReporter implements UsageReporter {
       });
     this.reading = read;
     return read;
+  }
+
+  private publishAccounting(accounting: SessionAccounting): void {
+    const key = `${accounting.counterId}:${accounting.source}`;
+    const signature = JSON.stringify(usageAmountKeys.map((metric) => accounting[metric]));
+    if (this.accountingSignatures.get(key) === signature) return;
+    this.accountingSignatures.set(key, signature);
+    this.context.report({
+      accounting: {
+        ...accounting,
+        baseline: this.baseline,
+        ...(this.startedAt ? { startedAt: this.startedAt } : {}),
+      },
+    });
   }
 
   onUpdate(update: acp.SessionUpdate): boolean {
