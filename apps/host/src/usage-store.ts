@@ -1,6 +1,9 @@
 import { isDeepStrictEqual } from "node:util";
 import type { DatabaseSync } from "node:sqlite";
 import {
+  LEGACY_CREDIT_BACKFILL_SOURCE,
+  HERMES_LEGACY_USAGE_SOURCE,
+  HERMES_NATIVE_USAGE_SOURCE,
   UsageBackupSchema,
   UsageReportQuerySchema,
   UsageSnapshotSchema,
@@ -66,6 +69,7 @@ export class UsageStore {
       CREATE INDEX IF NOT EXISTS usage_snapshots_session ON usage_snapshots(node_id,session_id,sequence);
       CREATE INDEX IF NOT EXISTS usage_snapshots_time ON usage_snapshots(observed_at);
       CREATE INDEX IF NOT EXISTS usage_snapshots_chronological ON usage_snapshots(node_id,observed_at,sequence);
+      CREATE INDEX IF NOT EXISTS usage_snapshots_source ON usage_snapshots(json_extract(data,'$.accounting.source'));
     `);
   }
 
@@ -206,6 +210,34 @@ export class UsageStore {
           (!query.role || value.role === query.role),
       ),
     );
+    // Legacy Hermes records interleaved exclusive database buckets and ACP
+    // process totals without provenance. Keep their immutable payloads, but
+    // never guess a conversion or let them seed corrected counter baselines.
+    const legacyHermesScopes = new Set<string>();
+    const selectedLegacyHermes = new Map<string, Set<string>>();
+    const correctedHermesScopes = new Set<string>();
+    if ([...metadata.values()].some((owner) => owner.backend === "hermes")) {
+      const legacyRows = this.db
+        .prepare(
+          `
+        SELECT node_id,session_id,json_extract(data,'$.accounting.counterId') AS counter_id,
+               MIN(observed_at) AS first_at
+        FROM usage_snapshots WHERE json_extract(data,'$.accounting.source')=?
+        GROUP BY node_id,session_id,counter_id
+      `,
+        )
+        .iterate(HERMES_LEGACY_USAGE_SOURCE);
+      for (const row of legacyRows) {
+        const sessionKey = metadataKey(String(row.node_id), String(row.session_id));
+        if (allMetadata.get(sessionKey)?.backend !== "hermes") continue;
+        const key = JSON.stringify([String(row.node_id), String(row.counter_id)]);
+        legacyHermesScopes.add(key);
+        if (!metadata.has(sessionKey) || Date.parse(String(row.first_at)) >= to) continue;
+        const sessions = selectedLegacyHermes.get(key) ?? new Set<string>();
+        sessions.add(sessionKey);
+        selectedLegacyHermes.set(key, sessions);
+      }
+    }
     // Stream history: all-time reporting must not materialize every snapshot in memory.
     const snapshots =
       metadata.size === 0
@@ -301,10 +333,27 @@ export class UsageStore {
       const selected = metadata.has(sessionKey);
       const snapshot = UsageSnapshotSchema.parse(JSON.parse(String(stored.data)));
       const sample = snapshot.accounting;
+      if (owner.backend === "hermes" && sample.source === HERMES_LEGACY_USAGE_SOURCE)
+        continue;
+      const importedCredit = sample.source === LEGACY_CREDIT_BACKFILL_SOURCE;
       const at = Date.parse(sample.observedAt);
+      const correctedHermes =
+        owner.backend === "hermes" &&
+        sample.source === HERMES_NATIVE_USAGE_SOURCE &&
+        sample.counterId.startsWith(`${HERMES_NATIVE_USAGE_SOURCE}:`);
+      const hermesScope = correctedHermes
+        ? JSON.stringify([
+            nodeId,
+            sample.counterId.slice(HERMES_NATIVE_USAGE_SOURCE.length + 1),
+          ])
+        : "";
+      if (correctedHermes && sample.totalTokens !== undefined && at < to)
+        correctedHermesScopes.add(hermesScope);
       const scope = JSON.stringify([nodeId, owner.backend, sample.counterId]);
       const origin = origins.get(scope) ?? {
-        baseline: sample.baseline === true,
+        baseline:
+          sample.baseline === true ||
+          (correctedHermes && legacyHermesScopes.has(hermesScope)),
         at:
           sample.baseline !== true && sample.startedAt
             ? Math.min(at, Date.parse(sample.startedAt))
@@ -313,17 +362,22 @@ export class UsageStore {
       origins.set(scope, origin);
       if (
         selected &&
+        !importedCredit &&
         (!coverage.lastReportedAt || at > Date.parse(coverage.lastReportedAt))
       )
         coverage.lastReportedAt = sample.observedAt;
       let regressed = false;
       for (const key of usageAmountKeys) {
+        if (importedCredit && key !== "aiCredits") continue;
         const reading = sample[key];
         if (reading === undefined || (owner.backend === "hermes" && key === "aiCredits"))
           continue;
         const value = units(key, reading);
         const stream = JSON.stringify([nodeId, owner.backend, sample.counterId, key]);
         const before = previous.get(stream);
+        // A delayed authoritative reading can already exceed an inferred import.
+        // It supersedes the lower backfill without a false regression warning.
+        if (importedCredit && before && value < before.value) continue;
         if (before && (value < before.value || at < before.at)) {
           regressed = true;
           continue;
@@ -335,7 +389,10 @@ export class UsageStore {
           if (key === "totalTokens") tokenSessions.add(sessionKey);
           totals[key] ??= 0;
         }
-        const opening = !before && (origin.baseline || sample.baseline === true);
+        // Imported top-ups remain undated even if older native readings arrive
+        // later and sort before the migration record.
+        const opening =
+          importedCredit || (!before && (origin.baseline || sample.baseline === true));
         const delta = quantity(key, value - (before?.value ?? 0));
         const start = before?.at ?? origin.at;
         if (opening) {
@@ -356,6 +413,16 @@ export class UsageStore {
     }
     coverage.creditSessions = creditSessions.size;
     coverage.tokenSessions = tokenSessions.size;
+    if (selectedLegacyHermes.size > 0) {
+      coverage.legacyHermesSessions = new Set(
+        [...selectedLegacyHermes.values()].flatMap((sessions) => [...sessions]),
+      ).size;
+      coverage.pendingHermesSessions = new Set(
+        [...selectedLegacyHermes].flatMap(([key, sessions]) =>
+          correctedHermesScopes.has(key) ? [] : [...sessions],
+        ),
+      ).size;
+    }
     const machines = new Map<string, string>();
     const tasks = new Map<string, string>();
     for (const owner of allMetadata.values()) {

@@ -200,6 +200,14 @@ const useStyles = makeStyles({
     marginTop: "14px",
     marginBottom: 0,
   },
+  accountingNotice: {
+    marginTop: "16px",
+    padding: "12px 16px",
+    borderLeft: `3px solid ${tokens.colorBrandStroke1}`,
+    backgroundColor: tokens.colorNeutralBackground3,
+    fontSize: "13px",
+    lineHeight: "1.7",
+  },
   warning: {
     color: tokens.colorPaletteRedForeground1,
     fontSize: "13px",
@@ -326,11 +334,31 @@ export const UsageReportView = ({
         </section>
       </div>
 
+      {(coverage.legacyHermesSessions ?? 0) > 0 && (
+        <div className={styles.accountingNotice} role="status">
+          <p>
+            {coverage.legacyHermesSessions} Hermes{" "}
+            {coverage.legacyHermesSessions === 1 ? "session has" : "sessions have"}{" "}
+            incompatible legacy readings that are excluded from totals. Refreshed native
+            balances enter as undated opening balances; period breakdowns from the old
+            mixed counters are unavailable.
+          </p>
+          {(coverage.pendingHermesSessions ?? 0) > 0 && (
+            <p>
+              {coverage.pendingHermesSessions}{" "}
+              {coverage.pendingHermesSessions === 1 ? "session has" : "sessions have"} no
+              corrected native reading before this report's end. Totals remain partial.
+              Update affected Nodes for future readings; closed legacy sessions are not
+              automatically rescanned.
+            </p>
+          )}
+        </div>
+      )}
       <div className={styles.analysis}>
         <section className={styles.section} aria-label="Token details">
           <div className={styles.headingRow}>
             <h2 className={styles.heading}>Token details</h2>
-            <span className={styles.caption}>Source-reported counters</span>
+            <span className={styles.caption}>Normalized source counters</span>
           </div>
           {hasDetails ? (
             <dl className={styles.details}>
@@ -366,9 +394,9 @@ export const UsageReportView = ({
             </p>
           )}
           <p className={styles.description}>
-            These counters can overlap: cache may be included in input, and reasoning in
-            output. They are not added together. Bars are relative to the largest detail
-            counter, not shares of total tokens.
+            These counters can overlap: input includes cached input, and output includes
+            reasoning where reported. They are not added together. Bars are relative to
+            the largest detail counter, not shares of total tokens.
           </p>
         </section>
 

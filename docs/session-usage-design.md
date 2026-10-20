@@ -104,13 +104,22 @@ seconds where the schema is supported. It uses `HERMES_HOME`, or `~/.hermes`, an
 reads `state.db` for the default profile or `profiles/<profile>/state.db` for a
 named profile.
 
-Supported ACP prompt-completion responses also supply cumulative usage. The
-reporter compares those totals with persisted readings. A database reading behind
-a completed ACP response is treated as a stale coalesced write, not another
-charge or a reset.
+Hermes's native database uses disjoint canonical buckets: uncached input,
+cache reads, cache writes, and output. Fleet requires all four to be known,
+normalizes input to include both cache buckets, and computes inclusive input plus
+output. Reasoning remains a detail within output and is never added again.
+Missing/invalid required buckets leave the total unavailable, not understated.
 
-Hermes counter identities include the profile and native session ID. Hermes does
-not publish AI credits into the combined report.
+ACP prompt-completion responses can describe only an attached process and have
+a different input definition. They are therefore excluded from durable Hermes
+consumption, rather than compared with lifetime database counters by size.
+After completion the reporter reads the database; coalesced updates are picked
+up by subsequent polling.
+
+Hermes emits source `hermes-native-totals-v2`; its counter identity includes that
+version, the profile, and the native session ID. This prevents the Node journal
+from suppressing a corrected reading with unchanged numbers. Hermes does not
+publish AI credits into the combined report.
 
 The reader queries the selected native session. It does not blindly sum parent
 conversations, compression descendants, or auxiliary-call aggregates. Complete
@@ -304,9 +313,10 @@ Total tokens are the primary consumption measure. For supported Copilot native
 formats, inclusive input plus output supplies the total: cache reads/writes are
 already input categories, and reasoning is already an output category.
 
-Hermes prompt responses can supply a direct `totalTokens` value; supported native
-session summaries supply compatible input/output totals. Optional categories
-remain source-reported details. They are not added again to the primary total.
+Hermes native session summaries store uncached input separately from cache reads
+and writes. Fleet includes those cache buckets exactly once in normalized input,
+then adds output for total tokens. Optional detail categories are not added again
+to the primary total. ACP response totals are not used as a lifetime fallback.
 
 Missing or ambiguous categories remain unknown. Fleet does not estimate them
 from transcript length, derive token counts from credits, or convert token counts
@@ -346,6 +356,26 @@ are not a transactionally frozen snapshot: new readings can arrive between Host
 queries. Opening and multi-day buckets stay outside the dated chart, and missing
 days are not invented as zero. A failed live refresh retains the last successful
 report with an explicit error notice.
+
+## Hermes legacy counter reconciliation
+
+The original `hermes-session-totals` source mixed exclusive database input with inclusive ACP process totals under the same counter identity. Independent metric regressions could then leave the report with cache reads greater than its understated total. Raw legacy records do not identify which source produced each value, so adding cache to every old record or choosing per-metric maxima would invent a repair.
+
+The report therefore retains those immutable snapshots in storage/backups but excludes them completely from consumption, detail, freshness, and baseline calculations. Corrected native v2 readings form a separate counter series. When legacy history exists for that Node + profile/native scope, the first v2 balance is forced to an undated opening even if a sender incorrectly labels it new. Subsequent observed increases retain normal period and boundary accounting. Copilot counters and credit backfills are unchanged.
+
+Optional coverage fields `legacyHermesSessions` and `pendingHermesSessions` explain excluded sessions and those still lacking a corrected native reading before the report end. Scope matching occurs across Fleet session aliases and before task filters. The UI states that totals are partial until affected Nodes refresh and that period breakdowns from the old mixed history are unavailable. **Update the Host first, then the Nodes**; the refresh restores all-time native balances without charging the normalization difference to the upgrade day. No existing database rows are rewritten or live models invoked. Closed legacy Hermes sessions are not automatically rescanned on update and remain excluded until a trusted corrected native reading is collected; a historical query ending before the first v2 reading continues to report missing corrected coverage.
+
+## Legacy credit backfill
+
+The Usage page's **Backfill old credits** action previews and confirms a Host-side import of saved cumulative credits. `GET /api/usage/backfill` returns counts, skipped reasons, and a deterministic SHA-256 plan fingerprint. `POST /api/usage/backfill` accepts only that fingerprint; callers cannot supply amounts. Both endpoints require a Microsoft administrator, or the existing explicit local no-auth operator mode. The POST retains the central origin/CSRF protections and emits an authorization audit record.
+
+[UsageBackfillStore](../apps/host/src/usage-backfill.ts) groups saved Copilot session readings by Node identity and native conversation ID. Only terminal sessions are eligible; an active alias blocks its conversation. Missing/invalid identities or values, conflicting cumulative balances/task/role attribution, and existing native credit history are skipped. Matching aliases collapse to a single balance. Existing token-only snapshots do not prevent a credit-only import. The deterministic snapshot ID and stored credit history make repeated imports, cleanup, and backup restores idempotent without a global once-only flag.
+
+Fleet revalidates the fingerprint before backup and again under the write transaction before insertion. A nonempty import first uses SQLite `VACUUM INTO` to create a consistent full database backup in the protected Host data directory; a private, exclusive server-generated filename prevents overwrites. This backup includes sensitive Host keys and transcripts and is never exposed by a download route. Backup failure refuses the import, and an ingestion failure rolls back the entire batch. An in-memory test Host has no persistent file to back up.
+
+Imports use source `legacy-credit-backfill-v1`, the original native counter identity, baseline=true, no startedAt, and credits only. Node snapshot batches cannot submit this reserved source. The source is always an undated opening increment, including if an older native reading arrives later and sorts before the imported record. For example, late native 80 + imported cumulative 100 + fresh native 112 yields 100 opening credits and 12 subsequent credits, never 212 credits. A lower inferred import is ignored when authoritative earlier history already exceeds it. Imported timestamps describe recording, not consumption or provider freshness; they do not advance Last reported. Original session records and token counters are unchanged.
+
+The UI previews fleet-wide scope, counts, skipped reasons, and the undated-history limitation before confirmation. It blocks duplicate submissions, requires another preview after failure, and switches to all recorded Copilot history on success. Backfill never starts agents or requests model responses. Exact historical period attribution requires historical readings and cannot be inferred from one saved total.
 
 ## Retention, backups, and privacy
 
@@ -425,6 +455,7 @@ links can change; installed versions may differ.
   units.
 - [Copilot checkpoint schema](https://github.com/github/copilot-sdk/blob/main/java/sdk/src/generated/java/com/github/copilot/generated/SessionUsageCheckpointEvent.java)
   and [cumulative metrics](https://github.com/github/copilot-sdk/blob/main/java/sdk/src/generated/java/com/github/copilot/generated/UsageGetMetricsResult.java).
+- [Hermes canonical usage buckets](https://github.com/NousResearch/hermes-agent/blob/main/agent/usage_pricing.py): `prompt_tokens` includes uncached input plus cache read/write; total adds output. Reviewed for the correction on 20 October 2026.
 - [Hermes ACP usage projection](https://github.com/NousResearch/hermes-agent/blob/main/acp_adapter/gateway_session_meta.py)
   and [persisted usage accounting](https://github.com/NousResearch/hermes-agent/blob/main/hermes_state_usage.py).
 - [Tokscale Copilot native-store reader](https://github.com/junhoyeo/tokscale/blob/main/crates/tokscale-core/src/sessions/copilot_session_store.rs):

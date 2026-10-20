@@ -284,6 +284,61 @@ describe("UsagePage", () => {
       vi.useRealTimers();
     }
   });
+  it("shows all recorded Copilot history after a confirmed legacy import", async () => {
+    vi.mocked(api).mockImplementation(async (path, options) => {
+      if (path === "/api/usage/backfill")
+        return options?.method === "POST"
+          ? {
+              importedConversations: 1,
+              aiCredits: 100,
+              backupFile: "usage-backfill-test.db",
+            }
+          : {
+              previewId: "a".repeat(64),
+              eligibleConversations: 1,
+              eligibleSessions: 1,
+              aiCredits: 100,
+              skipped: {
+                active: 0,
+                otherBackend: 0,
+                missingIdentity: 0,
+                missingCredits: 0,
+                conflicting: 0,
+                alreadyRecorded: 0,
+              },
+            };
+      return report;
+    });
+    render(<UsagePage />);
+    await screen.findByRole("region", { name: "Total tokens" });
+    fireEvent.click(screen.getByRole("button", { name: "Backfill old credits" }));
+    const confirm = await screen.findByRole("button", { name: "Import credits" });
+    await waitFor(() => expect(confirm.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(confirm);
+    await waitFor(() => {
+      const paths = vi
+        .mocked(api)
+        .mock.calls.map(([path]) => path)
+        .filter((path) => path.startsWith("/api/usage?"));
+      const query = new URL(paths.at(-1)!, "http://localhost").searchParams;
+      expect(query.get("backend")).toBe("copilot");
+      expect(query.has("from")).toBe(false);
+      expect(query.has("to")).toBe(false);
+    });
+  });
+  it("explains excluded legacy Hermes counters and partial coverage until Nodes refresh", async () => {
+    vi.mocked(api).mockResolvedValue({
+      ...report,
+      coverage: { ...report.coverage, legacyHermesSessions: 2, pendingHermesSessions: 1 },
+    });
+    render(<UsagePage />);
+    const notice = await screen.findByText(
+      /2 Hermes sessions have incompatible legacy readings/,
+    );
+    expect(notice.textContent).toContain("excluded");
+    expect(notice.textContent).toContain("undated opening balances");
+    expect(screen.getByText(/1 session has no corrected native reading/)).toBeTruthy();
+  });
   it("surfaces a report request failure", async () => {
     vi.mocked(api).mockRejectedValue(new Error("Host unavailable"));
     render(<UsagePage />);

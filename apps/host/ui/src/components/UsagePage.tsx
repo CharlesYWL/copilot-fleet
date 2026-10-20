@@ -12,6 +12,7 @@ import { ArrowClockwise20Regular } from "@fluentui/react-icons";
 import type { UsageReport } from "@fleet/protocol";
 import { api } from "../hooks/useFleet";
 import { UsageReportView } from "./UsageReportView";
+import { UsageBackfillButton } from "./UsageBackfillButton";
 
 type UsageFilters = {
   period: string;
@@ -134,7 +135,9 @@ const useStyles = makeStyles({
     gap: "16px",
     marginTop: "28px",
     marginBottom: "24px",
+    flexWrap: "wrap",
   },
+  actions: { display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: "8px" },
   heading: {
     fontFamily: 'Georgia, "Times New Roman", serif',
     fontSize: "clamp(30px, 3.2vw, 44px)",
@@ -181,6 +184,15 @@ export const UsagePage = () => {
   const [loading, setLoading] = useState(true);
   const [refresh, setRefresh] = useState(0);
   const handleRefresh = () => setRefresh((value) => value + 1);
+  const handleBackfillCompleted = () => {
+    setFilters((previous) => ({
+      ...initialFilters,
+      groupBy: previous.groupBy,
+      period: "all",
+      backend: "copilot",
+    }));
+    handleRefresh();
+  };
   const handleFilter = (key: keyof UsageFilters, value: string) =>
     setFilters((previous) => ({ ...previous, [key]: value }));
   useEffect(() => {
@@ -259,12 +271,15 @@ export const UsagePage = () => {
               AI credits and tokens across sessions, including Orchestrators.
             </p>
           </div>
-          <Button
-            icon={<ArrowClockwise20Regular aria-hidden="true" />}
-            onClick={handleRefresh}
-          >
-            Refresh
-          </Button>
+          <div className={styles.actions}>
+            <UsageBackfillButton onCompleted={handleBackfillCompleted} />
+            <Button
+              icon={<ArrowClockwise20Regular aria-hidden="true" />}
+              onClick={handleRefresh}
+            >
+              Refresh
+            </Button>
+          </div>
         </header>
         <div className={styles.filters}>
           <Field label="Period">

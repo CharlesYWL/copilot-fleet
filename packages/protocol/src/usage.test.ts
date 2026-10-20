@@ -3,6 +3,9 @@ import {
   SessionAccountingSchema,
   UsageReportQuerySchema,
   UsageSnapshotSchema,
+  UsageSnapshotBatchSchema,
+  UsageBackfillRequestSchema,
+  LEGACY_CREDIT_BACKFILL_SOURCE,
 } from "./usage.js";
 
 describe("session accounting contracts", () => {
@@ -50,6 +53,33 @@ describe("session accounting contracts", () => {
         accounting,
       }).success,
     ).toBe(false);
+  });
+  it("requires a preview fingerprint and rejects caller-supplied import amounts", () => {
+    expect(
+      UsageBackfillRequestSchema.safeParse({ previewId: "a".repeat(64) }).success,
+    ).toBe(true);
+    expect(UsageBackfillRequestSchema.safeParse({ previewId: "invalid" }).success).toBe(
+      false,
+    );
+    expect(
+      UsageBackfillRequestSchema.safeParse({ previewId: "a".repeat(64), aiCredits: 100 })
+        .success,
+    ).toBe(false);
+  });
+  it("reserves legacy backfill records for the Host rather than Node batches", () => {
+    const legacy = {
+      id: "import",
+      sessionId: "fleet-1",
+      sequence: 1,
+      accounting: {
+        ...accounting,
+        source: LEGACY_CREDIT_BACKFILL_SOURCE,
+        baseline: true,
+        aiCredits: 100,
+      },
+    };
+    expect(UsageSnapshotSchema.safeParse(legacy).success).toBe(true);
+    expect(UsageSnapshotBatchSchema.safeParse([legacy]).success).toBe(false);
   });
   it("validates timezones and exclusive report boundaries", () => {
     expect(UsageReportQuerySchema.parse({}).groupBy).toBe("day");

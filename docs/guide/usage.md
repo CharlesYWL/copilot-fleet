@@ -12,7 +12,7 @@ Open **Usage** in the Fleet sidebar to review AI credits and token consumption a
 - The English-language dark report shows headline totals, independent token-detail counters, a daily chart, the selected breakdown, and reporting-scope notes. All filters apply to both the chart and the table, even when grouping the table by machine, task, or session.
 - Token and credit values use decimal **K / M / B** units (1,000 / 1,000,000 / 1,000,000,000), with two decimal places for abbreviated values. Hover or use a screen reader to read the underlying value. Rounded displayed values may not sum exactly.
 - The daily chart shows allocated daily token totals only. Opening balances and intervals spanning multiple days are listed separately, never assigned an invented date. Missing days are not confirmed zero usage. Long histories scroll horizontally.
-- Input, output, cache read/write, and reasoning are optional source-reported details. They are not necessarily additive: cached input may already be included in input, and reasoning may already be included in output.
+- Input, output, cache read/write, and reasoning are optional normalized source details. **Input includes cached input**: Copilot already reports it that way, while Fleet adds Hermes's separate cache buckets during normalization. Reasoning may already be included in output. Detail counters are therefore not additive to the headline total.
 - Context-window occupancy is deliberately excluded from consumption totals.
 
 Filter by machine, task, backend, or role. Choose the last 24 hours, 7 days, 30 days, all recorded history, or a custom date range. Daily groups use the report timezone; custom end dates include that whole local day.
@@ -24,6 +24,24 @@ Fleet records changed cumulative session snapshots while sessions remain open. I
 The first reading of an already-running conversation can be an **opening balance**. All-time totals include it once, but Fleet does not assign older usage to the day it discovered the session. Intervals spanning a filter boundary are shown as unallocated rather than guessed or prorated. Intervals spanning multiple days have their own daily-report group.
 
 Workers and reviewers use their task binding. Long-lived Orchestrators can serve several tasks, so their spend appears under **Shared Orchestrator usage**, not an arbitrary split among tasks. Standalone sessions have their own task group.
+
+## Corrected Hermes token history
+
+Hermes consumption now uses one consistent lifetime database source, including cache read/write in input and total exactly once. ACP response counters are not substituted when persistence is unavailable; polling waits for a supported native reading. Older Hermes databases lacking required cache counters leave consumption unavailable rather than assuming zero cache use.
+
+Earlier Fleet versions mixed incompatible Hermes counters. Those legacy readings remain stored but are excluded from report totals and details. The report shows an explicit warning and counts sessions awaiting refreshed data. **Update the Host first, then the affected Nodes.** A corrected native cumulative reading restores all-time usage as an undated opening balance; only subsequent increases can enter period totals. This prevents the correction from appearing as new spending on upgrade day. Daily/weekly/monthly attribution from the old mixed series cannot be reliably reconstructed. Closed legacy Hermes sessions are not automatically rescanned after a Node update; they remain excluded until a trusted corrected native reading is collected. Copilot totals are unaffected.
+
+## Backfill saved Copilot credits
+
+Use **Backfill old credits** beside Refresh to preview a one-time import per native conversation from saved **stopped, completed, or failed Copilot sessions**. This action covers all machines and tasks, regardless of the report filters. The preview shows eligible credits and skipped-session counts. Nothing is written until you choose **Import credits**.
+
+The action requires a Microsoft administrator (or the deliberately enabled local no-auth operator mode). Running/idle conversations, missing identities/counters, conflicting balances or task attribution, and conversations with existing credit history are skipped. Matching duplicate Fleet sessions are collapsed by machine and native Copilot identity, rather than summed. Token-only history does not block a missing credit import.
+
+Imported credits appear as **undated opening balances** under **All recorded history**. They are never assigned to today or another guessed date. Token totals are unchanged, no agents are started/resumed, and no provider requests are made. After importing, the page switches to all recorded Copilot history and clears machine/task/role filters so you can see the result. A repeated import skips previously recorded conversations; newly eligible conversations can be previewed later.
+
+Before a nonempty import, Fleet saves a consistent SQLite backup named `usage-backfill-<id>.db` inside the Host's protected data directory. The backup includes credentials and transcripts: keep it private, like the original database. It is not a downloadable or portable backup archive. Large databases may take time to copy. If backup creation fails, the import is refused. The import is transactional, and a changed preview requires a fresh confirmation.
+
+Updating an older Node is still necessary for future live history. Backfill cannot reconstruct precise historical day/week/month usage from a single cumulative credit value, or recover saved credits from session records that have already been deleted.
 
 ## Reliability and privacy
 

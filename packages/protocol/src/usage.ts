@@ -1,6 +1,36 @@
 import { z } from "zod";
 
 export const USAGE_SNAPSHOTS_CAPABILITY = "usage-snapshots-v1";
+/** Reserved for Host imports; Nodes cannot submit this source. */
+export const LEGACY_CREDIT_BACKFILL_SOURCE = "legacy-credit-backfill-v1";
+/** Inclusive-input Hermes lifetime database counters; never ACP process totals. */
+export const HERMES_NATIVE_USAGE_SOURCE = "hermes-native-totals-v2";
+export const HERMES_LEGACY_USAGE_SOURCE = "hermes-session-totals";
+export const UsageBackfillRequestSchema = z
+  .object({
+    previewId: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+export type UsageBackfillPreview = {
+  previewId: string;
+  eligibleConversations: number;
+  eligibleSessions: number;
+  aiCredits: number;
+  skipped: {
+    active: number;
+    otherBackend: number;
+    missingIdentity: number;
+    missingCredits: number;
+    conflicting: number;
+    alreadyRecorded: number;
+  };
+};
+export type UsageBackfillResult = {
+  importedConversations: number;
+  aiCredits: number;
+  /** Filename inside the Host's protected data directory; never an API download. */
+  backupFile: string | null;
+};
 const identity = z.string().min(1).max(500);
 const tokenCount = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 /** Cumulative consumption, never current context occupancy. Missing metrics remain unknown. */
@@ -43,7 +73,17 @@ export const UsageSnapshotSchema = z.object({
   accounting: SessionAccountingSchema,
 });
 export type UsageSnapshot = z.infer<typeof UsageSnapshotSchema>;
-export const UsageSnapshotBatchSchema = z.array(UsageSnapshotSchema).min(1).max(100);
+export const UsageSnapshotBatchSchema = z
+  .array(UsageSnapshotSchema)
+  .min(1)
+  .max(100)
+  .refine(
+    (snapshots) =>
+      snapshots.every(
+        (snapshot) => snapshot.accounting.source !== LEGACY_CREDIT_BACKFILL_SOURCE,
+      ),
+    "Legacy credit backfill records can only be created by the Host",
+  );
 export const UsageReportQuerySchema = z
   .object({
     from: z.string().datetime().optional(),
@@ -91,6 +131,10 @@ export type UsageReport = {
     unallocatedTokens: number;
     regressions: number;
     lastReportedAt: string | null;
+    /** Old Hermes mixed-definition history is retained but excluded from reporting. */
+    legacyHermesSessions?: number;
+    /** Legacy sessions whose counter scope has no corrected reading before the report end. */
+    pendingHermesSessions?: number;
   };
   machines: Array<{ id: string; name: string }>;
   tasks: Array<{ id: string; name: string }>;

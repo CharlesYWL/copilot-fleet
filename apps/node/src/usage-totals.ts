@@ -61,24 +61,6 @@ export const accountingTokens = (data: unknown): TokenTotals | undefined => {
   const totalTokens = (totals.inputTokens ?? 0) + (totals.outputTokens ?? 0);
   return Number.isSafeInteger(totalTokens) ? { ...totals, totalTokens } : undefined;
 };
-export const hermesResponseTokens = (response: unknown): TokenTotals | undefined => {
-  const usage = usageObject(usageObject(response)?.usage);
-  if (!usage) return undefined;
-  const total = count(usage.totalTokens);
-  if (total === undefined) return undefined;
-  const result: TokenTotals = { totalTokens: total };
-  for (const [field, source] of [
-    ["inputTokens", "inputTokens"],
-    ["outputTokens", "outputTokens"],
-    ["cacheReadTokens", "cachedReadTokens"],
-    ["cacheWriteTokens", "cachedWriteTokens"],
-    ["reasoningTokens", "thoughtTokens"],
-  ] as const) {
-    const value = count(usage[source]);
-    if (value !== undefined) result[field] = value;
-  }
-  return result;
-};
 
 /** Optional read-only aggregate. No per-request records leave the native database. */
 export const readNativeTokenTotals = (
@@ -134,14 +116,18 @@ export const readNativeTokenTotals = (
               .get(sessionId)
           : db.prepare(`SELECT ${selection} FROM sessions WHERE id=?`).get(sessionId);
       if (!row || (kind === "copilot" && Number(row.records) === 0)) continue;
-      const input = count(row.input_tokens);
+      const uncachedInput = count(row.input_tokens);
       const output = count(row.output_tokens);
-      if (
-        input === undefined ||
-        output === undefined ||
-        !Number.isSafeInteger(input + output)
-      )
+      if (uncachedInput === undefined || output === undefined) continue;
+      const cacheRead = count(row.cache_read_tokens);
+      const cacheWrite = count(row.cache_write_tokens);
+      // Copilot input is inclusive. Hermes stores disjoint canonical buckets;
+      // unknown cache values cannot safely be replaced with zero.
+      if (kind === "hermes" && (cacheRead === undefined || cacheWrite === undefined))
         continue;
+      const input =
+        kind === "hermes" ? uncachedInput + cacheRead! + cacheWrite! : uncachedInput;
+      if (!Number.isSafeInteger(input) || !Number.isSafeInteger(input + output)) continue;
       const totals: TokenTotals = {
         totalTokens: input + output,
         inputTokens: input,

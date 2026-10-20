@@ -3,11 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  accountingTokens,
-  hermesResponseTokens,
-  readNativeTokenTotals,
-} from "./usage-totals.js";
+import { accountingTokens, readNativeTokenTotals } from "./usage-totals.js";
 const paths: string[] = [];
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -46,17 +42,6 @@ describe("cumulative backend token snapshots", () => {
     expect(
       accountingTokens({ modelMetrics: { model: { usage: { inputTokens: 100 } } } }),
     ).toBeUndefined();
-    expect(
-      hermesResponseTokens({
-        usage: {
-          totalTokens: 100,
-          inputTokens: 80,
-          outputTokens: 20,
-          cachedReadTokens: 60,
-          thoughtTokens: 10,
-        },
-      }),
-    ).toMatchObject({ totalTokens: 100, cacheReadTokens: 60, reasoningTokens: 10 });
   });
   it("reads live totals even when an older native database lacks optional detail columns", () => {
     const home = mkdtempSync(join(tmpdir(), "fleet-token-totals-"));
@@ -73,10 +58,62 @@ describe("cumulative backend token snapshots", () => {
       outputTokens: 30,
     });
   });
+  it("includes Hermes's disjoint cache buckets in input and total exactly once", () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-hermes-totals-"));
+    paths.push(home);
+    vi.stubEnv("HERMES_HOME", home);
+    const db = new DatabaseSync(join(home, "state.db"));
+    db.exec(
+      "CREATE TABLE sessions(id TEXT,input_tokens INTEGER,output_tokens INTEGER,cache_read_tokens INTEGER,cache_write_tokens INTEGER,reasoning_tokens INTEGER); INSERT INTO sessions VALUES ('native',1518197,872784,414225335,38500830,165576)",
+    );
+    db.close();
+    expect(readNativeTokenTotals("hermes", "native")).toEqual({
+      inputTokens: 454244362,
+      outputTokens: 872784,
+      cacheReadTokens: 414225335,
+      cacheWriteTokens: 38500830,
+      reasoningTokens: 165576,
+      totalTokens: 455117146,
+    });
+  });
+  it("requires known Hermes cache counters instead of returning an understated total", () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-hermes-totals-"));
+    paths.push(home);
+    vi.stubEnv("HERMES_HOME", home);
+    const db = new DatabaseSync(join(home, "state.db"));
+    db.exec(
+      "CREATE TABLE sessions(id TEXT,input_tokens INTEGER,output_tokens INTEGER,cache_read_tokens INTEGER); INSERT INTO sessions VALUES ('missing-column',100,20,300),('null-cache',100,20,NULL)",
+    );
+    db.close();
+    expect(readNativeTokenTotals("hermes", "missing-column")).toBeUndefined();
+    expect(readNativeTokenTotals("hermes", "null-cache")).toBeUndefined();
+  });
+  it("rejects Hermes overflow and negative cache values while preserving explicit zero", () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-hermes-totals-"));
+    paths.push(home);
+    vi.stubEnv("HERMES_HOME", home);
+    const db = new DatabaseSync(join(home, "state.db"));
+    db.exec(
+      "CREATE TABLE sessions(id TEXT,input_tokens INTEGER,output_tokens INTEGER,cache_read_tokens INTEGER,cache_write_tokens INTEGER); INSERT INTO sessions VALUES ('overflow',9007199254740991,0,1,0),('negative',1,2,-3,0),('zero',0,0,0,0)",
+    );
+    db.close();
+    expect(readNativeTokenTotals("hermes", "overflow")).toBeUndefined();
+    expect(readNativeTokenTotals("hermes", "negative")).toBeUndefined();
+    expect(readNativeTokenTotals("hermes", "zero")).toMatchObject({
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    });
+  });
   it("rejects malformed and negative totals without exposing payload text", () => {
-    expect(hermesResponseTokens({ usage: { totalTokens: -1 } })).toBeUndefined();
-    expect(
-      hermesResponseTokens({ usage: { totalTokens: Number.POSITIVE_INFINITY } }),
-    ).toBeUndefined();
+    for (const inputTokens of [-1, Number.POSITIVE_INFINITY]) {
+      expect(
+        accountingTokens({
+          modelMetrics: { model: { usage: { inputTokens, outputTokens: 1 } } },
+        }),
+      ).toBeUndefined();
+    }
   });
 });
