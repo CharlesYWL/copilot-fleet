@@ -50,9 +50,9 @@ export type UsageContext = {
 export interface UsageReporter {
   /** True when the update was consumed (for example a hidden usage query). */
   onUpdate(update: acp.SessionUpdate): boolean;
-  start?(sessionId: string, reset?: boolean): Promise<void>;
+  start?(sessionId: string, reset?: boolean, resumed?: boolean): Promise<void>;
   beforePrompt?(text: string, hasAttachments: boolean): void;
-  afterPrompt?(): Promise<void>;
+  afterPrompt?(response?: acp.PromptResponse): Promise<void>;
   finishPrompt?(): void;
   reset?(): void;
   flush?(): Promise<void>;

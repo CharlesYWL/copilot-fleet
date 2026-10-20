@@ -59,6 +59,7 @@ import { authRoutes } from "./routes/auth.js";
 import { catalogRoutes } from "./routes/catalog.js";
 import { nodeRoutes } from "./routes/nodes.js";
 import { portableBackupRoutes } from "./routes/portable-backup.js";
+import { usageRoutes } from "./routes/usage.js";
 import { notificationRoutes } from "./routes/notifications.js";
 import { commandExecutionRoutes } from "./routes/command-executions.js";
 import { startNotificationRetentionMonitor } from "./notifications/retention.js";
@@ -496,6 +497,7 @@ export async function buildServer(
   await app.register(sessionRoutes, { service });
   await app.register(sessionFileRoutes, { service });
   await app.register(notificationRoutes, { service });
+  await app.register(usageRoutes, { store });
   await app.register(commandExecutionRoutes, { service, auth });
 
   /*

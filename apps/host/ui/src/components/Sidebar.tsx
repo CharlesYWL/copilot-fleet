@@ -1094,6 +1094,14 @@ export const Sidebar = ({
           </Button>
         )}
         <Button
+          appearance={view === "usage" ? "secondary" : "subtle"}
+          className={styles.navButton}
+          aria-current={view === "usage" ? "page" : undefined}
+          onClick={() => onSelectView("usage")}
+        >
+          Usage
+        </Button>
+        <Button
           appearance={view === "settings" ? "secondary" : "subtle"}
           className={styles.navButton}
           icon={<Settings20Regular />}

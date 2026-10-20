@@ -117,6 +117,7 @@ import { nativeCommandSupervisor } from "./command-supervisor-adapter.js";
 import { LeadPromptJournal } from "./lead-prompt-delivery.js";
 import { CheckoutLocks } from "./checkout-locks.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
+import { UsageJournal } from "./usage-journal.js";
 import { EventOutbox } from "./outbox.js";
 import { NODE_CAPABILITIES } from "./node-capabilities.js";
 import { startHealthSampler } from "./health.js";
@@ -453,6 +454,37 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let updating = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
+  let usageNegotiated = false;
+  let usageInFlight = false;
+  let usageJournal: UsageJournal | undefined;
+  try {
+    usageJournal = new UsageJournal(join(configDirectory(), "usage-history"));
+  } catch (error) {
+    warn(`Usage accounting storage unavailable: ${errorMessage(error)}`);
+  }
+  const usageHostId = () =>
+    credentials.authProtocol === MUTUAL_AUTH_PROTOCOL
+      ? JSON.stringify([credentials.host.hostId, credentials.nodeId])
+      : "";
+  const pumpUsage = () => {
+    if (
+      !usageNegotiated ||
+      !channel ||
+      !sealedConnection ||
+      usageInFlight ||
+      !usageJournal
+    )
+      return;
+    const hostId = usageHostId();
+    try {
+      const snapshots = usageJournal.pending(hostId);
+      if (!snapshots.length || !send({ type: "usage_snapshots", snapshots })) return;
+      usageJournal.sent(hostId, snapshots.at(-1)!.sequence);
+      usageInFlight = true;
+    } catch (error) {
+      warn(`Usage accounting delivery failed: ${errorMessage(error)}`);
+    }
+  };
   const consoleSlot: { current?: NodeSessionConsole } = {};
   let sessionConsoleSupported = false;
   const admission = new NodeAdmission();
@@ -689,6 +721,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     factory,
     settings.maxSessions,
     (event) => {
+      try {
+        usageJournal?.observe(usageHostId(), event);
+        pumpUsage();
+      } catch (error) {
+        warn(`Usage accounting snapshot could not be saved: ${errorMessage(error)}`);
+      }
       if (consoleSlot.current?.capture(event)) return;
       // Held rather than dropped when the Host is unreachable: the agent keeps
       // working through a Host restart, and these are the only record of it.
@@ -951,6 +989,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
   /** Drops the current socket so the next connect uses the latest credentials. */
   function reconnect(): void {
+    usageNegotiated = false;
+    usageInFlight = false;
     consoleSlot.current?.disconnected();
     if (reconnectTimer) clearTimeout(reconnectTimer);
     dialUrl = firstDialUrl(settings, credentials.hostUrl, tunnelMode);
@@ -1273,6 +1313,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   identityUrl = () => nodeIdentityUrl(configServer);
 
   function connect(): void {
+    usageNegotiated = false;
+    usageInFlight = false;
     router.setMcpAvailable(false);
     const auth = credentials;
     /*
@@ -1487,6 +1529,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         commandPermissionsNegotiated =
           commandExecutionsNegotiated && frame.value.commandPermissions;
         sessionConsoleSupported = !!channel && frame.value.sessionConsole === true;
+        usageNegotiated = !!channel && frame.value.usageSnapshots === true;
+        usageInFlight = false;
+        pumpUsage();
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
         if (socket !== active || active.readyState !== WebSocket.OPEN) return;
@@ -1506,6 +1551,21 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           void finishSessionReconnect().catch((error: unknown) =>
             warn(`Session recovery failed: ${errorMessage(error)}`),
           );
+        }
+        return;
+      }
+      if (frame.value.type === "usage_ack") {
+        if (!usageNegotiated || !channel) {
+          active.close(1008, "Unexpected usage acknowledgment");
+          return;
+        }
+        try {
+          usageJournal?.acknowledge(usageHostId(), frame.value.throughSequence);
+          usageInFlight = false;
+          pumpUsage();
+        } catch (error) {
+          warn(errorMessage(error));
+          active.close(1008, "Invalid usage acknowledgment");
         }
         return;
       }
@@ -1862,6 +1922,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     const payload = JSON.stringify(NodeToHostMessageSchema.parse(message));
     if (
       (message.type.startsWith("command_execution_") ||
+        message.type === "usage_snapshots" ||
         message.type === "lead_prompt_receipt") &&
       target.bufferedAmount + Buffer.byteLength(payload) * 2 + 2048 >
         (message.type === "command_execution_output"
@@ -1987,6 +2048,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         });
     }
     commands.flush();
+    usageInFlight = false;
+    pumpUsage();
     if (credentials.authProtocol === MUTUAL_AUTH_PROTOCOL)
       leadDeliveries.flush(credentials.host.hostId);
     send({
@@ -2038,6 +2101,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       journal.close();
       leadDeliveries.close();
       sessionJournal.close();
+      usageJournal?.close();
       journalsClosed = true;
     }
     if (errors.length === 1) throw errors[0];

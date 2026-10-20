@@ -42,6 +42,55 @@ describe("SessionCreditReader", () => {
     await fs.rm(home, { recursive: true, force: true });
   });
 
+  it("exposes cumulative checkpoint and shutdown tokens without adding cache or reasoning twice", async () => {
+    await fs.writeFile(
+      events,
+      JSON.stringify({
+        type: "session.usage_checkpoint",
+        timestamp: "2026-10-19T10:00:00Z",
+        data: {
+          totalNanoAiu: 2e9,
+          accountingSnapshot: {
+            modelMetrics: {
+              model: {
+                usage: {
+                  inputTokens: 100,
+                  outputTokens: 50,
+                  cacheReadTokens: 60,
+                  reasoningTokens: 20,
+                },
+              },
+            },
+          },
+        },
+      }) + "\n",
+    );
+    await expect(reader.read()).resolves.toBe(2);
+    expect(reader.accounting).toMatchObject({
+      totalTokens: 150,
+      aiCredits: 2,
+      cacheReadTokens: 60,
+      source: "copilot-checkpoint",
+    });
+    await fs.appendFile(
+      events,
+      JSON.stringify({
+        type: "session.shutdown",
+        timestamp: "2026-10-19T11:00:00Z",
+        data: {
+          totalNanoAiu: 3e9,
+          modelMetrics: { model: { usage: { inputTokens: 200, outputTokens: 50 } } },
+        },
+      }) + "\n",
+    );
+    await expect(reader.read()).resolves.toBe(3);
+    expect(reader.accounting).toMatchObject({
+      totalTokens: 250,
+      aiCredits: 3,
+      source: "copilot-shutdown",
+    });
+  });
+
   it("converts a real native checkpoint's nano-AIU to AI credits", async () => {
     await fs.writeFile(
       events,

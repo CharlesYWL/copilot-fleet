@@ -136,6 +136,8 @@ import {
   PrMaintenanceError,
   type PrMaintenanceOperationalReview,
 } from "./pr-maintenance-store.js";
+import { UsageStore } from "./usage-store.js";
+import type { UsageStreamMetadata } from "@fleet/protocol";
 import { WorkerResumeStore } from "./worker-resume-store.js";
 import {
   DEFAULT_NOTIFICATION_LIFECYCLE_ENABLED,
@@ -556,6 +558,7 @@ export class FleetStore {
    */
   private readonly heartbeats = new Map<string, string>();
   readonly commands: CommandExecutionStore;
+  readonly usage: UsageStore;
   readonly sessionConsole: SessionConsoleStore;
   readonly localAgent: LocalAgentStore;
   readonly prMaintenance: PrMaintenanceStore;
@@ -1076,6 +1079,17 @@ export class FleetStore {
         ('orchestrator.model.copilot',COALESCE((SELECT value FROM settings WHERE key='defaults.model'),'')),
         ('orchestrator.reasoningEffort',COALESCE((SELECT value FROM settings WHERE key='defaults.reasoningEffort'),''));
     `);
+    this.usage = new UsageStore(
+      this.db,
+      (nodeId, sessionId) => {
+        const session = this.getSession(sessionId);
+        if (session && session.nodeId !== nodeId)
+          throw new Error("Usage session ownership mismatch");
+        return session ? this.usageMetadata(session) : undefined;
+      },
+      (work) => this.writeAtomically(work),
+      () => this.listSessions().map((session) => this.usageMetadata(session)),
+    );
     this.sessionConsole = new SessionConsoleStore(this.db);
     this.commands = new CommandExecutionStore(this.db, (work) =>
       this.writeAtomically(work),
@@ -2305,6 +2319,25 @@ export class FleetStore {
     };
   }
 
+  private usageMetadata(session: FleetSession): UsageStreamMetadata {
+    const lead = session.runRole === "lead";
+    const taskId = lead ? "__shared_orchestrator__" : session.runId || "__standalone__";
+    return {
+      nodeId: session.nodeId,
+      nodeName: session.nodeName,
+      sessionId: session.id,
+      sessionName: session.name || `Session ${session.id.slice(0, 8)}`,
+      backend: session.agentParams?.kind ?? "copilot",
+      role: session.runRole || "standalone",
+      taskId,
+      taskName: lead
+        ? "Shared Orchestrator usage"
+        : session.runId
+          ? this.getRun(session.runId)?.name || "Deleted task"
+          : "Standalone sessions",
+    };
+  }
+
   /**
    * A portable snapshot of this Host: catalog, transcripts, settings, and the
    * hashes Nodes authenticate with. The caller supplies the enrollment token
@@ -2320,6 +2353,7 @@ export class FleetStore {
       version: BACKUP_VERSION,
       exportedAt: new Date().toISOString(),
       commandExecutionData: this.commands.exportBackup(),
+      usageData: this.usage.exportBackup(),
       enrollmentToken: input.enrollmentToken,
       ...(input.publicUrl ? { publicUrl: input.publicUrl } : {}),
       tunnel: input.tunnel ?? this.getTunnelBackupSettings(),
@@ -2846,6 +2880,7 @@ export class FleetStore {
     // backup with the one workspace nothing is written to work without.
     this.seedChatsWorkspace();
     this.commands.importBackup(parsed.commandExecutionData);
+    this.usage.importBackup(parsed.usageData);
     this.retireReplayedLocalBriefs();
   }
 
@@ -6577,6 +6612,8 @@ export class FleetStore {
         "Release settled maintenance before deleting its conversation.",
       );
     }
+    const retainedUsageSession = this.getSession(id);
+    if (retainedUsageSession) this.usage.retain(this.usageMetadata(retainedUsageSession));
     this.statement("DELETE FROM notification_preferences WHERE session_id=?").run(id);
     this.statement("DELETE FROM events WHERE session_id=?").run(id);
     this.noteEventWrite(id);

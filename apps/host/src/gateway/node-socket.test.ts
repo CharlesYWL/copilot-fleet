@@ -475,6 +475,95 @@ describe("node gateway mutual authentication", () => {
     socket.close();
   });
 
+  it("persists negotiated usage snapshots before acknowledging and deduplicates retries", async () => {
+    const { keys, receipt } = await enrollNode();
+    const { socket, channel } = await handshake({
+      nodeId: receipt.nodeId,
+      keys,
+      inventory: { capabilities: [...registration.capabilities, "usage-snapshots-v1"] },
+    });
+    const welcome = channel.open(
+      (await nextFrame(socket)) as unknown as AuthenticatedEnvelope,
+    );
+    expect(welcome.ok && JSON.parse(welcome.plaintext)).toMatchObject({
+      usageSnapshots: true,
+    });
+    const headers = { cookie: owner.cookie(), "x-csrf-token": await csrfFor(owner) };
+    const workspace = (
+      await app.inject({
+        method: "POST",
+        url: "/api/workspaces",
+        headers,
+        payload: { name: "Usage workspace", description: "" },
+      })
+    ).json() as { id: string };
+    const placement = (
+      await app.inject({
+        method: "POST",
+        url: "/api/placements",
+        headers,
+        payload: {
+          workspaceId: workspace.id,
+          nodeId: receipt.nodeId,
+          localPath: "/repo",
+        },
+      })
+    ).json() as { id: string };
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/sessions",
+      headers,
+      payload: {
+        placementId: placement.id,
+        prompt: "Fixture",
+        name: "Usage worker",
+        yolo: false,
+      },
+    });
+    expect(created.statusCode).toBe(202);
+    const session = created.json() as { id: string };
+    const packet = {
+      type: "usage_snapshots",
+      snapshots: [
+        {
+          id: "usage-1",
+          sequence: 1,
+          sessionId: session.id,
+          accounting: {
+            nativeSessionId: "native",
+            counterId: "native",
+            source: "fixture",
+            observedAt: "2026-10-19T12:00:00Z",
+            aiCredits: 1.25,
+            totalTokens: 200,
+          },
+        },
+      ],
+    };
+    const sendAndReadAck = async () => {
+      socket.send(JSON.stringify(channel.seal(JSON.stringify(packet))));
+      for (let i = 0; i < 5; i++) {
+        const opened = channel.open(
+          (await nextFrame(socket)) as unknown as AuthenticatedEnvelope,
+        );
+        if (opened.ok && JSON.parse(opened.plaintext).type === "usage_ack")
+          return JSON.parse(opened.plaintext);
+      }
+      throw new Error("Usage acknowledgment missing");
+    };
+    expect(await sendAndReadAck()).toMatchObject({ throughSequence: 1 });
+    expect(await sendAndReadAck()).toMatchObject({ throughSequence: 1 });
+    const report = (
+      await app.inject({
+        method: "GET",
+        url: "/api/usage",
+        headers: { cookie: owner.cookie() },
+      })
+    ).json() as { totals: { aiCredits: number; totalTokens: number } };
+    expect(report.totals).toMatchObject({ aiCredits: 1.25, totalTokens: 200 });
+    socket.close();
+  });
+
   it("carries the Node's inventory sealed, and welcomes it back", async () => {
     const { keys, receipt } = await enrollNode();
     const { socket, channel } = await handshake({

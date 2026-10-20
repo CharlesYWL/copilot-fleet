@@ -805,6 +805,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     });
     child.on("exit", (code, signal) => {
       this.usageReporter.close?.();
+      void this.usageReporter
+        .flush?.()
+        .then(() => this.usageReporter.flush?.())
+        .catch(() => undefined);
       this.denyPendingPermissions();
       this.unprompted.clear();
       if (!this.stopping && !this.hasTerminated) {
@@ -905,7 +909,11 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     this.assertActive();
     this.captureConfigOptions(this.configOptions);
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
-    await this.usageReporter.start?.(this.agentSessionId);
+    await this.usageReporter.start?.(
+      this.agentSessionId,
+      false,
+      Boolean(resumeAgentSessionId),
+    );
     this.assertActive();
     if (resumeAgentSessionId) {
       this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
@@ -1048,7 +1056,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         this.endHeldTurn(turn);
         return;
       }
-      await this.usageReporter.afterPrompt?.();
+      await this.usageReporter.afterPrompt?.(response);
       this.emit("turn_complete", { stopReason: response.stopReason });
       this.prompting = false;
       this.emit("state", { state: "idle", activity: "Ready for follow-up" });
@@ -1301,7 +1309,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       if (announce && !this.startupAborted) {
         try {
           await Promise.race([
-            this.usageReporter.flush?.() ?? Promise.resolve(),
+            (this.usageReporter.flush?.() ?? Promise.resolve()).then(() =>
+              this.usageReporter.flush?.(),
+            ),
             new Promise<void>((resolve) => {
               if (this.startupAborted) resolve();
               else this.abortStartupWait = resolve;

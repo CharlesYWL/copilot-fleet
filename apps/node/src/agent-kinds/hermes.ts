@@ -3,7 +3,7 @@ import { z } from "zod";
 import { errorMessage, type AgentParams } from "@fleet/protocol";
 import type { LogLevel } from "@fleet/protocol/log-buffer";
 import { agentOutput, findAgentCommand } from "../copilot-launch.js";
-import { acpContextUsage } from "../context-usage.js";
+import { HermesUsageReporter } from "./hermes-usage.js";
 import type {
   AgentKindAdapter,
   AgentLaunch,
@@ -154,17 +154,6 @@ export class HermesAgentKind implements AgentKindAdapter {
   }
 
   usage(context: UsageContext): UsageReporter {
-    return {
-      onUpdate(update) {
-        if (update.sessionUpdate !== "usage_update") return false;
-        const model = context.model();
-        context.report({
-          contextTokens: update.used,
-          contextWindow: update.size > 0 ? update.size : null,
-          context: acpContextUsage(update.used, update.size, model),
-        });
-        return true;
-      },
-    };
+    return new HermesUsageReporter(context, this.params.profile);
   }
 }
