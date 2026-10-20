@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { UsageReport } from "@fleet/protocol";
 import { UsagePage, usageQuery } from "./UsagePage";
@@ -39,8 +39,14 @@ describe("UsagePage", () => {
   it("shows independent totals, reporting coverage and machine filters", async () => {
     vi.mocked(api).mockResolvedValue(report);
     render(<UsagePage />);
-    expect((await screen.findAllByText("300")).length).toBe(2);
-    expect(screen.getAllByText("2.5").length).toBe(2);
+    expect(
+      within(await screen.findByRole("region", { name: "Total tokens" })).getByText(
+        "300",
+      ),
+    ).toBeTruthy();
+    expect(
+      within(screen.getByRole("region", { name: "AI credits" })).getByText("2.5"),
+    ).toBeTruthy();
     fireEvent.change(screen.getByLabelText("Machine"), { target: { value: "n1" } });
     await waitFor(() =>
       expect(api).toHaveBeenLastCalledWith(
@@ -82,6 +88,201 @@ describe("UsagePage", () => {
         role: "",
       }),
     ).toThrow(/date/i);
+  });
+  it("uses English report sections and compact numbers with exact accessible values", async () => {
+    vi.mocked(api).mockResolvedValue({
+      ...report,
+      totals: { ...amounts, totalTokens: 100_572_259 },
+      rows: [
+        {
+          ...amounts,
+          totalTokens: 100_572_259,
+          key: "2026-10-19",
+          label: "2026-10-19",
+          sessions: 2,
+        },
+      ],
+    });
+    render(<UsagePage />);
+    expect(await screen.findByRole("heading", { name: "Usage report" })).toBeTruthy();
+    const total = await screen.findByRole("region", { name: "Total tokens" });
+    const value = within(total).getByText("100.57M");
+    expect(value.getAttribute("title")).toBe("100,572,259 tokens");
+    expect(value.getAttribute("aria-label")).toBe("100,572,259 tokens");
+    expect(screen.getByRole("heading", { name: "Daily usage" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Reporting scope" })).toBeTruthy();
+  });
+  it("loads daily totals alongside machine groups using the same filters and dates", async () => {
+    sessionStorage.setItem(
+      "fleet.usage.filters",
+      JSON.stringify({
+        period: "custom",
+        from: "2026-10-18",
+        to: "2026-10-20",
+        groupBy: "machine",
+        nodeId: "n1",
+        taskId: "t1",
+        backend: "copilot",
+        role: "lead",
+      }),
+    );
+    vi.mocked(api).mockImplementation(async (path) => {
+      const query = new URL(String(path), "http://localhost").searchParams;
+      if (query.get("groupBy") !== "day") return report;
+      return {
+        ...report,
+        rows: [
+          {
+            ...amounts,
+            totalTokens: 12_345,
+            key: "2026-10-19",
+            label: "2026-10-19",
+            sessions: 1,
+          },
+          {
+            ...amounts,
+            totalTokens: 50_000,
+            key: "__opening__",
+            label: "Opening balances · date unknown",
+            sessions: 1,
+          },
+          {
+            ...amounts,
+            totalTokens: 25_000,
+            key: "__unallocated_time__",
+            label: "Intervals spanning multiple days",
+            sessions: 1,
+          },
+        ],
+      };
+    });
+    render(<UsagePage />);
+    expect(
+      await screen.findByRole("img", { name: "2026-10-19: 12,345 tokens" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Laptop", { selector: "td" })).toBeTruthy();
+    expect(screen.getByText(/opening balances/).textContent).toContain("50.00K tokens");
+    expect(screen.getByText(/spanning multiple days/).textContent).toContain(
+      "25.00K tokens",
+    );
+    expect(screen.queryByRole("img", { name: /Opening balances/ })).toBeNull();
+    const queries = vi
+      .mocked(api)
+      .mock.calls.map(([path]) => new URL(String(path), "http://localhost").searchParams);
+    expect(queries).toHaveLength(2);
+    expect(queries.map((query) => query.get("groupBy")).sort()).toEqual([
+      "day",
+      "machine",
+    ]);
+    for (const key of ["from", "to", "timeZone", "nodeId", "taskId", "backend", "role"]) {
+      expect(queries[0]!.get(key)).toBeTruthy();
+      expect(queries[0]!.get(key)).toBe(queries[1]!.get(key));
+    }
+  });
+  it("keeps overlapping token details independent rather than inventing composition shares", async () => {
+    vi.mocked(api).mockResolvedValue({
+      ...report,
+      totals: {
+        ...amounts,
+        totalTokens: 1_000,
+        inputTokens: 900,
+        outputTokens: 100,
+        cacheReadTokens: 800,
+        reasoningTokens: 50,
+      },
+    });
+    render(<UsagePage />);
+    const details = await screen.findByRole("region", { name: "Token details" });
+    expect(within(details).getByText("Cache read")).toBeTruthy();
+    expect(within(details).getByText("800")).toBeTruthy();
+    expect(within(details).getByText(/can overlap/)).toBeTruthy();
+    expect(within(details).queryByText(/%/)).toBeNull();
+  });
+  it("shows daily readings as unavailable rather than zero when only credits exist", async () => {
+    vi.mocked(api).mockResolvedValue({
+      ...report,
+      rows: [
+        {
+          ...amounts,
+          totalTokens: null,
+          key: "2026-10-19",
+          label: "2026-10-19",
+          sessions: 1,
+        },
+      ],
+    });
+    render(<UsagePage />);
+    expect(
+      await screen.findByRole("img", { name: "2026-10-19: token reading unavailable" }),
+    ).toBeTruthy();
+    expect(api).toHaveBeenCalledTimes(1);
+  });
+  it("refreshes cumulative readings every five seconds and stops polling on unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(api).mockResolvedValue(report);
+      let view: ReturnType<typeof render>;
+      await act(async () => {
+        view = render(<UsagePage />);
+      });
+      expect(api).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(api).toHaveBeenCalledTimes(2);
+      view!.unmount();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(api).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("ignores stale responses after a filter change", async () => {
+    let finishOldRequest!: (value: UsageReport) => void;
+    vi.mocked(api)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishOldRequest = resolve;
+          }),
+      )
+      .mockResolvedValue(report);
+    render(<UsagePage />);
+    const signal = vi.mocked(api).mock.calls[0]![1]!.signal!;
+    fireEvent.change(screen.getByLabelText("Period"), { target: { value: "all" } });
+    await screen.findByRole("region", { name: "Total tokens" });
+    expect(signal.aborted).toBe(true);
+    await act(async () => {
+      finishOldRequest({ ...report, totals: { ...amounts, totalTokens: 999_000 } });
+    });
+    expect(screen.queryByText("999.00K")).toBeNull();
+    expect(
+      within(screen.getByRole("region", { name: "Total tokens" })).getByText("300"),
+    ).toBeTruthy();
+  });
+  it("retains the last successful report and identifies it when a live refresh fails", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(api)
+        .mockResolvedValueOnce(report)
+        .mockRejectedValue(new Error("Host unavailable"));
+      let view: ReturnType<typeof render>;
+      await act(async () => {
+        view = render(<UsagePage />);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(screen.getByRole("alert").textContent).toContain(
+        "showing the last successful report",
+      );
+      expect(
+        within(screen.getByRole("region", { name: "Total tokens" })).getByText("300"),
+      ).toBeTruthy();
+      view!.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it("surfaces a report request failure", async () => {
     vi.mocked(api).mockRejectedValue(new Error("Host unavailable"));
