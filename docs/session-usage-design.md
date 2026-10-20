@@ -331,6 +331,22 @@ The browser refreshes every five seconds while mounted, cancels obsolete
 requests, and retains filter choices in session storage. Its last-reported time
 is an overall timestamp, not a separate freshness indicator for every metric.
 
+The English-language report uses Fleet's dark theme and decimal K/M/B units,
+with exact readings in accessible labels and hover titles. Headline values show
+tokens, AI credits, and token-reporting session coverage; no model-price estimate
+is inferred. Optional token details use independent bars because their counters
+can overlap, rather than a stacked composition chart.
+
+The daily chart stays visible when the breakdown is grouped by machine, task,
+or session. In those modes the browser concurrently requests a second report
+with `groupBy=day`, preserving the same filters, timezone, and exact range
+boundaries. Day grouping reuses its single response. The browser replaces the
+pair together and ignores responses from aborted selections. Separate requests
+are not a transactionally frozen snapshot: new readings can arrive between Host
+queries. Opening and multi-day buckets stay outside the dated chart, and missing
+days are not invented as zero. A failed live refresh retains the last successful
+report with an explicit error notice.
+
 ## Retention, backups, and privacy
 
 Usage tables deliberately have no cascading foreign key to disposable sessions.

@@ -9,6 +9,9 @@ Open **Usage** in the Fleet sidebar to review AI credits and token consumption a
 
 - **AI credits** are Copilot-reported credits. Hermes has no Copilot credit reading; unavailable credits are not a claim of zero consumption.
 - **Total tokens** combines reported Copilot and Hermes consumption. Coverage shows how many sessions have supplied token and credit readings.
+- The English-language dark report shows headline totals, independent token-detail counters, a daily chart, the selected breakdown, and reporting-scope notes. All filters apply to both the chart and the table, even when grouping the table by machine, task, or session.
+- Token and credit values use decimal **K / M / B** units (1,000 / 1,000,000 / 1,000,000,000), with two decimal places for abbreviated values. Hover or use a screen reader to read the underlying value. Rounded displayed values may not sum exactly.
+- The daily chart shows allocated daily token totals only. Opening balances and intervals spanning multiple days are listed separately, never assigned an invented date. Missing days are not confirmed zero usage. Long histories scroll horizontally.
 - Input, output, cache read/write, and reasoning are optional source-reported details. They are not necessarily additive: cached input may already be included in input, and reasoning may already be included in output.
 - Context-window occupancy is deliberately excluded from consumption totals.
 
