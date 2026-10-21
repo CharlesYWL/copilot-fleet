@@ -50,6 +50,8 @@ describe("nodeReachable", () => {
     expect(nodeReachable("GET", "/api/backup")).toBe(false);
     expect(nodeReachable("GET", "/api/sessions/s1/events")).toBe(false);
     expect(nodeReachable("DELETE", "/api/workspaces/w1")).toBe(false);
+    expect(nodeReachable("GET", "/api/usage/backfill")).toBe(false);
+    expect(nodeReachable("POST", "/api/usage/backfill")).toBe(false);
     // Deeper paths must not ride in on a prefix.
     expect(nodeReachable("GET", "/api/placements/p1/sessions")).toBe(false);
   });
@@ -216,6 +218,35 @@ describe("guarded server", () => {
     await app.close();
   });
 
+  it("protects credit backfill with sign-in, CSRF, origin, and administrator authorization", async () => {
+    const request = {
+      method: "POST" as const,
+      url: "/api/usage/backfill",
+      payload: { previewId: "a".repeat(64) },
+    };
+    expect((await app.inject(request)).statusCode).toBe(401);
+    const missingCsrf = await app.inject({ ...request, headers: { cookie } });
+    expect(missingCsrf.statusCode).toBe(403);
+    expect(missingCsrf.json().error).toMatch(/csrf/i);
+    expect(
+      (
+        await app.inject({
+          ...request,
+          headers: {
+            cookie,
+            "x-csrf-token": csrfToken,
+            origin: "https://evil.example.com",
+          },
+        })
+      ).statusCode,
+    ).toBe(403);
+    const nonAdministrator = await app.inject({
+      ...request,
+      headers: { cookie, "x-csrf-token": csrfToken },
+    });
+    expect(nonAdministrator.statusCode).toBe(403);
+    expect(nonAdministrator.json().error).toMatch(/administrator/i);
+  });
   it("answers health and the sign-in question before anyone has signed in", async () => {
     expect((await app.inject({ method: "GET", url: "/api/health" })).statusCode).toBe(
       200,

@@ -1,5 +1,5 @@
 import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
@@ -137,6 +137,7 @@ import {
   type PrMaintenanceOperationalReview,
 } from "./pr-maintenance-store.js";
 import { UsageStore } from "./usage-store.js";
+import { UsageBackfillStore } from "./usage-backfill.js";
 import type { UsageStreamMetadata } from "@fleet/protocol";
 import { WorkerResumeStore } from "./worker-resume-store.js";
 import {
@@ -559,6 +560,7 @@ export class FleetStore {
   private readonly heartbeats = new Map<string, string>();
   readonly commands: CommandExecutionStore;
   readonly usage: UsageStore;
+  readonly usageBackfill: UsageBackfillStore;
   readonly sessionConsole: SessionConsoleStore;
   readonly localAgent: LocalAgentStore;
   readonly prMaintenance: PrMaintenanceStore;
@@ -1090,6 +1092,20 @@ export class FleetStore {
       (work) => this.writeAtomically(work),
       () => this.listSessions().map((session) => this.usageMetadata(session)),
     );
+    this.usageBackfill = new UsageBackfillStore({
+      db: this.db,
+      usage: this.usage,
+      sessions: () =>
+        this.listSessions().map((session) => ({
+          metadata: this.usageMetadata(session),
+          nativeSessionId: session.agentSessionId,
+          state: session.state,
+          aiCredits: session.usage?.aiCredits,
+          accountingNativeSessionId: session.usage?.accounting?.nativeSessionId,
+        })),
+      transaction: (work) => this.writeAtomically(work),
+      backup: () => this.backupBeforeUsageBackfill(),
+    });
     this.sessionConsole = new SessionConsoleStore(this.db);
     this.commands = new CommandExecutionStore(this.db, (work) =>
       this.writeAtomically(work),
@@ -2317,6 +2333,25 @@ export class FleetStore {
       enabledProviders,
       ids: devtunnel ? { devtunnel } : {},
     };
+  }
+
+  private backupBeforeUsageBackfill(): string | null {
+    if (!this.dataDirectory) return null;
+    const filename = `usage-backfill-${randomUUID()}.db`;
+    const path = join(this.dataDirectory, filename);
+    // The directory inherits the Host's protected ACL on Windows; explicitly
+    // create the new file as owner-only on Unix, before SQLite writes any data.
+    closeSync(openSync(path, "wx", 0o600));
+    try {
+      this.db.prepare("VACUUM INTO ?").run(path);
+      return filename;
+    } catch (error) {
+      rmSync(path, { force: true });
+      throw new Error(
+        "Could not create the pre-backfill database backup. No credits were imported.",
+        { cause: error },
+      );
+    }
   }
 
   private usageMetadata(session: FleetSession): UsageStreamMetadata {
