@@ -2679,11 +2679,11 @@ describe("PR maintenance with durable commands", () => {
     f.store.setSessionDispatchAttempt(f.lead.id, previous);
     f.store.prMaintenance.beginWake(f.lead.id, previous.commandId);
     f.store.prMaintenance.chargeWake(f.lead.id, previous.commandId, {
-      requests: 40,
+      requests: 100,
       milliseconds: 0,
     });
     const claim = () => {
-      const result = tools.getPrMaintenance({ takeDue: true, reserveRequests: 40 });
+      const result = tools.getPrMaintenance({ takeDue: true, reserveRequests: 100 });
       expect(result.ok, result.text).toBe(true);
       return JSON.parse(result.text);
     };
@@ -2724,7 +2724,7 @@ describe("PR maintenance with durable commands", () => {
     expect(f.store.getSessionDispatchAttempt(f.lead.id)).toEqual(accepted);
     expect(claim()).toMatchObject({
       record: { id: record.id },
-      observationAllowance: { requests: 40 },
+      observationAllowance: { requests: 100 },
       allowance: { requests: 0 },
     });
     event(2);
@@ -2744,7 +2744,7 @@ describe("PR maintenance with durable commands", () => {
     });
     expect(claim()).toMatchObject({
       record: { id: record.id },
-      observationAllowance: { requests: 40 },
+      observationAllowance: { requests: 100 },
     });
     expect(receive(receipt)).toBe(false);
     expect(f.store.getSessionDispatchAttempt(f.lead.id)?.commandId).toBe(
@@ -2764,6 +2764,7 @@ describe("PR maintenance with durable commands", () => {
       commandDelay?: number;
       handback?: boolean;
       deferPreparation?: boolean;
+      reservedRequests?: number;
     } = {},
   ) {
     if (timing.preparationMs || timing.approvalDelay || timing.commandDelay)
@@ -2876,7 +2877,7 @@ describe("PR maintenance with durable commands", () => {
     );
     const claim = await call("fleet_get_pr_maintenance", {
       takeDue: true,
-      reserveRequests: 39,
+      reserveRequests: timing.reservedRequests ?? 39,
     });
     expect(claim.ok, claim.text).toBe(true);
     const request = {
@@ -3010,6 +3011,31 @@ describe("PR maintenance with durable commands", () => {
       observation,
     };
   }
+
+  it.each([0, 100, 101])(
+    "keeps the full 100-request reservation charged when a command receipt reports %i used",
+    async (requestsConsumed) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const h = await observationCommand(":memory:", true, undefined, 0, {
+        reservedRequests: 100,
+      });
+      expect(h.execution.descriptor!.observationBudget?.requests).toBe(100);
+      const result = deadlineResult();
+      result.requestsConsumed = result.observation.requestsConsumed = requestsConsumed;
+      h.finish(result);
+      h.completionTurn();
+      const saved = await h.call(
+        "fleet_checkpoint_pr_maintenance",
+        h.checkpoint(result.observation),
+      );
+      expect(saved.ok, saved.text).toBe(requestsConsumed <= 100);
+      expect(
+        h.f.store.prMaintenance.remainingWake(h.f.lead.id, h.first.delivery.deliveryId)
+          .requests,
+      ).toBe(0);
+      expect(h.f.store.prMaintenance.get(h.record.id)!.readyFingerprint).toBeUndefined();
+    },
+  );
 
   function receiptPath() {
     const directory = resolve(".test-tmp", randomUUID());
@@ -4052,7 +4078,7 @@ describe("PR maintenance with durable commands", () => {
       expect(record.counters).toEqual(h.record.counters);
       expect(
         store.prMaintenance.remainingWake(h.f.lead.id, h.first.delivery.deliveryId),
-      ).toEqual({ requests: 1, visits: 4, milliseconds: 0 });
+      ).toEqual({ requests: 61, visits: 4, milliseconds: 0 });
       const restored = open();
       restored.replaceHostBackup(store.exportHostBackup({ enrollmentToken: "" }));
       expect(restored.prMaintenance.get(record.id)?.lastAttempt).toEqual(
@@ -4102,7 +4128,7 @@ describe("PR maintenance with durable commands", () => {
     });
     expect(
       h.f.store.prMaintenance.remainingWake(h.f.lead.id, h.first.delivery.deliveryId),
-    ).toEqual({ visits: 4, requests: 1, milliseconds: 0 });
+    ).toEqual({ visits: 4, requests: 61, milliseconds: 0 });
     expect(h.f.store.prMaintenance.beginWake(h.f.lead.id, nextTurn).visits).toBe(0);
     const retry = await h.call("fleet_checkpoint_pr_maintenance", args);
     expect(retry.ok, retry.text).toBe(true);

@@ -37,7 +37,7 @@ const repository = z
 export const PR_MAINTENANCE_SCHEMA_VERSION = 1;
 export const PR_MAINTENANCE_WAKE_LIMITS = Object.freeze({
   visits: 5,
-  requests: 40,
+  requests: 100,
   milliseconds: 300_000,
 });
 /**
@@ -497,7 +497,12 @@ export const PrMaintenanceObservationSchema = z
   .object({
     attemptedAt: time,
     complete: z.boolean(),
-    requestsConsumed: z.number().int().min(0).max(40).default(0),
+    requestsConsumed: z
+      .number()
+      .int()
+      .min(0)
+      .max(PR_MAINTENANCE_WAKE_LIMITS.requests)
+      .default(0),
     elapsedMs: z.number().int().min(0).max(1_000_000).default(0),
     helperState: z
       .json()
@@ -624,7 +629,7 @@ export const PrMaintenanceIncidentSchema = z
             id,
             wakeId: id,
             provenance: PrMaintenanceProvenanceSchema,
-            requests: z.number().int().min(1).max(40),
+            requests: z.number().int().min(1).max(PR_MAINTENANCE_WAKE_LIMITS.requests),
             reservedAt: time,
             state: z.enum(["reserved", "incomplete", "resolved", "rejected"]),
             receivedAt: time.optional(),
@@ -732,7 +737,7 @@ export const PrMaintenanceCheckpointSchema = z.discriminatedUnion("kind", [
       incidentId: id,
       resolutionId: id,
       provenance: PrMaintenanceProvenanceSchema,
-      requests: z.number().int().min(1).max(40),
+      requests: z.number().int().min(1).max(PR_MAINTENANCE_WAKE_LIMITS.requests),
     })
     .strict(),
   z
@@ -1558,7 +1563,7 @@ export const PrMaintenanceWakeSchema = z
             scopeKey: sha,
             claimedAt: time,
             deadlineAt: time,
-            requests: z.number().int().min(1).max(40),
+            requests: z.number().int().min(1).max(PR_MAINTENANCE_WAKE_LIMITS.requests),
             executionId: z.string().uuid().optional(),
             attemptId: z.string().uuid().optional(),
             receiptHash: sha.optional(),

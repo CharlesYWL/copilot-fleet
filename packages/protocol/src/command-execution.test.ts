@@ -17,6 +17,7 @@ import {
   commandApprovalExpiresAt,
   commandDigestPayload,
   CommandObservationClockSchema,
+  CommandObservationBudgetSchema,
   commandObservationClock,
 } from "./command-execution.js";
 import {
@@ -66,6 +67,15 @@ const body = {
 };
 
 describe("remote command contracts", () => {
+  it.each([100, 101])(
+    "bounds Host-owned command observation requests at %i",
+    (requests) => {
+      expect(
+        CommandObservationBudgetSchema.safeParse({ deadlineAt: at, requests }).success,
+      ).toBe(requests === 100);
+    },
+  );
+
   it("keeps F5 observation budgets Host-owned and immutable in the approval digest", () => {
     const observationBudget = { deadlineAt: at, requests: 39 };
     expect(RunCommandSchema.safeParse({ ...request, observationBudget }).success).toBe(

@@ -43,7 +43,7 @@ outside the skill folder so reinstalling the skill never erases it.
 
 - One authoritative `store.json` per state directory: exclusive lock directory, temp file
   plus flush plus rename, idempotent `--op` receipts, no automatic stale-lock takeover.
-- Bounded passes (5 visits, 40 provider requests, 5 minutes), oldest-due scan order with
+- Bounded passes (5 visits, 100 provider requests, 5 minutes), oldest-due scan order with
   carry-over, one active pass per state directory.
 - Modes `observe`, `answer`, `repair`. Repair and answer run in the current agent session:
   `plan` produces an immutable `prm.work-order/1`, the agent works it with

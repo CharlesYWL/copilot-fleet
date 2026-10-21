@@ -49,7 +49,7 @@ const input = (changes: Record<string, any> = {}) => ({
     number: 7,
   },
   budget: {
-    maxRequests: 40,
+    maxRequests: 100,
     deadlineAt: new Date(started + 120_000).toISOString(),
     maxBytes: 1_048_576,
   },
@@ -1569,7 +1569,7 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     expect(first.snapshot).toBeUndefined();
     const resumed = await run(data, input({ resume: first.resume }));
     expect(resumed.complete).toBe(true);
-    expect(resumed.requestsConsumed).toBeLessThanOrEqual(40);
+    expect(resumed.requestsConsumed).toBeLessThanOrEqual(100);
     expect(resumed.snapshot.actionableSources).toHaveLength(12);
     expect(resumed.observation.sources).toHaveLength(12);
   });
@@ -1641,7 +1641,7 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
 
   it("never carries verification credit when a full pass cannot fit the maximum request allowance", async () => {
     const data = fixtures();
-    data.policies = Array.from({ length: 31 }, (_, index) => ({
+    data.policies = Array.from({ length: 91 }, (_, index) => ({
       ...policy(),
       id: index + 1,
     }));
@@ -1656,15 +1656,15 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     const first = await run(data);
     expect(first).toMatchObject({
       complete: false,
-      requestsConsumed: 40,
-      progress: { phase: "verify", pages: 39, verifiedPages: 0 },
+      requestsConsumed: 100,
+      progress: { phase: "verify", pages: 99, verifiedPages: 0 },
       error: { code: "budget_exhausted" },
     });
     const later = await run(data, input({ resume: first.resume }));
     expect(later).toMatchObject({
       complete: false,
       requestsConsumed: 1,
-      progress: { phase: "verify", pages: 39, verifiedPages: 0 },
+      progress: { phase: "verify", pages: 99, verifiedPages: 0 },
       error: { code: "budget_exhausted" },
     });
     expect(later.snapshot).toBeUndefined();
@@ -1778,6 +1778,7 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
       code: "payload_overflow",
       limit: { kind: "items", stage: "response", actual: 201, maximum: 200 },
     });
+
     const overflow = await run(fixtures(), input(), () => ({
       status: 200,
       body: "x".repeat(1_048_576),
@@ -1803,6 +1804,25 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     expect(timed.error.code).toBe("deadline_exhausted");
     expect(timed.requestsConsumed).toBe(1);
   });
+
+  it.each([100, 101])(
+    "enforces the finite ADO maxRequests boundary at %i",
+    async (maxRequests) => {
+      const result = await run(
+        fixtures(),
+        input({ budget: { ...input().budget, maxRequests } }),
+      );
+      if (maxRequests === 100) {
+        expect(result.complete).toBe(true);
+        expect(result.requestsConsumed).toBeGreaterThan(0);
+        expect(result.requestsConsumed).toBeLessThanOrEqual(100);
+      } else {
+        expect(result.error.code).toBe("invalid_input");
+        expect(result.requestsConsumed).toBe(0);
+        expect(result.calls).toHaveLength(0);
+      }
+    },
+  );
 
   it("emits protocol-valid CLI input errors with no az installation/authentication", () => {
     const child = spawnSync(process.execPath, [helper], {

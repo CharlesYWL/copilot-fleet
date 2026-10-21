@@ -144,7 +144,7 @@ unrelated review, and never change the task state.
 - Idempotent operator actions (`requestId`), exact immutable batch prompts.
 - Full audit: observations, decisions, review history, hold history, batches,
   effects and findings.
-- Per-turn read limits (5 visits, 40 requests, 5 minutes) bound one
+- Per-turn read limits (5 visits, 100 requests, 5 minutes) bound one
   orchestrator turn; a manual review is always delivered in its own turn.
 
 Removed: batch/mutation budgets and Renew, continuation objects, `task_human_hold`,
