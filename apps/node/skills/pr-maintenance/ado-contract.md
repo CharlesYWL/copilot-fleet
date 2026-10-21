@@ -408,10 +408,10 @@ any separately authorized worker publication.
 ## Worker publication boundary
 
 This helper never mutates. Any repair stays with the existing retained worker and
-its authorized scope and budget:
+its authorized scope:
 
-Authenticated direction with explicit eligible continuation uses that existing
-grant, not a new ADO permission. Routine repair/verification/ordinary publication
+Authenticated design direction resumes maintenance under that existing grant, not
+a new ADO permission. Routine repair/verification/ordinary publication
 does not require identical authorization again; replies, evidenced resolutions,
 named reviewer requests and check retries remain off unless separately present
 in the grant. One-turn manual handback is Host-owned after correlated settlement,

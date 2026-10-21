@@ -816,6 +816,17 @@ export const PrMaintenanceCheckpointSchema = z.discriminatedUnion("kind", [
     })
     .strict(),
   z.object({ kind: z.literal("ready"), fingerprint: id, evidence: text }).strict(),
+  z
+    .object({
+      kind: z.literal("review_done"),
+      summary: text.describe(
+        "What the review found: why nothing is actionable now, or what it is waiting for.",
+      ),
+    })
+    .strict()
+    .describe(
+      "Conclude the current review with no routine work to dispatch and no design decision: the job becomes Idle until the next heartbeat, manual review or provider change.",
+    ),
 ]);
 export type PrMaintenanceCheckpoint = z.infer<typeof PrMaintenanceCheckpointSchema>;
 
@@ -827,7 +838,19 @@ export const PrMaintenanceOperatorActionSchema = z.discriminatedUnion("action", 
       requestId: z.string().uuid(),
       direction: text,
     })
-    .strict(),
+    .strict()
+    .describe(
+      "Queue routine work for the retained worker and start a review immediately. Idempotent by requestId.",
+    ),
+  z
+    .object({
+      action: z.literal("review"),
+      requestId: z.string().uuid(),
+    })
+    .strict()
+    .describe(
+      "Review now: refresh provider metadata and classify current feedback, regardless of the heartbeat interval. Idempotent by requestId.",
+    ),
   z
     .object({
       action: z.literal("resume"),
@@ -845,21 +868,15 @@ export const PrMaintenanceOperatorActionSchema = z.discriminatedUnion("action", 
     .strict(),
   z
     .object({
-      action: z.literal("renew"),
-      scope: PrMaintenanceScopeSchema.optional(),
-      budgets: PrMaintenanceBudgetsSchema.optional(),
-    })
-    .strict(),
-  z
-    .object({
       action: z.literal("direction"),
       decisionId: id,
       decisionVersion: z.number().int().positive(),
       direction: text,
-      resume: z.boolean().default(true),
-      continueEligible: z.boolean().default(false),
     })
-    .strict(),
+    .strict()
+    .describe(
+      "Answer the pending design decision. Recording it resumes maintenance with a fresh review; no separate Resume is needed.",
+    ),
 ]);
 export type PrMaintenanceOperatorAction = z.infer<
   typeof PrMaintenanceOperatorActionSchema
@@ -903,6 +920,7 @@ const authorizationSchema = z
     issuedAt: time,
     headSha: sha,
     scope: legacyScopeSchema,
+    /** Historical v1 allowances, retained for audit and no longer enforced. */
     budgets: PrMaintenanceBudgetsSchema,
     eligibilityEvidence: text.optional(),
     sourceProposal: z
@@ -912,54 +930,93 @@ const authorizationSchema = z
   })
   .strict();
 
-const pauseOriginSchema = z
+const workRequestSchema = z
   .object({
+    id: z.string().uuid(),
+    operatorId: id,
+    direction: text,
+    createdAt: time,
+    state: z.enum(["pending", "completed", "cancelled"]),
+    batchId: id.optional(),
+    settledAt: time.optional(),
+    reason: text.optional(),
+  })
+  .strict();
+
+/**
+ * The exceptional conditions that stop worker dispatch and new effects.
+ *
+ * A hold is only ever set by an explicit act (operator/lead Pause, a worker or
+ * task Stop, a manual takeover) or by a provider fact Fleet cannot work around
+ * (authentication/permission denial, a changed identity). Nothing else pauses
+ * maintenance: stale evidence, timing, task review and orchestrator restarts
+ * are handled by refreshing, not by holding.
+ */
+export const PrMaintenanceHoldKindSchema = z.enum([
+  "stopped",
+  "paused",
+  "access",
+  "identity",
+  "manual_control",
+]);
+export type PrMaintenanceHoldKind = z.infer<typeof PrMaintenanceHoldKindSchema>;
+
+const holdSchema = z
+  .object({
+    kind: PrMaintenanceHoldKindSchema,
+    reason: z.string().min(1).max(8_192),
     actor: z.enum(["lead", "operator", "node_console", "system"]),
     actorId: id,
     at: time,
   })
   .strict();
+export type PrMaintenanceHold = z.infer<typeof holdSchema>;
 
-const continuationSchema = z
+export const PrMaintenanceReviewSourceSchema = z.enum([
+  "enable",
+  "heartbeat",
+  "manual",
+  "worker_result",
+  "direction",
+  "resume",
+  "handback",
+  "recovery",
+  "migration",
+]);
+export type PrMaintenanceReviewSource = z.infer<typeof PrMaintenanceReviewSourceSchema>;
+
+/**
+ * One owed review: refresh provider state, then decide whether there is routine
+ * work, a genuine design decision, or nothing to do.
+ *
+ * At most one review is open per registration. Further requests coalesce into
+ * it, which is what keeps a heartbeat and a manual trigger from producing two
+ * reviews or two batches. A manual request never changes the heartbeat
+ * schedule; it only opens (or reuses) this request.
+ */
+const reviewSchema = z
   .object({
     id,
-    operatorId: id,
+    source: PrMaintenanceReviewSourceSchema,
     requestedAt: time,
-    expectedVersion: z.number().int().positive(),
-    authorityHash: id,
-    headSha: sha,
-    evidenceState: z.enum(["pinned", "refresh_required"]).default("pinned"),
-    state: z.enum(["checking", "handback", "consumed", "cancelled"]),
-    manualCommandId: id.optional(),
-    completedAt: time.optional(),
+    actorId: id.optional(),
+    /** Durable lead-prompt key that delivered this review, once queued. */
+    wakeKey: z.string().max(512).optional(),
     wakeQueuedAt: time.optional(),
-    settledAt: time.optional(),
-    reason: text.optional(),
-    batchId: id.optional(),
+    /** Set when a fresh observation for this review is recorded. */
+    claimedAt: time.optional(),
+    concludedAt: time.optional(),
+    outcome: z
+      .enum(["working", "decision", "idle", "terminal", "failed", "held", "abandoned"])
+      .optional(),
+    summary: z.string().max(8_192).optional(),
   })
   .strict();
+export type PrMaintenanceReview = z.infer<typeof reviewSchema>;
 
-export const PrMaintenanceEffectiveStateSchema = z
+const PrMaintenanceRegistrationV2Schema = z
   .object({
-    status: z.enum([
-      "checking",
-      "queued",
-      "running_manually",
-      "running",
-      "needs_decision",
-      "released",
-    ]),
-    reason: z.string(),
-    action: z.string(),
-  })
-  .strict();
-export type PrMaintenanceEffectiveState = z.infer<
-  typeof PrMaintenanceEffectiveStateSchema
->;
-
-export const PrMaintenanceRegistrationSchema = z
-  .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     id,
     version: z.number().int().positive(),
     generation: z.number().int().positive(),
@@ -971,33 +1028,16 @@ export const PrMaintenanceRegistrationSchema = z
     checkoutKey: id,
     bindingGeneration: count,
     eligibilityEvidence: text,
-    lifecycle: z.enum(["active", "paused", "merged", "closed"]),
-    pauseReason: z.string().max(8_192).default(""),
-    pauseOrigin: pauseOriginSchema.optional(),
-    pausedAt: time.optional(),
+    /** Provider terminal state; `active` covers every working phase. */
+    lifecycle: z.enum(["active", "merged", "closed"]),
+    hold: holdSchema.optional(),
+    holdHistory: z.array(holdSchema).max(100).default([]),
+    review: reviewSchema.optional(),
+    reviewHistory: z.array(reviewSchema).max(50).default([]),
     renewedAt: time,
-    pausedNoticeAt: time.optional(),
     ownershipReleasedAt: time.optional(),
     retentionReleasedBy: id.optional(),
-    continuation: continuationSchema.optional(),
-    continuationHistory: z.array(continuationSchema).max(100).optional(),
-    workRequests: z
-      .array(
-        z
-          .object({
-            id: z.string().uuid(),
-            operatorId: id,
-            direction: text,
-            createdAt: time,
-            state: z.enum(["pending", "completed", "cancelled"]),
-            batchId: id.optional(),
-            settledAt: time.optional(),
-            reason: text.optional(),
-          })
-          .strict(),
-      )
-      .max(100)
-      .default([]),
+    workRequests: z.array(workRequestSchema).max(100).default([]),
     manualControl: z
       .object({
         operatorId: id.optional(),
@@ -1014,20 +1054,6 @@ export const PrMaintenanceRegistrationSchema = z
       .optional(),
     authorization: authorizationSchema,
     authorizationHistory: z.array(authorizationSchema).max(100).default([]),
-    resumeHistory: z
-      .array(
-        z
-          .object({
-            actor: z.enum(["lead", "operator"]),
-            actorId: id,
-            resumedAt: time,
-            pauseReason: z.string().max(8_192),
-            pauseOrigin: pauseOriginSchema.optional(),
-          })
-          .strict(),
-      )
-      .max(100)
-      .default([]),
     decision: PrMaintenanceDecisionSchema.optional(),
     decisionHistory: z.array(PrMaintenanceDecisionSchema).max(100).default([]),
     observation: PrMaintenanceObservationSchema.optional(),
@@ -1043,6 +1069,7 @@ export const PrMaintenanceRegistrationSchema = z
       .max(PR_MAINTENANCE_RECOVERY_LIMITS.incidents)
       .default([]),
     lastReconciliationEvidence: text.optional(),
+    /** Next unattended heartbeat check. Manual reviews never write it. */
     nextCheckAt: time,
     readyFingerprint: id.optional(),
     counters: z
@@ -1052,8 +1079,8 @@ export const PrMaintenanceRegistrationSchema = z
         mutationAttempts: count.default(0),
         consecutiveFailures: count.default(0),
         totalFailures: count.default(0),
-        scanStalls: count.default(0),
-        reconciliationStalls: count.default(0),
+        /** Batches dispatched since the last human direction (activity only, never a limit). */
+        dispatchesSinceDirection: count.default(0),
       })
       .strict(),
     findings: z.array(PrMaintenanceFindingSchema).max(200).default([]),
@@ -1067,11 +1094,122 @@ export const PrMaintenanceRegistrationSchema = z
       .default([]),
     batches: z.array(PrMaintenanceBatchSchema).max(100).default([]),
     actions: z.array(PrMaintenanceEffectSchema).max(200).default([]),
+    /** v1 continuation, resume and pause audit, preserved verbatim on upgrade. */
+    legacyAudit: z.record(z.string(), z.unknown()).optional(),
     createdAt: time,
     updatedAt: time,
   })
   .strict();
-export type PrMaintenanceRegistration = z.infer<typeof PrMaintenanceRegistrationSchema>;
+
+/** The stored v1 registration, accepted only to upgrade it. */
+const legacyRegistrationSchema = z
+  .object({ schemaVersion: z.literal(1) })
+  .passthrough()
+  .transform((value) => upgradeLegacyRegistration(value as Record<string, unknown>));
+
+/** Holds the v1 `pauseReason` strings map onto. Unknown reasons become `paused`. */
+const legacyHoldKind = (reason: string): PrMaintenanceHoldKind =>
+  reason === "stopped"
+    ? "stopped"
+    : reason === "authorization_failed"
+      ? "access"
+      : ["remote_identity_changed", "continuation_identity_changed"].includes(reason)
+        ? "identity"
+        : reason === "manual_control"
+          ? "manual_control"
+          : "paused";
+
+/**
+ * Converts a v1 registration. Explicit pauses stay held until one Resume;
+ * human-decision pauses become `waiting_for_decision` without a second hold.
+ * Continuations, resume history and pause origin move to `legacyAudit`.
+ */
+export function upgradeLegacyRegistration(
+  legacy: Record<string, unknown>,
+): z.input<typeof PrMaintenanceRegistrationV2Schema> {
+  const {
+    schemaVersion: _schemaVersion,
+    lifecycle,
+    pauseReason,
+    pauseOrigin,
+    pausedAt,
+    pausedNoticeAt,
+    continuation,
+    continuationHistory,
+    resumeHistory,
+    counters,
+    ...rest
+  } = legacy as Record<string, unknown> & {
+    lifecycle: string;
+    pauseReason?: string;
+    pauseOrigin?: { actor: string; actorId: string; at: string };
+    pausedAt?: string;
+    counters?: Record<string, number>;
+  };
+  const decision = legacy.decision as { state?: string } | undefined;
+  // The decision schema defaults a missing state to pending.
+  const decisionPending =
+    Boolean(decision) && (decision!.state ?? "pending") === "pending";
+  const reason = pauseReason ?? "";
+  const holdKind =
+    lifecycle === "paused" &&
+    !(decisionPending && ["wait_for_human", "finding_needs_human"].includes(reason))
+      ? legacyHoldKind(reason)
+      : undefined;
+  const at =
+    pauseOrigin?.at ??
+    pausedAt ??
+    (legacy.updatedAt as string) ??
+    new Date(0).toISOString();
+  const legacyAudit = Object.fromEntries(
+    Object.entries({
+      lifecycle,
+      pauseReason: reason || undefined,
+      pauseOrigin,
+      pausedAt,
+      pausedNoticeAt,
+      continuation,
+      continuationHistory,
+      resumeHistory,
+      scanStalls: counters?.scanStalls,
+      reconciliationStalls: counters?.reconciliationStalls,
+    }).filter(([, value]) => value !== undefined),
+  );
+  return {
+    ...(rest as object),
+    schemaVersion: 2,
+    lifecycle: lifecycle === "merged" || lifecycle === "closed" ? lifecycle : "active",
+    ...(holdKind
+      ? {
+          hold: {
+            kind: holdKind,
+            reason: reason || "Paused before the v2 upgrade",
+            actor: (["lead", "operator", "node_console", "system"].includes(
+              pauseOrigin?.actor ?? "",
+            )
+              ? pauseOrigin!.actor
+              : "system") as PrMaintenanceHold["actor"],
+            actorId: pauseOrigin?.actorId ?? "host",
+            at,
+          },
+        }
+      : {}),
+    counters: {
+      repairBatches: counters?.repairBatches ?? 0,
+      answerBatches: counters?.answerBatches ?? 0,
+      mutationAttempts: counters?.mutationAttempts ?? 0,
+      consecutiveFailures: counters?.consecutiveFailures ?? 0,
+      totalFailures: counters?.totalFailures ?? 0,
+      dispatchesSinceDirection: 0,
+    },
+    ...(Object.keys(legacyAudit).length ? { legacyAudit } : {}),
+  } as z.input<typeof PrMaintenanceRegistrationV2Schema>;
+}
+
+export const PrMaintenanceRegistrationSchema = z
+  .union([legacyRegistrationSchema, z.unknown()])
+  .pipe(PrMaintenanceRegistrationV2Schema);
+export type PrMaintenanceRegistration = z.infer<typeof PrMaintenanceRegistrationV2Schema>;
 
 export function prMaintenanceObservationFresh(
   observation: PrMaintenanceObservation | undefined,
@@ -1083,57 +1221,13 @@ export function prMaintenanceObservationFresh(
   return age >= 0 && age <= PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs;
 }
 
-/**
- * Until when the last complete observation still describes the PR in status
- * labels: through the next routine check plus the evidence window to perform
- * it, since checks follow the heartbeat and are often hours apart. Acting on
- * that evidence still requires {@link prMaintenanceObservationFresh}.
- */
-export function prMaintenanceEvidenceCurrentUntil(
-  record: Pick<
-    PrMaintenanceRegistration,
-    "observation" | "observationHostAt" | "nextCheckAt"
-  >,
-): number | undefined {
-  const observedAt = record.observationHostAt ?? record.observation?.attemptedAt;
-  if (!observedAt) return undefined;
-  const observed = Date.parse(observedAt);
-  const nextCheck = Date.parse(record.nextCheckAt);
-  return (
-    Math.max(observed, Number.isFinite(nextCheck) ? nextCheck : observed) +
-    PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs
-  );
-}
-
-function evidenceCurrent(record: PrMaintenanceRegistration, nowMs: number): boolean {
-  const observedAt = record.observationHostAt ?? record.observation?.attemptedAt;
-  const until = prMaintenanceEvidenceCurrentUntil(record);
-  return (
-    observedAt !== undefined &&
-    until !== undefined &&
-    nowMs >= Date.parse(observedAt) &&
-    nowMs <= until
-  );
-}
-
-export const PrMaintenanceStageSchema = z.enum([
-  "released",
-  "merged",
-  "closed",
-  "human_hold",
+/** Batch states that still need execution or reconciliation. */
+export const prMaintenanceOutstandingBatchStates: ReadonlySet<string> = new Set([
+  "prepared",
+  "accepted",
   "reconciling",
-  "authorization_required",
-  "paused",
-  "recovering",
-  "blocked",
-  "addressing_review",
-  "triage",
-  "waiting_checks",
-  "waiting_review",
-  "ready",
-  "checking",
+  "uncertain",
 ]);
-export type PrMaintenanceStage = z.infer<typeof PrMaintenanceStageSchema>;
 
 export function prMaintenanceWorkSources(
   record: Pick<PrMaintenanceRegistration, "workRequests">,
@@ -1159,34 +1253,12 @@ export function prMaintenanceSources(
   ];
 }
 
-/** Current facts, not budget reservations or provider review iteration numbers. */
-export function prMaintenanceProgress(
-  record: PrMaintenanceRegistration,
-  nowMs = Date.now(),
-): { stage: PrMaintenanceStage; completedIterations: number } {
-  const outstanding = new Set(["prepared", "accepted", "reconciling", "uncertain"]);
-  const completedIterations = new Set(
-    record.batches
-      .filter(
-        (batch) =>
-          batch.stepId &&
-          batch.attempt &&
-          batch.executionSettled &&
-          !outstanding.has(batch.state) &&
-          !batch.executionNotDispatched,
-      )
-      .map((batch) => `${batch.stepId}:${batch.attempt}`),
-  ).size;
-  const result = (stage: PrMaintenanceStage) => ({ stage, completedIterations });
-  if (record.lifecycle === "merged" || record.lifecycle === "closed")
-    return result(record.lifecycle);
-  if (record.ownershipReleasedAt) return result("released");
-  if (
-    record.decision?.state === "pending" ||
-    (record.lifecycle === "paused" && record.pauseReason === "task_human_hold")
-  )
-    return result("human_hold");
-  if (
+/**
+ * Execution or an external effect whose outcome is not yet known. While true,
+ * PRM refuses new effects and new batches until the evidence is reconciled.
+ */
+export function prMaintenanceReconciling(record: PrMaintenanceRegistration): boolean {
+  return (
     record.incidents.some(
       (incident) => incident.kind === "effects" && !incident.resolvedAt,
     ) ||
@@ -1194,111 +1266,198 @@ export function prMaintenanceProgress(
       (batch) =>
         batch.state === "uncertain" ||
         batch.state === "reconciling" ||
-        (batch.stepId && !batch.executionSettled && !outstanding.has(batch.state)) ||
-        (batch.state === "accepted" && batch.cancellationRequestedAt),
+        (Boolean(batch.stepId) &&
+          !batch.executionSettled &&
+          !prMaintenanceOutstandingBatchStates.has(batch.state)),
     ) ||
     [...record.actions, ...record.batches.flatMap((batch) => batch.effects)].some(
       (effect) => effect.state === "uncertain" || effect.state === "reserved",
     )
-  )
-    return result("reconciling");
-  if (
-    !record.authorization.scope.publicationAuthorized &&
-    (!record.manualControl || record.manualControl.endedAt)
-  )
-    return result("authorization_required");
-  if (record.lifecycle === "paused")
-    return result(
-      ["authorization_failed", "remote_identity_changed"].includes(record.pauseReason)
-        ? "blocked"
-        : "paused",
-    );
-  if (record.lastAttempt?.draft || record.lastAttempt?.mergeability === "conflicting")
-    return result("blocked");
-  const incident = record.incidents.find((entry) => !entry.resolvedAt);
-  if (incident)
-    return result(
-      incident.kind === "capability" &&
-        incident.attempts.length < PR_MAINTENANCE_RECOVERY_LIMITS.attempts
-        ? "recovering"
-        : "blocked",
-    );
-  const observation = record.observation;
-  if (
-    record.lastAttempt?.failure ||
-    (record.lastAttempt && !record.lastAttempt.complete) ||
-    (record.lastAttempt?.complete &&
-      observation?.complete &&
-      (record.lastAttempt.headSha !== observation.headSha ||
-        record.lastAttempt.snapshotId !== observation.snapshotId))
-  )
-    return result("blocked");
-  if (record.batches.some((batch) => batch.state === "accepted"))
-    return result("addressing_review");
-  if (record.workRequests.some((request) => request.state === "pending"))
-    return result("checking");
-  if (
-    !observation?.complete ||
-    !record.lastAttempt?.complete ||
-    !evidenceCurrent(record, nowMs)
-  )
-    return result("checking");
-  if (observation.draft || observation.mergeability === "conflicting")
-    return result("blocked");
-  const currentFindings = prMaintenanceSources(record).map((source) =>
-    record.findings.find(
-      (finding) =>
-        finding.source.id === source.id &&
-        finding.source.revision === source.revision &&
-        (finding.verifiedHeadSha ?? finding.publishedCommit) === observation.headSha,
-    ),
   );
-  if (currentFindings.some((finding) => !finding)) return result("triage");
-  if (
-    currentFindings.some(
-      (finding) =>
-        finding && !["addressed", "already_satisfied"].includes(finding.outcome),
-    )
-  )
-    return result("checking");
-  if (
-    !observation.checksComplete ||
-    observation.checks.some(
-      (check) => check.state !== "passed" || check.headSha !== observation.headSha,
-    )
-  )
-    return result("waiting_checks");
-  if (
-    !observation.reviewsComplete ||
-    observation.reviews.some(
-      (review) => review.state !== "approved" || review.headSha !== observation.headSha,
-    )
-  )
-    return result("waiting_review");
-  return result(
-    observation.state === "open" &&
-      observation.mergeability === "mergeable" &&
-      !record.batches.some((batch) => outstanding.has(batch.state)) &&
-      record.readyFingerprint === observation.fingerprint
-      ? "ready"
-      : "checking",
+}
+
+/** The phases a user sees. Holds are reported beside the phase, never instead of it. */
+export const PrMaintenancePhaseSchema = z.enum([
+  "reviewing",
+  "working",
+  "idle",
+  "waiting_for_decision",
+  "merged",
+  "closed",
+  "released",
+]);
+export type PrMaintenancePhase = z.infer<typeof PrMaintenancePhaseSchema>;
+
+export const PrMaintenanceStatusSchema = z
+  .object({
+    phase: PrMaintenancePhaseSchema,
+    hold: PrMaintenanceHoldKindSchema.or(
+      z.enum(["reconciling", "binding", "permission"]),
+    ).optional(),
+    label: z.string(),
+    reason: z.string(),
+    action: z.string(),
+    /** The single operator control that moves the job forward, when one exists. */
+    operatorAction: z.enum(["resume", "direction", "review"]).optional(),
+  })
+  .strict();
+export type PrMaintenanceStatus = z.infer<typeof PrMaintenanceStatusSchema>;
+
+export const prMaintenancePhaseLabels: Record<PrMaintenancePhase, string> = {
+  reviewing: "Reviewing",
+  working: "Working",
+  idle: "Idle",
+  waiting_for_decision: "Waiting for Design Decision",
+  merged: "Merged",
+  closed: "Closed",
+  released: "Released",
+};
+
+const holdLabels: Record<NonNullable<PrMaintenanceStatus["hold"]>, string> = {
+  stopped: "Stopped",
+  paused: "Paused",
+  access: "Access needed",
+  identity: "PR identity changed",
+  manual_control: "Manual control",
+  reconciling: "Reconciling",
+  binding: "Worker unavailable",
+  permission: "Permission pending",
+};
+
+/** The batch currently running on the retained worker, if any. */
+export function prMaintenanceActiveBatch(
+  record: Pick<PrMaintenanceRegistration, "batches">,
+): PrMaintenanceBatch | undefined {
+  return record.batches.find(
+    (batch) =>
+      batch.state === "accepted" && Boolean(batch.stepId) && !batch.executionSettled,
+  );
+}
+
+/**
+ * The one authoritative description of a registration.
+ *
+ * `overlay` carries facts only the Host can see — a broken retained binding or
+ * a pending session permission. Everything else is derived from the record, so
+ * the browser, the orchestrator and admission can never disagree.
+ */
+export function prMaintenanceStatus(
+  record: PrMaintenanceRegistration,
+  overlay: { binding?: string | undefined; permission?: boolean | undefined } = {},
+): PrMaintenanceStatus {
+  const make = (
+    phase: PrMaintenancePhase,
+    reason: string,
+    action: string,
+    hold?: PrMaintenanceStatus["hold"],
+    operatorAction?: PrMaintenanceStatus["operatorAction"],
+  ): PrMaintenanceStatus => ({
+    phase,
+    ...(hold ? { hold } : {}),
+    label: hold
+      ? `${prMaintenancePhaseLabels[phase]} · ${holdLabels[hold]}`
+      : prMaintenancePhaseLabels[phase],
+    reason,
+    action,
+    ...(operatorAction ? { operatorAction } : {}),
+  });
+  // A provider terminal state is the useful fact even after ownership auto-releases.
+  if (record.lifecycle === "merged" || record.lifecycle === "closed")
+    return make(
+      record.lifecycle,
+      `The PR was ${record.lifecycle} on the provider. Maintenance stopped; it never merges.`,
+      prMaintenanceReconciling(record)
+        ? "Outstanding effects are still being reconciled."
+        : "Nothing further to do.",
+      prMaintenanceReconciling(record) ? "reconciling" : undefined,
+    );
+  if (record.ownershipReleasedAt)
+    return make(
+      "released",
+      "Ownership was released; history is retained for audit.",
+      "Enable maintenance again to resume work on a PR.",
+    );
+  const active = prMaintenanceActiveBatch(record);
+  const phase: PrMaintenancePhase =
+    record.decision?.state === "pending"
+      ? "waiting_for_decision"
+      : active
+        ? "working"
+        : record.review && !record.review.concludedAt
+          ? "reviewing"
+          : "idle";
+  if (record.hold) {
+    const hold = record.hold;
+    const actions: Record<PrMaintenanceHoldKind, string> = {
+      stopped: "Resume maintenance to continue with the same worker.",
+      paused: "Resume maintenance, or answer the pending decision.",
+      access:
+        "Restore provider sign-in or permissions on the Node, then Resume maintenance.",
+      identity:
+        "The PR or its source branch changed identity. Confirm it is still the same PR, then Resume, or release it.",
+      manual_control:
+        "A person is driving the retained worker. Hand back, or Resume maintenance when done.",
+    };
+    return make(phase, hold.reason, actions[hold.kind], hold.kind, "resume");
+  }
+  if (overlay.binding)
+    return make(
+      phase,
+      `The retained worker or checkout is unavailable (${overlay.binding}).`,
+      "Restore the original worker session or checkout; maintenance never replaces it.",
+      "binding",
+    );
+  if (overlay.permission)
+    return make(
+      phase,
+      "A session permission request is waiting for an answer.",
+      "Answer it in the requesting session.",
+      "permission",
+    );
+  if (prMaintenanceReconciling(record))
+    return make(
+      phase,
+      "An execution or external effect has an unknown outcome.",
+      "Fleet reconciles it from provider evidence before any new effect; nothing is replayed.",
+      "reconciling",
+    );
+  if (phase === "waiting_for_decision")
+    return make(
+      phase,
+      record.decision!.proposal,
+      "Give direction in the PR maintenance panel or tell the orchestrator. Maintenance resumes automatically.",
+      undefined,
+      "direction",
+    );
+  if (phase === "working")
+    return make(
+      phase,
+      "The retained worker is applying routine fixes.",
+      "Its result wakes the orchestrator to review the PR again.",
+    );
+  if (phase === "reviewing")
+    return make(
+      phase,
+      "Refreshing PR state and deciding what, if anything, needs doing.",
+      record.review?.claimedAt
+        ? "The orchestrator is reviewing now."
+        : "Queued for the orchestrator's next turn.",
+    );
+  return make(
+    "idle",
+    record.review?.summary ?? "No actionable feedback and no pending decision.",
+    "The next heartbeat checks again. Use Review now to check immediately.",
+    undefined,
+    "review",
   );
 }
 
 /** The registration a task view should describe: retained active work before history. */
 export function currentPrMaintenance<
-  T extends Pick<
-    PrMaintenanceRegistration,
-    "ownershipReleasedAt" | "lifecycle" | "createdAt"
-  >,
+  T extends Pick<PrMaintenanceRegistration, "ownershipReleasedAt" | "createdAt">,
 >(records: readonly T[]): T | undefined {
   const retained = records.filter((record) => !record.ownershipReleasedAt);
-  const active = retained.filter((record) =>
-    ["active", "paused"].includes(record.lifecycle),
-  );
-  return (active.length ? active : retained.length ? retained : records).reduce<
-    T | undefined
-  >(
+  return (retained.length ? retained : records).reduce<T | undefined>(
     (latest, record) =>
       !latest || record.createdAt > latest.createdAt ? record : latest,
     undefined,
@@ -1309,32 +1468,22 @@ export function currentPrMaintenance<
  * A task's retained PR maintenance, reduced to what a task list needs.
  *
  * The Host computes this for the snapshot so a list can say a task is maintaining
- * a PR without fetching every full registration. It is a label, not evidence;
- * task details still read the complete record.
+ * a PR without fetching every full registration. Task details read the record.
  */
 export const PrMaintenanceTaskStatusSchema = z.object({
   taskId: id,
   recordId: id,
   workerSessionId: id.optional(),
-  stage: PrMaintenanceStageSchema,
   prUrl: z.string().min(1),
-  manualControl: z.boolean(),
-  effective: PrMaintenanceEffectiveStateSchema.optional(),
-  /** After this, a stage that relied on the last observation is only "checking". */
-  freshUntil: time.optional(),
+  status: PrMaintenanceStatusSchema,
 });
 export type PrMaintenanceTaskStatus = z.infer<typeof PrMaintenanceTaskStatusSchema>;
 
-const freshnessDependentStages = new Set<PrMaintenanceStage>([
-  "triage",
-  "waiting_checks",
-  "waiting_review",
-  "ready",
-]);
-
 export function prMaintenanceTaskStatuses(
   records: readonly PrMaintenanceRegistration[],
-  nowMs = Date.now(),
+  overlay: (
+    record: PrMaintenanceRegistration,
+  ) => Parameters<typeof prMaintenanceStatus>[1] = () => ({}),
 ): PrMaintenanceTaskStatus[] {
   const byTask = new Map<string, PrMaintenanceRegistration[]>();
   for (const record of records)
@@ -1342,21 +1491,13 @@ export function prMaintenanceTaskStatuses(
   return [...byTask.values()].flatMap((taskRecords) => {
     const record = currentPrMaintenance(taskRecords);
     if (!record) return [];
-    const { stage } = prMaintenanceProgress(record, nowMs);
-    const currentUntil = prMaintenanceEvidenceCurrentUntil(record);
-    const freshUntil =
-      currentUntil !== undefined && freshnessDependentStages.has(stage)
-        ? new Date(currentUntil).toISOString()
-        : undefined;
     return [
       {
         taskId: record.taskId,
         recordId: record.id,
         workerSessionId: record.workerSessionId,
-        stage,
         prUrl: prMaintenanceUrl(record.identity),
-        manualControl: Boolean(record.manualControl && !record.manualControl.endedAt),
-        ...(freshUntil ? { freshUntil } : {}),
+        status: prMaintenanceStatus(record, overlay(record)),
       },
     ];
   });

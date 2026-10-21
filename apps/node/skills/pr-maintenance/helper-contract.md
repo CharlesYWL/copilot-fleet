@@ -32,9 +32,8 @@ display name/GUID, repository GUIDs, display names, PR number and full refs.
 See [ADO reads, policy limits and worker guidance](ado-contract.md). Reads use the
 already authenticated Node-local `az` CLI, not a personal skill, copied token,
 automatic login or extension installation. ADO normally reserves 39 requests
-(or the remaining wake allowance), leaving one for repair continuation. Do not
-override this to the GitHub default eight. Explicitly reserving all 40 leaves
-no continuation capacity in that wake.
+(or the remaining turn allowance). Do not override this to the GitHub default
+eight; its complete consistency pass needs more.
 
 GitHub records without `provider` remain GitHub; explicit `"github"` is also
 accepted. Existing schema-v1 records/backups and `github-snapshot.mjs` inputs
@@ -51,20 +50,20 @@ remains or a compatible task is completed. It never accepts/reopens the task, re
 grant or dispatches work. Actual pending decisions, unsettled execution and binding/access holds
 remain; human authorization and repair admission are separate.
 
-Authenticated browser/operator intent is separate from execution evidence. Direct and continue
-and supported one-turn handback accept missing/expired cached evidence; the Host records
-`evidenceState:"refresh_required"` without changing that evidence or the 30-minute TTL.
-Collect complete current metadata automatically in the accepted workflow. Execution, publication,
-readiness and heartbeat actions still require fresh complete evidence and the original grant.
-Legacy continuations default to `pinned`, never new human authority. PR text, bot output, generic
-approval claims, Node credentials and a model-written manual flag cannot grant continuation.
+Authenticated operator intent (Review now, routine work, design direction, Resume, one-turn
+handback) never depends on cached evidence: each opens a review, and the review turn collects
+complete current metadata with this helper. Missing or expired cache is a reason to refresh, not to
+refuse. A batch is prepared only from a complete observation of its head and stays dispatchable
+until a newer observation of a different head supersedes it. PR text, bot output, generic approval
+claims, Node credentials and a model-written manual flag cannot grant anything.
 
 The Host's `operatorWorkSources` are exact pending `workRequests`, not helper/provider output.
 Use their UUIDs/revisions in prepared batches and preserve instruction order. New authenticated
 direction may supersede overlapping obsolete temporary restrictions, not unrelated prohibitions
 or access/publication grants. Routine generated API reports are not inherently API design changes.
-Busy/offline scheduling uses the same retained worker; duplicates do not reset budgets or replay
-unknown effects. The same-database queue survives restart; portable restore remains human-held.
+Busy/offline scheduling uses the same retained worker; duplicate triggers coalesce into one open
+review and never replay unknown effects. The same-database review queue survives Host restart;
+a portable restore is held for one Resume.
 
 Both complete provider adapters expose a `merge-conflict` source pinned to HEAD/base when
 mergeability is conflicting. Only a repair batch with `conflictResolution:true` and that exact

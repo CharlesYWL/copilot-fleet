@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import {
   Button,
-  Checkbox,
   Dialog,
   DialogActions,
   DialogBody,
@@ -26,7 +25,6 @@ import {
   Open16Regular,
 } from "@fluentui/react-icons";
 import {
-  prMaintenanceEvidenceCurrentUntil,
   prMaintenanceUrl,
   type FleetSession,
   type RunNote,
@@ -40,10 +38,7 @@ import {
   latestReviewNote,
   taskOverview,
 } from "../../lib/task-overview";
-import type {
-  MaintenanceReviewReference,
-  TaskMaintenanceView,
-} from "../../lib/pr-maintenance";
+import type { TaskMaintenanceView } from "../../lib/pr-maintenance";
 import { semanticColors, statusVisuals, terminal } from "../../theme";
 import { MarkdownBody } from "../MarkdownBody";
 import { RunStatusIndicator } from "./RunStatusIndicator";
@@ -278,11 +273,7 @@ export type OrchestratorTaskDetailProps = {
   /** "Resume now" for a queued follow-up; the Host decides whether approval is needed. */
   onResumeNow?: ((step: RunStep) => Promise<unknown> | void) | undefined;
   onReviewApproval?: ((requestId: string) => void) | undefined;
-  onReview: (
-    approved: boolean,
-    note: string,
-    maintenance?: MaintenanceReviewReference,
-  ) => Promise<boolean>;
+  onReview: (approved: boolean, note: string) => Promise<boolean>;
   onArchive: () => Promise<boolean>;
   onReopen: (note: string) => Promise<boolean>;
   onDelete: () => Promise<boolean>;
@@ -296,8 +287,6 @@ type ReviewContext = {
   body: string;
   summary: string;
   blocked: boolean;
-  reference: MaintenanceReviewReference | undefined;
-  proposal: string;
 };
 
 export const OrchestratorTaskDetail = ({
@@ -330,10 +319,8 @@ export const OrchestratorTaskDetail = ({
   const [reviewContext, setReviewContext] = useState<ReviewContext>();
   const [reopenNote, setReopenNote] = useState("");
   const [note, setNote] = useState("");
-  const [continueEligible, setContinueEligible] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState("");
-  const [freshnessRevision, setFreshnessRevision] = useState(0);
   const nowMs = Date.now();
   const [maintenanceState, setMaintenanceState] = useState<{
     taskId: string;
@@ -349,52 +336,19 @@ export const OrchestratorTaskDetail = ({
     maintenanceState?.taskId === run.id ? maintenanceState.view : undefined;
 
   const record = currentMaintenance(maintenance?.records ?? []);
-  const observedAt = record?.observationHostAt ?? record?.observation?.attemptedAt;
-  const currentUntil = record ? prMaintenanceEvidenceCurrentUntil(record) : undefined;
-  useEffect(() => {
-    if (!observedAt || currentUntil === undefined) return;
-    const observed = Date.parse(observedAt);
-    const now = Date.now();
-    const nextBoundary = observed > now ? observed : currentUntil + 1;
-    const delay = nextBoundary - now;
-    if (!Number.isFinite(delay) || delay <= 0) return;
-    // Evidence can expire without a socket update; re-render at that boundary, not on a poll.
-    const timer = window.setTimeout(
-      () => setFreshnessRevision((value) => value + 1),
-      Math.min(delay, 2_147_483_647),
-    );
-    return () => window.clearTimeout(timer);
-  }, [observedAt, currentUntil, freshnessRevision]);
-  const maintenanceHold = maintenance?.records.find(
-    (entry) =>
-      entry.taskId === run.id &&
-      !entry.ownershipReleasedAt &&
-      entry.decision?.state === "pending",
-  );
-  const maintenanceReference = maintenanceHold?.decision
-    ? {
-        recordId: maintenanceHold.id,
-        expectedVersion: maintenanceHold.version,
-        decisionId: maintenanceHold.decision.id,
-        decisionVersion: maintenanceHold.decision.version,
-      }
-    : undefined;
   const report = latestReviewNote(notes);
   const overview = taskOverview(model, notes, maintenance, nowMs);
   const finished = ["completed", "cancelled", "failed"].includes(run.state);
-  const needsReview = run.state === "awaiting_human" || Boolean(maintenanceHold);
+  // The task's review only. A PR design decision is answered in the PRM panel.
+  const needsReview = run.state === "awaiting_human";
   const reviewChanged = Boolean(
     reviewContext &&
     (reviewContext.taskId !== run.id ||
       reviewContext.reviewSeq !== run.reviewSeq ||
-      reviewContext.reportId !== report?.id ||
-      JSON.stringify(reviewContext.reference) !== JSON.stringify(maintenanceReference) ||
-      reviewContext.proposal !== (maintenanceHold?.decision?.proposal ?? "")),
+      reviewContext.reportId !== report?.id),
   );
-  const reviewUnavailable = !maintenance || Boolean(maintenance.statusError);
 
   const openReview = () => {
-    setContinueEligible(false);
     setReviewContext({
       taskId: run.id,
       reviewSeq: run.reviewSeq,
@@ -402,25 +356,16 @@ export const OrchestratorTaskDetail = ({
       body: report?.body ?? "",
       summary: overview.summary,
       blocked: blockedReview(report),
-      reference: maintenanceReference,
-      proposal: maintenanceHold?.decision?.proposal ?? "",
     });
     setNote("");
     setActionError("");
     setReviewOpen(true);
   };
   const answer = async (approved: boolean) => {
-    if (busy || reviewChanged || reviewUnavailable || !reviewContext || actionError)
-      return;
-    if (reviewContext.reference && (approved || !maintenance?.canAuthorize)) return;
+    if (busy || reviewChanged || !reviewContext || actionError) return;
     setBusy(true);
     try {
-      const ok = reviewContext.reference
-        ? await onReview(false, note.trim(), {
-            ...reviewContext.reference,
-            ...(continueEligible ? { continueEligible } : {}),
-          })
-        : await onReview(approved, note.trim());
+      const ok = await onReview(approved, note.trim());
       if (ok) {
         setReviewOpen(false);
         setNote("");
@@ -533,9 +478,7 @@ export const OrchestratorTaskDetail = ({
             </div>
             {needsReview ? (
               <Button {...restoreFocusTarget} appearance="primary" onClick={openReview}>
-                {maintenanceHold || blockedReview(report)
-                  ? "Review decision"
-                  : "Review result"}
+                {blockedReview(report) ? "Review decision" : "Review result"}
               </Button>
             ) : model.attentionSessionId ? (
               <Button
@@ -621,11 +564,7 @@ export const OrchestratorTaskDetail = ({
         <DialogSurface>
           <DialogBody>
             <DialogTitle>
-              {reviewContext?.reference
-                ? "Direct PR maintenance"
-                : reviewContext?.blocked
-                  ? "Review decision"
-                  : "Review task"}
+              {reviewContext?.blocked ? "Review decision" : "Review task"}
             </DialogTitle>
             <DialogContent>
               {reviewChanged ? (
@@ -634,48 +573,17 @@ export const OrchestratorTaskDetail = ({
                   version before sending instructions.
                 </p>
               ) : null}
-              {reviewUnavailable ? (
-                <p role="status">
-                  Current maintenance status is needed before recording a decision.
-                  Refresh maintenance status if it cannot be loaded.
-                </p>
-              ) : null}
               {actionError ? (
                 <p role="alert" className={styles.error}>
                   {actionError}
                 </p>
               ) : null}
               <p className={styles.dialogSummary}>{reviewContext?.summary}</p>
-              {reviewContext?.reference ? (
-                <>
-                  <p className={styles.decision}>{reviewContext.proposal}</p>
-                  <p>
-                    Task approval cannot authorize this design change. Your direction
-                    applies only to this exact proposal; it does not resume a stopped
-                    worker, resolve defects, or merge the PR.
-                  </p>
-                  <Checkbox
-                    checked={continueEligible}
-                    disabled={busy || reviewChanged || !maintenance?.canAuthorize}
-                    onChange={(_, data) => setContinueEligible(data.checked === true)}
-                    label="Continue already-authorized work after recording this direction"
-                  />
-                  <p>
-                    This accepts your direction even if cached PR evidence is missing or
-                    expired, and refreshes metadata automatically using the same worker
-                    and grant. No refresh-and-click-again step or budget reset is needed.
-                    Independent Stop, access holds and ongoing manual takeover are not
-                    cleared. If a hold prevents continuation, neither direction nor
-                    continuation is saved.
-                  </p>
-                  {maintenanceHold &&
-                  maintenance?.effectiveStates?.[maintenanceHold.id] ? (
-                    <p role="status">
-                      Current hold:{" "}
-                      {maintenance.effectiveStates[maintenanceHold.id]!.reason}
-                    </p>
-                  ) : null}
-                </>
+              {record && !record.ownershipReleasedAt ? (
+                <p className={styles.dialogSummary}>
+                  Answering this task review does not change PR maintenance; it keeps
+                  running on its own.
+                </p>
               ) : null}
               {reviewContext?.body ? (
                 <details className={styles.report} open={!report?.summary || undefined}>
@@ -687,11 +595,7 @@ export const OrchestratorTaskDetail = ({
               ) : null}
               <Field
                 label="What needs changing?"
-                hint={
-                  reviewContext?.reference
-                    ? "Name the chosen approach and its limits. Changed assumptions need a new decision."
-                    : "Guidance goes to the existing Orchestrator. It is required when sending work back."
-                }
+                hint="Guidance goes to the existing Orchestrator. It is required when sending work back."
               >
                 <Textarea
                   value={note}
@@ -705,38 +609,19 @@ export const OrchestratorTaskDetail = ({
               <Button disabled={busy} onClick={() => setReviewOpen(false)}>
                 Cancel
               </Button>
-              {!reviewContext?.reference ? (
-                <Button
-                  appearance={reviewContext?.blocked ? "secondary" : "primary"}
-                  disabled={
-                    busy || reviewChanged || reviewUnavailable || Boolean(actionError)
-                  }
-                  onClick={() => void answer(true)}
-                >
-                  {reviewContext?.blocked ? "Accept incomplete result" : "Approve"}
-                </Button>
-              ) : null}
               <Button
-                appearance={
-                  reviewContext?.blocked || reviewContext?.reference
-                    ? "primary"
-                    : "secondary"
-                }
-                disabled={
-                  busy ||
-                  reviewChanged ||
-                  reviewUnavailable ||
-                  Boolean(actionError) ||
-                  !note.trim() ||
-                  Boolean(reviewContext?.reference && !maintenance?.canAuthorize)
-                }
+                appearance={reviewContext?.blocked ? "secondary" : "primary"}
+                disabled={busy || reviewChanged || Boolean(actionError)}
+                onClick={() => void answer(true)}
+              >
+                {reviewContext?.blocked ? "Accept incomplete result" : "Approve"}
+              </Button>
+              <Button
+                appearance={reviewContext?.blocked ? "primary" : "secondary"}
+                disabled={busy || reviewChanged || Boolean(actionError) || !note.trim()}
                 onClick={() => void answer(false)}
               >
-                {reviewContext?.reference
-                  ? continueEligible
-                    ? "Direct and continue"
-                    : "Send back with instructions"
-                  : "Send back"}
+                Send back
               </Button>
             </DialogActions>
           </DialogBody>
@@ -799,7 +684,6 @@ export const OrchestratorTaskDetail = ({
                     {...restoreFocusTarget}
                     appearance="subtle"
                     icon={<ArrowCounterclockwise20Regular />}
-                    disabled={Boolean(maintenanceHold)}
                     onClick={() => {
                       setDetailsOpen(false);
                       setReopenOpen(true);

@@ -39,7 +39,6 @@ import { NotificationContext, useAppNotifications } from "./hooks/useAppNotifica
 import { useStickyFlag } from "./hooks/useStickyFlag";
 import { useOnboardingTour } from "./hooks/useOnboardingTour";
 import type { TourStep } from "./lib/onboarding";
-import type { MaintenanceReviewReference } from "./lib/pr-maintenance";
 import { signOut } from "./lib/auth";
 import { notificationTarget } from "./lib/notification-navigation";
 import {
@@ -1021,15 +1020,10 @@ export function App() {
    * The one decision left to a human. Approving closes the task; sending it
    * back returns it to the orchestrator with the note, which it acts on.
    */
-  const handleReviewTask = async (
-    runId: string,
-    approved: boolean,
-    note: string,
-    maintenance?: MaintenanceReviewReference,
-  ) => {
+  const handleReviewTask = async (runId: string, approved: boolean, note: string) => {
     const answered = await request(`/api/runs/${runId}/review`, {
       method: "POST",
-      body: JSON.stringify({ approved, note, ...(maintenance ? { maintenance } : {}) }),
+      body: JSON.stringify({ approved, note }),
     });
     if (!answered.ok) return false;
     await refresh();
@@ -1554,8 +1548,8 @@ export function App() {
                   }
                   onResumeNow={handleResumeNow}
                   onReviewApproval={setResumeReviewId}
-                  onReview={(approved, note, maintenance) =>
-                    handleReviewTask(selectedRunModel.run.id, approved, note, maintenance)
+                  onReview={(approved, note) =>
+                    handleReviewTask(selectedRunModel.run.id, approved, note)
                   }
                   onArchive={() => handleArchiveRun(selectedRunModel.run.id)}
                   onReopen={(note) => handleReopenRun(selectedRunModel.run.id, note)}
@@ -1657,8 +1651,7 @@ export function App() {
                         maintenanceWorker={snapshot.prMaintenanceTasks?.some(
                           (status) =>
                             status.workerSessionId === activeSession.id &&
-                            status.effective?.status !== "released" &&
-                            status.stage !== "released",
+                            status.status.phase !== "released",
                         )}
                         onPrompt={(prompt, attachments, handback) =>
                           command(`/api/sessions/${activeSession.id}/prompt`, {
@@ -1780,8 +1773,7 @@ export function App() {
             maintenanceWorker={snapshot.prMaintenanceTasks?.some(
               (status) =>
                 status.workerSessionId === activeSession.id &&
-                status.effective?.status !== "released" &&
-                status.stage !== "released",
+                status.status.phase !== "released",
             )}
             onPrompt={(prompt, attachments, handback) =>
               command(`/api/sessions/${activeSession.id}/prompt`, {

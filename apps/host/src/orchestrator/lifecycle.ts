@@ -40,7 +40,11 @@ export function stopSessions(
   sessions: readonly FleetSession[],
 ): StopSessionsResult {
   for (const session of sessions)
-    service.store.prMaintenance.pauseForSession(session.id, "Session Stop requested");
+    if (session.runRole !== "lead")
+      service.store.prMaintenance.stopForSession(
+        session.id,
+        "The retained worker was stopped.",
+      );
   for (const session of sessions) service.store.assertSessionMutable(session.id);
   const result: StopSessionsResult = {
     matched: sessions.length,
@@ -96,11 +100,9 @@ export function archiveRun(
   const run = store.getRun(runId);
   if (!run) return;
 
-  store.prMaintenance.pauseForTask(runId, reason);
-  const held =
-    store.prMaintenance.admission({ taskId: runId, action: "discover" }).reason ===
-    "wait_for_human";
-  if (!held) service.resolveRunReview(runId);
+  store.prMaintenance.stopForTask(runId, reason);
+  // Archiving answers the task's own review; a PRM decision stays with PRM.
+  service.resolveRunReview(runId);
   if (!terminalRunStates.has(run.state)) {
     const cancelled = store.cancelRunWithUnfinishedSteps(
       runId,
@@ -168,7 +170,7 @@ export function reopenOrchestratorStoppedRun(
 export function purgeRun(service: FleetService, runId: string): boolean {
   const { store } = service;
   if (!store.getRun(runId)) return false;
-  store.prMaintenance.pauseForTask(runId, "Task deletion requested");
+  store.prMaintenance.stopForTask(runId, "Task deletion requested");
   store.prMaintenance.assertTaskCleanupAllowed(runId);
   store.assertWorktreePurgeAllowed(runId);
   service.resolveRunReview(runId);

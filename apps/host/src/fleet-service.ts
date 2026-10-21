@@ -397,13 +397,9 @@ export class FleetService {
   }
 
   private maintenanceTaskStatuses() {
-    const records = this.retainedPrMaintenance();
-    return prMaintenanceTaskStatuses(records).map((status) => ({
-      ...status,
-      effective: this.store.prMaintenance.effectiveState(
-        records.find((record) => record.id === status.recordId)!,
-      ),
-    }));
+    return prMaintenanceTaskStatuses(this.retainedPrMaintenance(), (record) =>
+      this.store.prMaintenance.statusOverlay(record),
+    );
   }
 
   listNodes(): FleetNode[] {
@@ -919,9 +915,11 @@ export class FleetService {
         ...(cursor ? { cursor } : {}),
       });
       for (const record of page.records) {
-        if (record.lifecycle === "paused" && record.decision?.state !== "pending") {
+        // A person is needed: a design decision, or a hold only they can clear.
+        if (record.decision?.state === "pending")
+          this.notifications.createPrMaintenanceAttention(record, "decision");
+        else if (record.hold && record.hold.kind !== "manual_control")
           this.notifications.createPrMaintenanceAttention(record, "paused");
-        }
         if (record.readyFingerprint)
           this.notifications.createPrMaintenanceAttention(record, "ready");
         for (const batch of record.batches) {
@@ -1763,13 +1761,12 @@ export class FleetService {
     if (request.type !== "delete_session") {
       this.store.assertSessionMutable(request.sessionId);
     }
-    if (request.type === "stop" || request.type === "cancel") {
-      this.store.prMaintenance.pauseForSession(
-        request.sessionId,
-        "Session stop or cancellation requested",
-      );
-      this.publishSnapshot();
-    }
+    /*
+     * A low-level stop/cancel is not maintenance intent. It is also sent by the
+     * Host itself (queued "send now", interrupting the orchestrator's turn,
+     * cancelling a held batch). Explicit Stop of the retained worker or task is
+     * recorded where the person asks for it (`stopSessions`, task cancel).
+     */
     if (
       request.type === "start_session" ||
       request.type === "resume_session" ||

@@ -229,7 +229,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     const { id } = request.params as { id: string };
     const run = store.getRun(id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
-    store.prMaintenance.pauseForTask(id, "Task cancellation requested");
+    store.prMaintenance.stopForTask(id, "Task cancellation requested");
     if (terminalRunStates.has(run.state)) return withSteps(id);
 
     archiveRun(service, id, "Cancelled by an operator");
