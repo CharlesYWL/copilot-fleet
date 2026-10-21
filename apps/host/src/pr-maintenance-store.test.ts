@@ -78,16 +78,40 @@ describe("prepared maintenance observation recovery", () => {
         requests: 1,
         milliseconds: 150_000,
       }),
-    ).toEqual({ requests: 39, visits: 5, milliseconds: 150_000 });
+    ).toEqual({ requests: 99, visits: 5, milliseconds: 150_000 });
     expect(
       f.store.prMaintenance.chargeWake(f.lead.id, "five-minute-wake", {
         requests: 1,
         milliseconds: 150_000,
       }),
-    ).toEqual({ requests: 38, visits: 5, milliseconds: 0 });
+    ).toEqual({ requests: 98, visits: 5, milliseconds: 0 });
     expect(() =>
       f.store.prMaintenance.chargeWake(f.lead.id, "five-minute-wake", {
         requests: 0,
+        milliseconds: 0,
+      }),
+    ).toThrow(/End this maintenance pass/);
+  });
+
+  it("accepts a finite 100-request wake charge, rejects 101 and never resets it on replay", () => {
+    const f = setup();
+    f.store.prMaintenance.beginWake(f.lead.id, "request-boundary");
+    expect(() =>
+      f.store.prMaintenance.chargeWake(f.lead.id, "request-boundary", {
+        requests: 101,
+        milliseconds: 0,
+      }),
+    ).toThrow();
+    expect(
+      f.store.prMaintenance.chargeWake(f.lead.id, "request-boundary", {
+        requests: 100,
+        milliseconds: 0,
+      }),
+    ).toEqual({ requests: 0, visits: 5, milliseconds: 300_000 });
+    f.store.prMaintenance.beginWake(f.lead.id, "request-boundary");
+    expect(() =>
+      f.store.prMaintenance.chargeWake(f.lead.id, "request-boundary", {
+        requests: 1,
         milliseconds: 0,
       }),
     ).toThrow(/End this maintenance pass/);
@@ -566,13 +590,31 @@ describe("bounded alternate PR observations", () => {
     expect(() => reserve(f, record)).toThrow(/wake/);
     record = visit(f, record);
     f.store.prMaintenance.chargeWake(f.lead.id, "wake", {
-      requests: 39,
+      requests: 99,
       milliseconds: 0,
     });
     expect(() => reserve(f, record)).toThrow(/End this maintenance pass/);
     expect(f.store.prMaintenance.get(record.id)!.incidents[0]!.attempts).toHaveLength(0);
     vi.setSystemTime(Date.parse(at) + 300_001);
     expect(() => reserve(f, record, "timed-out", 1)).toThrow(/End this maintenance pass/);
+  });
+
+  it("keeps unused and rejected recovery reservations charged and limits the incident to three attempts", () => {
+    const f = setup();
+    let record = visit(f, fallback(f));
+    record = reserve(f, record, "unused", 98);
+    expect(f.store.prMaintenance.remainingWake(f.lead.id, "wake").requests).toBe(2);
+    expect(reserve(f, record, "unused", 98)).toEqual(record);
+    expect(f.store.prMaintenance.remainingWake(f.lead.id, "wake").requests).toBe(2);
+    record = reserve(f, record, "rejected", 1);
+    record = alternate(f, record, { requestsConsumed: 2 }, "rejected");
+    expect(record.incidents[0]!.attempts[1]!.state).toBe("rejected");
+    expect(f.store.prMaintenance.remainingWake(f.lead.id, "wake").requests).toBe(1);
+    record = reserve(f, record, "third", 1);
+    expect(f.store.prMaintenance.remainingWake(f.lead.id, "wake").requests).toBe(0);
+    expect(() => reserve(f, record, "fourth", 1)).toThrow(/attempts are exhausted/);
+    expect(record.incidents[0]!.attempts).toHaveLength(3);
+    expect(record.counters).toEqual(f.store.prMaintenance.get(record.id)!.counters);
   });
 
   it.each(["2026-09-17T23:29:59.999Z", "2026-09-18T00:00:00.001Z"])(

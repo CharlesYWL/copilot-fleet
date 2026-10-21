@@ -333,7 +333,7 @@ describe("authenticated PR maintenance controls", () => {
         leadId,
         reopened.getSessionDispatchAttempt(leadId)!.commandId,
       ).requests,
-    ).toBe(1);
+    ).toBe(61);
     expect(Buffer.byteLength(cli.stdout)).toBe(291_959);
     expect(Buffer.byteLength(JSON.stringify(args))).toBe(291_797);
   });
@@ -599,8 +599,17 @@ describe("authenticated PR maintenance controls", () => {
         .ok,
     ).toBe(false);
     expect(
-      (await mcp("fleet_get_pr_maintenance", { takeDue: true, reserveRequests: 40 })).ok,
-    ).toBe(true);
+      (await mcp("fleet_get_pr_maintenance", { takeDue: true, reserveRequests: 101 })).ok,
+    ).toBe(false);
+    const fullClaim = await mcp("fleet_get_pr_maintenance", {
+      takeDue: true,
+      reserveRequests: 100,
+    });
+    expect(fullClaim.ok, fullClaim.text).toBe(true);
+    expect(JSON.parse(fullClaim.text)).toMatchObject({
+      observationAllowance: { requests: 100 },
+      allowance: { requests: 0 },
+    });
     record = store.prMaintenance.get(record.id)!;
     const failed = await checkpoint({
       kind: "fallback",
@@ -609,6 +618,12 @@ describe("authenticated PR maintenance controls", () => {
     });
     expect(failed.ok, failed.text).toBe(true);
     record = JSON.parse(failed.text);
+    expect(
+      store.prMaintenance.remainingWake(
+        leadId,
+        store.getSessionDispatchAttempt(leadId)!.commandId,
+      ).requests,
+    ).toBe(0);
     const incidentId = record.incidents[0]!.id;
     const attempt = {
       kind: "alternate_attempt",
@@ -698,7 +713,7 @@ describe("authenticated PR maintenance controls", () => {
       expect(claim.ok, claim.text).toBe(true);
       expect(JSON.parse(claim.text)).toMatchObject({
         observationAllowance: { requests },
-        allowance: { requests: 40 - requests },
+        allowance: { requests: 100 - requests },
       });
     },
   );

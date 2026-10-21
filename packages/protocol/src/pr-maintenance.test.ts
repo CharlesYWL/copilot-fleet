@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  PR_MAINTENANCE_WAKE_LIMITS,
+  PR_MAINTENANCE_RECOVERY_LIMITS,
   PrMaintenanceCheckpointSchema,
   PrMaintenanceIdentitySchema,
   PrMaintenanceOperatorActionSchema,
   PrMaintenanceScopeSchema,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceObservationSchema,
+  PrMaintenanceIncidentSchema,
+  PrMaintenanceWakeSchema,
   PrMaintenanceBatchSchema,
   PrMaintenanceGithubSnapshotIdentitySchema,
   PrMaintenanceHelperSnapshotIdentitySchema,
@@ -35,6 +39,74 @@ const identity = {
 };
 
 describe("PR maintenance wire schemas", () => {
+  it.each([100, 101])(
+    "enforces the request boundary across observations, recovery and durable claims at %i",
+    (requests) => {
+      const accepted = requests === 100;
+      const at = "2026-10-21T00:00:00.000Z";
+      const provenance = { source: "provider", method: "read", evidenceRef: "test" };
+      expect(
+        PrMaintenanceObservationSchema.safeParse({
+          attemptedAt: at,
+          complete: false,
+          requestsConsumed: requests,
+          evidence: "bounded",
+        }).success,
+      ).toBe(accepted);
+      expect(
+        PrMaintenanceCheckpointSchema.safeParse({
+          kind: "alternate_attempt",
+          incidentId: "incident",
+          resolutionId: "resolution",
+          provenance,
+          requests,
+        }).success,
+      ).toBe(accepted);
+      const attempt = {
+        id: "resolution",
+        wakeId: "wake",
+        provenance,
+        requests,
+        reservedAt: at,
+        state: "reserved",
+      };
+      const attempts = PrMaintenanceIncidentSchema.shape.attempts;
+      expect(attempts.safeParse([attempt]).success).toBe(accepted);
+      expect(
+        attempts.safeParse(Array.from({ length: 4 }, () => ({ ...attempt, requests: 1 })))
+          .success,
+      ).toBe(false);
+      expect(
+        PrMaintenanceWakeSchema.safeParse({
+          leadSessionId: "lead",
+          wakeId: "wake",
+          startedAt: at,
+          visits: 1,
+          requests,
+          milliseconds: 0,
+          visitedIds: ["record"],
+          observationClaims: [
+            {
+              recordId: "record",
+              generation: 1,
+              recordVersion: 1,
+              scopeKey: "a".repeat(64),
+              claimedAt: at,
+              deadlineAt: at,
+              requests,
+            },
+          ],
+        }).success,
+      ).toBe(accepted);
+      expect(PR_MAINTENANCE_WAKE_LIMITS).toEqual({
+        visits: 5,
+        requests: 100,
+        milliseconds: 300_000,
+      });
+      expect(PR_MAINTENANCE_RECOVERY_LIMITS.attempts).toBe(3);
+    },
+  );
+
   const ado = {
     provider: "azure-devops",
     host: "dev.azure.com",

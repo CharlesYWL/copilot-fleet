@@ -43,8 +43,8 @@ authenticated MCP boundary and lifecycle tool explicit, and requires semantic
 public/Fleet mapping parity. Appendix C records qualifications to the guard,
 capacity, and skill-length findings rather than accepting inaccurate premises.
 
-**Numbers under review:** preserve the existing 5 visits / 40 requests / 120-second
-pass allowance; preserve 40 baseline scenarios and three repetitions per advertised
+**Numbers under review:** preserve the existing 5 visits / 100 requests / 300-second
+pass allowance and 120-second helper clamp; preserve 40 baseline scenarios and three repetitions per advertised
 configuration. The proposed 16 MiB store budget is binding; 100 retained jobs is
 only a secondary count ceiling, not guaranteed capacity. The existing 1 MiB
 protocol limit bounds `helperState`, not an entire observation.
@@ -567,11 +567,11 @@ and `terminal_pending_settlement`, with an explicit reason. They are result
 vocabulary, not replacements for Fleet Run/session states.
 
 The initial observer budgets retain the current shape: up to five PR visits,
-40 initiated provider requests, and 120 seconds per control-plane pass, or a
+100 initiated provider requests, and 300 seconds per control-plane pass, or a
 smaller runtime allowance. Failed requests and lost reservations count. Preserve
 provider-specific defaults, including ADO's larger complete-scan requirements.
-An implementation must not reinterpret the 120-second control-plane allowance
-as a repair worker's execution/test deadline.
+Each helper invocation remains capped at 120 seconds. An implementation must not
+reinterpret these observer allowances as a repair worker's execution/test deadline.
 
 Fleet's defaults of three published repair batches, three answer-only batches,
 and 100 mutation attempts per authorization remain unchanged. A different runtime

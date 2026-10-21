@@ -440,7 +440,8 @@ and the proposed repeated model evaluations have not been established by unit
 tests.
 Pilot defaults are three repair batches, three answer-only batches and 100
 external mutation attempts per authorization. An existing lead wake admits at
-most five PR visits, 40 provider requests and 120 seconds of maintenance work,
+most five PR visits, 100 provider requests and five minutes of maintenance work,
+with each helper invocation capped at 120 seconds,
 with persisted carried scan progress. **Renew maintenance budgets** authorizes
 another allowance for the same scope; it neither changes design authority nor
 automatically resumes paused work.

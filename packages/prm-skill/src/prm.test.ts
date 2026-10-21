@@ -5,12 +5,39 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { run, type CliDeps } from "./cli.js";
 import type { HelperInput, ProviderResult } from "./engine.js";
 import { sha256 } from "./state.js";
+import { PASS_LIMITS, JOB_BUDGET_DEFAULTS } from "./contracts.js";
+import { PR_MAINTENANCE_WAKE_LIMITS } from "@fleet/protocol";
 
 const PR_URL = "https://github.com/octo/widgets/pull/7";
 const HEAD = "a".repeat(40);
 const BASE = "b".repeat(40);
 const NEW_HEAD = "c".repeat(40);
 const REV = (n: number) => String(n).padStart(64, "0");
+
+it("keeps portable and Host limits and published request documentation aligned without changing safeguards", async () => {
+  expect(PASS_LIMITS).toEqual({
+    ...PR_MAINTENANCE_WAKE_LIMITS,
+    helperMilliseconds: 120_000,
+  });
+  expect(PASS_LIMITS.requests).toBe(100);
+  expect(JOB_BUDGET_DEFAULTS).toEqual({
+    repairBatches: 3,
+    answerBatches: 3,
+    mutationAttempts: 100,
+  });
+  for (const path of [
+    ["apps", "node", "skills", "pr-maintenance", "SKILL.md"],
+    ["packages", "prm-skill", "README.md"],
+    ["packages", "prm-skill", "skill", "references", "commands.md"],
+    ["docs", "pr-maintenance-state-machine.md"],
+    ["docs", "pr-maintenance-flow.html"],
+    ["docs", "pr-maintenance-technical-flow.html"],
+  ]) {
+    expect(await readFile(join(process.cwd(), ...path), "utf8")).toMatch(
+      /100 (?:provider )?requests/,
+    );
+  }
+});
 
 type Source = {
   kind: string;
@@ -341,7 +368,22 @@ describe("passes and observation", () => {
     providerQueue.push(providerResult());
     await prm("observe", "--pass", passId, "--job", jobId);
     const status = await prm("status");
-    expect(status.activePass.requestsRemaining).toBe(40 - 6);
+    expect(status.activePass.requestsRemaining).toBe(100 - 6);
+  });
+
+  it("accepts 100 requested provider operations but rejects 101 before provider I/O", async () => {
+    const jobId = await setup("observe");
+    const passId = await begin();
+    expect(
+      await prm("observe", "--pass", passId, "--job", jobId, "--requests", "101"),
+    ).toMatchObject({ ok: false });
+    expect(helperInputs).toHaveLength(0);
+    providerQueue.push(providerResult());
+    expect(
+      await prm("observe", "--pass", passId, "--job", jobId, "--requests", "100"),
+    ).toMatchObject({ ok: true });
+    expect(helperInputs[0]!.budget.maxRequests).toBe(100);
+    expect((await prm("status")).activePass.requestsRemaining).toBe(94);
   });
 
   it("records ready only with complete passing evidence and no open items", async () => {

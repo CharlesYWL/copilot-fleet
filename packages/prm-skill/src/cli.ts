@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import {
   ModeSchema,
+  PASS_LIMITS,
   PlanInputSchema,
   TriageInputSchema,
   WorkReportSchema,
@@ -221,7 +222,7 @@ const runObserve = async (
 ) => {
   const passId = required(values, "pass");
   const jobId = required(values, "job");
-  const requests = integer(values, "requests", 1, 40);
+  const requests = integer(values, "requests", 1, PASS_LIMITS.requests);
   const op = values.op;
   if (op) {
     const prior = (await readStore(root)).receipts[`${op}:record`];

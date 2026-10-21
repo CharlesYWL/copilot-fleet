@@ -29,7 +29,7 @@ const input = (extra: Record<string, unknown> = {}) => ({
     baseRepositoryId: "R_base",
     baseRef: "refs/heads/main",
   },
-  budget: { maxRequests: 40, deadlineAt: new Date(start + 120_000).toISOString() },
+  budget: { maxRequests: 100, deadlineAt: new Date(start + 120_000).toISOString() },
   ...extra,
 });
 const metadata = (
@@ -525,6 +525,26 @@ describe("bounded read-only PR snapshot", () => {
       expect(result.error.code).toMatch(/exhausted$/);
     }
   });
+
+  it.each([100, 101])(
+    "enforces the finite GitHub maxRequests boundary at %i",
+    async (maxRequests) => {
+      const f = fixture();
+      const result = await observe(
+        input({ budget: { ...input().budget, maxRequests } }),
+        f,
+      );
+      if (maxRequests === 100) {
+        expect(result.complete).toBe(true);
+        expect(result.requestsConsumed).toBeGreaterThan(0);
+        expect(result.requestsConsumed).toBeLessThanOrEqual(100);
+      } else {
+        expect(result.error.code).toBe("invalid_input");
+        expect(result.requestsConsumed).toBe(0);
+        expect(f.calls).toHaveLength(0);
+      }
+    },
+  );
 
   it("does not use stale-HEAD check results", async () => {
     const result = await observe(

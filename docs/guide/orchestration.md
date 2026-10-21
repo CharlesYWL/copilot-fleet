@@ -294,8 +294,8 @@ they add no duplicated observation blob or new execution authority. Older wakes
 default to no receipt association, and old unbound commands cannot be attached
 retroactively. Same-database restart preserves associations; portable restore keeps
 evidence but quarantines admission. The original reservation stays charged, including
-zero-operation and bounded in-flight failures after deadline. Receipt admission does not reset 5-PR/40-request/
-120-second limits or authorize a repair: actions need a current live allowance.
+zero-operation and bounded in-flight failures after deadline. Receipt admission does not reset 5-PR/100-request/
+5-minute wake limits or the 120-second helper limit, or authorize a repair: actions need a current live allowance.
 Late incomplete, stale or same-scope held/released evidence is attempt-only: it cannot
 promote findings/readiness or revive maintenance. Complete scans finishing beyond
 the original deadline are refused; no timeout grace or new-read permission is added.

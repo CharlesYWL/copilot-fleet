@@ -16,7 +16,7 @@ export const WORK_REPORT_SCHEMA = "prm.work-report/1";
 /** Per-pass allowance, matching Fleet's existing wake limits. */
 export const PASS_LIMITS = Object.freeze({
   visits: 5,
-  requests: 40,
+  requests: 100,
   milliseconds: 300_000,
   helperMilliseconds: 120_000,
 });

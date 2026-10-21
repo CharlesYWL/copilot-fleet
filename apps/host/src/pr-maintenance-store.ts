@@ -4394,7 +4394,7 @@ export class PrMaintenanceStore {
   ) {
     const usage = z
       .object({
-        requests: z.number().int().min(0).max(40),
+        requests: z.number().int().min(0).max(PR_MAINTENANCE_WAKE_LIMITS.requests),
         milliseconds: z
           .number()
           .int()

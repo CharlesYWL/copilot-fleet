@@ -47,7 +47,7 @@ a heartbeat and a manual trigger share one review, so you never see duplicates.
 
 1. Claim it with `fleet_get_pr_maintenance` `takeDue: true`. The returned
    `observationAllowance` and `observationClaim` bound this turn (5 PR visits,
-   40 provider requests, 5 minutes). A refused read never consumes a visit.
+   100 provider requests, 5 minutes). A refused read never consumes a visit.
    For a finite helper command, pass `observationClaim` as `maintenanceObservation`
    to `fleet_run_command` and use the absolute `observationAllowance.deadlineAt`.
    The Node injects the approved preparation clock; do not translate it.
@@ -232,7 +232,7 @@ evidence complete, or rerun with a reset allowance in the same wake.
 
 Inspect ADO `error.limit` for the actual kind/stage. A later authorized bounded
 attempt may pass the unchanged continuation and a larger byte allowance up to
-1 MiB. Item/depth limits and a fresh verification pass too large for 40 operations
+1 MiB. Item/depth limits and a fresh verification pass too large for 100 operations
 require manual evidence; repeated attempts cannot make them complete.
 If an independently authorized provider MCP/CLI can supply fresh exact metadata,
 it may support a repair proposal only with independently verified existing task
@@ -287,7 +287,7 @@ blocked checkpoint and ask the operator for the missing prerequisite.
 provenance: {source, method, evidenceRef}, requests}`. `source` identifies the
    already-authorized tool, `method` its actual read operation, and `evidenceRef`
    a retrievable source/transcript reference. The allowance is charged before I/O.
-   Use the remaining wake allowance, not a fresh 40-request claim. At most three
+   Use the remaining wake allowance, not a fresh 100-request claim. At most three
    alternate attempts are allowed per incident across restart/compaction.
 3. Read the provider through that tool, counting requests and pages. Record actual
    collection start time (the returned reservation's `reservedAt` is a Host clock).

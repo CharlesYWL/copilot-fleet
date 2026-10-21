@@ -922,7 +922,7 @@ export class OrchestratorEngine {
           [
             `PR maintenance observation recovery: record ${pending.recordId}, incident ${pending.incidentId}.`,
             "Read fleet_get_pr_maintenance for the exact retained error and receipts. Claim a bounded visit before read-only recovery.",
-            "Use alternate_attempt to reserve an alternate evidence method BEFORE calling it, then alternate_observation with pinned identity, fresh structured evidence and the same resolutionId. At most 3 attempts per incident; the existing 5 visits / 40 requests / 120 seconds per wake still apply.",
+            "Use alternate_attempt to reserve an alternate evidence method BEFORE calling it, then alternate_observation with pinned identity, fresh structured evidence and the same resolutionId. At most 3 attempts per incident; the existing 5 visits / 100 requests / 5 minutes per wake still apply. Each helper invocation remains capped at 120 seconds.",
             "Do not repeat a reserved attempt after uncertain delivery. Incomplete evidence stays incomplete. Provider auth/permission denial, identity drift, Stop, human holds and unknown effects are not capability recovery. Do not resume, authorize, release, reset budgets or replay worker dispatch.",
           ].join("\n"),
           `pr-maintenance-recovery:${pending.incidentId}`,

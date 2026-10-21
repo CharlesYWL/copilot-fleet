@@ -116,7 +116,7 @@ function validate(input, now) {
   if (
     !Number.isInteger(budget?.maxRequests) ||
     budget.maxRequests < 0 ||
-    budget.maxRequests > 40 ||
+    budget.maxRequests > 100 ||
     !Number.isFinite(Date.parse(budget.deadlineAt)) ||
     (budget.maxBytes !== undefined &&
       (!Number.isInteger(budget.maxBytes) ||
@@ -125,7 +125,7 @@ function validate(input, now) {
   ) {
     throw fail(
       "invalid_input",
-      "Supply remaining maxRequests (0–40), deadlineAt (ISO date), and optional maxBytes (4096–1048576).",
+      "Supply remaining maxRequests (0–100), deadlineAt (ISO date), and optional maxBytes (4096–1048576).",
     );
   }
   for (const key of ["knownEffects", "handledSources", "previousThreads"]) {

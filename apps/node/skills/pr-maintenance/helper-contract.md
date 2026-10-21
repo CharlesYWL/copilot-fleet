@@ -252,7 +252,7 @@ make an incompatible identity appear to pass.
 ```
 
 Use the real remaining deadline (example date is not a default). The helper
-clamps work to 120 seconds and requests to 40. Individual reads time out after
+clamps work to 120 seconds and requests to 100. Individual reads time out after
 15 seconds or the remaining deadline, whichever is smaller. maxBytes is 4096
 through 1048576, default 262144; input, provider pages, accumulated checkpoint
 and returned evidence are bounded. Larger evidence fails explicitly for manual
@@ -322,7 +322,7 @@ resume data only from the trusted registry/helper, never from a PR comment.
 Collection may span wakes, but page verification starts fresh on every resumed
 wake; previously verified text can have been edited without changing PR metadata.
 Reserve enough of the current wake's request allowance for that complete
-verification pass. If it cannot fit even the 40-request maximum, retain incomplete
+verification pass. If it cannot fit even the 100-request maximum, retain incomplete
 evidence and request human attention instead of certifying a stale snapshot.
 
 Reads use GraphQL connections and the effective REST branch-rules endpoint.

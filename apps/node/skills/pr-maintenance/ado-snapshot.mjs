@@ -188,7 +188,7 @@ function validate(input, started) {
   required(
     Number.isInteger(budget?.maxRequests) &&
       budget.maxRequests >= 0 &&
-      budget.maxRequests <= 40 &&
+      budget.maxRequests <= 100 &&
       date(budget.deadlineAt) &&
       (budget.maxBytes === undefined ||
         (Number.isInteger(budget.maxBytes) &&

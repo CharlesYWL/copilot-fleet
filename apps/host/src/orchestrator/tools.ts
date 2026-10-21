@@ -5,6 +5,7 @@ import {
   AGENT_NODE_ID_ENV,
   CriterionOutcomeSchema,
   HOST_YOLO_CAPABILITY,
+  PR_MAINTENANCE_WAKE_LIMITS,
   WorkspaceModeSchema,
   AccessIntentSchema,
   contextUsePercent,
@@ -660,13 +661,13 @@ export const GetPrMaintenanceSchema = z
       .boolean()
       .default(false)
       .describe(
-        "Claim the oldest due PR within this lead turn's shared limit: 5 visits, 40 requests and 5 minutes. Pagination and retries do not reset it.",
+        "Claim the oldest due PR within this lead turn's shared limit: 5 visits, 100 requests and 5 minutes. Pagination and retries do not reset it.",
       ),
     reserveRequests: z
       .number()
       .int()
       .min(1)
-      .max(40)
+      .max(PR_MAINTENANCE_WAKE_LIMITS.requests)
       .optional()
       .describe(
         "Override the reserved helper allowance. Defaults: recovery 1 (reserve alternate I/O separately), ADO 39 (leaves continuation capacity), GitHub 8. Lost/unused reservations stay charged.",
