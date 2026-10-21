@@ -22,14 +22,14 @@ import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetTools } from "../orchestrator/tools.js";
 import { orchestratorBriefing, owedPrompt } from "../orchestrator/briefing.js";
-import { maintenanceDirectionPrompt, reviewOutcome } from "../orchestrator/review.js";
+import { reviewOutcome } from "../orchestrator/review.js";
 import {
   assertTaskAdmissible,
   createTaskOnLead,
   findTaskLead,
   TaskApplicationError,
 } from "../orchestrator/task-application.js";
-import { PrMaintenanceError, prMaintenanceUnsettled } from "../pr-maintenance-store.js";
+import { prMaintenanceUnsettled } from "../pr-maintenance-store.js";
 import {
   reopenOrchestratorStoppedRun,
   stopSessions,
@@ -55,16 +55,6 @@ const ReviewSchema = z
     approved: z.boolean(),
     /** Required when sending back: the orchestrator acts on it verbatim. */
     note: z.string().max(4_000).optional(),
-    maintenance: z
-      .object({
-        recordId: z.string().min(1),
-        expectedVersion: z.number().int().positive(),
-        decisionId: z.string().min(1),
-        decisionVersion: z.number().int().positive(),
-        continueEligible: z.boolean().optional(),
-      })
-      .strict()
-      .optional(),
   })
   .strict();
 
@@ -210,8 +200,8 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           : undefined;
     return {
       records,
-      effectiveStates: Object.fromEntries(
-        records.map((record) => [record.id, store.prMaintenance.effectiveState(record)]),
+      statuses: Object.fromEntries(
+        records.map((record) => [record.id, store.prMaintenance.status(record)]),
       ),
       proposal: store.prMaintenance.getProposal(id),
       canAuthorize: Boolean(maintenanceOperator(request)),
@@ -258,7 +248,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       if (
         retained &&
         (retained.authorization.scope.publicationAuthorized ||
-          !["active", "paused"].includes(retained.lifecycle) ||
+          retained.lifecycle !== "active" ||
           prMaintenanceUnsettled(retained) ||
           retained.decision?.state === "pending")
       )
@@ -277,7 +267,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         "A released job's old task review or a compatible completed task does not require whole-task acceptance to create this unapproved proposal. Preserve task state, acceptance history and actual unresolved design decisions; preparation never revives a released grant or dispatches repairs.",
         ...(retained
           ? [
-              `Prepare repair reauthorization for the exact retained PR ${prMaintenanceUrl(retained.identity)} and worker ${retained.workerSessionId}. Preserve history, decisions and binding; do not release or replace it. Authorization leaves it paused until explicit Resume.`,
+              `Prepare repair reauthorization for the exact retained PR ${prMaintenanceUrl(retained.identity)} and worker ${retained.workerSessionId}. Preserve history, decisions and binding; do not release or replace it. Authorization starts a review immediately.`,
             ]
           : []),
         "This request is NOT publication or maintenance authorization. Present the readable proposal for signed-in operator approval, then end your turn. Do not repair, publish, merge, change credentials or create sessions.",
@@ -354,37 +344,49 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         return reply
           .code(404)
           .send({ error: "Maintenance registration not found for this task." });
-      if (input.operation.action === "direction")
-        return reply.code(409).send({
-          error:
-            "Use Send back with instructions to record maintenance direction with its task review.",
-        });
+      const operation = input.operation;
       updated = store.prMaintenance.operatorAction(
         record.id,
         input.expectedVersion,
-        input.operation,
+        operation,
         actor,
         () => {
-          if (input.operation.action !== "release") return;
-          store.appendRunNote(
-            id,
-            run.phaseIndex,
-            `Maintenance released by ${actor}: ${input.operation.reason}`,
-            {
-              summary: "PR maintenance ownership released",
-              kind: "decision",
-              source: "operator",
-            },
-          );
-          if (record.decision?.state === "pending") service.resolveRunReview(id);
+          // Audit trail on the task: direction and release are durable decisions.
+          if (operation.action === "direction")
+            store.appendRunNote(
+              id,
+              run.phaseIndex,
+              `PR maintenance direction (${operation.decisionId} v${operation.decisionVersion}) by ${actor}:\n\n${operation.direction}`,
+              {
+                summary: "PR maintenance design direction recorded",
+                kind: "decision",
+                source: "operator",
+              },
+            );
+          if (operation.action === "release")
+            store.appendRunNote(
+              id,
+              run.phaseIndex,
+              `Maintenance released by ${actor}: ${operation.reason}`,
+              {
+                summary: "PR maintenance ownership released",
+                kind: "decision",
+                source: "operator",
+              },
+            );
         },
       );
     }
     service.cancelPausedPrMaintenance();
     service.publishRun(store.getRun(id)!);
-    if (input.action === "update" && input.operation.action === "work")
-      return reply.code(202).send(updated);
+    service.publishSnapshot();
+    // Reviews are delivered by the tick; an accepted request is not its result.
     engine.tick();
+    if (
+      input.action === "update" &&
+      ["work", "review", "direction", "resume"].includes(input.operation.action)
+    )
+      return reply.code(202).send(updated);
     return updated;
   });
 
@@ -594,20 +596,13 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     const { id } = request.params as { id: string };
     const input = ReviewSchema.parse(request.body);
     const run = store.getRun(id);
-    const held = maintenanceForTask(id).find(
-      (record) => record.decision?.state === "pending",
-    );
-    const outcome = reviewOutcome(run, input, Boolean(held));
+    // The task's review is about the task. A PR maintenance decision is
+    // answered in the PRM panel or the orchestrator conversation, never here,
+    // so settling this review can never cancel or settle maintenance intent.
+    const outcome = reviewOutcome(run, input);
 
     if (outcome.kind === "not_found") {
       return reply.code(404).send({ error: "Task not found" });
-    }
-    if (outcome.kind === "maintenance_direction_required") {
-      return reply.code(409).send({
-        code: "wait_for_human",
-        error:
-          "Approve task cannot authorize a maintenance design change. Use Send back with instructions for the exact decision.",
-      });
     }
     if (outcome.kind === "not_waiting") {
       return reply.code(409).send({ error: "That task is not waiting for a review" });
@@ -617,83 +612,10 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         .code(400)
         .send({ error: "Say what needs changing, so the orchestrator can act on it" });
     }
-
-    if (held) {
-      const actor = maintenanceOperator(request);
-      if (!actor)
-        return reply.code(403).send({
-          error: "Maintenance direction requires an authenticated browser operator.",
-        });
-      const reference = input.maintenance;
-      if (!reference || reference.recordId !== held.id)
-        return reply.code(409).send({
-          error:
-            "Refresh the task and reference the current maintenance decision and record version.",
-        });
-      if (outcome.kind !== "send_back")
-        throw new PrMaintenanceError(
-          "wait_for_human",
-          "Maintenance needs bounded direction.",
-        );
-      const record = store.prMaintenance.operatorAction(
-        held.id,
-        reference.expectedVersion,
-        {
-          action: "direction",
-          decisionId: reference.decisionId,
-          decisionVersion: reference.decisionVersion,
-          direction: outcome.note,
-          resume: reference.continueEligible ?? false,
-          continueEligible: reference.continueEligible ?? false,
-        },
-        actor,
-        () => {
-          store.appendRunNote(
-            id,
-            run!.phaseIndex,
-            `Maintenance direction (${reference.decisionId} v${reference.decisionVersion}) by ${actor}:\n\n${outcome.note}`,
-            {
-              summary: "Bounded PR design guidance recorded",
-              kind: "decision",
-              source: "operator",
-            },
-          );
-          service.resolveRunReview(id);
-          store.updateRun(id, {
-            ...(run!.state === "awaiting_human" ? { state: "running" as const } : {}),
-            pendingPrompt: reference.continueEligible
-              ? (store.getRun(id)?.pendingPrompt ?? "")
-              : owedPrompt(
-                  store.getRun(id)?.pendingPrompt ?? "",
-                  maintenanceDirectionPrompt(
-                    run!.name,
-                    reference.decisionId,
-                    outcome.note,
-                  ),
-                ),
-          });
-        },
-      );
-      const directed = store.getRun(id)!;
-      service.publishRun(directed);
-      // Durable consent is admitted by the ordinary tick, not inside the committed request.
-      if (!reference.continueEligible) engine.tick();
-      return reply.code(reference.continueEligible ? 202 : 200).send({
-        ok: true,
-        run: directed,
-        maintenance: record,
-        effectiveState: store.prMaintenance.effectiveState(record),
-      });
-    }
-    if (input.maintenance)
-      return reply.code(409).send({
-        error: "The displayed maintenance decision is stale; refresh before acting.",
-      });
     store.prMaintenance.assertAdmission({
       taskId: id,
       action: outcome.kind === "approve" ? "approve" : "reopen",
     });
-
     if (outcome.kind === "approve") {
       store.appendRunNote(
         run!.id,
@@ -909,7 +831,6 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     if (!session || session.runRole !== "lead") {
       return reply.code(404).send({ error: "Orchestrator not found" });
     }
-    store.prMaintenance.pauseForSession(id, "Orchestrator Stop requested");
     if (terminalSessionStates.has(session.state)) {
       engine.tick();
       return { ok: true, alreadyTerminal: true };
@@ -942,7 +863,6 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
    */
   app.delete("/api/orchestrators/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
-    store.prMaintenance.pauseForSession(id, "Orchestrator dismissed");
     const error = dismissalError(id);
     if (error) {
       return reply.code(error === "Orchestrator not found" ? 404 : 409).send({ error });
@@ -955,8 +875,6 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
 
   app.post("/api/orchestrators/cleanup", async (request, reply) => {
     const input = StopSessionsSchema.parse(request.body);
-    for (const id of new Set(input.sessionIds))
-      store.prMaintenance.pauseForSession(id, "Orchestrator cleanup requested");
     const error = input.sessionIds.map(dismissalError).find(Boolean);
     if (error) return reply.code(409).send({ error });
     for (const id of new Set(input.sessionIds)) {

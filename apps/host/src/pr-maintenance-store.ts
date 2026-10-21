@@ -9,8 +9,11 @@ import {
   CommandReceiptSchema,
   commandDigestPayload,
   nextHeartbeat,
+  prMaintenanceActiveBatch,
   prMaintenanceObservationFresh,
+  prMaintenanceReconciling,
   prMaintenanceSources,
+  prMaintenanceStatus,
   prMaintenanceProviderKey,
   isWritingCategory,
   terminalRunStepStates,
@@ -26,7 +29,6 @@ import {
   PrMaintenanceHelperSnapshotIdentitySchema,
   PrMaintenanceProposalSchema,
   PrMaintenanceRegistrationSchema,
-  PrMaintenanceScanSchema,
   PrMaintenanceWakeSchema,
   type PrMaintenanceAdmission,
   type PrMaintenanceApproval,
@@ -34,6 +36,8 @@ import {
   type PrMaintenanceBatch,
   type PrMaintenanceCheckpoint,
   type PrMaintenanceEffect,
+  type PrMaintenanceHold,
+  type PrMaintenanceHoldKind,
   type PrMaintenanceIdentity,
   type PrMaintenanceIncident,
   type PrMaintenanceManualCommand,
@@ -42,7 +46,9 @@ import {
   type PrMaintenanceOperatorAction,
   type PrMaintenanceProposal,
   type PrMaintenanceRegistration,
-  type PrMaintenanceEffectiveState,
+  type PrMaintenanceReview,
+  type PrMaintenanceReviewSource,
+  type PrMaintenanceStatus,
   type CommandExecution,
   type SessionActor,
   sessionActor,
@@ -61,14 +67,24 @@ const neverSentEffect = (effect: PrMaintenanceEffect) =>
 const nowIso = () => new Date().toISOString();
 /** Only if the heartbeat schedule has no future time at all. */
 const ROUTINE_CHECK_FALLBACK_MS = 60 * 60_000;
+/** Unattended heartbeat checks are never closer together than this. */
+const ROUTINE_CHECK_MIN_MS = 60 * 60_000;
+/**
+ * The loop guard. A finding group that fails to make progress this many times
+ * in a row becomes a design decision instead of another automatic attempt.
+ * There is deliberately no cap on total batches: a PR with many valid comments
+ * needs many fixes.
+ */
+export const PR_MAINTENANCE_LOOP_LIMITS = Object.freeze({
+  findingAttempts: 3,
+});
 const emptyCounters = () => ({
   repairBatches: 0,
   answerBatches: 0,
   mutationAttempts: 0,
   consecutiveFailures: 0,
   totalFailures: 0,
-  scanStalls: 0,
-  reconciliationStalls: 0,
+  dispatchesSinceDirection: 0,
 });
 const actorSchema = z.string().trim().min(1).max(512);
 const wakeIdSchema = z.string().min(1).max(512);
@@ -225,7 +241,7 @@ export class PrMaintenanceStore {
     const version = Number(
       db.prepare("SELECT version FROM pr_maintenance_schema").get()?.version,
     );
-    if (![1, 2, 3].includes(version))
+    if (![1, 2, 3, 4].includes(version))
       refuse(
         "schema_version",
         "This Host does not support the maintenance registry schema.",
@@ -259,6 +275,21 @@ export class PrMaintenanceStore {
           );
         }
         db.exec("UPDATE pr_maintenance_schema SET version=3");
+      });
+    // v2 records: one effective state (phase + optional hold) instead of
+    // lifecycle/pause/continuation. Parsing upgrades; this persists it once.
+    if (version < 4)
+      this.store.writeAtomically(() => {
+        for (const row of db.prepare("SELECT data FROM pr_maintenance").all()) {
+          const record = PrMaintenanceRegistrationSchema.parse(
+            JSON.parse(String(row.data)),
+          );
+          db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+            JSON.stringify(record),
+            record.id,
+          );
+        }
+        db.exec("UPDATE pr_maintenance_schema SET version=4");
       });
   }
 
@@ -561,13 +592,10 @@ export class PrMaintenanceStore {
           eligibilityEvidence: registration.eligibilityEvidence,
           sourceProposal: { id: proposal.id, version: proposal.version },
         };
-        // Reauthorization grants scope, not permission to resume old paused/finished work.
-        if (record.lifecycle === "active")
-          this.pause(record, "repair_authorized_requires_explicit_resume", undefined, {
-            actor: "operator",
-            actorId: operatorId,
-          });
-        else delete record.readyFingerprint;
+        // The operator just authorized repairs for this exact PR and worker: review now.
+        delete record.readyFingerprint;
+        if (record.hold?.kind === "paused") this.clearHold(record, operatorId, nowIso());
+        this.requestReview(record, "enable", nowIso(), operatorId);
         const saved = this.save(record);
         this.consumeProposal(taskId, true);
         return saved;
@@ -582,7 +610,7 @@ export class PrMaintenanceStore {
   ): void {
     if (
       record.ownershipReleasedAt ||
-      !["active", "paused"].includes(record.lifecycle) ||
+      record.lifecycle !== "active" ||
       record.authorization.scope.publicationAuthorized ||
       record.taskId !== registration.taskId ||
       record.workerSessionId !== registration.workerSessionId ||
@@ -610,7 +638,7 @@ export class PrMaintenanceStore {
       refuse(reason, "The retained binding is not eligible for repair authorization.");
     const { task, worker } = this.ownedWorker(record.taskId, record.workerSessionId);
     if (
-      !["running", "awaiting_lead", "completed"].includes(task.state) ||
+      !["running", "awaiting_lead", "awaiting_human", "completed"].includes(task.state) ||
       worker.stopRequested ||
       !["idle", "completed", "stopped"].includes(worker.state) ||
       this.store
@@ -651,13 +679,15 @@ export class PrMaintenanceStore {
       record.findings.length > 200 ||
       record.findingAttempts.length > 200 ||
       record.actions.length > 200 ||
-      record.decisionHistory.length > 100 ||
-      (record.resumeHistory?.length ?? 0) > 100
+      record.decisionHistory.length > 100
     )
       refuse(
         "checkpoint_overflow",
         "The bounded checkpoint is full; settle pending work and archive its history explicitly, without discarding pending findings.",
       );
+    // Rolling audit trails: the newest entries are kept, never refused.
+    record.holdHistory = record.holdHistory.slice(-100);
+    record.reviewHistory = record.reviewHistory.slice(-50);
     this.archiveManualCommands(record);
     const parsed = PrMaintenanceRegistrationSchema.parse(record);
     if (
@@ -938,7 +968,7 @@ export class PrMaintenanceStore {
         );
       const now = nowIso();
       const record: PrMaintenanceRegistration = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         id: randomUUID(),
         version: 1,
         generation,
@@ -969,9 +999,9 @@ export class PrMaintenanceStore {
             : {}),
         },
         authorizationHistory: [],
-        resumeHistory: [],
         lifecycle: "active",
-        pauseReason: "",
+        holdHistory: [],
+        reviewHistory: [],
         renewedAt: now,
         nextCheckAt: now,
         counters: emptyCounters(),
@@ -986,78 +1016,80 @@ export class PrMaintenanceStore {
         createdAt: now,
         updatedAt: now,
       };
-      const reason =
-        this.binding(record) ??
-        (task.state === "awaiting_human"
-          ? "task_human_hold"
-          : ["awaiting_approval", "blocked", "failed", "aggregating"].includes(task.state)
-            ? "task_not_eligible"
-            : worker.stopRequested || task.state === "cancelled"
-              ? "stopped"
-              : undefined);
-      if (reason) this.pause(record, reason, now);
+      /*
+       * Enablement is the operator's explicit intent for this exact PR. It
+       * never inherits an unrelated task hold (a task waiting for review is
+       * waiting on a person about the task, not about this PR). Only an
+       * explicit Stop already in force on the retained worker or task carries
+       * over, because Stop always wins.
+       */
+      if (worker.stopRequested || task.state === "cancelled")
+        this.setHold(record, "stopped", "The retained worker or task is stopped.", now);
+      else {
+        const bindingReason = this.binding(record);
+        if (bindingReason)
+          this.setHold(
+            record,
+            "paused",
+            `The retained worker or checkout is not usable (${bindingReason}); a supported handoff is required.`,
+            now,
+          );
+        else this.requestReview(record, "enable", now, operatorId);
+      }
       const saved = this.write(record, true);
       this.consumeProposal(task.id, Boolean(approvedProposal));
       return saved;
     });
   }
 
-  private pause(
+  /**
+   * Records an exceptional hold. Undispatched work is cancelled and refunded;
+   * accepted in-flight work is asked to stop through its own receipts. Durable
+   * operator intent — routine-work requests and a pending review — survives:
+   * only an explicit operator Pause or Release cancels routine work.
+   */
+  private setHold(
     record: PrMaintenanceRegistration,
+    kind: PrMaintenanceHoldKind,
     reason: string,
     at = nowIso(),
-    origin: {
-      actor: "lead" | "operator" | "node_console" | "system";
-      actorId: string;
-    } = { actor: "system", actorId: "host" },
+    origin: Pick<PrMaintenanceHold, "actor" | "actorId"> = {
+      actor: "system",
+      actorId: "host",
+    },
   ): void {
-    if (
-      record.continuation &&
-      record.continuation.state !== "cancelled" &&
-      (["checking", "handback"].includes(record.continuation.state) ||
-        record.batches.some(
-          (batch) =>
-            batch.id === record.continuation?.batchId &&
-            outstanding.has(batch.state) &&
-            this.neverDispatched(record, batch),
-        ))
-    ) {
-      record.continuation.state = "cancelled";
-      record.continuation.reason = reason;
-      record.continuation.settledAt = at;
-    }
-    if (
-      (origin.actor === "operator" && reason !== "manual_control") ||
-      [
-        "stopped",
-        "continuation_identity_changed",
-        "remote_identity_changed",
-        "terminal_cancellation_requested",
-      ].includes(reason) ||
-      this.store.getSession(record.workerSessionId)?.stopRequested ||
-      this.store.getSession(record.leadSessionId)?.stopRequested ||
-      this.store.getRun(record.taskId)?.state === "cancelled"
-    ) {
+    if (record.hold) record.holdHistory.push(record.hold);
+    record.hold = { kind, reason, ...origin, at };
+    delete record.readyFingerprint;
+    if (record.review && !record.review.concludedAt)
+      this.concludeReview(record, "held", at, reason);
+    if (origin.actor === "operator" && kind === "paused")
       for (const request of record.workRequests) {
         if (request.state !== "pending") continue;
         request.state = "cancelled";
         request.settledAt = at;
         request.reason = reason;
       }
-    }
-    if (record.lifecycle === "active") {
-      record.lifecycle = "paused";
-      record.pausedAt = at;
-    }
-    record.pauseReason = reason;
-    record.pauseOrigin = { ...origin, at };
-    delete record.readyFingerprint;
+    this.cancelUndispatched(record, reason, at);
+  }
+
+  /**
+   * Cancels work that has not reached the worker and asks accepted work to
+   * stop through its own receipts. Prepared batches are refunded; nothing
+   * dispatched is ever assumed cancelled.
+   */
+  private cancelUndispatched(
+    record: PrMaintenanceRegistration,
+    reason: string,
+    at: string,
+  ): void {
     for (const batch of record.batches) {
       if (!outstanding.has(batch.state)) continue;
       batch.cancellationRequestedAt ??= at;
       if (batch.state === "prepared") {
         batch.state = "cancelled";
         batch.executionSettled = true;
+        batch.executionNotDispatched = true;
         batch.reason = reason;
         batch.evidence =
           "Dispatch was not accepted; cancelled transactionally before admission.";
@@ -1068,7 +1100,7 @@ export class PrMaintenanceStore {
           evidence: [],
           responseRequired: true,
           responseIds: [],
-          nextAction: "Wait for authorized continuation.",
+          nextAction: "Prepare again after the hold is cleared.",
           progress: false,
         }));
         this.refund(record, batch, 0, false);
@@ -1076,22 +1108,86 @@ export class PrMaintenanceStore {
     }
   }
 
-  pauseForSession(sessionId: string, reason = "Session stopped or removed"): void {
+  private clearHold(record: PrMaintenanceRegistration, actorId: string, at: string) {
+    if (!record.hold) return;
+    record.holdHistory.push({
+      ...record.hold,
+      reason: `${record.hold.reason} (cleared by ${actorId} at ${at})`,
+    });
+    delete record.hold;
+    if (record.manualControl && !record.manualControl.endedAt)
+      record.manualControl.endedAt = at;
+    for (const incident of record.incidents)
+      if (
+        !incident.resolvedAt &&
+        ["identity", "provider_denial"].includes(incident.kind)
+      ) {
+        incident.resolvedAt = at;
+        incident.resolution = "operator_resume";
+        delete record.lastAttempt;
+      }
+    record.counters.consecutiveFailures = 0;
+  }
+
+  /**
+   * Opens a review, or reuses the open one. This is the only way any trigger —
+   * heartbeat, Review now, a worker result, direction, Resume — asks for a
+   * look at the PR, so concurrent triggers coalesce into one review. A manual
+   * trigger never touches `nextCheckAt`.
+   */
+  private requestReview(
+    record: PrMaintenanceRegistration,
+    source: PrMaintenanceReviewSource,
+    at = nowIso(),
+    actorId?: string,
+  ): PrMaintenanceReview {
+    if (record.review && !record.review.concludedAt) return record.review;
+    if (record.review) record.reviewHistory.push(record.review);
+    record.review = {
+      id: randomUUID(),
+      source,
+      requestedAt: at,
+      ...(actorId ? { actorId } : {}),
+    };
+    return record.review;
+  }
+
+  private concludeReview(
+    record: PrMaintenanceRegistration,
+    outcome: NonNullable<PrMaintenanceReview["outcome"]>,
+    at = nowIso(),
+    summary?: string,
+  ): void {
+    const review = record.review;
+    if (!review || review.concludedAt) return;
+    review.concludedAt = at;
+    review.outcome = outcome;
+    if (summary) review.summary = summary.slice(0, 8_192);
+  }
+
+  /**
+   * Explicit Stop, cancel or deletion of the retained worker. Stopping the
+   * orchestrator's own session is deliberately not a reason: maintenance
+   * continues when the orchestrator next runs.
+   */
+  stopForSession(sessionId: string, reason = "The retained worker was stopped."): void {
     this.store.writeAtomically(() => {
       for (const record of this.retained().filter(
-        (entry) =>
-          entry.workerSessionId === sessionId || entry.leadSessionId === sessionId,
+        (entry) => entry.workerSessionId === sessionId,
       )) {
-        this.pause(record, reason);
+        if (record.hold?.kind === "stopped") continue;
+        this.setHold(record, "stopped", reason);
         this.save(record);
       }
     });
   }
 
-  pauseForTask(taskId: string, reason = "Task stopped or removed"): void {
+  /** Explicit cancel, archive or deletion of the maintained task. */
+  stopForTask(taskId: string, reason = "The task was stopped."): void {
     this.store.writeAtomically(() => {
       for (const record of this.retained().filter((entry) => entry.taskId === taskId)) {
-        this.pause(record, reason);
+        if (record.hold?.kind === "stopped") continue;
+        this.setHold(record, "stopped", reason);
         this.save(record);
       }
     });
@@ -1124,11 +1220,13 @@ export class PrMaintenanceStore {
         record.leadSessionId = leadSessionId;
         // The previous owner's own pause is the owning lead's pause, not an
         // operator's or the Host's, so whichever lead owns the task may lift it.
-        if (
-          record.pauseOrigin?.actor === "lead" &&
-          record.pauseOrigin.actorId === previous
-        )
-          record.pauseOrigin = { ...record.pauseOrigin, actorId: leadSessionId };
+        if (record.hold?.actor === "lead" && record.hold.actorId === previous)
+          record.hold = { ...record.hold, actorId: leadSessionId };
+        // An open review moves with the task and is re-delivered to the new owner.
+        if (record.review && !record.review.concludedAt) {
+          delete record.review.wakeKey;
+          delete record.review.wakeQueuedAt;
+        }
         const saved = this.save(record);
         this.db
           .prepare("UPDATE pr_maintenance SET lead_session_id=? WHERE id=?")
@@ -1547,7 +1645,11 @@ export class PrMaintenanceStore {
             "handback_unavailable",
             "One-turn handback requires a retained maintenance worker prompt.",
           );
-        this.assertEligibleContinuation(record, true);
+        if (record.hold && record.hold.kind !== "manual_control")
+          refuse(
+            "independent_hold",
+            `Handback cannot clear this hold: ${record.hold.reason}. Resume maintenance first.`,
+          );
       }
       if (this.manualCommand(sessionId, command.id))
         refuse(
@@ -1580,10 +1682,18 @@ export class PrMaintenanceStore {
           "Host queue and dispatch receipt prove this attempt was never sent.";
         this.refund(record, batch, 0, false);
       }
-      this.pause(record, "manual_control", now, {
-        actor: actor.kind,
-        actorId: sessionActorId(actor),
-      });
+      const origin = { actor: actor.kind, actorId: sessionActorId(actor) };
+      // A manual takeover never overrides Stop, access or identity holds.
+      if (!record.hold || record.hold.kind === "manual_control")
+        this.setHold(
+          record,
+          "manual_control",
+          command.handback === "after_turn"
+            ? "A person is driving this worker for one turn; maintenance resumes after it."
+            : "A person took manual control of the retained worker.",
+          now,
+          origin,
+        );
       record.manualControl ??= {
         ...(actor.kind === "operator" ? { operatorId: actor.operatorId } : {}),
         actor,
@@ -1591,13 +1701,42 @@ export class PrMaintenanceStore {
         commands: [],
       };
       delete record.manualControl.endedAt;
-      record.manualControl.commands.push(receipt);
-      if (command.handback === "after_turn") {
-        if (actor.kind !== "operator")
-          refuse("handback_unavailable", "Host operator required");
-        this.requestContinuation(record, actor.operatorId, now, command.id);
-      }
+      record.manualControl.commands.push({
+        ...receipt,
+        ...(command.handback ? { handback: command.handback } : {}),
+      });
       this.save(record);
+    });
+  }
+
+  /**
+   * Ends a one-turn handback once its exact command settled and the worker is
+   * idle again: the hold clears and a review is requested, with no second
+   * Resume. Called on every engine tick.
+   */
+  reconcileHandbacks(): boolean {
+    return this.store.writeAtomically(() => {
+      let changed = false;
+      for (const record of this.retained()) {
+        if (record.hold?.kind !== "manual_control" || !record.manualControl) continue;
+        const last = record.manualControl.commands.at(-1);
+        if (!last || last.handback !== "after_turn") continue;
+        const command = this.manualCommand(record.workerSessionId, last.id);
+        const worker = this.store.getSession(record.workerSessionId);
+        if (
+          command?.state !== "settled" ||
+          worker?.state !== "idle" ||
+          worker.stopRequested ||
+          this.hasPendingManualExecution(record.workerSessionId)
+        )
+          continue;
+        const now = nowIso();
+        this.clearHold(record, last.operatorId ?? "operator", now);
+        this.requestReview(record, "handback", now, last.operatorId);
+        this.save(record);
+        changed = true;
+      }
+      return changed;
     });
   }
 
@@ -1628,164 +1767,6 @@ export class PrMaintenanceStore {
     });
   }
 
-  private assertResumeSafety(
-    record: PrMaintenanceRegistration,
-    decisionId?: string,
-    decisionVersion?: number,
-  ): void {
-    this.assertNoPendingPermission(record);
-    if (record.ownershipReleasedAt)
-      refuse("released", "Released maintenance needs explicit new enablement.");
-    if (!record.authorization.scope.publicationAuthorized)
-      refuse(
-        "repair_authorization_required",
-        "Observation-only maintenance is retired. Prepare and authenticate a repair proposal for this retained PR and worker.",
-      );
-    if (this.hasPendingManualExecution(record.workerSessionId))
-      refuse(
-        "execution_uncertain",
-        "Settle the manual command receipt before changing maintenance control.",
-      );
-    if (record.decision) {
-      if (record.decision.state === "pending")
-        refuse(
-          "wait_for_human",
-          "Record authenticated direction, not an approval claim, for this decision.",
-        );
-      this.matchDecision(record, decisionId, decisionVersion);
-    }
-    if (record.lifecycle === "merged" || record.lifecycle === "closed")
-      refuse(
-        "terminal",
-        "Terminal registrations cannot resume; settle and enable a new generation.",
-      );
-    if (
-      record.incidents.some(
-        (incident) => incident.kind === "effects" && !incident.resolvedAt,
-      )
-    )
-      refuse(
-        "unsettled",
-        "Reconcile ambiguous effects with correlated receipts before resuming maintenance.",
-      );
-    const reason = this.binding(record);
-    if (reason)
-      refuse(
-        reason,
-        "Current worker binding is not eligible; an explicit supported handoff is required.",
-      );
-  }
-
-  private authorityHash(record: PrMaintenanceRegistration): string {
-    const task = this.store.getRun(record.taskId);
-    const worker = this.store.getSession(record.workerSessionId);
-    return createHash("sha256")
-      .update(
-        JSON.stringify({
-          identity: record.identity,
-          generation: record.generation,
-          taskId: record.taskId,
-          leadSessionId: record.leadSessionId,
-          workerSessionId: record.workerSessionId,
-          placementId: record.placementId,
-          checkoutKey: record.checkoutKey,
-          bindingGeneration: record.bindingGeneration,
-          authorization: record.authorization,
-          decision: record.decision,
-          objective: task?.objective,
-          policy: task?.policy,
-          workspaceBinding: task?.workspaceBinding,
-          agentSessionId: worker?.agentSessionId,
-        }),
-      )
-      .digest("hex");
-  }
-
-  /** Consent to a design decision is not consent to clear another kind of hold. */
-  private assertEligibleContinuation(
-    record: PrMaintenanceRegistration,
-    manual = false,
-    queuedWork = false,
-  ): void {
-    this.assertNoPendingPermission(record);
-    const task = this.store.getRun(record.taskId);
-    const worker = this.store.getSession(record.workerSessionId);
-    const lead = this.store.getSession(record.leadSessionId);
-    const reason = this.binding(record);
-    if (reason) refuse(reason, "The retained task, worker or checkout binding changed.");
-    if (record.ownershipReleasedAt)
-      refuse("released", "Released ownership cannot continue.");
-    if (!record.authorization.scope.publicationAuthorized)
-      refuse(
-        "repair_authorization_required",
-        "Repair authorization is required; continuation grants no permissions.",
-      );
-    if (worker?.stopRequested || lead?.stopRequested || task?.state === "cancelled")
-      refuse(
-        "stopped",
-        "Stop is independent. Explicitly resume the stopped task/session before requesting continuation.",
-      );
-    if (worker?.dismissed || lead?.dismissed)
-      refuse("dismissed", "Restore the retained session before requesting continuation.");
-    if (
-      task &&
-      (["awaiting_approval", "blocked", "failed", "aggregating"].includes(task.state) ||
-        (task.state === "completed" && !queuedWork))
-    )
-      refuse(
-        "task_not_eligible",
-        "Resolve the task's independent approval or lifecycle hold first.",
-      );
-    if (!manual && record.manualControl && !record.manualControl.endedAt)
-      refuse(
-        "manual_control",
-        "Ongoing manual takeover requires explicit handback; direction cannot end it.",
-      );
-    if (manual && record.decision?.state === "pending")
-      refuse("wait_for_human", "Handback cannot approve a pending design decision.");
-    if (
-      record.lifecycle !== "active" &&
-      !(
-        record.lifecycle === "paused" &&
-        (["wait_for_human", "finding_needs_human"].includes(record.pauseReason) ||
-          (manual && record.pauseReason === "manual_control"))
-      )
-    )
-      refuse(
-        "independent_hold",
-        `Continuation cannot clear this hold: ${record.pauseReason || record.lifecycle}.`,
-      );
-    if (record.incidents.some((incident) => !incident.resolvedAt))
-      refuse(
-        "independent_hold",
-        "Reconcile the recorded access, identity or effect incident first.",
-      );
-    if (
-      queuedWork
-        ? record.actions.some((effect) => effect.state === "uncertain") ||
-          record.batches.some(
-            (batch) =>
-              ["uncertain", "reconciling"].includes(batch.state) ||
-              batch.effects.some((effect) => effect.state === "uncertain") ||
-              (batch.stepId && !batch.executionSettled && !outstanding.has(batch.state)),
-          )
-        : prMaintenanceUnsettled(record)
-    )
-      refuse(
-        "unsettled",
-        "Reconcile existing execution and effects before requesting continuation.",
-      );
-    if (
-      record.counters.mutationAttempts >= record.authorization.budgets.mutationAttempts ||
-      (record.counters.repairBatches >= record.authorization.budgets.repairBatches &&
-        record.counters.answerBatches >= record.authorization.budgets.answerBatches)
-    )
-      refuse(
-        "budget_exhausted",
-        "Renew exhausted allowances explicitly; continuation never resets budgets.",
-      );
-  }
-
   private hasPendingPermission(record: PrMaintenanceRegistration): boolean {
     return this.store
       .listPermissionEvents()
@@ -1796,6 +1777,18 @@ export class PrMaintenanceStore {
       );
   }
 
+  /** The single authoritative status, with the facts only the Host can see. */
+  status(record: PrMaintenanceRegistration): PrMaintenanceStatus {
+    return prMaintenanceStatus(record, this.statusOverlay(record));
+  }
+
+  statusOverlay(record: PrMaintenanceRegistration) {
+    return {
+      binding: record.ownershipReleasedAt ? undefined : this.binding(record),
+      permission: this.hasPendingPermission(record),
+    };
+  }
+
   private assertNoPendingPermission(record: PrMaintenanceRegistration): void {
     if (this.hasPendingPermission(record))
       refuse(
@@ -1804,601 +1797,10 @@ export class PrMaintenanceStore {
       );
   }
 
-  private requestContinuation(
-    record: PrMaintenanceRegistration,
-    operatorId: string,
-    at: string,
-    manualCommandId?: string,
-  ): void {
-    const headSha =
-      record.observation?.headSha ??
-      record.decision?.headSha ??
-      record.authorization.headSha;
-    if (record.continuation)
-      (record.continuationHistory ??= []).push(record.continuation);
-    record.continuation = {
-      id: randomUUID(),
-      operatorId,
-      requestedAt: at,
-      expectedVersion: record.version,
-      authorityHash: this.authorityHash(record),
-      headSha,
-      evidenceState: "refresh_required",
-      state: manualCommandId ? "handback" : "checking",
-      ...(manualCommandId ? { manualCommandId } : {}),
-    };
-    delete record.readyFingerprint;
-    record.nextCheckAt = at;
-  }
-
-  private continuationChanged(record: PrMaintenanceRegistration): boolean {
-    const intent = record.continuation;
-    const pinned =
-      intent &&
-      (["checking", "handback"].includes(intent.state) ||
-        (intent.state === "consumed" &&
-          record.batches.some(
-            (batch) =>
-              batch.id === intent.batchId &&
-              outstanding.has(batch.state) &&
-              this.neverDispatched(record, batch),
-          )));
-    return Boolean(
-      pinned &&
-      (intent.authorityHash !== this.authorityHash(record) ||
-        (intent.evidenceState === "pinned" &&
-          intent.headSha !== record.observation?.headSha) ||
-        this.binding(record)),
-    );
-  }
-
-  /** Called on existing engine wakes, never by a new polling loop. */
-  reconcileContinuations(): boolean {
-    return this.store.writeAtomically(() => {
-      let changed = false;
-      for (const record of this.retained()) {
-        const intent = record.continuation;
-        if (!intent || intent.state === "cancelled") continue;
-        const retainedWorker = this.store.getSession(record.workerSessionId);
-        const retainedLead = this.store.getSession(record.leadSessionId);
-        if (
-          ["checking", "handback"].includes(intent.state) &&
-          (retainedWorker?.stopRequested ||
-            retainedLead?.stopRequested ||
-            this.store.getRun(record.taskId)?.state === "cancelled")
-        ) {
-          this.pause(record, "stopped");
-          this.save(record);
-          changed = true;
-          continue;
-        }
-        if (this.continuationChanged(record)) {
-          this.pause(record, "continuation_identity_changed");
-          this.save(record);
-          changed = true;
-          continue;
-        }
-        if (intent.state !== "handback") continue;
-        if (!this.handbackQuiescent(record)) continue;
-        if (!intent.completedAt) {
-          intent.completedAt = nowIso();
-          record.nextCheckAt = intent.completedAt;
-          this.save(record);
-          changed = true;
-          continue;
-        }
-        if (
-          !record.observation?.complete ||
-          !record.lastAttempt?.complete ||
-          record.lastAttempt.failure ||
-          record.lastAttempt.snapshotId !== record.observation.snapshotId ||
-          (record.observationHostAt ?? record.observation.attemptedAt) <
-            intent.completedAt ||
-          !prMaintenanceObservationFresh(
-            record.observation,
-            Date.now(),
-            record.observationHostAt,
-          )
-        )
-          continue;
-        this.applyResume(
-          record,
-          { actor: "operator", actorId: intent.operatorId },
-          nowIso(),
-          true,
-        );
-        intent.state = "checking";
-        intent.headSha = record.observation.headSha!;
-        intent.evidenceState = "refresh_required";
-        delete intent.wakeQueuedAt;
-        // Reobserve after the manual turn, not merely after it was requested.
-        intent.requestedAt = nowIso();
-        this.save(record);
-        changed = true;
-      }
-      return changed;
-    });
-  }
-
-  effectiveState(record: PrMaintenanceRegistration): PrMaintenanceEffectiveState {
-    const state = (
-      status: PrMaintenanceEffectiveState["status"],
-      reason: string,
-      action: string,
-    ) => ({ status, reason, action });
-    if (record.ownershipReleasedAt)
-      return state(
-        "released",
-        "Ownership released; historical lifecycle is retained for audit.",
-        "No continuation. A new registration requires explicit authorization.",
-      );
-    const worker = this.store.getSession(record.workerSessionId);
-    const lead = this.store.getSession(record.leadSessionId);
-    if (
-      worker?.stopRequested ||
-      lead?.stopRequested ||
-      this.store.getRun(record.taskId)?.state === "cancelled"
-    )
-      return state(
-        "needs_decision",
-        "Independent Stop is still in effect.",
-        "Explicitly resume the stopped task/session; recording design direction cannot clear Stop.",
-      );
-    if (this.hasPendingPermission(record))
-      return state(
-        "needs_decision",
-        "An independent session permission request is pending.",
-        "Open the requesting session and review the actual permission; continuation does not approve it.",
-      );
-    const bindingHold = this.binding(record);
-    if (bindingHold)
-      return state(
-        "needs_decision",
-        bindingHold,
-        "Resolve the retained checkout or session binding; continuation cannot replace it.",
-      );
-    if (record.decision?.state === "pending")
-      return state(
-        "needs_decision",
-        record.decision.proposal,
-        "Record bounded direction; select continuation to queue fresh checks within the existing grant.",
-      );
-    if (
-      (record.lifecycle !== "active" && record.pauseReason !== "manual_control") ||
-      (record.manualControl &&
-        !record.manualControl.endedAt &&
-        (["stopped", "completed", "failed"].includes(worker?.state ?? "") ||
-          (record.continuation?.manualCommandId &&
-            record.continuation.state === "cancelled")))
-    )
-      return state(
-        "needs_decision",
-        record.pauseReason !== "manual_control"
-          ? record.pauseReason || record.lifecycle
-          : "Manual control is stopped or its selected handback was cancelled.",
-        "Review the durable hold with the operator; resumption requires explicit consent after settlement.",
-      );
-    if (record.manualControl && !record.manualControl.endedAt)
-      return state(
-        "running_manually",
-        record.continuation?.state === "handback"
-          ? "Selected one-turn handback is waiting for correlated completion, quiescence and effect reconciliation."
-          : "Ongoing manual takeover; idleness is not handback consent.",
-        "Wait for selected handback or explicitly resume maintenance after settlement. Stop remains available.",
-      );
-    const admission = this.admission({
-      action: "discover",
-      recordId: record.id,
-      taskId: record.taskId,
-    });
-    if (!admission.allowed)
-      return state(
-        "needs_decision",
-        record.pauseReason || admission.reason || "Admission held",
-        "Resolve this specific hold; direction does not clear independent Stop or access controls.",
-      );
-    const batch = record.batches.find((entry) => entry.state === "accepted");
-    if (batch?.stepId) {
-      const step = this.store.getRunStep(batch.stepId);
-      if (step?.state === "pending") {
-        const gate = this.admission({
-          action: "execute",
-          taskId: record.taskId,
-          sessionId: record.workerSessionId,
-          recordId: record.id,
-          generation: record.generation,
-          batchId: batch.id,
-        });
-        return state(
-          "queued",
-          gate.allowed
-            ? "Accepted immutable work is waiting for normal Node admission."
-            : `Accepted work retained; ${gate.reason}.`,
-          "Do not resend or replace the worker. Refresh evidence/reconcile before normal admission.",
-        );
-      }
-      if (step && ["starting", "running"].includes(step.state))
-        return state(
-          "running",
-          "The accepted retained-worker attempt is in flight.",
-          "Wait for correlated completion; Stop remains available.",
-        );
-    }
-    if (
-      record.incidents.some((incident) => !incident.resolvedAt) ||
-      prMaintenanceUnsettled(record)
-    )
-      return state(
-        "checking",
-        "Execution or external effects still require reconciliation.",
-        "Settle the recorded effects before preparing another batch; never replay an uncertain effect.",
-      );
-    if (
-      record.counters.mutationAttempts >= record.authorization.budgets.mutationAttempts ||
-      (record.counters.repairBatches >= record.authorization.budgets.repairBatches &&
-        record.counters.answerBatches >= record.authorization.budgets.answerBatches)
-    )
-      return state(
-        "needs_decision",
-        "The existing batch or mutation budget is exhausted.",
-        "Renew the specific allowance explicitly; continuation cannot reset it.",
-      );
-    return state(
-      "checking",
-      record.continuation?.state === "checking" && !record.continuation.wakeQueuedAt
-        ? "Continuation accepted; awaiting durable lead delivery. Reconnect a compatible Node; older transports cannot safely acknowledge this wake."
-        : "Checking current PR evidence, remaining authority and effects.",
-      "Use the existing bounded maintenance visit; no new approval for already-granted actions.",
-    );
-  }
-
-  pendingContinuationWakes(): PrMaintenanceRegistration[] {
-    return this.retained().filter((record) => {
-      const intent = record.continuation;
-      return (
-        intent &&
-        !this.hasPendingPermission(record) &&
-        !intent.wakeQueuedAt &&
-        (intent.state === "checking" ||
-          (intent.state === "handback" &&
-            intent.completedAt &&
-            intent.manualCommandId &&
-            this.manualCommand(record.workerSessionId, intent.manualCommandId)?.state ===
-              "settled"))
-      );
-    });
-  }
-
-  markContinuationWake(recordId: string, intentId: string, at: string): boolean {
-    const record = this.required(recordId);
-    if (
-      record.continuation?.id !== intentId ||
-      record.continuation.wakeQueuedAt ||
-      this.hasPendingPermission(record) ||
-      !["checking", "handback"].includes(record.continuation.state) ||
-      this.continuationChanged(record)
-    )
-      return false;
-    record.continuation.wakeQueuedAt = at;
-    this.save(record);
-    return true;
-  }
-
   private executionInFlight(record: PrMaintenanceRegistration): boolean {
     return prMaintenanceInFlight({
       ...record,
       batches: record.batches.filter((batch) => !this.neverDispatched(record, batch)),
-    });
-  }
-
-  private handbackQuiescent(record: PrMaintenanceRegistration): boolean {
-    const worker = this.store.getSession(record.workerSessionId);
-    const lead = this.store.getSession(record.leadSessionId);
-    const command =
-      record.continuation?.manualCommandId &&
-      this.manualCommand(record.workerSessionId, record.continuation.manualCommandId);
-    return Boolean(
-      record.continuation?.state === "handback" &&
-      !record.ownershipReleasedAt &&
-      record.lifecycle === "paused" &&
-      !this.continuationChanged(record) &&
-      !this.hasPendingPermission(record) &&
-      record.authorization.scope.publicationAuthorized &&
-      record.pauseReason === "manual_control" &&
-      command &&
-      command.state === "settled" &&
-      worker?.state === "idle" &&
-      !worker.stopRequested &&
-      !worker.cleanupRequested &&
-      !worker.dismissed &&
-      !this.store.getSessionTransitionIntent(worker.id) &&
-      lead &&
-      !lead.stopRequested &&
-      !lead.cleanupRequested &&
-      !lead.dismissed &&
-      !["stopped", "completed", "failed"].includes(lead.state) &&
-      !this.store.getSessionTransitionIntent(lead.id) &&
-      this.store.getRun(record.taskId)?.state === "running" &&
-      this.store.getSessionDispatchAttempt(worker.id)?.commandId === command.id &&
-      this.store.hasEventAfter(worker.id, command.eventSeqFrom, "turn_complete") &&
-      !prMaintenanceUnsettled(record) &&
-      record.decision?.state !== "pending" &&
-      !record.incidents.some((incident) => !incident.resolvedAt),
-    );
-  }
-
-  private observingHandback(record: PrMaintenanceRegistration): boolean {
-    return Boolean(record.continuation?.completedAt && this.handbackQuiescent(record));
-  }
-
-  private applyResume(
-    record: PrMaintenanceRegistration,
-    actor: { actor: "lead" | "operator"; actorId: string },
-    at: string,
-    preserveCounters = false,
-  ): void {
-    record.resumeHistory.push({
-      ...actor,
-      resumedAt: at,
-      pauseReason: record.pauseReason,
-      ...(record.pauseOrigin ? { pauseOrigin: record.pauseOrigin } : {}),
-    });
-    record.lifecycle = "active";
-    if (record.manualControl) record.manualControl.endedAt = at;
-    record.pauseReason = "";
-    delete record.pauseOrigin;
-    if (!preserveCounters) {
-      record.counters.scanStalls = 0;
-      record.counters.reconciliationStalls = 0;
-    }
-    record.nextCheckAt = at;
-    if (!preserveCounters) record.renewedAt = at;
-    delete record.pausedNoticeAt;
-    for (const incident of record.incidents) {
-      if (
-        !incident.resolvedAt &&
-        ["identity", "provider_denial"].includes(incident.kind)
-      ) {
-        incident.resolvedAt = at;
-        incident.resolution = `${actor.actor}_resume`;
-        delete record.lastAttempt;
-        delete record.readyFingerprint;
-      }
-    }
-  }
-
-  private assertLeadResumeAllowed(
-    record: PrMaintenanceRegistration,
-    leadSessionId: string,
-  ): void {
-    if (record.pausedNoticeAt)
-      refuse(
-        "operator_required",
-        "A long-paused registration requires authenticated operator review.",
-      );
-    if (
-      record.counters.repairBatches >= record.authorization.budgets.repairBatches ||
-      record.counters.answerBatches >= record.authorization.budgets.answerBatches ||
-      record.counters.mutationAttempts >= record.authorization.budgets.mutationAttempts
-    )
-      refuse(
-        "budget_exhausted",
-        "An authenticated operator must renew the exhausted maintenance allowance.",
-      );
-    if (
-      record.incidents.some(
-        (incident) =>
-          !incident.resolvedAt && ["identity", "provider_denial"].includes(incident.kind),
-      )
-    )
-      refuse(
-        "operator_required",
-        "Provider access and identity holds require authenticated operator resume.",
-      );
-    const ownPause =
-      record.pauseOrigin?.actor === "lead" &&
-      record.pauseOrigin.actorId === leadSessionId;
-    const directedHold =
-      ["wait_for_human", "finding_needs_human"].includes(record.pauseReason) &&
-      record.decision?.state === "directed";
-    if (!ownPause && !directedHold)
-      refuse(
-        "operator_required",
-        "The owning lead may resume only its own pause or a directed human-decision hold.",
-      );
-  }
-
-  operatorAction(
-    id: string,
-    expectedVersion: number,
-    input: z.input<typeof PrMaintenanceOperatorActionSchema>,
-    actorId: string,
-    writeDirection?: () => void,
-  ): PrMaintenanceRegistration {
-    const action: PrMaintenanceOperatorAction =
-      PrMaintenanceOperatorActionSchema.parse(input);
-    const operatorId = actorSchema.parse(actorId);
-    return this.store.writeAtomically(() => {
-      if (action.action === "work") {
-        const existing = this.required(id);
-        const prior = existing.workRequests.find(
-          (request) => request.id === action.requestId,
-        );
-        if (prior) {
-          if (prior.operatorId !== operatorId || prior.direction !== action.direction)
-            refuse(
-              "work_conflict",
-              "This request key already identifies different operator work.",
-            );
-          return existing;
-        }
-      }
-      const record = this.required(id, undefined, expectedVersion);
-      if (record.ownershipReleasedAt)
-        refuse("released", "Released maintenance needs explicit new enablement.");
-      if (
-        !record.authorization.scope.publicationAuthorized &&
-        (action.action === "resume" ||
-          action.action === "renew" ||
-          (action.action === "direction" && action.resume))
-      )
-        refuse(
-          "repair_authorization_required",
-          "Observation-only maintenance is retired. Prepare and authenticate a repair proposal for this retained PR and worker; direction without resume and manual supervisor control remain available.",
-        );
-      if (
-        this.hasPendingManualExecution(record.workerSessionId) &&
-        action.action !== "pause"
-      )
-        refuse(
-          "execution_uncertain",
-          "Settle the manual command receipt before changing maintenance control.",
-        );
-      const now = nowIso();
-      if (action.action === "pause") {
-        this.pause(record, action.reason, now, {
-          actor: "operator",
-          actorId: operatorId,
-        });
-      } else if (action.action === "release") {
-        if (prMaintenanceUnsettled(record))
-          refuse(
-            "unsettled",
-            "Reconcile accepted execution and unknown effects before releasing ownership.",
-          );
-        if (record.decision?.state === "pending") {
-          this.matchDecision(record, action.decisionId, action.decisionVersion);
-          record.decision = {
-            ...record.decision,
-            state: "withdrawn",
-            operatorId,
-            direction: action.reason,
-            resolvedAt: now,
-          };
-        }
-        this.pause(record, action.reason, now, {
-          actor: "operator",
-          actorId: operatorId,
-        });
-        record.ownershipReleasedAt = now;
-        record.retentionReleasedBy = operatorId;
-      } else if (action.action === "work") {
-        if (
-          record.lifecycle !== "active" ||
-          (record.manualControl && !record.manualControl.endedAt)
-        )
-          refuse(
-            "independent_hold",
-            "Resume the independent hold or complete manual handback before queuing routine work.",
-          );
-        if (record.decision?.state === "pending")
-          refuse(
-            "wait_for_human",
-            "Direction for the exact pending design decision is required.",
-          );
-        this.assertEligibleContinuation(record, false, true);
-        if (record.workRequests.length >= 100)
-          refuse("work_queue_full", "The retained operator work history is full.");
-        record.workRequests.push({
-          id: action.requestId,
-          operatorId,
-          direction: action.direction,
-          createdAt: now,
-          state: "pending",
-        });
-        if (!prMaintenanceUnsettled(record) && record.continuation?.state !== "checking")
-          this.requestContinuation(record, operatorId, now);
-        delete record.readyFingerprint;
-        record.nextCheckAt = now;
-      } else if (action.action === "renew") {
-        if (prMaintenanceUnsettled(record))
-          refuse(
-            "unsettled",
-            "Settle the reserved allowance before budget or scope renewal.",
-          );
-        if (record.decision?.state === "pending")
-          refuse(
-            "wait_for_human",
-            "Direction for the pending proposal is required before renewal.",
-          );
-        const previous = this.archiveAuthorization(record);
-        record.authorization = {
-          id: randomUUID(),
-          operatorId,
-          issuedAt: now,
-          headSha: record.observation?.headSha ?? record.authorization.headSha,
-          scope: action.scope ?? record.authorization.scope,
-          budgets: action.budgets ?? record.authorization.budgets,
-          eligibilityEvidence: previous.eligibilityEvidence,
-          sourceProposal: previous.sourceProposal,
-        };
-        record.counters = emptyCounters();
-        record.findingAttempts = [];
-        record.renewedAt = now;
-        delete record.pausedNoticeAt;
-        if (record.lifecycle === "paused") {
-          record.pausedAt = now;
-          record.pauseOrigin = {
-            actor: "operator",
-            actorId: operatorId,
-            at: now,
-          };
-        }
-      } else {
-        if (action.action === "direction") {
-          this.matchDecision(record, action.decisionId, action.decisionVersion);
-          if (action.continueEligible && !action.resume)
-            refuse(
-              "invalid_continuation",
-              "Continuation must explicitly include resume consent.",
-            );
-          if (
-            action.continueEligible &&
-            (record.decision?.state !== "pending" ||
-              (record.observation?.headSha &&
-                record.decision.headSha !== record.observation.headSha) ||
-              (record.lastAttempt?.headSha &&
-                record.decision.headSha !== record.lastAttempt.headSha))
-          )
-            refuse(
-              "decision_conflict",
-              "Direction requires the pending decision at the same current PR HEAD.",
-            );
-          if (action.continueEligible) this.assertEligibleContinuation(record);
-          record.decision = {
-            ...record.decision!,
-            state: "directed",
-            operatorId,
-            direction: action.direction,
-            resolvedAt: now,
-          };
-          if (!action.continueEligible) record.renewedAt = now;
-          if (!action.continueEligible) {
-            record.counters.reconciliationStalls = 0;
-            record.counters.scanStalls = 0;
-          }
-        }
-        if (action.action !== "direction" || action.resume) {
-          this.assertResumeSafety(record, action.decisionId, action.decisionVersion);
-          this.applyResume(
-            record,
-            { actor: "operator", actorId: operatorId },
-            now,
-            action.action === "direction" && action.continueEligible,
-          );
-          if (action.action === "direction" && action.continueEligible)
-            this.requestContinuation(record, operatorId, now);
-        }
-      }
-      const saved = this.save(record);
-      const priorDirectionTask = this.directionTaskId;
-      try {
-        if (action.action === "direction") this.directionTaskId = record.taskId;
-        writeDirection?.();
-      } finally {
-        this.directionTaskId = priorDirectionTask;
-      }
-      return saved;
     });
   }
 
@@ -2418,64 +1820,290 @@ export class PrMaintenanceStore {
       );
   }
 
-  /** The scoped model surface can pause and narrowly resume, but never mint a grant. */
+  /** Things Resume can never clear: they are facts, not holds. */
+  private assertResumable(record: PrMaintenanceRegistration): void {
+    if (record.ownershipReleasedAt)
+      refuse("released", "Released maintenance needs explicit new enablement.");
+    if (record.lifecycle !== "active")
+      refuse("terminal", `The PR is ${record.lifecycle}; maintenance has ended.`);
+    if (!record.authorization.scope.publicationAuthorized)
+      refuse(
+        "repair_authorization_required",
+        "Observation-only maintenance is retired. Authorize a repair proposal for this PR and worker.",
+      );
+    if (this.hasPendingManualExecution(record.workerSessionId))
+      refuse(
+        "execution_uncertain",
+        "A manual command on the retained worker has no receipt yet; it settles on its own.",
+      );
+    const reason = this.binding(record);
+    if (reason)
+      refuse(
+        reason,
+        "The retained worker or checkout changed; maintenance never replaces them. A supported handoff is required.",
+      );
+    const worker = this.store.getSession(record.workerSessionId);
+    if (worker?.stopRequested)
+      refuse("stopping", "The retained worker is still stopping; resume once it has.");
+    if (this.store.getRun(record.taskId)?.state === "cancelled")
+      refuse("task_cancelled", "Reopen the cancelled task before resuming maintenance.");
+  }
+
+  /**
+   * Records a decision's direction and resumes in one step: the pending
+   * decision is answered, any operator/lead pause is superseded by this newer
+   * direction, and a review is requested with fresh provider metadata.
+   * Independent Stop, access, identity and manual holds are not cleared.
+   */
+  private applyDirection(
+    record: PrMaintenanceRegistration,
+    input: { decisionId: string; decisionVersion: number; direction: string },
+    actorId: string,
+    at: string,
+  ): void {
+    this.matchDecision(record, input.decisionId, input.decisionVersion);
+    if (record.decision!.state !== "pending")
+      refuse("decision_settled", "This decision already has direction.");
+    record.decision = {
+      ...record.decision!,
+      state: "directed",
+      operatorId: actorId,
+      direction: input.direction,
+      resolvedAt: at,
+    };
+    record.counters.dispatchesSinceDirection = 0;
+    record.findingAttempts = [];
+    if (record.hold?.kind === "paused") this.clearHold(record, actorId, at);
+    this.requestReview(record, "direction", at, actorId);
+  }
+
+  operatorAction(
+    id: string,
+    expectedVersion: number,
+    input: z.input<typeof PrMaintenanceOperatorActionSchema>,
+    actorId: string,
+    writeAudit?: () => void,
+  ): PrMaintenanceRegistration {
+    const action: PrMaintenanceOperatorAction =
+      PrMaintenanceOperatorActionSchema.parse(input);
+    const operatorId = actorSchema.parse(actorId);
+    return this.store.writeAtomically(() => {
+      // Idempotent retries of uncertain HTTP requests return the recorded result.
+      if (action.action === "work" || action.action === "review") {
+        const existing = this.required(id);
+        if (action.action === "work") {
+          const prior = existing.workRequests.find(
+            (request) => request.id === action.requestId,
+          );
+          if (prior) {
+            if (prior.operatorId !== operatorId || prior.direction !== action.direction)
+              refuse(
+                "work_conflict",
+                "This request key already identifies different operator work.",
+              );
+            return existing;
+          }
+        } else if (
+          [existing.review, ...existing.reviewHistory].some(
+            (review) => review?.id === action.requestId,
+          )
+        )
+          return existing;
+      }
+      const record = this.required(id, undefined, expectedVersion);
+      if (record.ownershipReleasedAt)
+        refuse("released", "Released maintenance needs explicit new enablement.");
+      const now = nowIso();
+      switch (action.action) {
+        case "pause":
+          this.setHold(record, "paused", action.reason, now, {
+            actor: "operator",
+            actorId: operatorId,
+          });
+          break;
+        case "release": {
+          if (
+            prMaintenanceUnsettled(record) ||
+            this.hasPendingManualExecution(record.workerSessionId)
+          )
+            refuse(
+              "unsettled",
+              "Reconcile accepted execution, manual command receipts and unknown effects before releasing ownership.",
+            );
+          if (record.decision?.state === "pending") {
+            this.matchDecision(record, action.decisionId, action.decisionVersion);
+            record.decision = {
+              ...record.decision,
+              state: "withdrawn",
+              operatorId,
+              direction: action.reason,
+              resolvedAt: now,
+            };
+          }
+          this.concludeReview(record, "held", now, action.reason);
+          for (const request of record.workRequests)
+            if (request.state === "pending")
+              Object.assign(request, {
+                state: "cancelled",
+                settledAt: now,
+                reason: action.reason,
+              });
+          record.ownershipReleasedAt = now;
+          record.retentionReleasedBy = operatorId;
+          break;
+        }
+        case "resume": {
+          this.assertResumable(record);
+          if (record.decision?.state === "pending")
+            refuse(
+              "decision_pending",
+              "Answer the pending design decision; recording direction resumes maintenance.",
+            );
+          this.clearHold(record, operatorId, now);
+          this.requestReview(record, "resume", now, operatorId);
+          break;
+        }
+        case "direction":
+          this.applyDirection(record, action, operatorId, now);
+          break;
+        case "review":
+        case "work": {
+          if (record.lifecycle !== "active")
+            refuse("terminal", `The PR is ${record.lifecycle}; maintenance has ended.`);
+          if (record.hold)
+            refuse(
+              "held",
+              `Maintenance is held: ${record.hold.reason}. Resume it first.`,
+            );
+          if (action.action === "work") {
+            if (record.workRequests.length >= 100)
+              refuse("work_queue_full", "The retained operator work history is full.");
+            record.workRequests.push({
+              id: action.requestId,
+              operatorId,
+              direction: action.direction,
+              createdAt: now,
+              state: "pending",
+            });
+            this.requestReview(record, "manual", now, operatorId);
+          } else {
+            // A fresh review: an open one keeps its id, a new one takes the request id.
+            if (!record.review || record.review.concludedAt) {
+              if (record.review) record.reviewHistory.push(record.review);
+              record.review = {
+                id: action.requestId,
+                source: "manual",
+                requestedAt: now,
+                actorId: operatorId,
+              };
+            }
+          }
+          delete record.readyFingerprint;
+          break;
+        }
+      }
+      const saved = this.save(record);
+      writeAudit?.();
+      return saved;
+    });
+  }
+
+  /**
+   * The orchestrator's lifecycle controls. It can pause, resume its own pause,
+   * start a review, and record direction the person just gave it in chat. It
+   * cannot enable, release, authorize, or clear Stop/access/identity holds.
+   */
   set(
     leadSessionId: string,
     input: {
       id: string;
       expectedVersion: number;
-      action: "pause" | "enable" | "resume" | "release";
+      action: "pause" | "resume" | "review" | "direction";
       reason?: string;
+      decisionId?: string;
+      decisionVersion?: number;
+      direction?: string;
+      /** Host-verified: the lead's current turn answers an operator's message. */
+      userTurn?: boolean;
     },
   ): PrMaintenanceRegistration {
     const parsed = z
       .object({
         id: actorSchema,
         expectedVersion: z.number().int().positive(),
-        action: z.enum(["pause", "enable", "resume", "release"]),
+        action: z.enum(["pause", "resume", "review", "direction"]),
         reason: z.string().min(1).max(8_192).optional(),
+        decisionId: z.string().min(1).max(512).optional(),
+        decisionVersion: z.number().int().positive().optional(),
+        direction: z.string().min(1).max(8_192).optional(),
+        userTurn: z.boolean().optional(),
       })
       .strict()
       .parse(input);
     return this.store.writeAtomically(() => {
-      const record = this.required(parsed.id, leadSessionId, parsed.expectedVersion);
-      if (!record.authorization.scope.publicationAuthorized && parsed.action !== "pause")
-        refuse(
-          "repair_authorization_required",
-          "Legacy observation grants cannot activate maintenance. Prepare a repair proposal for authenticated authorization.",
-        );
-      if (
-        parsed.action === "enable" &&
-        record.lifecycle === "active" &&
-        !record.ownershipReleasedAt
-      )
+      const record = this.required(parsed.id, leadSessionId);
+      // Starting a review is idempotent while one is open; the version is advisory.
+      if (parsed.action === "review" && record.review && !record.review.concludedAt)
         return record;
-      if (parsed.action === "resume") {
-        this.assertResumeSafety(record, record.decision?.id, record.decision?.version);
-        this.assertLeadResumeAllowed(record, leadSessionId);
-        this.applyResume(record, { actor: "lead", actorId: leadSessionId }, nowIso());
-        return this.save(record);
+      if (record.version !== parsed.expectedVersion)
+        refuse(
+          "version_conflict",
+          "Maintenance changed; reread the record and reconcile before retrying.",
+        );
+      if (record.ownershipReleasedAt)
+        refuse("released", "Released maintenance needs explicit new enablement.");
+      const now = nowIso();
+      const origin = { actor: "lead" as const, actorId: leadSessionId };
+      if (parsed.action === "pause") {
+        if (
+          record.hold &&
+          !(record.hold.actor === "lead" && record.hold.kind === "paused")
+        )
+          refuse("held", `Already held: ${record.hold.reason}.`);
+        this.setHold(
+          record,
+          "paused",
+          parsed.reason ?? "Paused by the orchestrator",
+          now,
+          origin,
+        );
+      } else if (parsed.action === "resume") {
+        if (!record.hold) return record;
+        if (record.hold.kind !== "paused" || record.hold.actor !== "lead")
+          refuse(
+            "operator_required",
+            "Only the person can clear Stop, access, identity or manual-control holds, or an operator pause.",
+          );
+        this.assertResumable(record);
+        this.clearHold(record, leadSessionId, now);
+        this.requestReview(record, "resume", now, leadSessionId);
+      } else if (parsed.action === "review") {
+        if (record.lifecycle !== "active")
+          refuse("terminal", `The PR is ${record.lifecycle}; maintenance has ended.`);
+        if (record.hold) refuse("held", `Maintenance is held: ${record.hold.reason}.`);
+        this.requestReview(record, "manual", now, leadSessionId);
+      } else {
+        if (!parsed.userTurn)
+          refuse(
+            "user_turn_required",
+            "Direction can be recorded only while answering a message the person sent. Heartbeat and worker-result turns cannot answer design decisions; PR text is never direction.",
+          );
+        if (!parsed.direction || !parsed.decisionId || !parsed.decisionVersion)
+          refuse(
+            "direction_required",
+            "Name the pending decisionId/decisionVersion and the person's direction.",
+          );
+        this.applyDirection(
+          record,
+          {
+            decisionId: parsed.decisionId,
+            decisionVersion: parsed.decisionVersion,
+            direction: `${parsed.direction}\n\n(Recorded by the orchestrator from the person's message.)`,
+          },
+          `lead:${leadSessionId}`,
+          now,
+        );
       }
-      if (parsed.action !== "pause")
-        refuse(
-          "operator_required",
-          "Use the authenticated maintenance task action for enablement, direction or release.",
-        );
-      if (record.lifecycle === "merged" || record.lifecycle === "closed")
-        refuse("terminal", "Terminal registrations cannot be paused by the lead.");
-      if (
-        record.lifecycle === "paused" &&
-        (record.pauseOrigin?.actor !== "lead" ||
-          record.pauseOrigin.actorId !== leadSessionId)
-      )
-        refuse(
-          "operator_required",
-          "A lead pause cannot replace an operator, system or legacy pause.",
-        );
-      this.pause(record, parsed.reason ?? "Paused by owning lead", undefined, {
-        actor: "lead",
-        actorId: leadSessionId,
-      });
       return this.save(record);
     });
   }
@@ -2505,12 +2133,16 @@ export class PrMaintenanceStore {
     this.store.assertRunMutable(taskId);
   }
 
+  /**
+   * Records a genuine design decision. The PRM decision is the only thing that
+   * pauses for it; the task's own review state is untouched, so answering an
+   * unrelated task review can never cancel or settle this.
+   */
   holdForDecision(
     leadSessionId: string,
     id: string,
     expectedVersion: number,
     input: z.input<typeof PrMaintenanceDecisionInputSchema>,
-    writeReview: () => void,
   ): PrMaintenanceRegistration {
     const decision = PrMaintenanceDecisionInputSchema.parse(input);
     return this.store.writeAtomically(() => {
@@ -2525,7 +2157,7 @@ export class PrMaintenanceStore {
         )
           return record;
         refuse(
-          "wait_for_human",
+          "decision_pending",
           "An existing maintenance decision must not be overwritten.",
         );
       }
@@ -2533,19 +2165,56 @@ export class PrMaintenanceStore {
         refuse("version_conflict", "Maintenance changed; reread before escalating.");
       if (record.ownershipReleasedAt)
         refuse("released", "Cannot hold released maintenance.");
-      if (record.decision) record.decisionHistory.push(record.decision);
-      record.decision = { ...decision, state: "pending" };
-      this.pause(record, "wait_for_human");
-      writeReview();
-      if (this.store.getRun(record.taskId)?.state !== "awaiting_human")
-        refuse(
-          "review_required",
-          "The existing task review must be recorded in the same transaction as its maintenance decision.",
-        );
+      this.raiseDecision(record, decision);
       return this.save(record);
     });
   }
 
+  private raiseDecision(
+    record: PrMaintenanceRegistration,
+    decision: z.infer<typeof PrMaintenanceDecisionInputSchema>,
+  ): void {
+    if (record.decision) record.decisionHistory.push(record.decision);
+    record.decision = { ...decision, state: "pending" };
+    delete record.readyFingerprint;
+    this.concludeReview(record, "decision", nowIso(), decision.proposal);
+    // An undispatched batch would act on the question being asked.
+    for (const batch of record.batches)
+      if (batch.state === "prepared")
+        this.settleBatch(
+          record,
+          {
+            kind: "batch",
+            batchId: batch.id,
+            generation: record.generation,
+            state: "cancelled",
+            findings: batch.sources.map((source) => ({
+              source,
+              outcome: "incomplete",
+              stage: "not_attempted",
+              evidence: [],
+              responseRequired: true,
+              responseIds: [],
+              nextAction: "Prepare again after the design decision.",
+              progress: false,
+            })),
+            effects: [],
+            executionSettled: true,
+            usedMutations: 0,
+            published: false,
+            reason: "design_decision",
+            evidence: "Cancelled before dispatch while a design decision is pending.",
+          },
+          true,
+        );
+  }
+
+  /**
+   * What maintenance allows. Read-only refresh is refused only for Stop,
+   * manual control or released ownership; everything that writes is refused
+   * for any hold, pending decision or unknown effect. The underlying task's
+   * own state (awaiting review, completed) never blocks maintenance.
+   */
   admission(input: PrMaintenanceAdmission): PrMaintenanceAdmissionResult {
     const action = PrMaintenanceAdmissionSchema.parse(input);
     const session = action.sessionId
@@ -2579,147 +2248,109 @@ export class PrMaintenanceStore {
           ? { decisionId: record.decision.id }
           : {}),
       });
-      if (["cancel", "pause", "direction", "reconcile"].includes(action.action)) continue;
+      if (["cancel", "pause", "direction", "reconcile", "reopen"].includes(action.action))
+        continue;
       if (action.action === "cleanup") return denied("maintenance_retention");
       if (action.leadSessionId && action.leadSessionId !== record.leadSessionId)
         return denied("ownership");
-      if (this.hasPendingPermission(record)) return denied("permission_pending");
-      if (record.decision?.state === "pending") return denied("wait_for_human");
-      if (
-        action.action === "reopen" &&
-        this.directionTaskId === record.taskId &&
-        record.decision?.state === "directed"
-      )
-        continue;
-      if (this.continuationChanged(record))
-        return denied("continuation_identity_changed");
-      if (record.lifecycle !== "active")
-        return denied(record.lifecycle === "paused" ? "paused" : "terminal_draining");
-      if (record.manualControl && !record.manualControl.endedAt)
-        return denied("manual_control");
       if (action.generation !== undefined && action.generation !== record.generation)
         return denied("stale_generation");
+      if (action.action === "discover") {
+        if (record.lifecycle !== "active") return denied("terminal");
+        if (record.hold?.kind === "stopped") return denied("stopped");
+        if (record.hold?.kind === "manual_control") return denied("manual_control");
+        continue;
+      }
+      // Task acceptance waits for in-flight maintenance, never for its review.
+      if (["approve", "advance", "submit", "aggregate"].includes(action.action)) {
+        if (prMaintenanceUnsettled(record)) return denied("unsettled");
+        if (record.workRequests.some((request) => request.state === "pending"))
+          return denied("pending_operator_work");
+        continue;
+      }
+      // dispatch, execute, prompt, resume, publish: writes on the retained worker.
+      if (record.lifecycle !== "active") return denied("terminal");
+      if (record.hold) return denied(record.hold.kind);
+      if (record.decision?.state === "pending") return denied("decision_pending");
+      if (this.hasPendingPermission(record)) return denied("permission_pending");
       const reason = this.binding(record);
       if (reason) return denied(reason);
-      const task = this.store.getRun(record.taskId)!;
-      const worker = this.store.getSession(record.workerSessionId)!;
-      if (
-        task.state === "awaiting_human" &&
-        !(action.action === "reopen" && record.decision?.state === "directed")
-      )
-        return denied("wait_for_human");
-      // Stop pauses the registration first. Only an operator action can make it
-      // active again, after which the existing Run resume may clear Stop intent.
       if (!record.authorization.scope.publicationAuthorized)
         return denied("repair_authorization_required");
-      if (action.action === "reopen") continue;
+      const task = this.store.getRun(record.taskId)!;
+      const worker = this.store.getSession(record.workerSessionId)!;
+      if (worker.stopRequested || task.state === "cancelled") return denied("stopped");
       if (
-        worker.stopRequested ||
-        this.store.getSession(record.leadSessionId)?.stopRequested ||
-        task.state === "cancelled"
+        record.batches.some(
+          (batch) =>
+            batch.stepId && !batch.executionSettled && !outstanding.has(batch.state),
+        )
       )
-        return denied("stopped");
-      if (["awaiting_approval", "blocked", "failed", "aggregating"].includes(task.state))
-        return denied("task_not_eligible");
-      if (action.action === "discover") continue;
+        return denied("execution_uncertain");
+      if (action.taskId && action.taskId !== record.taskId)
+        return denied("resource_reserved");
+      if (action.sessionId && action.sessionId !== record.workerSessionId)
+        return denied("worker_reserved");
       if (
-        ["approve", "advance", "submit", "aggregate"].includes(action.action) &&
-        prMaintenanceUnsettled(record)
+        action.recordId !== record.id ||
+        action.generation !== record.generation ||
+        !action.batchId
       )
-        return denied("unsettled");
+        return denied("maintenance_batch_required");
+      const batch = record.batches.find((entry) => entry.id === action.batchId);
+      if (!batch || !outstanding.has(batch.state) || batch.cancellationRequestedAt)
+        return denied("batch_not_admitted");
       if (
-        ["approve", "advance", "submit", "aggregate"].includes(action.action) &&
-        record.workRequests.some((request) => request.state === "pending")
+        batch.authorizationId !== record.authorization.id ||
+        batch.generation !== record.generation
       )
-        return denied("pending_operator_work");
+        return denied("stale_authorization");
+      if (batch.state === "uncertain" || batch.state === "reconciling")
+        return denied("execution_uncertain");
+      if (action.action === "dispatch" && batch.state !== "prepared")
+        return denied("batch_already_accepted");
       if (
-        ["dispatch", "execute", "prompt", "resume", "publish"].includes(action.action)
-      ) {
-        if (!record.authorization.scope.publicationAuthorized)
-          return denied("publication_not_authorized");
-        if (
-          record.batches.some(
-            (batch) =>
-              batch.stepId && !batch.executionSettled && !outstanding.has(batch.state),
-          )
+        ["execute", "prompt", "resume", "publish"].includes(action.action) &&
+        batch.state !== "accepted"
+      )
+        return denied("batch_not_accepted");
+      // The batch was prepared from fresh evidence for exactly this head; only
+      // a newer observation of a different head invalidates it.
+      if (!record.observation?.complete || batch.headSha !== record.observation.headSha)
+        return denied("stale_observation");
+      if (batch.baseSha && batch.baseSha !== record.observation.baseSha)
+        return denied("stale_base");
+      if (
+        record.lastAttempt?.complete &&
+        (record.lastAttempt.headSha !== record.observation.headSha ||
+          record.lastAttempt.snapshotId !== record.observation.snapshotId)
+      )
+        return denied("stale_observation");
+      if (record.observation.draft) return denied("draft");
+      if (
+        record.observation.mergeability === "conflicting" &&
+        !(
+          batch.kind === "repair" &&
+          batch.conflictResolution &&
+          batch.baseSha === record.observation.baseSha
         )
-          return denied("execution_uncertain");
-        if (task.state === "completed") return denied("task_completed_reopen_required");
-        if (action.taskId && action.taskId !== record.taskId)
-          return denied("resource_reserved");
-        if (action.sessionId && action.sessionId !== record.workerSessionId)
-          return denied("worker_reserved");
-        if (
-          action.recordId !== record.id ||
-          action.generation !== record.generation ||
-          !action.batchId
+      )
+        return denied("merge_conflict");
+      if (
+        record.incidents.some(
+          (incident) => !incident.resolvedAt && incident.kind !== "capability",
         )
-          return denied("maintenance_batch_required");
-        const batch = record.batches.find((entry) => entry.id === action.batchId);
-        if (!batch || !outstanding.has(batch.state) || batch.cancellationRequestedAt)
-          return denied("batch_not_admitted");
-        if (
-          batch.authorizationId !== record.authorization.id ||
-          batch.generation !== record.generation
+      )
+        return denied("observation_recovery_required");
+      if (
+        action.action === "dispatch" &&
+        !(
+          worker.state === "idle" ||
+          (["completed", "stopped", "offline"].includes(worker.state) &&
+            worker.agentSessionId)
         )
-          return denied("stale_authorization");
-        if (batch.state === "uncertain" || batch.state === "reconciling")
-          return denied("execution_uncertain");
-        if (action.action === "dispatch" && batch.state !== "prepared")
-          return denied("batch_already_accepted");
-        if (
-          ["execute", "prompt", "resume", "publish"].includes(action.action) &&
-          batch.state !== "accepted"
-        )
-          return denied("batch_not_accepted");
-        if (!record.lastAttempt?.complete || record.lastAttempt.failure)
-          return denied("observation_incomplete");
-        if (!record.observation?.complete || batch.headSha !== record.observation.headSha)
-          return denied("stale_observation");
-        if (batch.baseSha && batch.baseSha !== record.observation.baseSha)
-          return denied("stale_base");
-        if (
-          record.continuation?.state === "checking" &&
-          (record.continuation.evidenceState !== "pinned" ||
-            (record.observationHostAt ?? record.observation.attemptedAt) <
-              record.continuation.requestedAt)
-        )
-          return denied("fresh_observation_required");
-        if (
-          record.lastAttempt.headSha !== record.observation.headSha ||
-          record.lastAttempt.snapshotId !== record.observation.snapshotId
-        )
-          return denied("stale_observation");
-        if (
-          !prMaintenanceObservationFresh(
-            record.observation,
-            Date.now(),
-            record.observationHostAt,
-          )
-        )
-          return denied("stale_observation");
-        if (record.observation.draft) return denied("draft");
-        if (
-          record.observation.mergeability === "conflicting" &&
-          !(
-            batch.kind === "repair" &&
-            batch.conflictResolution &&
-            batch.baseSha === record.observation.baseSha
-          )
-        )
-          return denied("merge_conflict");
-        if (record.incidents.some((incident) => !incident.resolvedAt))
-          return denied("observation_recovery_required");
-        if (
-          action.action === "dispatch" &&
-          !(
-            worker.state === "idle" ||
-            (["completed", "stopped", "offline"].includes(worker.state) &&
-              worker.agentSessionId)
-          )
-        )
-          return denied("worker_unavailable");
-      }
+      )
+        return denied("worker_unavailable");
     }
     if (
       action.sessionId &&
@@ -2729,7 +2360,6 @@ export class PrMaintenanceStore {
       return { allowed: false, reason: "manual_execution_unsettled" };
     return { allowed: true };
   }
-
   assertAdmission(input: PrMaintenanceAdmission): void {
     const result = this.admission(input);
     if (!result.allowed)
@@ -2830,11 +2460,9 @@ export class PrMaintenanceStore {
       batch.stepId = stepId;
       batch.attempt = attempt;
       batch.updatedAt = nowIso();
-      if (record.continuation?.state === "checking") {
-        record.continuation.state = "consumed";
-        record.continuation.batchId = batch.id;
-        record.continuation.settledAt = nowIso();
-      }
+      // Reviewing → Working.
+      this.concludeReview(record, "working", batch.updatedAt, batch.scope);
+      record.counters.dispatchesSinceDirection++;
       return this.save(record);
     });
   }
@@ -2914,13 +2542,18 @@ export class PrMaintenanceStore {
               );
           return record;
         }
-        const admission = this.admission({
-          action: "discover",
-          recordId: id,
-          leadSessionId,
-        });
-        if (!admission.allowed)
-          refuse(admission.reason!, "Maintenance is held; cannot prepare repairs.");
+        if (record.lifecycle !== "active")
+          refuse("terminal", `The PR is ${record.lifecycle}; maintenance has ended.`);
+        if (record.hold)
+          refuse(record.hold.kind, `Maintenance is held: ${record.hold.reason}`);
+        if (record.decision?.state === "pending")
+          refuse(
+            "decision_pending",
+            "A design decision is pending; prepare work after its direction.",
+          );
+        const bindingReason = this.binding(record);
+        if (bindingReason)
+          refuse(bindingReason, "The retained worker or checkout is unavailable.");
         if (prMaintenanceUnsettled(record))
           refuse(
             "unsettled",
@@ -2952,7 +2585,7 @@ export class PrMaintenanceStore {
         )
           refuse(
             "observation_blocked",
-            "Drafts, merge conflicts without an exact planned repair, and unresolved observation incidents cannot admit repair or publication.",
+            "Drafts, merge conflicts without an exact planned repair, and unresolved access or identity incidents cannot admit repair or publication.",
           );
         if (
           (prepared.baseSha && prepared.baseSha !== record.observation.baseSha) ||
@@ -3001,16 +2634,8 @@ export class PrMaintenanceStore {
               "Verified unchanged feedback must not dispatch again.",
             );
         }
+        // Counters are audit only; the loop guard limits repetition, not volume.
         const budgetKey = prepared.kind === "repair" ? "repairBatches" : "answerBatches";
-        if (
-          record.counters[budgetKey] >= record.authorization.budgets[budgetKey] ||
-          record.counters.mutationAttempts + prepared.reservedMutations >
-            record.authorization.budgets.mutationAttempts
-        )
-          refuse(
-            "budget_exhausted",
-            "An authenticated operator must renew the exhausted maintenance allowance.",
-          );
         record.counters[budgetKey]++;
         record.counters.mutationAttempts += prepared.reservedMutations;
         const now = nowIso();
@@ -3036,8 +2661,7 @@ export class PrMaintenanceStore {
           !record.authorization.scope.publicationAuthorized ||
           record.lifecycle !== "active" ||
           record.decision?.state === "pending" ||
-          (record.continuation?.state === "checking" &&
-            record.continuation.evidenceState !== "pinned") ||
+          record.hold !== undefined ||
           record.workRequests.some((request) => request.state === "pending") ||
           prMaintenanceUnsettled(record) ||
           !record.observation?.complete ||
@@ -3083,18 +2707,24 @@ export class PrMaintenanceStore {
             "Readiness requires complete current-HEAD feedback/check/review/mergeability evidence, with no hold or unknown effects.",
           );
         record.readyFingerprint = checkpoint.fingerprint;
+      } else if (checkpoint.kind === "review_done") {
+        // Reviewing → Idle. Nothing actionable and nothing for a person.
+        if (
+          prMaintenanceActiveBatch(record) ||
+          record.batches.some((b) => b.state === "prepared")
+        )
+          refuse(
+            "work_outstanding",
+            "A batch is prepared or running; the review concludes when its result is reviewed.",
+          );
+        if (!record.review || record.review.concludedAt)
+          this.requestReview(record, "manual", nowIso(), leadSessionId);
+        this.concludeReview(record, "idle", nowIso(), checkpoint.summary);
       } else {
-        const progress =
-          checkpoint.progress &&
-          record.lastReconciliationEvidence !== checkpoint.evidence;
-        record.counters.reconciliationStalls = progress
-          ? 0
-          : record.counters.reconciliationStalls + 1;
+        // Reconciliation evidence is recorded; a settled execution asks for a review.
         record.lastReconciliationEvidence = checkpoint.evidence;
-        if (record.counters.reconciliationStalls >= 3)
-          this.pause(record, "reconciliation_stalled");
-        if (checkpoint.immediateCheck && record.lifecycle === "active")
-          record.nextCheckAt = nowIso();
+        if (checkpoint.immediateCheck && record.lifecycle === "active" && !record.hold)
+          this.requestReview(record, "worker_result");
       }
       if (
         checkpoint.kind !== "fallback" &&
@@ -3167,32 +2797,21 @@ export class PrMaintenanceStore {
     return incident;
   }
 
+  /**
+   * Whether read-only alternate evidence may resolve a helper capability
+   * failure. Only the same facts that refuse a read apply: no task state, lead
+   * state or pending decision can stop authorized read-only recovery.
+   */
   private recoveryAllowed(record: PrMaintenanceRegistration): boolean {
-    const task = this.store.getRun(record.taskId);
-    const worker = this.store.getSession(record.workerSessionId);
-    const lead = this.store.getSession(record.leadSessionId);
     return (
       record.authorization.scope.publicationAuthorized &&
-      !this.hasPendingPermission(record) &&
       record.lifecycle === "active" &&
       !record.ownershipReleasedAt &&
-      record.decision?.state !== "pending" &&
+      !record.hold &&
       !record.incidents.some(
         (incident) => !incident.resolvedAt && incident.kind !== "capability",
       ) &&
-      !this.executionInFlight(record) &&
-      !this.binding(record) &&
-      !!task &&
-      ["running", "awaiting_lead", "completed"].includes(task.state) &&
-      !!worker &&
-      !worker.stopRequested &&
-      !this.store.getSessionTransitionIntent(worker.id) &&
-      !!lead &&
-      !["stopped", "completed", "failed", "offline"].includes(lead.state) &&
-      !lead.stopRequested &&
-      !lead.dismissed &&
-      !lead.cleanupRequested &&
-      !this.store.getSessionTransitionIntent(lead.id)
+      !this.binding(record)
     );
   }
 
@@ -3335,7 +2954,11 @@ export class PrMaintenanceStore {
     if (!observation.identity || !sameIdentity(observation.identity, record.identity)) {
       if (observation.identity) {
         this.incident(record, observation, observation.evidence, "identity");
-        this.pause(record, "remote_identity_changed");
+        this.setHold(
+          record,
+          "identity",
+          `The PR or its source branch changed identity: ${observation.evidence}`,
+        );
       }
       return reject("identity_mismatch");
     }
@@ -3389,6 +3012,7 @@ export class PrMaintenanceStore {
       delete record.readyFingerprint;
       return;
     }
+    // The next unattended check. Only completed reads move it; manual reviews never do.
     record.nextCheckAt = new Date(
       Math.max(
         Date.parse(this.routineCheckAt(hostLatestAt)),
@@ -3405,12 +3029,17 @@ export class PrMaintenanceStore {
       (observation.identity && !sameIdentity(observation.identity, record.identity))
     ) {
       this.incident(record, observation, error, "identity");
-      this.pause(record, "remote_identity_changed");
+      this.setHold(
+        record,
+        "identity",
+        `The PR or its source branch changed identity: ${error}`,
+      );
       return;
     }
     if (code === "ambiguous_effect") {
+      // Reconciling is derived from the incident; new effects wait for it.
       this.incident(record, observation, error, "effects");
-      this.pause(record, "execution_or_effect_uncertain");
+      this.concludeReview(record, "failed", nowIso(), error);
       return;
     }
     if (!observation.complete) {
@@ -3435,19 +3064,14 @@ export class PrMaintenanceStore {
         record.counters.consecutiveFailures++;
         record.counters.totalFailures++;
       }
-      const progress =
-        observation.cursor &&
-        (previous?.cursor !== observation.cursor ||
-          previous?.revision !== observation.revision);
-      record.counters.scanStalls = progress ? 0 : record.counters.scanStalls + 1;
-      if (providerDenied) this.pause(record, "authorization_failed");
-      else if (
-        record.counters.consecutiveFailures >= 3 ||
-        record.counters.totalFailures >= 10
-      )
-        this.pause(record, "observation_failures");
-      else if (record.counters.scanStalls >= 3) this.pause(record, "scan_stalled");
+      void previous;
       delete record.readyFingerprint;
+      if (providerDenied)
+        this.setHold(record, "access", `Provider access was denied: ${error}`);
+      // A failed or partial read ends this review. It is not a reason to ask a
+      // person: the next heartbeat or Review now retries, and a resumable scan
+      // continues from its persisted cursor.
+      else this.concludeReview(record, "failed", nowIso(), error);
       return;
     }
     record.observation = observation;
@@ -3455,15 +3079,8 @@ export class PrMaintenanceStore {
       record.observationHostAt = hostAttemptedAt;
     else delete record.observationHostAt;
     record.lastSuccessAt = hostAttemptedAt;
-    if (
-      record.continuation?.state === "checking" &&
-      record.continuation.evidenceState === "refresh_required" &&
-      hostAttemptedAt >= record.continuation.requestedAt &&
-      observation.state === "open"
-    ) {
-      record.continuation.headSha = observation.headSha!;
-      record.continuation.evidenceState = "pinned";
-    }
+    if (record.review && !record.review.concludedAt)
+      record.review.claimedAt ??= hostAttemptedAt;
     for (const batch of record.batches) {
       if (
         this.neverDispatched(record, batch) &&
@@ -3500,7 +3117,6 @@ export class PrMaintenanceStore {
     }
     if (!alternate) {
       record.counters.consecutiveFailures = 0;
-      record.counters.scanStalls = 0;
       const effects = [
         ...record.actions,
         ...record.batches.flatMap((batch) => batch.effects),
@@ -3560,8 +3176,17 @@ export class PrMaintenanceStore {
       !alternate &&
       (observation.state === "merged" || observation.state === "closed")
     ) {
+      // Reviewing → Merged/Closed. PRM records it and stops; it never merges.
       record.lifecycle = observation.state;
-      this.pause(record, "terminal_cancellation_requested", hostAttemptedAt);
+      this.concludeReview(record, "terminal", hostAttemptedAt, `PR ${observation.state}`);
+      this.cancelUndispatched(record, `PR ${observation.state}`, hostAttemptedAt);
+      for (const request of record.workRequests)
+        if (request.state === "pending")
+          Object.assign(request, {
+            state: "cancelled",
+            settledAt: hostAttemptedAt,
+            reason: `PR ${observation.state}`,
+          });
       if (record.decision?.state === "pending") {
         record.decision = {
           ...record.decision,
@@ -3724,14 +3349,9 @@ export class PrMaintenanceStore {
     this.validateEffects(update.effects);
     this.preserveEffects(batch.effects, update.effects);
     const final = !outstanding.has(update.state);
-    if (
-      update.findings.some((finding) => finding.outcome === "needs_human") &&
-      record.decision?.state !== "pending"
-    )
-      refuse(
-        "human_decision_required",
-        "Call maintenance-aware escalation to atomically record the question before checkpointing needs_human findings.",
-      );
+    const needsHuman = update.findings.filter(
+      (finding) => finding.outcome === "needs_human",
+    );
     if (
       final &&
       (!update.executionSettled ||
@@ -3838,9 +3458,22 @@ export class PrMaintenanceStore {
         }
       }
     }
-    if (update.findings.some((finding) => finding.outcome === "needs_human"))
-      this.pause(record, "finding_needs_human");
-    if (update.state === "uncertain") this.pause(record, "execution_or_effect_uncertain");
+    // `uncertain` is reported as Reconciling (derived), not as a pause.
+    let loopReason: string | undefined;
+    if (needsHuman.length && record.decision?.state !== "pending")
+      this.raiseDecision(record, {
+        id: `finding-${batch.id}`,
+        version: 1,
+        proposal: needsHuman
+          .map(
+            (finding) =>
+              `${finding.source.id}: ${finding.nextAction ?? finding.evidence.join(" ") ?? "needs a design decision"}`,
+          )
+          .join("\n")
+          .slice(0, 8_000),
+        headSha: record.observation?.headSha ?? batch.headSha,
+        scope: record.authorization.scope.baseline,
+      });
     if (final && batch.kind === "repair" && batch.stepId) {
       for (const groupKey of new Set(batch.sources.map((source) => source.groupKey))) {
         const group = update.findings.filter(
@@ -3865,25 +3498,46 @@ export class PrMaintenanceStore {
           : prior.attempts + 1;
         prior.revisions = [...prior.revisions, revision].slice(-3);
         if (
-          prior.attempts >= 2 ||
+          prior.attempts >= PR_MAINTENANCE_LOOP_LIMITS.findingAttempts ||
           (prior.revisions.length === 3 &&
             prior.revisions[0] === prior.revisions[2] &&
             prior.revisions[0] !== prior.revisions[1])
         )
-          this.pause(record, "no_progress");
+          loopReason ??= `Finding group "${groupKey}" was attempted ${prior.attempts} times without progress (or flipped back to an earlier state).`;
       }
     }
     if (newPublication) {
       // Retain historical evidence, but require a new observation attempt after a push.
       delete record.lastAttempt;
       delete record.readyFingerprint;
-      record.nextCheckAt = nowIso();
     }
-    const pendingWork = record.workRequests.find(
-      (request) => request.state === "pending",
-    );
-    if (final && pendingWork && record.lifecycle === "active")
-      this.requestContinuation(record, pendingWork.operatorId, nowIso());
+    /*
+     * The loop guard. Repeating routine work that does not converge (a flaky
+     * check, a bot re-posting the same comment) becomes a question for a
+     * person instead of another unattended push.
+     */
+    if (
+      loopReason &&
+      record.decision?.state !== "pending" &&
+      record.lifecycle === "active"
+    )
+      this.raiseDecision(record, {
+        id: `loop-${batch.id}`,
+        version: 1,
+        proposal: `${loopReason} Fleet stopped repeating it. How should this be handled: a different approach, leave it for a person, or ignore that feedback?`,
+        headSha: record.observation?.headSha ?? batch.headSha,
+        scope: record.authorization.scope.baseline,
+      });
+    // Working → Reviewing: a settled worker result is reviewed immediately.
+    if (
+      final &&
+      batch.stepId &&
+      !batch.executionNotDispatched &&
+      record.lifecycle === "active" &&
+      !record.hold &&
+      record.decision?.state !== "pending"
+    )
+      this.requestReview(record, "worker_result");
   }
 
   private validateEffects(effects: PrMaintenanceEffect[]): void {
@@ -3962,7 +3616,9 @@ export class PrMaintenanceStore {
       );
     if (
       record.lifecycle !== "active" ||
+      record.hold ||
       record.decision?.state === "pending" ||
+      prMaintenanceReconciling(record) ||
       record.actions.some(unsettledEffect) ||
       record.batches.some(
         (batch) =>
@@ -4027,14 +3683,7 @@ export class PrMaintenanceStore {
         "worker_effect_required",
         "Pushes, replies and resolutions belong to a reserved worker batch.",
       );
-    if (
-      record.counters.mutationAttempts + effect.attempts >
-      record.authorization.budgets.mutationAttempts
-    )
-      refuse(
-        "budget_exhausted",
-        "External mutation allowance exhausted; operator renewal required.",
-      );
+
     if (
       record.actions.some(
         (entry) =>
@@ -4127,19 +3776,14 @@ export class PrMaintenanceStore {
       );
   }
 
-  wakeEligibleLeadIds(): string[] {
+  /** Leads with unattended heartbeat work: an idle, unheld PR that is due. */
+  wakeEligibleLeadIds(at = nowIso()): string[] {
     return [
       ...new Set(
         this.retained()
           .filter(
             (record) =>
-              !this.hasPendingPermission(record) &&
-              (!record.manualControl || Boolean(record.manualControl.endedAt)) &&
-              ((record.lifecycle === "active" &&
-                record.authorization.scope.publicationAuthorized) ||
-                prMaintenanceUnsettled(record)) &&
-              record.counters.reconciliationStalls < 3 &&
-              record.counters.scanStalls < 3 &&
+              (this.heartbeatDue(record, at) || prMaintenanceUnsettled(record)) &&
               !record.incidents.some(
                 (incident) =>
                   !incident.resolvedAt &&
@@ -4150,6 +3794,107 @@ export class PrMaintenanceStore {
           .map((record) => record.leadSessionId),
       ),
     ];
+  }
+
+  /**
+   * Unattended heartbeat eligibility, deliberately separate from manual
+   * admission: only active, unheld, authorized PRs whose stored `nextCheckAt`
+   * has passed and that are not already reviewing, working or waiting.
+   */
+  private heartbeatDue(record: PrMaintenanceRegistration, at: string): boolean {
+    return (
+      !record.ownershipReleasedAt &&
+      record.lifecycle === "active" &&
+      record.authorization.scope.publicationAuthorized &&
+      !record.hold &&
+      record.decision?.state !== "pending" &&
+      !prMaintenanceActiveBatch(record) &&
+      !(record.review && !record.review.concludedAt) &&
+      record.nextCheckAt <= at
+    );
+  }
+
+  /**
+   * Reviews that a lead should be woken for now: open, unheld, not yet queued.
+   * The engine queues one durable lead prompt per review id, so a lost or
+   * repeated tick never delivers it twice.
+   */
+  pendingReviewWakes(): PrMaintenanceRegistration[] {
+    return this.retained().filter(
+      (record) =>
+        record.lifecycle === "active" &&
+        !record.hold &&
+        record.review !== undefined &&
+        !record.review.concludedAt &&
+        !record.review.wakeQueuedAt &&
+        !prMaintenanceActiveBatch(record),
+    );
+  }
+
+  markReviewWake(recordId: string, reviewId: string, key: string, at = nowIso()) {
+    const record = this.required(recordId);
+    if (
+      record.review?.id !== reviewId ||
+      record.review.concludedAt ||
+      record.review.wakeQueuedAt
+    )
+      return false;
+    record.review.wakeQueuedAt = at;
+    record.review.wakeKey = key;
+    this.save(record);
+    return true;
+  }
+
+  /** Opens heartbeat reviews for every due PR. Called on engine ticks. */
+  openDueReviews(at = nowIso()): number {
+    return this.store.writeAtomically(() => {
+      let opened = 0;
+      for (const record of this.retained()) {
+        if (!this.heartbeatDue(record, at)) continue;
+        this.requestReview(record, "heartbeat", at);
+        this.save(record);
+        opened++;
+      }
+      return opened;
+    });
+  }
+
+  /**
+   * A lead turn that ended without concluding its claimed review: the review is
+   * abandoned so a later trigger can open a new one. Nothing is charged and no
+   * hold is set — the next heartbeat or Review now simply tries again.
+   */
+  abandonReview(recordId: string, reviewId: string, summary: string): boolean {
+    return this.store.writeAtomically(() => {
+      const record = this.get(recordId);
+      if (!record || record.review?.id !== reviewId || record.review.concludedAt)
+        return false;
+      this.concludeReview(record, "abandoned", nowIso(), summary);
+      this.save(record);
+      return true;
+    });
+  }
+
+  /** Open reviews whose delivering lead turn has already ended. */
+  staleReviews(leadTurnOpen: (leadSessionId: string, key: string) => boolean) {
+    return this.retained().flatMap((record) =>
+      record.review &&
+      !record.review.concludedAt &&
+      record.review.wakeKey &&
+      !prMaintenanceActiveBatch(record) &&
+      !record.batches.some((batch) => batch.state === "prepared") &&
+      !this.observationInFlight(record) &&
+      !leadTurnOpen(record.leadSessionId, record.review.wakeKey)
+        ? [{ recordId: record.id, reviewId: record.review.id }]
+        : [],
+    );
+  }
+
+  /** A claimed helper command for this record that has not produced its receipt. */
+  private observationInFlight(record: PrMaintenanceRegistration): boolean {
+    return this.store.commands
+      .unsettled()
+      .some((execution) => execution.maintenanceObservation?.recordId === record.id);
   }
 
   beginWake(
@@ -4240,7 +3985,6 @@ export class PrMaintenanceStore {
   ) {
     return this.store.writeAtomically(() => {
       const record = this.required(recordId, leadSessionId);
-      this.assertNoPendingPermission(record);
       const before = this.wake(leadSessionId, wakeId);
       if (
         !before.visitedIds.includes(recordId) ||
@@ -4332,8 +4076,6 @@ export class PrMaintenanceStore {
         "wake_exhausted",
         "The original helper deadline expired; do not restart it on command creation or approval.",
       );
-    // Only this bound finite-command path may observe a completed selected handback.
-    if (this.observingHandback(record)) return;
     this.assertAdmission({
       action: "discover",
       recordId: record.id,
@@ -4597,7 +4339,7 @@ export class PrMaintenanceStore {
       if (
         !late &&
         helperError(observation)?.code !== "clock_unverified" &&
-        (admission.allowed || this.observingHandback(record)) &&
+        admission.allowed &&
         !this.executionInFlight(record) &&
         prMaintenanceObservationFresh(observation, Date.now(), hostAttemptedAt)
       ) {
@@ -4694,8 +4436,11 @@ export class PrMaintenanceStore {
   private routineCheckAt(observedAt: string): string {
     const observed = Date.parse(observedAt);
     return new Date(
-      nextHeartbeat(this.store.getOrchestratorHeartbeatSchedule(), observed) ??
-        observed + ROUTINE_CHECK_FALLBACK_MS,
+      Math.max(
+        observed + ROUTINE_CHECK_MIN_MS,
+        nextHeartbeat(this.store.getOrchestratorHeartbeatSchedule(), observed) ??
+          observed + ROUTINE_CHECK_FALLBACK_MS,
+      ),
     ).toISOString();
   }
 
@@ -4717,6 +4462,12 @@ export class PrMaintenanceStore {
     });
   }
 
+  /**
+   * Claims the next PR this lead turn should read: one with an open review
+   * (manual, heartbeat, worker result, direction or resume) or an unresolved
+   * capability incident. A claim is only charged for a PR that can actually be
+   * read now, so a refused refresh never consumes a visit.
+   */
   takeDue(
     leadSessionId: string,
     wakeId: string,
@@ -4728,69 +4479,46 @@ export class PrMaintenanceStore {
       const remaining = this.remainingWake(leadSessionId, wakeId, at);
       if (!remaining.visits || !remaining.requests || !remaining.milliseconds)
         return undefined;
-      const row = this.db
-        .prepare("SELECT data FROM pr_maintenance_scans WHERE lead_session_id=?")
-        .get(leadSessionId);
-      let scan = row
-        ? PrMaintenanceScanSchema.parse(JSON.parse(String(row.data)))
-        : undefined;
-      const eligible = (record: PrMaintenanceRegistration) =>
+      // Due heartbeat checks become ordinary reviews; manual ones already are.
+      for (const record of this.retained())
+        if (record.leadSessionId === leadSessionId && this.heartbeatDue(record, at)) {
+          this.requestReview(record, "heartbeat", at);
+          this.save(record);
+        }
+      const readable = (record: PrMaintenanceRegistration) =>
         !record.ownershipReleasedAt &&
-        !this.hasPendingPermission(record) &&
-        (!record.manualControl ||
-          Boolean(record.manualControl.endedAt) ||
-          this.observingHandback(record)) &&
         record.leadSessionId === leadSessionId &&
-        ((record.lifecycle === "active" &&
-          record.authorization.scope.publicationAuthorized) ||
-          prMaintenanceUnsettled(record) ||
-          this.observingHandback(record)) &&
-        record.counters.scanStalls < 3 &&
-        record.counters.reconciliationStalls < 3 &&
+        record.lifecycle === "active" &&
+        record.authorization.scope.publicationAuthorized &&
+        this.admission({ action: "discover", recordId: record.id }).allowed &&
         !this.repairInProgress(record);
-      if (!scan?.unservedIds.length) {
-        const ids = this.retained()
-          .filter(
-            (record) =>
-              eligible(record) &&
-              (record.nextCheckAt <= at ||
-                (this.recoveryAllowed(record) &&
-                  record.incidents.some(
-                    (incident) =>
-                      incident.kind === "capability" &&
-                      !incident.resolvedAt &&
-                      incident.attempts.length < PR_MAINTENANCE_RECOVERY_LIMITS.attempts,
-                  ))),
-          )
-          .sort(
-            (a, b) =>
-              a.nextCheckAt.localeCompare(b.nextCheckAt) || a.id.localeCompare(b.id),
-          )
-          .map((record) => record.id);
-        scan = PrMaintenanceScanSchema.parse({
-          leadSessionId,
-          cutoff: at,
-          unservedIds: ids,
-        });
-      }
-      let chosen: PrMaintenanceRegistration | undefined;
-      while (scan.unservedIds.length) {
-        const id = scan.unservedIds[0]!;
-        const record = this.get(id);
-        if (record && eligible(record) && wake.visitedIds.includes(id)) break;
-        scan.unservedIds.shift();
-        if (!record || !eligible(record)) continue;
-        chosen = record;
-        wake.visits++;
-        wake.visitedIds.push(record.id);
-        break;
-      }
-      this.db
-        .prepare(
-          `INSERT INTO pr_maintenance_scans VALUES (?,?)
-        ON CONFLICT(lead_session_id) DO UPDATE SET data=excluded.data`,
-        )
-        .run(leadSessionId, JSON.stringify(scan));
+      const wanted = (record: PrMaintenanceRegistration) =>
+        readable(record) &&
+        ((record.review !== undefined && !record.review.concludedAt) ||
+          (this.recoveryAllowed(record) &&
+            record.incidents.some(
+              (incident) =>
+                incident.kind === "capability" &&
+                !incident.resolvedAt &&
+                incident.attempts.length < PR_MAINTENANCE_RECOVERY_LIMITS.attempts,
+            )));
+      const order = (a: PrMaintenanceRegistration, b: PrMaintenanceRegistration) =>
+        // Manual and result-driven reviews before routine heartbeats.
+        Number(a.review?.source === "heartbeat") -
+          Number(b.review?.source === "heartbeat") ||
+        (a.review?.requestedAt ?? a.nextCheckAt).localeCompare(
+          b.review?.requestedAt ?? b.nextCheckAt,
+        ) ||
+        a.id.localeCompare(b.id);
+      // The claim lives on this turn's wake, never on the record: reading a PR
+      // does not change it. One visit per record per turn; a lead runs one turn
+      // at a time, and one outstanding batch prevents duplicate dispatch.
+      const chosen = this.retained()
+        .filter((record) => !wake.visitedIds.includes(record.id) && wanted(record))
+        .sort(order)[0];
+      if (!chosen) return undefined;
+      wake.visits++;
+      wake.visitedIds.push(chosen.id);
       this.db
         .prepare(
           "UPDATE pr_maintenance_wakes SET data=? WHERE lead_session_id=? AND wake_id=?",
@@ -4800,30 +4528,25 @@ export class PrMaintenanceStore {
     });
   }
 
+  /** Paused for 30 days: notify once to resume or release. */
   notifyLongPauses(
     at: string,
     notify: (record: PrMaintenanceRegistration) => void,
   ): number {
     atSchema.parse(at);
-    return this.store.writeAtomically(() => {
-      let count = 0;
-      for (const record of this.retained()) {
-        if (
-          record.lifecycle !== "paused" ||
-          record.pausedNoticeAt ||
-          !record.pausedAt ||
-          Date.parse(at) -
-            Math.max(Date.parse(record.pausedAt), Date.parse(record.renewedAt)) <
-            30 * 24 * 60 * 60 * 1_000
-        )
-          continue;
-        record.pausedNoticeAt = at;
-        notify(record);
-        this.save(record);
-        count++;
-      }
-      return count;
-    });
+    let count = 0;
+    for (const record of this.retained()) {
+      const hold = record.hold;
+      if (
+        !hold ||
+        hold.kind === "manual_control" ||
+        Date.parse(at) - Date.parse(hold.at) < 30 * 24 * 60 * 60 * 1_000
+      )
+        continue;
+      notify(record);
+      count++;
+    }
+    return count;
   }
 
   exportBackup(): PrMaintenanceBackup {
@@ -4904,24 +4627,14 @@ export class PrMaintenanceStore {
       this.quarantineManualOperation(sessionId, command.id);
     for (const record of backup?.registrations ?? []) {
       if (!record.ownershipReleasedAt) {
-        if (
-          record.continuation &&
-          ["checking", "handback"].includes(record.continuation.state)
-        ) {
-          record.continuation.state = "cancelled";
-          record.continuation.reason =
-            "portable_restore_requires_operator_reconciliation";
-          record.continuation.settledAt = nowIso();
-        }
-        if (record.lifecycle === "active") record.lifecycle = "paused";
-        record.pauseReason = "portable_restore_requires_operator_reconciliation";
-        const pausedAt = nowIso();
-        record.pausedAt ??= pausedAt;
-        record.pauseOrigin = {
-          actor: "system",
-          actorId: "host",
-          at: pausedAt,
-        };
+        // Restored authority must be confirmed on this Host: hold for one Resume.
+        delete record.review;
+        if (!record.hold || record.hold.kind === "manual_control")
+          this.setHold(
+            record,
+            "paused",
+            "Restored from a portable backup; Resume to continue on this Host.",
+          );
         for (const batch of record.batches) {
           if (batch.state === "accepted") {
             batch.state = "uncertain";

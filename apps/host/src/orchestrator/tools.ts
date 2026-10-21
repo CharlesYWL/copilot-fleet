@@ -13,7 +13,6 @@ import {
   PrMaintenanceIdentitySchema,
   parsePrMaintenanceUrl,
   prMaintenanceProviderLabel,
-  prMaintenanceProgress,
   prMaintenanceSources,
   prMaintenanceWorkSources,
   prMaintenanceUrl,
@@ -568,8 +567,20 @@ export const SetPrMaintenanceSchema = z
   .object({
     recordId: z.string().min(1),
     expectedVersion: z.number().int().positive(),
-    action: z.enum(["enable", "pause", "resume", "release"]),
+    action: z
+      .enum(["review", "direction", "pause", "resume"])
+      .describe(
+        "review: check the PR now (bypasses the heartbeat interval; refreshes metadata itself). direction: record the person's answer to the pending design decision, only while answering their message; it resumes maintenance. pause: hold it. resume: lift your own pause.",
+      ),
     reason: z.string().min(1).max(8_192).optional(),
+    decisionId: z.string().min(1).max(512).optional(),
+    decisionVersion: z.number().int().positive().optional(),
+    direction: z
+      .string()
+      .min(1)
+      .max(8_192)
+      .optional()
+      .describe("The person's direction in their own words, for action direction."),
   })
   .strict();
 
@@ -1052,11 +1063,53 @@ export class FleetTools {
         expectedVersion: input.expectedVersion,
         action: input.action,
         ...(input.reason ? { reason: input.reason } : {}),
+        ...(input.decisionId ? { decisionId: input.decisionId } : {}),
+        ...(input.decisionVersion ? { decisionVersion: input.decisionVersion } : {}),
+        ...(input.direction ? { direction: input.direction } : {}),
+        userTurn: this.answeringOperator(),
       });
       this.service.cancelPausedPrMaintenance();
       this.service.publishSnapshot();
-      return record;
+      return {
+        record: {
+          id: record.id,
+          version: record.version,
+          review: record.review,
+          hold: record.hold,
+          decision: record.decision,
+        },
+        status: this.store.prMaintenance.status(record),
+        instruction:
+          input.action === "review" ||
+          input.action === "direction" ||
+          input.action === "resume"
+            ? "A review is queued and arrives as its own <fleet-pr-review> turn. End this turn."
+            : "Recorded.",
+      };
     });
+  }
+
+  /**
+   * Whether this lead turn is answering a message a signed-in person sent.
+   *
+   * Host-verified from the durable delivery that started the turn: only the
+   * operator message queue, with an authenticated operator, qualifies.
+   * Heartbeats, worker results, PR reviews and local-agent requests do not, so
+   * nothing read from a PR can be recorded as the person's direction.
+   */
+  private answeringOperator(): boolean {
+    const deliveryId = this.store.getSessionDispatchAttempt(
+      this.leadSessionId,
+    )?.commandId;
+    if (!deliveryId) return false;
+    const delivery = this.store.commands.prompt(deliveryId);
+    if (!delivery || delivery.delivery.sessionId !== this.leadSessionId) return false;
+    if (!delivery.key.startsWith("operator-queue:")) return false;
+    const message = this.store.queuedMessageByDeliveryKey(
+      this.leadSessionId,
+      delivery.key,
+    );
+    return Boolean(message && (message.operatorId || message.actor?.kind === "operator"));
   }
 
   proposePrMaintenance(input: z.infer<typeof ProposePrMaintenanceSchema>): ToolResult {
@@ -1241,8 +1294,8 @@ export class FleetTools {
         });
         return {
           serverTime: new Date().toISOString(),
-          effectiveStates: Object.fromEntries(
-            page.records.map((record) => [record.id, registry.effectiveState(record)]),
+          statuses: Object.fromEntries(
+            page.records.map((record) => [record.id, registry.status(record)]),
           ),
           ...page,
           proposal: registry.getProposal(parsed.taskId, this.leadSessionId) ?? null,
@@ -1261,7 +1314,7 @@ export class FleetTools {
         return {
           ...record,
           operatorWorkSources: prMaintenanceWorkSources(record),
-          effectiveState: registry.effectiveState(record),
+          status: registry.status(record),
           serverTime: new Date().toISOString(),
         };
       }
@@ -1303,7 +1356,7 @@ export class FleetTools {
             record: {
               ...record,
               operatorWorkSources: prMaintenanceWorkSources(record),
-              effectiveState: registry.effectiveState(record),
+              status: registry.status(record),
             },
             observationAllowance: {
               requests,
@@ -1313,8 +1366,8 @@ export class FleetTools {
             observationClaim,
             allowance: registry.remainingWake(this.leadSessionId, wakeId),
             instruction: recovery
-              ? "Recovery visit claimed; its reservation stays charged. Read the incident, reserve alternate_attempt BEFORE authorized alternate provider I/O, then checkpoint alternate_observation. Do not rerun the failed helper just to satisfy this claim, reclaim the visit or reset budgets. Paused/terminal records permit reconciliation only."
-              : "Allowance is reserved, including lost responses, within this lead turn's 5-minute window. Immediately run the helper once with observationAllowance.deadlineAt unchanged. For a finite Fleet command, pass observationClaim as maintenanceObservation at command creation; after completion checkpoint the exact observation with executionId, even in a new lead turn. A prepared, undispatched batch does not block fresh observations: keep its exact prompt at the same head; an observed head change supersedes and refunds it so a new batch can be prepared. Do not reclaim a visit to save old evidence. Receipt persistence grants no new I/O or repairs; actions still need a current claimed allowance.",
+              ? "Recovery review claimed. Read the incident, reserve alternate_attempt BEFORE authorized alternate provider I/O, then checkpoint alternate_observation. Do not rerun the failed helper just to satisfy this claim."
+              : "Review claimed. Run the helper once now with observationAllowance.deadlineAt unchanged (for a Fleet command, pass observationClaim as maintenanceObservation at creation) and checkpoint its exact observation. Then classify: prepare_work_order + fleet_follow_up for routine work, fleet_escalate for a genuine design decision, or review_done when nothing is actionable.",
           };
         });
       }
@@ -1337,14 +1390,13 @@ export class FleetTools {
           workerSessionId: record.workerSessionId,
           identity: record.identity,
           lifecycle: record.lifecycle,
-          pauseReason: record.pauseReason,
+          hold: record.hold,
+          review: record.review,
           lastSuccessAt: record.lastSuccessAt,
           nextCheckAt: record.nextCheckAt,
           decision: record.decision,
           ownershipReleasedAt: record.ownershipReleasedAt,
-          counters: record.counters,
-          progress: prMaintenanceProgress(record),
-          effectiveState: registry.effectiveState(record),
+          status: registry.status(record),
           recovery: record.incidents
             .filter((incident) => !incident.resolvedAt)
             .map((incident) => ({
@@ -1387,7 +1439,6 @@ export class FleetTools {
           );
         }
         if (input.checkpoint.kind === "prepare_work_order") {
-          this.requireMaintenanceVisit(input.recordId, true);
           return this.prepareWorkOrder(
             input.recordId,
             input.expectedVersion,
@@ -1400,9 +1451,6 @@ export class FleetTools {
             input.expectedVersion,
             input.checkpoint,
           );
-        }
-        if (input.checkpoint.kind === "prepare_batch") {
-          this.requireMaintenanceVisit(input.recordId, true);
         }
         if (
           input.checkpoint.kind === "observation" ||
@@ -1545,23 +1593,17 @@ export class FleetTools {
       published: settlement.published,
     };
     const wakeId = this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId;
-    let current = record;
     let version = expectedVersion;
     if (batch.state === "accepted" && settlement.state !== "uncertain") {
-      current = registry.checkpoint(
+      version = registry.checkpoint(
         this.leadSessionId,
         recordId,
         version,
         { ...base, state: "reconciling", usedMutations: undefined },
         wakeId,
-      );
-      version = current.version;
+      ).version;
     }
-    if (settlement.needsHuman && current.decision?.state !== "pending")
-      throw new PrMaintenanceError(
-        "human_decision_required",
-        "The worker reported needs_human. Escalate with maintenance-aware fleet_escalate first, then submit this report again.",
-      );
+    // A needs_human finding raises the PR's design decision during settlement.
     return registry.checkpoint(
       this.leadSessionId,
       recordId,
@@ -2002,6 +2044,12 @@ export class FleetTools {
       retainedOnly: true,
     }).records;
     if (input.maintenance || registrations.length) {
+      /*
+       * A maintenance escalation is a PR design decision, not a task review:
+       * the PR enters Waiting for Design Decision and the person answers in
+       * the PRM panel or this conversation. The task's own state is untouched,
+       * so answering or settling its review can never cancel maintenance.
+       */
       return this.maintenanceResult(() => {
         const record = input.maintenance
           ? this.store.prMaintenance.get(input.maintenance.recordId, this.leadSessionId)
@@ -2012,72 +2060,38 @@ export class FleetTools {
             "The maintenance record must belong to this task.",
           );
         }
-        const headSha = record.observation?.headSha;
-        if (!headSha) {
-          if (
-            !this.service.requestRunReview({
-              runId: run.id,
-              note: `**PR maintenance is operationally blocked.**\n\n${input.reason}\n\nNo complete PR observation is available. This review does not authorize repairs, publication or a design change; existing maintenance holds and authorization remain unchanged.`,
-              reason: "blocked",
-              operationalMaintenance: {
-                recordId: record.id,
-                leadSessionId: this.leadSessionId,
-                expectedVersion: input.maintenance?.expectedVersion ?? record.version,
-              },
-              metadata: {
-                summary: input.headline ?? "PR maintenance observation blocked",
-                kind: "blocked",
-                source: "orchestrator",
-                sessionId: this.leadSessionId,
-              },
-            })
-          )
-            throw new PrMaintenanceError(
-              "review_conflict",
-              "The existing human review cannot be overwritten.",
-            );
-          return record;
-        }
-        const held = this.store.prMaintenance.holdForDecision(
-          this.leadSessionId,
-          record.id,
-          input.maintenance?.expectedVersion ?? record.version,
-          {
-            id:
-              input.maintenance?.decisionId ??
-              record.decision?.id ??
-              `decision-${record.version}`,
-            version: 1,
-            proposal: input.reason,
-            headSha,
-            scope: record.authorization.scope.baseline,
-          },
-          () => {
-            if (terminalRunStates.has(run.state)) {
-              this.store.updateRun(run.id, { state: "running" });
-            }
-            if (
-              !this.service.requestRunReview({
-                runId: run.id,
-                note: `**PR maintenance needs a design decision.**\n\n${input.reason}\n\nUse Send back with instructions for bounded direction. Approve task does not authorize a design change.`,
-                reason: "blocked",
-                metadata: {
-                  summary: input.headline ?? "PR maintenance needs a design decision",
-                  kind: "blocked",
-                  source: "orchestrator",
-                  sessionId: this.leadSessionId,
-                },
-              })
-            ) {
-              throw new PrMaintenanceError(
-                "review_conflict",
-                "The existing human review cannot be overwritten.",
-              );
-            }
-          },
-        );
-        this.service.cancelPausedPrMaintenance();
-        return held;
+        const held = this.service.notifications.commitAtomically(() => {
+          const saved = this.store.prMaintenance.holdForDecision(
+            this.leadSessionId,
+            record.id,
+            input.maintenance?.expectedVersion ?? record.version,
+            {
+              id:
+                input.maintenance?.decisionId ??
+                (record.decision?.state === "pending"
+                  ? record.decision.id
+                  : `decision-${record.version}`),
+              version: 1,
+              proposal: input.reason,
+              headSha:
+                record.observation?.headSha ??
+                record.lastAttempt?.headSha ??
+                record.authorization.headSha,
+              scope: record.authorization.scope.baseline,
+            },
+          );
+          this.service.notifications.createPrMaintenanceAttention(saved, "decision");
+          return saved;
+        });
+        this.service.publishSnapshot();
+        return {
+          recordId: held.id,
+          version: held.version,
+          decision: held.decision,
+          status: this.store.prMaintenance.status(held),
+          instruction:
+            "The PR is Waiting for Design Decision. The person answers in the task's PR maintenance panel or in this conversation; then maintenance resumes with a fresh review. End your turn.",
+        };
       });
     }
     if (terminalRunStates.has(run.state)) {
@@ -2968,7 +2982,7 @@ export class FleetTools {
         : []),
       ...maintenance.records.map(
         (record) =>
-          `  PR maintenance: ${prMaintenanceUrl(record.identity)} (${record.id}) - ${JSON.stringify(this.store.prMaintenance.effectiveState(record))}; read fleet_get_pr_maintenance with taskId "${run.id}" for current facts and prior PR history before continuation.`,
+          `  PR maintenance: ${prMaintenanceUrl(record.identity)} (${record.id}) - ${this.store.prMaintenance.status(record).label}: ${this.store.prMaintenance.status(record).reason} Read fleet_get_pr_maintenance with taskId "${run.id}" for details.`,
       ),
       ...(steps.length
         ? steps.map((step) => {
@@ -2993,22 +3007,66 @@ export class FleetTools {
     ].join("\n");
   }
 
+  /**
+   * How a prepared maintenance batch reaches its retained worker. PRM
+   * admission has already checked holds, decision and evidence; the task's own
+   * state (awaiting review, completed) is deliberately not consulted, because
+   * maintaining the PR is separate from accepting the task.
+   */
+  private maintenanceContinuation(step: RunStep, session: FleetSession): Continuation {
+    if (session.dismissed)
+      return {
+        action: "restore_session",
+        reason: "Restore the dismissed retained worker before maintenance can use it.",
+      };
+    if (session.stopRequested)
+      return { action: "wait", reason: "The retained worker is still stopping." };
+    if (!terminalRunStepStates.has(step.state))
+      return step.state === "pending"
+        ? { action: "queued", reason: "The maintenance batch is already queued." }
+        : { action: "in_flight", reason: "A maintenance batch is already running." };
+    const needsResume =
+      terminalSessionStates.has(session.state) || session.state === "offline";
+    if (session.state !== "idle" && !needsResume)
+      return { action: "wait", reason: `The retained worker is ${session.state}.` };
+    if (needsResume && !session.agentSessionId)
+      return {
+        action: "unavailable",
+        reason:
+          "The retained worker has no resumable conversation; maintenance never replaces it. Release maintenance or restore the worker.",
+      };
+    return {
+      action: needsResume ? "resume" : "follow_up",
+      reason: "Dispatching the prepared maintenance batch to the retained worker.",
+    };
+  }
+
   /** Shared by discovery and dispatch so their advice cannot contradict each other. */
   private continuation(run: Run, step: RunStep, session?: FleetSession): Continuation {
-    const maintenance = this.store.prMaintenance.admission({
-      action: "discover",
-      taskId: run.id,
-      ...(session ? { sessionId: session.id } : {}),
-      leadSessionId: this.leadSessionId,
-    });
-    if (!maintenance.allowed) {
-      return {
-        action:
-          maintenance.decisionId || maintenance.reason === "wait_for_human"
-            ? "wait_for_human"
-            : "wait",
-        reason: `PR maintenance ${maintenance.recordId}: ${maintenance.reason}${maintenance.decisionId ? `; decision ${maintenance.decisionId}` : ""}. Read fleet_get_pr_maintenance; do not reopen or replace the worker.`,
-      };
+    const record = this.store.prMaintenance
+      .list({ taskId: run.id, leadSessionId: this.leadSessionId, retainedOnly: true })
+      .records.find((entry) => !session || entry.workerSessionId === session.id);
+    if (record) {
+      const status = this.store.prMaintenance.status(record);
+      if (status.phase === "waiting_for_decision")
+        return {
+          action: "wait_for_human",
+          reason: `PR maintenance ${record.id} is Waiting for Design Decision (${record.decision?.id}). The person answers in the PR maintenance panel or this conversation.`,
+        };
+      if (status.hold)
+        return {
+          action: "wait",
+          reason: `PR maintenance ${record.id}: ${status.label}. ${status.action}`,
+        };
+      if (
+        session?.id === record.workerSessionId &&
+        status.phase !== "merged" &&
+        status.phase !== "closed"
+      )
+        return {
+          action: "wait",
+          reason: `This worker is retained by PR maintenance ${record.id} (${status.label}). Send it work through a prepared maintenance batch from a <fleet-pr-review> turn, or call fleet_set_pr_maintenance action review.`,
+        };
     }
     if (terminalRunStates.has(run.state) || run.state === "awaiting_human") {
       return {
@@ -3154,13 +3212,6 @@ export class FleetTools {
           `Batch ${batch.id} is already ${batch.state}; no prompt was sent. Reconcile its recorded step/attempt through fleet_get_pr_maintenance.`,
         );
       }
-      try {
-        this.requireMaintenanceVisit(record.id, true);
-      } catch (error) {
-        if (error instanceof PrMaintenanceError)
-          return refuse(`${error.code}: ${error.message}`);
-        throw error;
-      }
     }
     const maintenance = this.maintenanceRefusal({
       action: "dispatch",
@@ -3174,7 +3225,9 @@ export class FleetTools {
       return refuse(
         "A prompt is required unless this follow-up names a prepared maintenance batch.",
       );
-    const next = this.continuation(run, step, owned);
+    const next = input.maintenance
+      ? this.maintenanceContinuation(step, owned)
+      : this.continuation(run, step, owned);
     if (
       (next.action === "queued" || next.action === "in_flight") &&
       step.prompt === prompt

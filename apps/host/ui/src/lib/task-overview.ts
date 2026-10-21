@@ -1,30 +1,28 @@
 import {
   currentPrMaintenance,
-  prMaintenanceProgress,
+  prMaintenanceStatus,
   type PrMaintenanceRegistration,
-  type PrMaintenanceStage,
+  type PrMaintenanceStatus,
   type RunNote,
 } from "@fleet/protocol";
 import { awaitingPlan, currentPhase, type RunViewModel } from "./orchestration-view";
 import type { TaskMaintenanceView } from "./pr-maintenance";
 
-export const maintenanceStageLabels: Record<PrMaintenanceStage, string> = {
-  checking: "Checking PR",
-  triage: "Reviewing feedback",
-  addressing_review: "Fixing feedback",
-  waiting_checks: "Waiting for checks",
-  waiting_review: "Waiting for review",
-  ready: "Ready to merge",
-  human_hold: "Decision needed",
-  reconciling: "Reconciling effects",
-  authorization_required: "Repair authorization required",
-  paused: "Paused",
-  recovering: "Recovering access",
-  blocked: "Blocked",
-  merged: "Merged",
-  closed: "Closed",
-  released: "Released",
-};
+/** The Host's status when it sent one; otherwise derived from the record. */
+export function maintenanceStatusOf(
+  record: PrMaintenanceRegistration,
+  view: Pick<TaskMaintenanceView, "statuses"> | undefined,
+): PrMaintenanceStatus {
+  return view?.statuses?.[record.id] ?? prMaintenanceStatus(record);
+}
+
+/** A person is needed: a design decision, or a hold only they clear. */
+export function maintenanceNeedsPerson(status: PrMaintenanceStatus): boolean {
+  return (
+    status.phase === "waiting_for_decision" ||
+    Boolean(status.hold && status.hold !== "manual_control")
+  );
+}
 
 export const currentMaintenance = currentPrMaintenance<PrMaintenanceRegistration>;
 
@@ -75,7 +73,7 @@ export function taskOverview(
   model: RunViewModel,
   notes: readonly RunNote[],
   maintenance: TaskMaintenanceView | undefined,
-  nowMs = Date.now(),
+  _nowMs = Date.now(),
 ): TaskOverview {
   const { run } = model;
   const report = latestReviewNote(notes);
@@ -90,31 +88,15 @@ export function taskOverview(
       attention: true,
     };
   }
-  const effective = record && maintenance?.effectiveStates?.[record.id];
-  if (effective) {
-    return {
-      title: `PR: ${effective.status.replaceAll("_", " ")}`,
-      summary: `${effective.reason} ${effective.action}`,
-      attention: effective.status === "needs_decision",
-    };
-  }
-  if (record?.ownershipReleasedAt) {
-    return {
-      title: "PR: released",
-      summary:
-        "Maintenance ownership is released. Prior paused lifecycle data is historical, not an active hold.",
-      attention: false,
-    };
-  }
-  if (record?.decision?.state === "pending" && !record.ownershipReleasedAt) {
-    return {
-      title: "Your design decision is needed",
-      summary:
-        report?.kind === "blocked" && report.summary
-          ? report.summary
-          : "PR maintenance is paused for bounded direction; no design change is authorized yet.",
-      attention: true,
-    };
+  // Maintenance describes the PR; the task's own review is described separately below.
+  if (record && !record.ownershipReleasedAt) {
+    const status = maintenanceStatusOf(record, maintenance);
+    if (maintenanceNeedsPerson(status) || run.state !== "awaiting_human")
+      return {
+        title: `PR: ${status.label}`,
+        summary: `${status.reason} ${status.action}`,
+        attention: maintenanceNeedsPerson(status),
+      };
   }
   if (run.state === "awaiting_human") {
     return {
@@ -190,78 +172,6 @@ export function taskOverview(
       title: "Task not started",
       summary: "The task is recorded but has not started dispatching work.",
       attention: false,
-    };
-  }
-  if (record && !record.ownershipReleasedAt) {
-    if (["merged", "closed"].includes(record.lifecycle) && hasOutstandingWork(record)) {
-      return {
-        title: `PR ${record.lifecycle}; reconciliation pending`,
-        summary:
-          "Previously accepted work or unknown effects still need reconciliation before ownership can be released.",
-        attention: true,
-      };
-    }
-    if (record.manualControl && !record.manualControl.endedAt) {
-      const unknown = record.manualControl.commands.some(
-        (command) => command.state === "unknown",
-      );
-      const accepted = record.manualControl.commands.some(
-        (command) => command.state === "accepted",
-      );
-      return {
-        title: "Manual supervisor control",
-        summary: unknown
-          ? "Manual delivery has no correlated receipt yet; do not replay it while unattended maintenance is paused."
-          : accepted
-            ? "The manual command is accepted; wait for its completion receipt while unattended maintenance stays paused."
-            : "Unattended maintenance stays paused; use the retained worker for manual work and explicitly resume maintenance when ready.",
-        attention: unknown,
-      };
-    }
-    const stage = prMaintenanceProgress(record, nowMs).stage;
-    const copy: Record<PrMaintenanceStage, string> = {
-      checking:
-        "Fleet is checking current PR evidence and remaining feedback obligations before claiming readiness.",
-      triage:
-        "Current feedback without a matching current-HEAD disposition is being assessed against the approved scope.",
-      addressing_review:
-        "An accepted feedback batch is queued or running on the retained worker within its authorization.",
-      waiting_checks: "Required checks have not all passed for the current PR head.",
-      waiting_review:
-        "Required review approval is still outstanding for the current PR head.",
-      ready: "Current evidence permits readiness; merging remains a human action.",
-      human_hold:
-        "Maintenance is waiting for your bounded direction before any further repairs.",
-      reconciling:
-        "Some work or remote effects are unsettled; do not blindly repeat the action.",
-      authorization_required:
-        "Legacy observation-only maintenance is retired. Prepare and authenticate repair authorization for the retained PR and worker; no writes or automatic resume.",
-      paused: "Maintenance is paused; review its controls and reason before resuming.",
-      recovering:
-        "Fleet is trying a bounded observation fallback, not bypassing permissions.",
-      blocked:
-        "Resolve the recorded blocker before further PR work or a readiness claim.",
-      merged:
-        "The PR merge was observed; this alone does not prove deployment or completion of the whole task.",
-      closed: "The PR is closed, not merged; no new maintenance repairs will be started.",
-      released:
-        "Maintenance ownership has been released; a new grant is needed to restart it.",
-    };
-    return {
-      title:
-        stage === "ready"
-          ? "PR ready to merge"
-          : stage === "checking"
-            ? "Checking PR status"
-            : `PR: ${maintenanceStageLabels[stage].toLowerCase()}`,
-      summary: copy[stage],
-      attention: [
-        "human_hold",
-        "blocked",
-        "reconciling",
-        "paused",
-        "authorization_required",
-      ].includes(stage),
     };
   }
   if (run.state === "completed") {

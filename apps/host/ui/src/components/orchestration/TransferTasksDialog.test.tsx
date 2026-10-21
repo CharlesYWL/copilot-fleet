@@ -64,9 +64,8 @@ const lead = (overrides: Partial<FleetSession> = {}): FleetSession => ({
 const maintained: PrMaintenanceTaskStatus = {
   taskId: "kept",
   recordId: "record-1",
-  stage: "waiting_review",
   prUrl: "https://github.com/example/repo/pull/7",
-  manualControl: false,
+  status: { phase: "reviewing", label: "Reviewing", reason: "r", action: "a" },
 };
 
 const models = () =>

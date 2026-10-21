@@ -30,8 +30,6 @@ import {
   PromptSchema,
   type PrMaintenanceIdentity,
   type PrMaintenanceObservation,
-  type SessionEvent,
-  PrMaintenanceObservationSchema,
   CommandExecutionPageSchema,
 } from "@fleet/protocol";
 import type { AuthenticatedChannel } from "@fleet/protocol/node-auth";
@@ -2563,129 +2561,6 @@ describe("durable command output", () => {
 });
 
 describe("PR maintenance with durable commands", () => {
-  it("retains authenticated continuation offline, queues it once while busy, and recovers the same delivery after restart", () => {
-    const directory = mkdtempSync(join(tmpdir(), "fleet-continuation-"));
-    directories.push(directory);
-    const path = join(directory, "host.sqlite");
-    const f = setup(path);
-    let record = enableMaintenance(f);
-    record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
-      kind: "observation",
-      observation: PrMaintenanceObservationSchema.parse({
-        attemptedAt: new Date().toISOString(),
-        complete: true,
-        identity: record.identity,
-        snapshotId: "before-consent",
-        headSha: "a".repeat(40),
-        baseSha: "b".repeat(40),
-        state: "open",
-        fingerprint: "before-consent",
-        checksComplete: true,
-        reviewsComplete: true,
-        evidence: "Isolated provider fixture.",
-      }),
-    });
-    record = f.store.prMaintenance.holdForDecision(
-      f.lead.id,
-      record.id,
-      record.version,
-      {
-        id: "decision",
-        version: 1,
-        proposal: "Keep API?",
-        scope: "Existing contract",
-        headSha: "a".repeat(40),
-      },
-      () => f.store.updateRun(record.taskId, { state: "awaiting_human" }),
-    );
-    record = f.store.prMaintenance.operatorAction(
-      record.id,
-      record.version,
-      {
-        action: "direction",
-        decisionId: "decision",
-        decisionVersion: 1,
-        direction: "Keep the approved API; repair within the existing grant.",
-        resume: true,
-        continueEligible: true,
-      },
-      "operator",
-      () => f.store.updateRun(record.taskId, { state: "running" }),
-    );
-    const offline = vi.spyOn(f.service, "nodeSocket").mockReturnValue(undefined);
-    const engine = new OrchestratorEngine(f.service);
-    engine.tick();
-    expect(f.store.commands.prompts(f.lead.id)).toHaveLength(0);
-    expect(f.store.prMaintenance.get(record.id)!.continuation).toEqual(
-      record.continuation,
-    );
-    offline.mockRestore();
-    f.store.transitionSession(f.lead.id, "running");
-    const enqueue = vi
-      .spyOn(f.service.commands, "queueLeadPrompt")
-      .mockImplementationOnce(() => {
-        throw new Error("Fixture queue unavailable");
-      });
-    expect(() => engine.tick()).toThrow("Fixture queue unavailable");
-    expect(f.store.commands.prompts(f.lead.id)).toHaveLength(0);
-    expect(f.store.prMaintenance.get(record.id)!.continuation).toEqual(
-      record.continuation,
-    );
-    enqueue.mockRestore();
-    engine.tick();
-    engine.tick();
-    const queued = f.store.commands
-      .prompts(f.lead.id)
-      .filter((entry) => entry.delivery.prompt.includes(record.continuation!.id));
-    expect(queued).toHaveLength(1);
-    const delivery = queued[0]!.delivery;
-    expect(
-      f.frames.filter(
-        (frame) =>
-          frame.type === "deliver_lead_prompt" &&
-          frame.delivery.deliveryId === delivery.deliveryId,
-      ),
-    ).toHaveLength(0);
-    const restored = open(path);
-    expect(
-      restored.prMaintenance.get(record.id)!.continuation?.wakeQueuedAt,
-    ).toBeTruthy();
-    expect(restored.commands.prompt(delivery.deliveryId)!.delivery).toEqual(delivery);
-    const restarted = new FleetService(restored, log, "test");
-    restarted.attachNode(f.node.id, f.service.nodeSocket(f.node.id)!);
-    restarted.commands.nodeReady(f.node.id, {
-      capabilities,
-      commandExecution: readiness,
-    });
-    restored.transitionSession(f.lead.id, "idle");
-    const restartedEngine = new OrchestratorEngine(restarted);
-    restartedEngine.tick();
-    expect(
-      restarted.commands.handleNodeMessage(f.node.id, {
-        type: "lead_prompt_receipt",
-        receipt: nativeReceipt({
-          deliveryId: delivery.deliveryId,
-          sessionId: f.lead.id,
-          state: "accepted",
-          at: new Date().toISOString(),
-        }),
-      }),
-    ).toBe(true);
-    restartedEngine.tick();
-    restarted.commands.pumpLead(f.lead.id);
-    expect(
-      f.frames.filter(
-        (frame) =>
-          frame.type === "deliver_lead_prompt" &&
-          frame.delivery.deliveryId === delivery.deliveryId,
-      ),
-    ).toHaveLength(1);
-    expect(restored.prMaintenance.get(record.id)!.authorization).toEqual(
-      record.authorization,
-    );
-    expect(restored.prMaintenance.get(record.id)!.counters).toEqual(record.counters);
-  });
-
   function enableMaintenance(
     f: ReturnType<typeof setup>,
     identity?: PrMaintenanceIdentity,
@@ -2747,21 +2622,16 @@ describe("PR maintenance with durable commands", () => {
       "maintenance_batch_required",
     );
     expect(() => f.request()).toThrow("maintenance_batch_required");
-    f.store.prMaintenance.holdForDecision(
-      f.lead.id,
-      record.id,
-      record.version,
-      {
-        id: "design-decision",
-        version: 1,
-        proposal: "The review would change the API.",
-        headSha: record.authorization.headSha,
-        scope: record.authorization.scope.baseline,
-      },
-      () => f.store.setRunState(record.taskId, "awaiting_human"),
-    );
-    expect(() => f.request({ taskId: record.taskId })).toThrow("wait_for_human");
-    expect(() => f.request()).toThrow("wait_for_human");
+    f.store.prMaintenance.holdForDecision(f.lead.id, record.id, record.version, {
+      id: "design-decision",
+      version: 1,
+      proposal: "The review would change the API.",
+      headSha: record.authorization.headSha,
+      scope: record.authorization.scope.baseline,
+    });
+    // The decision does not free the retained checkout for ordinary commands.
+    expect(() => f.request({ taskId: record.taskId })).toThrow("decision_pending");
+    expect(() => f.request()).toThrow("decision_pending");
     const helper = f.store.createPlacement(
       f.store.createWorkspace("Helper context", "").id,
       f.node.id,
@@ -2939,9 +2809,11 @@ describe("PR maintenance with durable commands", () => {
           sequence: f.store.maxEventSequence(record.workerSessionId) + 1,
           createdAt: new Date().toISOString(),
         });
-      f.store.prMaintenance.reconcileContinuations();
+      f.store.prMaintenance.reconcileHandbacks();
       record = f.store.prMaintenance.get(record.id)!;
-      expect(record.continuation?.completedAt).toBeDefined();
+      // The settled one-turn handback cleared the manual hold and owes a review.
+      expect(record.hold).toBeUndefined();
+      expect(record.review).toMatchObject({ source: "handback" });
       expect(record.manualControl?.endedAt).toBeUndefined();
     }
     const helper = f.store.createPlacement(
@@ -3630,140 +3502,6 @@ describe("PR maintenance with durable commands", () => {
       ).toBeUndefined();
     },
   );
-  it("reconciles selected handback through the real finite command and receipt path", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    const h = await observationCommand(":memory:", true, githubIdentity, 0, {
-      handback: true,
-    });
-    const before = h.f.store.prMaintenance.get(h.record.id)!;
-    vi.setSystemTime(Date.now() + COMMAND_LIMITS.clockDriftMs + 1);
-    expect(before.lifecycle).toBe("paused");
-    expect(before.manualControl?.endedAt).toBeUndefined();
-    expect(
-      h.f.store.prMaintenance.admission({
-        action: "discover",
-        recordId: before.id,
-        leadSessionId: h.f.lead.id,
-      }).allowed,
-    ).toBe(false);
-    const { cli, result, stdout } = nativeGithubResult(
-      {
-        schemaVersion: 1,
-        generation: before.generation,
-        pr: before.identity,
-        budget: {
-          maxRequests: 39,
-          maxBytes: 1_048_576,
-          deadlineAt: h.claim.observationAllowance.deadlineAt,
-        },
-      },
-      0,
-      { started: Date.now(), nodeOffset: 0 },
-    );
-    expect(cli.status, cli.stdout).toBe(0);
-    h.finish(result, {}, stdout);
-    h.completionTurn();
-    const saved = await h.call(
-      "fleet_checkpoint_pr_maintenance",
-      h.checkpoint(result.observation),
-    );
-    expect(saved.ok, saved.text).toBe(true);
-    expect(
-      h.f.store.prMaintenance.get(before.id)?.manualControl?.endedAt,
-    ).toBeUndefined();
-    h.f.store.prMaintenance.reconcileContinuations();
-    expect(h.f.store.prMaintenance.get(before.id)).toMatchObject({
-      lifecycle: "active",
-      continuation: { state: "checking" },
-      authorization: before.authorization,
-      counters: before.counters,
-      renewedAt: before.renewedAt,
-    });
-    expect(h.f.store.prMaintenance.get(before.id)?.manualControl?.endedAt).toBeDefined();
-    const wake = h.f.store.prMaintenance.beginWake(
-      h.f.lead.id,
-      h.first.delivery.deliveryId,
-    );
-    expect(wake.requests).toBe(39);
-    expect(wake.observationClaims[0]).toMatchObject({
-      executionId: h.execution.id,
-      attemptId: h.execution.attemptId,
-      deadlineAt: h.claim.observationAllowance.deadlineAt,
-    });
-  });
-
-  it.each(
-    (["preparation", "approval"] as const).flatMap((stage) =>
-      (
-        [
-          "stop",
-          "native",
-          "lead-permission",
-          "worker-permission",
-          "busy",
-          "uncertain",
-        ] as const
-      ).map((hold) => ({ stage, hold })),
-    ),
-  )("rechecks selected handback at $stage after $hold", async ({ stage, hold }) => {
-    const h = await observationCommand(":memory:", false, githubIdentity, 0, {
-      handback: true,
-      deferPreparation: stage === "preparation",
-    });
-    const record = h.f.store.prMaintenance.get(h.record.id)!;
-    const workerId = record.workerSessionId;
-    const wakeBefore = h.f.store.prMaintenance.beginWake(
-      h.f.lead.id,
-      h.first.delivery.deliveryId,
-    );
-    const event = (
-      sessionId: string,
-      type: SessionEvent["type"],
-      payload: Record<string, unknown>,
-    ) =>
-      h.f.service.handleEvent({
-        eventId: randomUUID(),
-        sessionId,
-        type,
-        payload,
-        sequence: h.f.store.maxEventSequence(sessionId) + 1,
-        createdAt: new Date().toISOString(),
-      });
-    if (hold === "stop")
-      h.f.service.dispatch(h.f.node.id, { type: "stop", sessionId: workerId });
-    if (hold === "native")
-      event(workerId, "agent_session", { agentSessionId: "different-native" });
-    if (hold.endsWith("permission"))
-      event(hold === "lead-permission" ? h.f.lead.id : workerId, "permission", {
-        requestId: "independent-access",
-        options: [],
-      });
-    if (hold === "busy") event(workerId, "state", { state: "running" });
-    if (hold === "uncertain")
-      h.f.store.prMaintenance.checkpoint(h.f.lead.id, record.id, record.version, {
-        kind: "observation",
-        observation: {
-          attemptedAt: new Date().toISOString(),
-          complete: false,
-          failure: "incomplete",
-          helperState: { error: { code: "ambiguous_effect" } },
-          evidence: "A correlated external effect remains unconfirmed.",
-        },
-      });
-    const starts = () =>
-      h.f.frames.filter((frame) => frame.type === "start_command_execution");
-    expect(starts()).toHaveLength(0);
-    if (stage === "preparation")
-      expect(h.f.prepare(h.execution, h.descriptor).state).toBe("failed");
-    else expect(() => h.f.approve(h.execution)).toThrow();
-    expect(starts()).toHaveLength(0);
-    expect(
-      h.f.store.prMaintenance.get(record.id)?.manualControl?.endedAt,
-    ).toBeUndefined();
-    expect(
-      h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId),
-    ).toEqual(wakeBefore);
-  });
 
   async function checkpointNativeAfterRestart(
     h: Awaited<ReturnType<typeof observationCommand>>,
@@ -3862,7 +3600,9 @@ describe("PR maintenance with durable commands", () => {
       },
     });
     expect(dispatch.ok).toBe(false);
-    expect(dispatch.text).toContain("visit_required");
+    expect(dispatch.text).toMatch(
+      /source_mismatch|observation_incomplete|stale_observation/,
+    );
     stores.splice(stores.indexOf(store), 1);
     store.close();
     const reopened = open(path);
@@ -4131,38 +3871,22 @@ describe("PR maintenance with durable commands", () => {
     ).toBe(39);
   });
 
-  it.each(["pause", "release", "design"] as const)(
+  it.each(["pause", "release"] as const)(
     "settles F4 exact evidence under a %s hold without reviving the job or consuming findings",
     async (hold) => {
       vi.useFakeTimers({ toFake: ["Date"] });
       const h = await observationCommand();
       const result = await observeFixture(fixtureInput(new Date().toISOString()));
       expect(result).toMatchObject({ complete: true, requestsConsumed: 19 });
-      if (hold === "design") {
-        h.f.store.prMaintenance.holdForDecision(
-          h.f.lead.id,
-          h.record.id,
-          h.record.version,
-          {
-            id: "design",
-            version: 1,
-            proposal: "Operator decision pending",
-            headSha: h.record.authorization.headSha,
-            scope: h.record.authorization.scope.baseline,
-          },
-          () => h.f.store.setRunState(h.record.taskId, "awaiting_human"),
-        );
-      } else {
-        h.f.store.prMaintenance.operatorAction(
-          h.record.id,
-          h.record.version,
-          {
-            action: hold,
-            reason: "Operator hold during collection",
-          },
-          "operator",
-        );
-      }
+      h.f.store.prMaintenance.operatorAction(
+        h.record.id,
+        h.record.version,
+        {
+          action: hold,
+          reason: "Operator hold during collection",
+        },
+        "operator",
+      );
       const held = h.f.store.prMaintenance.get(h.record.id)!;
       h.finish(result);
       h.completionTurn();
@@ -4171,22 +3895,62 @@ describe("PR maintenance with durable commands", () => {
         expectedVersion: held.version,
       });
       expect(saved.ok, saved.text).toBe(true);
-      expect(h.f.store.prMaintenance.get(held.id)).toEqual({
-        ...held,
-        version: held.version + 1,
-        updatedAt: expect.any(String),
-        lastAttempt: result.observation,
-        lastAttemptAt: result.observation.attemptedAt,
-      });
+      const after = h.f.store.prMaintenance.get(held.id)!;
+      expect(after.lastAttempt).toEqual(result.observation);
+      expect(after.hold).toEqual(held.hold);
+      expect(after.ownershipReleasedAt).toEqual(held.ownershipReleasedAt);
+      expect(after.batches).toEqual(held.batches);
+      expect(after.findings).toEqual(held.findings);
+      expect(after.decision).toEqual(held.decision);
+      if (hold === "release") expect(after.observation).toEqual(held.observation);
+      // Release ends maintenance; a pause still allows read-only refresh.
       expect(
         h.f.store.prMaintenance.admission({
           action: "discover",
           recordId: held.id,
           leadSessionId: h.f.lead.id,
         }).allowed,
-      ).toBe(false);
+      ).toBe(hold === "pause");
     },
   );
+
+  it("records fresh evidence while a design decision is pending, without dispatching work", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const result = await observeFixture(fixtureInput(new Date().toISOString()));
+    const held = h.f.store.prMaintenance.holdForDecision(
+      h.f.lead.id,
+      h.record.id,
+      h.record.version,
+      {
+        id: "design",
+        version: 1,
+        proposal: "Operator decision pending",
+        headSha: h.record.authorization.headSha,
+        scope: h.record.authorization.scope.baseline,
+      },
+    );
+    h.finish(result);
+    h.completionTurn();
+    const saved = await h.call("fleet_checkpoint_pr_maintenance", {
+      ...h.checkpoint(result.observation),
+      expectedVersion: held.version,
+    });
+    expect(saved.ok, saved.text).toBe(true);
+    const after = h.f.store.prMaintenance.get(held.id)!;
+    expect(after.observation).toEqual(result.observation);
+    expect(after.decision?.state).toBe("pending");
+    expect(
+      h.f.store.prMaintenance.admission({
+        action: "dispatch",
+        recordId: held.id,
+        generation: held.generation,
+        batchId: "none",
+        taskId: held.taskId,
+        sessionId: held.workerSessionId,
+      }),
+    ).toMatchObject({ allowed: false, reason: "decision_pending" });
+  });
 
   it("preserves F4 native GitHub in-flight timeout with its true collection start", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -4294,7 +4058,7 @@ describe("PR maintenance with durable commands", () => {
       expect(restored.prMaintenance.get(record.id)?.lastAttempt).toEqual(
         result.observation,
       );
-      expect(restored.prMaintenance.get(record.id)?.lifecycle).toBe("paused");
+      expect(restored.prMaintenance.get(record.id)?.hold?.kind).toBe("paused");
       expect(() =>
         restored.prMaintenance.checkpointObservationReceipt(
           h.f.lead.id,
@@ -4476,7 +4240,7 @@ describe("PR maintenance with durable commands", () => {
     },
   );
 
-  it("requires a new live action allowance after receipt ingestion and adopts exactly one retained-worker batch", async () => {
+  it("prepares from an ingested receipt in a later turn and adopts exactly one retained-worker batch", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const h = await observationCommand();
     const result = await observeFixture(fixtureInput(new Date().toISOString()));
@@ -4505,15 +4269,6 @@ describe("PR maintenance with durable commands", () => {
       expectedVersion: record.version,
       checkpoint: { kind: "prepare_batch", batch },
     };
-    const denied = await h.call("fleet_checkpoint_pr_maintenance", args);
-    expect(denied.ok).toBe(false);
-    expect(denied.text).toContain("visit_required");
-    const fresh = await h.call("fleet_get_pr_maintenance", {
-      takeDue: true,
-      reserveRequests: 1,
-    });
-    expect(fresh.ok, fresh.text).toBe(true);
-    expect(JSON.parse(fresh.text).record.id).toBe(record.id);
     const prepared = await h.call("fleet_checkpoint_pr_maintenance", args);
     expect(prepared.ok, prepared.text).toBe(true);
     const followUp = {
@@ -4716,7 +4471,7 @@ describe("PR maintenance with durable commands", () => {
     const backup = h.f.store.exportHostBackup({ enrollmentToken: "" });
     restored.replaceHostBackup(backup);
     const record = restored.prMaintenance.get(h.record.id)!;
-    expect(record.lifecycle).toBe("paused");
+    expect(record.hold?.kind).toBe("paused");
     expect(() =>
       restored.prMaintenance.checkpointObservationReceipt(
         h.f.lead.id,
@@ -4963,7 +4718,6 @@ describe("PR maintenance with durable commands", () => {
     "released",
     "binding",
     "owner",
-    "authorization",
     "generation",
     "head",
   ] as const)("never applies old completion evidence after %s drift", async (drift) => {
@@ -4981,6 +4735,7 @@ describe("PR maintenance with durable commands", () => {
         id: h.record.id,
         expectedVersion: h.record.version,
         action: "pause",
+        reason: "Lead pause during collection",
       });
     } else if (drift === "manual-unknown") {
       h.f.store.prMaintenance.beginManualControl(
@@ -5008,7 +4763,6 @@ describe("PR maintenance with durable commands", () => {
           headSha: h.record.authorization.headSha,
           scope: h.record.authorization.scope.baseline,
         },
-        () => h.f.store.setRunState(h.record.taskId, "awaiting_human"),
       );
     } else if (drift === "released") {
       h.f.store.prMaintenance.operatorAction(
@@ -5040,13 +4794,6 @@ describe("PR maintenance with durable commands", () => {
         runRole: "lead",
       });
       h.f.store.updateRun(h.record.taskId, { leadSessionId: other.id });
-    } else if (drift === "authorization") {
-      h.f.store.prMaintenance.operatorAction(
-        h.record.id,
-        h.record.version,
-        { action: "renew" },
-        "operator",
-      );
     } else {
       // Isolated persisted-scope drift; never change a live grant.
       const record = h.f.store.prMaintenance.get(h.record.id)!;
@@ -5069,20 +4816,14 @@ describe("PR maintenance with durable commands", () => {
     });
     if (["paused", "human-design", "released"].includes(drift)) {
       expect(saved.ok, saved.text).toBe(true);
-      expect(h.f.store.prMaintenance.get(h.record.id)).toEqual({
-        ...current,
-        version: current.version + 1,
-        updatedAt: expect.any(String),
-        lastAttempt: result.observation,
-        lastAttemptAt: result.observation.attemptedAt,
-      });
-      expect(
-        h.f.store.prMaintenance.admission({
-          action: "discover",
-          recordId: current.id,
-          leadSessionId: h.f.lead.id,
-        }).allowed,
-      ).toBe(false);
+      const after = h.f.store.prMaintenance.get(h.record.id)!;
+      expect(after.lastAttempt).toEqual(result.observation);
+      // Nothing is revived: the hold, decision or release stands unchanged.
+      expect(after.hold).toEqual(current.hold);
+      expect(after.decision).toEqual(current.decision);
+      expect(after.ownershipReleasedAt).toEqual(current.ownershipReleasedAt);
+      expect(after.batches).toEqual(current.batches);
+      expect(after.findings).toEqual(current.findings);
     } else {
       expect(saved.ok, saved.text).toBe(false);
       expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(current);

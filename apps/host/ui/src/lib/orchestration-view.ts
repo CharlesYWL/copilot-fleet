@@ -131,14 +131,13 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
   const blockedSessions = new Set(
     (input.waitingPermissions ?? []).map((event) => event.sessionId),
   );
-  const nowMs = input.nowMs ?? Date.now();
   const maintenanceByRun = new Map(
     (input.maintenance ?? []).map((status) => [status.taskId, status]),
   );
 
   return input.runs
     .map((run) => {
-      const maintenance = currentMaintenanceStatus(maintenanceByRun.get(run.id), nowMs);
+      const maintenance = maintenanceByRun.get(run.id);
       const steps = input.stepsByRun[run.id] ?? [];
       const live = steps.filter(isLive);
       const stoppingSessions = steps
@@ -209,17 +208,6 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
       (a, b) =>
         b.priority - a.priority || b.latestActivityAt.localeCompare(a.latestActivityAt),
     );
-}
-
-/** A summary whose observation has aged out only knows it needs checking again. */
-function currentMaintenanceStatus(
-  status: PrMaintenanceTaskStatus | undefined,
-  nowMs: number,
-): PrMaintenanceTaskStatus | undefined {
-  if (!status?.freshUntil || nowMs <= Date.parse(status.freshUntil)) return status;
-  const checking: PrMaintenanceTaskStatus = { ...status, stage: "checking" };
-  delete checking.freshUntil;
-  return checking;
 }
 
 /**

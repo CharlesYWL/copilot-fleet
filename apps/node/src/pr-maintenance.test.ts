@@ -1040,10 +1040,16 @@ describe("packaged maintenance resources", () => {
     const skill = readFileSync(join(assets, "SKILL.md"), "utf8");
     const contract = readFileSync(join(assets, "helper-contract.md"), "utf8");
     const ado = readFileSync(join(assets, "ado-contract.md"), "utf8");
+    // Stale or missing cached evidence starts a refresh; it never rejects intent.
+    expect(skill).toMatch(/Stale or missing cached evidence starts a\s+refresh/);
+    expect(contract).toMatch(
+      /Missing or expired cache is a reason to refresh, not to\s+refuse/,
+    );
     for (const document of [skill, contract]) {
-      expect(document).toContain("refresh_required");
+      expect(document).not.toContain("refresh_required");
+      expect(document).not.toContain("continueEligible");
       expect(document).toContain("operatorWorkSources");
-      expect(document).toContain("obsolete temporary restrictions");
+      expect(document).toMatch(/obsolete\s+temporary restrictions/);
       expect(document).toContain("unrelated");
       expect(document).toContain("conflictResolution:true");
       expect(document).toContain("generated");

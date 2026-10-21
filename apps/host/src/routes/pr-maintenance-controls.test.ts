@@ -1,20 +1,18 @@
 import Fastify from "fastify";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  ORCHESTRATOR_STOP_REASON,
   PrMaintenanceEnableSchema,
   prMaintenanceUrl,
-  prMaintenanceProgress,
+  prMaintenanceStatus,
 } from "@fleet/protocol";
 import { z } from "zod";
 import { fleet } from "../orchestrator/fleet-harness.js";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
-import { archiveRun } from "../orchestrator/lifecycle.js";
 import { PreparePrMaintenanceSchema } from "../orchestrator/tools.js";
 import { LeadTokens } from "../orchestrator/lead-tokens.js";
 import { mcpRoutes } from "../orchestrator/mcp-routes.js";
@@ -157,25 +155,14 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
       registration,
       "original-operator",
     );
-    return store.prMaintenance.holdForDecision(
-      leadId,
-      record.id,
-      record.version,
-      {
-        id: "decision",
-        version: 1,
-        proposal: "Change the contract?",
-        scope: "Public API",
-        headSha: "a".repeat(40),
-      },
-      () => {
-        service.requestRunReview({
-          runId: run.id,
-          note: "A real defect needs a design decision",
-          reason: "blocked",
-        });
-      },
-    );
+    // A PR design decision no longer moves the task into review.
+    return store.prMaintenance.holdForDecision(leadId, record.id, record.version, {
+      id: "decision",
+      version: 1,
+      proposal: "Change the contract?",
+      scope: "Public API",
+      headSha: "a".repeat(40),
+    });
   };
   const mcp = async (name: string, args: unknown) => {
     const response = await app.inject({
@@ -221,539 +208,6 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
 }
 
 describe("authenticated PR maintenance controls", () => {
-  async function continuationFixture(dbPath?: string, cachedEvidence = true) {
-    const f = await setup("github", dbPath);
-    const held = f.hold();
-    const record = cachedEvidence
-      ? f.store.prMaintenance.checkpoint(f.leadId, held.id, held.version, {
-          kind: "observation",
-          observation: {
-            attemptedAt: new Date().toISOString(),
-            complete: true,
-            identity: held.identity,
-            headSha: "a".repeat(40),
-            baseSha: "b".repeat(40),
-            state: "open",
-            snapshotId: "current",
-            fingerprint: "current",
-            evidence: "Complete fixture provider observation",
-          },
-        })
-      : held;
-    const payload = {
-      approved: false,
-      note: "Keep the existing contract; repair and verify within the existing grant.",
-      maintenance: {
-        recordId: record.id,
-        expectedVersion: record.version,
-        decisionId: record.decision!.id,
-        decisionVersion: record.decision!.version,
-        continueEligible: true,
-      },
-    };
-    const review = (headers: Record<string, string> = { "fixture-browser": "yes" }) =>
-      f.app.inject({
-        method: "POST",
-        url: `/api/runs/${f.run.id}/review`,
-        headers,
-        payload,
-      });
-    return { ...f, record, payload, review };
-  }
-
-  it("accepts Direct and continue at the exact observed stale age without making heartbeat evidence fresh", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime("2026-10-13T20:37:34.401Z");
-    const f = await continuationFixture();
-    vi.setSystemTime("2026-10-13T21:10:03.953Z");
-    expect(
-      Date.now() -
-        Date.parse(f.record.observationHostAt ?? f.record.observation!.attemptedAt),
-    ).toBe(1_949_552);
-
-    const response = await f.review();
-    expect(response.statusCode, response.body).toBe(202);
-    const accepted = f.store.prMaintenance.get(f.record.id)!;
-    expect(accepted.observation).toEqual(f.record.observation);
-    expect(accepted.observationHostAt).toBe(f.record.observationHostAt);
-    expect(accepted.authorization).toEqual(f.record.authorization);
-    expect(accepted.counters).toEqual(f.record.counters);
-    expect(accepted.renewedAt).toBe(f.record.renewedAt);
-    expect(accepted.continuation).toMatchObject({
-      state: "checking",
-      evidenceState: "refresh_required",
-      operatorId: "real-browser-principal",
-    });
-    expect(f.store.prMaintenance.pendingContinuationWakes()).toHaveLength(1);
-    expect(() =>
-      f.store.prMaintenance.checkpoint(f.leadId, accepted.id, accepted.version, {
-        kind: "prepare_batch",
-        batch: {
-          id: "unattended-stale-batch",
-          kind: "repair",
-          headSha: "a".repeat(40),
-          sources: [
-            { id: "thread", revision: "1", groupKey: "bug", evidence: "fixture" },
-          ],
-          prompt: "Repair within the accepted design",
-          scope: "Keep the existing contract",
-          reservedMutations: 1,
-        },
-      }),
-    ).toThrow(/fresh|stale|current/i);
-  });
-
-  it("accepts authenticated continuation with no cached provider observation", async () => {
-    const f = await continuationFixture(undefined, false);
-    expect(f.record.observation).toBeUndefined();
-    const response = await f.review();
-    expect(response.statusCode, response.body).toBe(202);
-    const saved = f.store.prMaintenance.get(f.record.id)!;
-    expect(saved.observation).toBeUndefined();
-    expect(saved.continuation).toMatchObject({
-      state: "checking",
-      evidenceState: "refresh_required",
-      headSha: f.record.decision!.headSha,
-    });
-    expect(f.store.prMaintenance.pendingContinuationWakes()).toHaveLength(1);
-  });
-
-  it("queues an authenticated routine work item without provider feedback, renewal or another design decision", async () => {
-    const f = await setup();
-    const enabled = await f.authorize();
-    expect(enabled.statusCode, enabled.body).toBe(200);
-    const before = f.store.prMaintenance.list({ taskId: f.run.id }).records[0]!;
-    const requestId = randomUUID();
-    const direction =
-      "Regenerate the API report from the accepted implementation; preserve public API semantics.";
-    const payload = {
-      action: "update",
-      recordId: before.id,
-      expectedVersion: before.version,
-      operation: { action: "work", requestId, direction },
-    };
-    const send = (headers: Record<string, string> = { "fixture-browser": "yes" }) =>
-      f.app.inject({
-        method: "POST",
-        url: `/api/runs/${f.run.id}/pr-maintenance`,
-        headers,
-        payload,
-      });
-    const response = await send();
-    expect(response.statusCode, response.body).toBe(202);
-    const accepted = f.store.prMaintenance.get(before.id)!;
-    expect(accepted).toMatchObject({
-      workerSessionId: f.worker.id,
-      generation: before.generation,
-      authorization: before.authorization,
-      counters: before.counters,
-      renewedAt: before.renewedAt,
-      workRequests: [
-        {
-          id: requestId,
-          direction,
-          operatorId: "real-browser-principal",
-          state: "pending",
-        },
-      ],
-      continuation: { state: "checking", evidenceState: "refresh_required" },
-    });
-    expect(accepted.decision).toBeUndefined();
-    expect((await send()).statusCode).toBe(202);
-    expect(f.store.prMaintenance.get(before.id)).toEqual(accepted);
-    expect(f.store.prMaintenance.pendingContinuationWakes()).toHaveLength(1);
-    expect((await send({ "fixture-node": "yes" })).statusCode).toBe(403);
-    expect(f.store.prMaintenance.get(before.id)).toEqual(accepted);
-  });
-
-  it("atomically persists authenticated direction and bounded continuation across restart without renewing authority", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "fleet-continuation-"));
-    const path = join(directory, "fixture.sqlite");
-    const f = await continuationFixture(path);
-    try {
-      const response = await f.review();
-      expect(response.statusCode, response.body).toBe(202);
-      const saved = f.store.prMaintenance.get(f.record.id)!;
-      expect(saved).toMatchObject({
-        lifecycle: "active",
-        decision: { state: "directed", operatorId: "real-browser-principal" },
-        continuation: {
-          state: "checking",
-          operatorId: "real-browser-principal",
-          headSha: "a".repeat(40),
-          expectedVersion: f.record.version,
-        },
-        authorization: f.record.authorization,
-        counters: f.record.counters,
-        renewedAt: f.record.renewedAt,
-      });
-      expect(f.store.getRun(f.run.id)?.state).toBe("running");
-      expect((await f.review()).statusCode).toBe(409);
-      expect(f.store.prMaintenance.get(saved.id)).toEqual(saved);
-      await f.close();
-      const reopened = new FleetStore(path);
-      try {
-        expect(reopened.prMaintenance.get(saved.id)).toEqual(saved);
-        expect(reopened.prMaintenance.pendingContinuationWakes()).toHaveLength(1);
-      } finally {
-        reopened.close();
-      }
-    } finally {
-      await f.close();
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("returns durable acceptance without depending on a synchronous scheduler wake", async () => {
-    const f = await continuationFixture();
-    vi.mocked(f.engine.tick).mockImplementation(() => {
-      throw new Error("Fixture scheduler unavailable");
-    });
-    const response = await f.review();
-    expect(response.statusCode, response.body).toBe(202);
-    expect(f.engine.tick).not.toHaveBeenCalled();
-    expect(
-      f.store.prMaintenance.pendingContinuationWakes().map((record) => record.id),
-    ).toEqual([f.record.id]);
-    expect(f.store.prMaintenance.get(f.record.id)?.continuation?.state).toBe("checking");
-  });
-
-  it.each(["lead", "worker"] as const)(
-    "rejects atomic continuation while the exact %s has an independent permission request",
-    async (owner) => {
-      const f = await continuationFixture();
-      const sessionId = owner === "lead" ? f.leadId : f.worker.id;
-      f.service.handleEvent({
-        eventId: `permission-${owner}`,
-        sessionId,
-        sequence: f.store.maxEventSequence(sessionId) + 1,
-        type: "permission",
-        payload: { requestId: "independent-access", options: [] },
-        createdAt: new Date().toISOString(),
-      });
-      const before = f.store.prMaintenance.get(f.record.id);
-      const task = f.store.getRun(f.run.id);
-      const notes = f.store.listRunNotes(f.run.id);
-      expect(f.store.prMaintenance.effectiveState(before!).status).toBe("needs_decision");
-      const denied = await f.review();
-      expect(denied.statusCode, denied.body).toBe(409);
-      expect(denied.body).toContain("permission");
-      expect(f.store.prMaintenance.get(f.record.id)).toEqual(before);
-      expect(f.store.getRun(f.run.id)).toEqual(task);
-      expect(f.store.listRunNotes(f.run.id)).toEqual(notes);
-      f.service.handleEvent({
-        eventId: `permission-result-${owner}`,
-        sessionId,
-        sequence: f.store.maxEventSequence(sessionId) + 1,
-        type: "permission_result",
-        payload: { requestId: "independent-access", outcome: "deny" },
-        createdAt: new Date().toISOString(),
-      });
-      expect((await f.review()).statusCode).toBe(202);
-    },
-  );
-
-  it.each(["stale", "unauthenticated", "expanded", "stop", "callback"] as const)(
-    "rolls back the whole direction transaction for %s",
-    async (failure) => {
-      const f = await continuationFixture();
-      if (failure === "stale") f.payload.maintenance.expectedVersion--;
-      if (failure === "stop")
-        f.store.setSessionControls(f.worker.id, { stopRequested: true });
-      if (failure === "callback")
-        vi.spyOn(f.store, "appendRunNote").mockImplementationOnce(() => {
-          throw new Error("fixture transaction failure");
-        });
-      const beforeTask = f.store.getRun(f.run.id);
-      const beforeNotes = f.store.listRunNotes(f.run.id);
-      const beforeRecord = f.store.prMaintenance.get(f.record.id);
-      if (failure === "stop")
-        f.payload.maintenance.expectedVersion = beforeRecord!.version;
-      const response =
-        failure === "expanded"
-          ? await f.app.inject({
-              method: "POST",
-              url: `/api/runs/${f.run.id}/review`,
-              headers: { "fixture-browser": "yes" },
-              payload: {
-                ...f.payload,
-                maintenance: { ...f.payload.maintenance, scope: { replies: true } },
-              },
-            })
-          : await f.review(failure === "unauthenticated" ? {} : undefined);
-      expect(response.statusCode, response.body).toBe(
-        failure === "callback"
-          ? 500
-          : failure === "expanded"
-            ? 400
-            : failure === "unauthenticated"
-              ? 403
-              : 409,
-      );
-      expect(f.store.prMaintenance.get(f.record.id)).toEqual(beforeRecord);
-      expect(f.store.getRun(f.run.id)).toEqual(beforeTask);
-      expect(f.store.listRunNotes(f.run.id)).toEqual(beforeNotes);
-    },
-  );
-
-  it("preserves F1 old and newly approved prerequisite markers in portable evidence", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "fleet-authorization-evidence-"));
-    const { store, run, registration, authorize, mcp, app, close } = await setup(
-      "azure-devops",
-      join(directory, "host.sqlite"),
-    );
-    cleanup.push(async () => rmSync(directory, { recursive: true, force: true }));
-    registration.eligibilityEvidence = "F1-original-grant-prerequisite";
-    expect((await authorize()).statusCode).toBe(200);
-    const backup = store.prMaintenance.exportBackup();
-    backup.registrations[0]!.authorization.scope.publicationAuthorized = false;
-    delete backup.registrations[0]!.authorization.eligibilityEvidence;
-    delete backup.registrations[0]!.authorization.sourceProposal;
-    const oldGrant = structuredClone(backup.registrations[0]!.authorization);
-    store.writeAtomically(() => store.prMaintenance.importBackup(backup));
-    const prepared = await mcp("fleet_prepare_pr_maintenance", {
-      taskId: run.id,
-      workerSessionId: registration.workerSessionId,
-      prUrl: prMaintenanceUrl(registration.identity),
-      identity: registration.identity,
-      headSha: registration.headSha,
-      observedAt: new Date().toISOString(),
-      method: "provider_mcp",
-      evidence: "F1-fresh-provider-metadata",
-      publicationEvidence: "F1-fresh-publication-path",
-      verification: registration.scope.verification,
-      eligibilityEvidence: "F1-fresh-retained-checkout",
-    });
-    expect(prepared.ok, prepared.text).toBe(true);
-    const proposal = store.prMaintenance.getProposal(run.id)!;
-    const payload = {
-      action: "authorize_proposal",
-      proposalId: proposal.id,
-      expectedVersion: proposal.version,
-    };
-    const approved = await app.inject({
-      method: "POST",
-      url: `/api/runs/${run.id}/pr-maintenance`,
-      headers: { "fixture-browser": "yes" },
-      payload,
-    });
-    expect(approved.statusCode, approved.body).toBe(200);
-    const record = approved.json();
-    store.insertAdministrator({
-      tenantId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-      objectId: "synthetic-evidence-operator",
-      username: "operator@example.com",
-      displayName: "Synthetic operator",
-      addedVia: "claim",
-    });
-    store.setSetting("auth.csrfKey", "synthetic-backup-csrf-key");
-    const exported = store.exportHostBackup({ enrollmentToken: "" });
-    const security = store.exportSecurityBackup();
-    for (const marker of [
-      "F1-original-grant-prerequisite",
-      "F1-fresh-provider-metadata",
-      "F1-fresh-publication-path",
-    ])
-      expect(JSON.stringify(exported)).toContain(marker);
-    expect(record).toMatchObject({
-      id: proposal.reauthorization!.recordId,
-      generation: proposal.reauthorization!.generation,
-      identity: proposal.registration.identity,
-      lifecycle: "paused",
-      eligibilityEvidence: proposal.registration.eligibilityEvidence,
-      authorization: {
-        operatorId: "real-browser-principal",
-        headSha: proposal.registration.headSha,
-        eligibilityEvidence: proposal.registration.eligibilityEvidence,
-        sourceProposal: { id: proposal.id, version: proposal.version },
-      },
-      authorizationHistory: [
-        { ...oldGrant, eligibilityEvidence: "F1-original-grant-prerequisite" },
-      ],
-    });
-    expect(
-      (
-        await app.inject({
-          method: "POST",
-          url: `/api/runs/${run.id}/pr-maintenance`,
-          headers: { "fixture-browser": "yes" },
-          payload,
-        })
-      ).statusCode,
-    ).toBe(409);
-    await close();
-    const reopened = new FleetStore(join(directory, "host.sqlite"));
-    const restored = new FleetStore(":memory:");
-    cleanup.unshift(async () => {
-      reopened.close();
-      restored.close();
-    });
-    const {
-      nodes,
-      kind: _kind,
-      version: _version,
-      enrollmentToken: _token,
-      ...data
-    } = exported;
-    restored.importPortableBackup({
-      data: {
-        ...data,
-        nodes: nodes.map(({ secretHash: _secretHash, ...node }) => node),
-      },
-      security,
-    });
-    for (const db of [reopened, restored]) {
-      const saved = db.prMaintenance.get(record.id)!;
-      expect(saved.authorization).toEqual(record.authorization);
-      expect(saved.authorizationHistory).toEqual(record.authorizationHistory);
-      expect(saved.eligibilityEvidence).toBe(proposal.registration.eligibilityEvidence);
-      expect(saved.identity).toEqual(record.identity);
-      expect(saved.generation).toBe(record.generation);
-      expect(saved.lifecycle).toBe("paused");
-      expect(
-        db.listRunNotes(run.id).filter((note) => note.body === JSON.stringify(proposal)),
-      ).toHaveLength(1);
-    }
-  });
-
-  it("preserves F2 pending legacy proposal markers when authenticated direct enable consumes it", async () => {
-    const { store, run, registration, authorize, app, leadId } = await setup();
-    const pending = store.prMaintenance.propose(leadId, {
-      ...registration,
-      eligibilityEvidence: "F2-unapproved-legacy-proposal",
-    });
-    pending.registration.scope.publicationAuthorized = false;
-    const backup = store.prMaintenance.exportBackup();
-    backup.proposals = [pending];
-    store.writeAtomically(() => store.prMaintenance.importBackup(backup));
-    const refused = await app.inject({
-      method: "POST",
-      url: `/api/runs/${run.id}/pr-maintenance`,
-      headers: { "fixture-browser": "yes" },
-      payload: {
-        action: "authorize_proposal",
-        proposalId: pending.id,
-        expectedVersion: pending.version,
-      },
-    });
-    expect(refused.statusCode).toBe(400);
-    expect(store.prMaintenance.getProposal(run.id)).toEqual(pending);
-    registration.eligibilityEvidence = "F2-approved-direct-repair-prerequisite";
-    const approved = await authorize();
-    expect(approved.statusCode, approved.body).toBe(200);
-    const exported = store.exportHostBackup({ enrollmentToken: "" });
-    expect(JSON.stringify(exported)).toContain("F2-unapproved-legacy-proposal");
-    expect(JSON.stringify(exported)).toContain("F2-approved-direct-repair-prerequisite");
-    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
-    expect(
-      store.listRunNotes(run.id).filter((note) => note.body === JSON.stringify(pending)),
-    ).toHaveLength(1);
-    expect((await authorize()).json()).toEqual(approved.json());
-    expect(
-      store.listRunNotes(run.id).filter((note) => note.body === JSON.stringify(pending)),
-    ).toHaveLength(1);
-    const restored = new FleetStore(":memory:");
-    cleanup.push(async () => restored.close());
-    restored.replaceHostBackup(exported);
-    expect(restored.listRunNotes(run.id)).toEqual(store.listRunNotes(run.id));
-    expect(restored.prMaintenance.get(approved.json().id)?.authorization).toEqual(
-      approved.json().authorization,
-    );
-    expect(restored.prMaintenance.get(approved.json().id)?.lifecycle).toBe("paused");
-  });
-
-  it("requires authenticated pinned repair reauthorization for a retained legacy grant, then explicit resume", async () => {
-    const { store, run, registration, authorize, mcp, app, worker } =
-      await setup("azure-devops");
-    expect((await authorize()).statusCode).toBe(200);
-    const backup = store.prMaintenance.exportBackup();
-    backup.registrations[0]!.authorization.scope.publicationAuthorized = false;
-    const oldGrant = structuredClone(backup.registrations[0]!.authorization);
-    store.writeAtomically(() => store.prMaintenance.importBackup(backup));
-    const result = await mcp("fleet_prepare_pr_maintenance", {
-      taskId: run.id,
-      workerSessionId: worker.id,
-      prUrl: prMaintenanceUrl(registration.identity),
-      identity: registration.identity,
-      headSha: registration.headSha,
-      observedAt: new Date().toISOString(),
-      method: "provider_mcp",
-      evidence: "Fresh synthetic provider metadata",
-      publicationEvidence:
-        "Existing task permits repair and ordinary push to this exact PR",
-      verification: registration.scope.verification,
-      eligibilityEvidence: registration.eligibilityEvidence,
-    });
-    expect(result.ok, result.text).toBe(true);
-    const proposal = store.prMaintenance.getProposal(run.id)!;
-    expect(proposal.reauthorization).toBeDefined();
-    const payload = {
-      action: "authorize_proposal",
-      proposalId: proposal.id,
-      expectedVersion: proposal.version,
-    };
-    for (const headers of [{}, { "fixture-node": "yes" }])
-      expect(
-        (
-          await app.inject({
-            method: "POST",
-            url: `/api/runs/${run.id}/pr-maintenance`,
-            headers,
-            payload,
-          })
-        ).statusCode,
-      ).toBe(403);
-    expect(store.prMaintenance.list().records[0]!.authorization).toEqual(oldGrant);
-    const approved = await app.inject({
-      method: "POST",
-      url: `/api/runs/${run.id}/pr-maintenance`,
-      headers: { "fixture-browser": "yes" },
-      payload,
-    });
-    expect(approved.statusCode, approved.body).toBe(200);
-    const record = approved.json();
-    expect(record).toMatchObject({
-      id: proposal.reauthorization!.recordId,
-      generation: 1,
-      workerSessionId: worker.id,
-      lifecycle: "paused",
-      authorization: {
-        operatorId: "real-browser-principal",
-        scope: {
-          publicationAuthorized: true,
-          replies: false,
-          resolveThreads: false,
-          retryChecks: false,
-          reviewers: [],
-        },
-      },
-      authorizationHistory: [oldGrant],
-    });
-    expect(store.prMaintenance.list().records).toHaveLength(1);
-    expect(
-      (
-        await mcp("fleet_set_pr_maintenance", {
-          recordId: record.id,
-          expectedVersion: record.version,
-          action: "resume",
-        })
-      ).ok,
-    ).toBe(false);
-    const resumed = await app.inject({
-      method: "POST",
-      url: `/api/runs/${run.id}/pr-maintenance`,
-      headers: { "fixture-browser": "yes" },
-      payload: {
-        action: "update",
-        recordId: record.id,
-        expectedVersion: record.version,
-        operation: { action: "resume" },
-      },
-    });
-    expect(resumed.statusCode, resumed.body).toBe(200);
-    expect(resumed.json().lifecycle).toBe("active");
-  });
-
   it("roundtrips 291675 helper observation bytes through exposed MCP and SQLite restart unchanged", async () => {
     const directory = mkdtempSync(join(tmpdir(), "fleet-maintenance-handoff-"));
     const dbPath = join(directory, "host.sqlite");
@@ -811,6 +265,8 @@ describe("authenticated PR maintenance controls", () => {
       attachments: [],
     });
     expect((await mcp("fleet_get_pr_maintenance", { takeDue: true })).ok).toBe(true);
+    // Claiming persists the review claim; checkpoint against the current version.
+    args.expectedVersion = store.prMaintenance.get(record.id)!.version;
     const rejected = await state.app.inject({
       method: "POST",
       url: "/mcp",
@@ -896,6 +352,7 @@ describe("authenticated PR maintenance controls", () => {
     const claim = JSON.parse(
       (await mcp("fleet_get_pr_maintenance", { takeDue: true })).text,
     );
+    record = store.prMaintenance.get(record.id)!;
     expect(claim.observationAllowance.requests).toBe(39);
     const helper = await observeFixture(fixtureInput(new Date().toISOString(), 39));
     expect(helper).toMatchObject({
@@ -983,6 +440,7 @@ describe("authenticated PR maintenance controls", () => {
     const claim = JSON.parse(
       (await mcp("fleet_get_pr_maintenance", { takeDue: true })).text,
     );
+    record = store.prMaintenance.get(record.id)!;
     const helper = await observeFixture(
       fixtureInput(new Date().toISOString(), claim.observationAllowance.requests),
     );
@@ -1143,6 +601,7 @@ describe("authenticated PR maintenance controls", () => {
     expect(
       (await mcp("fleet_get_pr_maintenance", { takeDue: true, reserveRequests: 40 })).ok,
     ).toBe(true);
+    record = store.prMaintenance.get(record.id)!;
     const failed = await checkpoint({
       kind: "fallback",
       error: observation.evidence,
@@ -1168,6 +627,8 @@ describe("authenticated PR maintenance controls", () => {
     expect(JSON.parse(recoveryVisit.text).record?.id, recoveryVisit.text).toBe(record.id);
     expect(JSON.parse(recoveryVisit.text).observationAllowance.requests).toBe(1);
     expect(JSON.parse(recoveryVisit.text).instruction).toContain("alternate_attempt");
+    // The recovery claim records itself on the review.
+    record = store.prMaintenance.get(record.id)!;
     const reserved = await checkpoint(attempt);
     expect(reserved.ok, reserved.text).toBe(true);
     record = JSON.parse(reserved.text);
@@ -1197,7 +658,9 @@ describe("authenticated PR maintenance controls", () => {
     expect(record.lastError).toBeTruthy();
     expect(record.readyFingerprint).toBeUndefined();
     expect(record.batches).toHaveLength(0);
-    expect(prMaintenanceProgress(record).stage).toBe("blocked");
+    // A partial read is not a hold; the review concludes as failed, no work runs.
+    expect(prMaintenanceStatus(record).hold).toBeUndefined();
+    expect(record.review?.outcome).toBe("failed");
     expect(record.incidents[0]!.attempts[0]).toMatchObject({
       id: attempt.resolutionId,
       state: "incomplete",
@@ -1287,148 +750,6 @@ describe("authenticated PR maintenance controls", () => {
       delivery!.delivery.deliveryId,
     );
     expect(store.commands.prompt(delivery!.delivery.deliveryId)?.state).toBe("settled");
-  });
-
-  it.each([
-    { provider: "github", state: "released-review" },
-    { provider: "azure-devops", state: "released-review" },
-    { provider: "github", state: "completed" },
-    { provider: "azure-devops", state: "completed" },
-  ] as const)(
-    "prepares unapproved maintenance for a $provider $state task without accepting it or reviving a released grant",
-    async ({ provider, state }) => {
-      const { app, store, service, run, worker, registration, hold, mcp } =
-        await setup(provider);
-      if (state === "released-review") {
-        const held = hold();
-        const release = await app.inject({
-          method: "POST",
-          url: `/api/runs/${run.id}/pr-maintenance`,
-          headers: { "fixture-browser": "yes" },
-          payload: {
-            action: "update",
-            recordId: held.id,
-            expectedVersion: held.version,
-            operation: {
-              action: "release",
-              reason: "Withdraw this maintenance question; prepare a new bounded grant.",
-              decisionId: held.decision!.id,
-              decisionVersion: held.decision!.version,
-            },
-          },
-        });
-        expect(release.statusCode, release.body).toBe(200);
-        expect(store.prMaintenance.get(held.id)).toMatchObject({
-          ownershipReleasedAt: expect.any(String),
-          decision: { state: "withdrawn" },
-          batches: [],
-          actions: [],
-        });
-        expect(store.getRun(run.id)?.state).toBe("awaiting_human");
-      } else {
-        store.setRunState(run.id, "completed");
-      }
-      const beforeTask = store.getRun(run.id)!;
-      const beforeNotes = store.listRunNotes(run.id);
-      const beforeRecords = store.prMaintenance.list({ taskId: run.id }).records;
-      const sessionCount = store.listSessions().length;
-      const dispatch = vi.spyOn(service, "dispatch");
-      const request = await app.inject({
-        method: "POST",
-        url: `/api/runs/${run.id}/pr-maintenance`,
-        headers: { "fixture-browser": "yes" },
-        payload: { action: "prepare", prUrl: prMaintenanceUrl(registration.identity) },
-      });
-      expect(request.statusCode, request.body).toBe(202);
-      const prepared = await mcp("fleet_prepare_pr_maintenance", {
-        taskId: run.id,
-        workerSessionId: worker.id,
-        prUrl: prMaintenanceUrl(registration.identity),
-        identity: registration.identity,
-        headSha: registration.headSha,
-        observedAt: new Date().toISOString(),
-        method: "provider_mcp",
-        evidence: "Isolated fresh open, mergeable PR with exact source and target refs.",
-        publicationEvidence:
-          "Existing writing intent permits normal source-branch pushes.",
-        verification: registration.scope.verification,
-        eligibilityEvidence: registration.eligibilityEvidence,
-      });
-      expect(prepared.ok, prepared.text).toBe(true);
-      expect(JSON.parse(prepared.text)).toMatchObject({
-        taskId: run.id,
-        status: "awaiting_operator_authorization",
-      });
-      const proposal = store.prMaintenance.getProposal(run.id)!;
-      expect(proposal.registration.workerSessionId).toBe(worker.id);
-      expect(proposal.reauthorization).toBeUndefined();
-      expect(store.prMaintenance.list({ taskId: run.id }).records).toEqual(beforeRecords);
-      expect(
-        store.prMaintenance.list({ taskId: run.id, retainedOnly: true }).records,
-      ).toEqual([]);
-      expect(store.getRun(run.id)).toEqual(beforeTask);
-      expect(store.listRunNotes(run.id)).toEqual(beforeNotes);
-      expect(store.listSessions()).toHaveLength(sessionCount);
-      expect(
-        dispatch.mock.calls.filter(
-          ([, message]) => message.type === "prompt" && message.sessionId === worker.id,
-        ),
-      ).toEqual([]);
-      expect(
-        store.prMaintenance.admission({
-          action: "dispatch",
-          taskId: run.id,
-          sessionId: worker.id,
-          recordId: proposal.id,
-          generation: 1,
-          batchId: "unapproved",
-        }).allowed,
-      ).toBe(false);
-    },
-  );
-
-  it("keeps an unresolved independent design review held across unapproved preparation and separate human authorization", async () => {
-    const { app, store, service, run, registration, mcp } = await setup();
-    service.requestRunReview({
-      runId: run.id,
-      reason: "blocked",
-      note: "Choose the public response schema; no implementation choice is authorized.",
-    });
-    const beforeTask = store.getRun(run.id)!;
-    const beforeNotes = store.listRunNotes(run.id);
-    const dispatch = vi.spyOn(service, "dispatch");
-    const prepared = await mcp("fleet_prepare_pr_maintenance", {
-      taskId: run.id,
-      prUrl: prMaintenanceUrl(registration.identity),
-      identity: registration.identity,
-      headSha: registration.headSha,
-      observedAt: new Date().toISOString(),
-      method: "provider_mcp",
-      evidence: "Current fixture PR metadata, not a design decision.",
-      publicationEvidence: "Existing task publication path, not new API authority.",
-      verification: registration.scope.verification,
-      eligibilityEvidence: registration.eligibilityEvidence,
-    });
-    expect(prepared.ok, prepared.text).toBe(true);
-    const proposal = store.prMaintenance.getProposal(run.id)!;
-    const authorized = await app.inject({
-      method: "POST",
-      url: `/api/runs/${run.id}/pr-maintenance`,
-      headers: { "fixture-browser": "yes" },
-      payload: {
-        action: "authorize_proposal",
-        proposalId: proposal.id,
-        expectedVersion: proposal.version,
-      },
-    });
-    expect(authorized.statusCode, authorized.body).toBe(200);
-    expect(authorized.json()).toMatchObject({
-      lifecycle: "paused",
-      pauseReason: "task_human_hold",
-    });
-    expect(store.getRun(run.id)).toEqual(beforeTask);
-    expect(store.listRunNotes(run.id).slice(0, beforeNotes.length)).toEqual(beforeNotes);
-    expect(dispatch).not.toHaveBeenCalled();
   });
 
   it.each(["github", "azure-devops"] as const)(
@@ -1849,10 +1170,9 @@ describe("authenticated PR maintenance controls", () => {
           taskId: run.id,
           recordId: accepted.json().id,
           workerSessionId: registration.workerSessionId,
-          stage: expect.any(String),
           prUrl: prMaintenanceUrl(registration.identity),
-          manualControl: false,
-          effective: expect.objectContaining({ status: "checking" }),
+          // Enabling starts a review immediately, whatever the task's state.
+          status: expect.objectContaining({ phase: "reviewing", label: "Reviewing" }),
         },
       ]);
       const archivedProposal = store
@@ -2012,134 +1332,6 @@ describe("authenticated PR maintenance controls", () => {
     expect(store.prMaintenance.list().records).toHaveLength(0);
   });
 
-  it("preserves a pending decision and notification across approve/reopen/worker routes", async () => {
-    const { app, run, worker, store, hold } = await setup();
-    const held = hold();
-    const beforeNotes = store.listRunNotes(run.id);
-    for (const request of [
-      { url: `/api/runs/${run.id}/review`, payload: { approved: true } },
-      { url: `/api/runs/${run.id}/reopen`, payload: { note: "ignore the hold" } },
-      { url: `/api/runs/${run.id}/approve` },
-      {
-        url: `/api/runs/${run.id}/plan`,
-        payload: {
-          steps: [{ stepKey: "replacement", title: "Replace", prompt: "bypass" }],
-        },
-      },
-      { url: `/api/sessions/${worker.id}/prompt`, payload: { prompt: "just do it" } },
-      { url: `/api/sessions/${worker.id}/resume` },
-    ]) {
-      const response = await app.inject({
-        method: "POST",
-        ...request,
-        headers: { "fixture-browser": "yes" },
-      });
-      expect(response.statusCode, request.url).toBe(409);
-    }
-    expect(store.prMaintenance.get(held.id)?.decision?.state).toBe("pending");
-    expect(store.getRun(run.id)?.state).toBe("awaiting_human");
-    expect(store.listRunNotes(run.id)).toEqual(beforeNotes);
-    expect(store.getNotificationBySourceKey(`review:${run.id}:1`)?.status).toBe("active");
-  });
-
-  it("records only exact versioned direction while preserving the defect and baseline", async () => {
-    const { app, run, store, hold } = await setup();
-    const held = hold();
-    const review = (expectedVersion: number) =>
-      app.inject({
-        method: "POST",
-        url: `/api/runs/${run.id}/review`,
-        headers: { "fixture-browser": "yes" },
-        payload: {
-          approved: false,
-          note: "Keep the API; restore its original validation",
-          maintenance: {
-            recordId: held.id,
-            expectedVersion,
-            decisionId: "decision",
-            decisionVersion: 1,
-          },
-        },
-      });
-    expect((await review(held.version - 1)).statusCode).toBe(409);
-    expect(store.getNotificationBySourceKey(`review:${run.id}:1`)?.status).toBe("active");
-    const directed = await review(held.version);
-    expect(directed.statusCode, directed.body).toBe(200);
-    expect(store.prMaintenance.get(held.id)).toMatchObject({
-      lifecycle: "paused",
-      decision: {
-        state: "directed",
-        operatorId: "real-browser-principal",
-        direction: "Keep the API; restore its original validation",
-      },
-      authorization: { scope: { baseline: "Keep the existing contract" } },
-    });
-    expect(store.getNotificationBySourceKey(`review:${run.id}:1`)?.status).toBe(
-      "resolved",
-    );
-    expect(
-      store.listRunNotes(run.id).some((note) => note.body.includes("A real defect")),
-    ).toBe(true);
-    expect(store.getRun(run.id)?.pendingPrompt).toContain(
-      "not proof that a defect is fixed",
-    );
-    expect(store.getRun(run.id)?.state).toBe("running");
-    expect((await review(held.version)).statusCode).toBe(409);
-  });
-
-  it("rolls back direction if its linked task review mutation fails", async () => {
-    const { app, run, store, hold } = await setup();
-    const held = hold();
-    const append = vi.spyOn(store, "appendRunNote").mockImplementation(() => {
-      throw new Error("simulated write failure");
-    });
-    const response = await app.inject({
-      method: "POST",
-      url: `/api/runs/${run.id}/review`,
-      headers: { "fixture-browser": "yes" },
-      payload: {
-        approved: false,
-        note: "Keep the existing API",
-        maintenance: {
-          recordId: held.id,
-          expectedVersion: held.version,
-          decisionId: "decision",
-          decisionVersion: 1,
-        },
-      },
-    });
-    append.mockRestore();
-    expect(response.statusCode).toBe(500);
-    expect(store.prMaintenance.get(held.id)).toMatchObject({
-      version: held.version,
-      decision: { state: "pending" },
-    });
-    expect(store.getNotificationBySourceKey(`review:${run.id}:1`)?.status).toBe("active");
-  });
-
-  it("pauses before archive/delete without resolving a design hold or deleting continuity", async () => {
-    const { app, run, worker, store, hold } = await setup();
-    const held = hold();
-    expect(
-      (await app.inject({ method: "POST", url: `/api/runs/${run.id}/archive` }))
-        .statusCode,
-    ).toBe(200);
-    expect(store.prMaintenance.get(held.id)).toMatchObject({
-      lifecycle: "paused",
-      decision: { state: "pending" },
-    });
-    expect(store.getNotificationBySourceKey(`review:${run.id}:1`)?.status).toBe("active");
-    expect(
-      (await app.inject({ method: "DELETE", url: `/api/runs/${run.id}` })).statusCode,
-    ).toBe(409);
-    expect(
-      (await app.inject({ method: "DELETE", url: `/api/sessions/${worker.id}` }))
-        .statusCode,
-    ).toBe(409);
-    expect(store.getRun(run.id)).toBeDefined();
-    expect(store.getSession(worker.id)).toBeDefined();
-  });
-
   it("fails stale pause/resume explicitly without overwriting a newer state", async () => {
     const { app, run, store, authorize } = await setup();
     const enabled = (await authorize()).json();
@@ -2158,7 +1350,7 @@ describe("authenticated PR maintenance controls", () => {
     const paused = await action({ action: "pause", reason: "Human pause" });
     expect(paused.statusCode, paused.body).toBe(200);
     expect((await action({ action: "resume" })).statusCode).toBe(409);
-    expect(store.prMaintenance.get(enabled.id)?.lifecycle).toBe("paused");
+    expect(store.prMaintenance.get(enabled.id)?.hold?.kind).toBe("paused");
   });
 
   it("cannot release or delete an unknown accepted effect even after Stop", async () => {
@@ -2209,78 +1401,11 @@ describe("authenticated PR maintenance controls", () => {
       (await app.inject({ method: "DELETE", url: `/api/runs/${run.id}` })).statusCode,
     ).toBe(409);
     expect(store.prMaintenance.get(record.id)).toMatchObject({
-      lifecycle: "paused",
+      lifecycle: "active",
+      hold: expect.objectContaining({ kind: "stopped" }),
       actions: [expect.objectContaining({ key: "notification-1", state: "reserved" })],
     });
     expect(store.prMaintenance.get(record.id)?.ownershipReleasedAt).toBeUndefined();
     expect(store.getSession(worker.id)).toBeDefined();
-  });
-
-  it("resumes unrelated tasks with an active worker without reopening the maintenance-held task", async () => {
-    const { app, run, worker, leadId, store, service, hold } = await setup();
-    const held = hold();
-    const unrelated = store.createRun({
-      workspaceId: run.workspaceId,
-      name: "Unrelated",
-      objective: "Independent work",
-    });
-    store.updateRun(unrelated.id, { leadSessionId: leadId, state: "running" });
-    store.appendEvent({
-      eventId: "native-lead",
-      sessionId: leadId,
-      sequence: 1,
-      type: "agent_session",
-      payload: { agentSessionId: "retained-native-lead" },
-      createdAt: new Date().toISOString(),
-    });
-    // Tasks an older Host cancelled when it stopped this lead: Stop no longer
-    // cancels anything, but Resume still reopens what it left in this state.
-    for (const id of [run.id, unrelated.id])
-      archiveRun(service, id, ORCHESTRATOR_STOP_REASON, { stoppedByOrchestrator: true });
-    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
-    for (const id of [worker.id, leadId]) {
-      store.transitionSession(id, "stopped");
-      store.setSessionControls(id, { stopRequested: false });
-    }
-    const activePlacement = store
-      .listPlacements()
-      .find((entry) => entry.workspaceName === "Beta")!;
-    const activeRun = store.createRun({
-      workspaceId: activePlacement.workspaceId,
-      name: "Ongoing independent work",
-      objective: "Keep an unrelated worker running",
-    });
-    store.updateRun(activeRun.id, { leadSessionId: leadId, state: "running" });
-    const activeWorker = store.createSession(activePlacement, "Keep working", false, "", {
-      runId: activeRun.id,
-      runRole: "worker",
-    });
-    store.transitionSession(activeWorker.id, "starting");
-    store.transitionSession(activeWorker.id, "running");
-    const activeStep = store.upsertRunStep(activeRun.id, {
-      stepKey: "active",
-      title: "Independent work",
-      prompt: "Keep working",
-      placementId: activePlacement.id,
-    });
-    store.updateRunStep(activeStep.id, {
-      sessionId: activeWorker.id,
-      state: "running",
-      dispatchedAt: new Date().toISOString(),
-    });
-    const resumed = await app.inject({
-      method: "POST",
-      url: `/api/orchestrators/${leadId}/resume`,
-    });
-    expect(resumed.statusCode, resumed.body).toBe(202);
-    expect(resumed.json().blockedRuns).toEqual([
-      expect.objectContaining({ runId: run.id, reason: "wait_for_human" }),
-    ]);
-    expect(store.getRun(unrelated.id)?.state).toBe("running");
-    expect(store.getSession(activeWorker.id)?.state).toBe("running");
-    expect(store.getRunStep(activeStep.id)?.state).toBe("running");
-    expect(store.getRun(run.id)?.state).toBe("cancelled");
-    expect(store.prMaintenance.get(held.id)?.decision?.state).toBe("pending");
-    expect(store.getNotificationBySourceKey(`review:${run.id}:1`)?.status).toBe("active");
   });
 });

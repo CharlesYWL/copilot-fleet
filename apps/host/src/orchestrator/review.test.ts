@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { RunPolicySchema, type Run } from "@fleet/protocol";
-import {
-  maintenanceDirectionPrompt,
-  reopenPrompt,
-  reviewOutcome,
-  sendBackPrompt,
-} from "./review.js";
+import { reopenPrompt, reviewOutcome, sendBackPrompt } from "./review.js";
 
 const run = (overrides: Partial<Run> = {}): Run => ({
   id: "r1",
@@ -39,20 +34,15 @@ describe("reviewOutcome", () => {
     });
   });
 
-  it("never treats task approval as permission for a maintenance design change", () => {
-    expect(reviewOutcome(run(), { approved: true }, true)).toEqual({
-      kind: "maintenance_direction_required",
+  it("answers only the task's own review; PR maintenance decisions are separate", () => {
+    // A task approval is just a task approval; there is no maintenance argument.
+    expect(reviewOutcome(run(), { approved: true })).toEqual({
+      kind: "approve",
+      note: "",
     });
-    expect(reviewOutcome(run(), { approved: false, note: " " }, true).kind).toBe(
+    expect(reviewOutcome(run(), { approved: false, note: " " }).kind).toBe(
       "needs_reason",
     );
-    const prompt = maintenanceDirectionPrompt("Ship it", "decision-1", "Keep the API");
-    expect(prompt).toContain('decision="decision-1"');
-    expect(prompt).toContain("Keep the API");
-    expect(prompt).toContain("Preserve unresolved findings");
-    expect(prompt).toContain("then resume maintenance with fleet_set_pr_maintenance");
-    expect(prompt).not.toContain("requesting maintenance resume");
-    expect(prompt).not.toContain("Call fleet_submit_task");
   });
 
   it("sends a task back with the note as the instruction", () => {

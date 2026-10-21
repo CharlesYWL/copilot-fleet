@@ -2,18 +2,14 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { FluentProvider } from "@fluentui/react-components";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  PR_MAINTENANCE_RECOVERY_LIMITS,
   PrMaintenanceApprovalSchema,
-  PrMaintenanceRegistrationSchema,
-  PrMaintenanceProposalSchema,
-  PrMaintenanceObservationSchema,
   PrMaintenanceBatchSchema,
-  PrMaintenanceFindingSchema,
-  PrMaintenanceIncidentSchema,
-  prMaintenanceTaskStatuses,
+  PrMaintenanceObservationSchema,
+  PrMaintenanceProposalSchema,
+  PrMaintenanceRegistrationSchema,
   RunPolicySchema,
-  RunStepSchema,
   type FleetSession,
+  type PrMaintenanceHoldKind,
   type PrMaintenanceRegistration,
   type Run,
 } from "@fleet/protocol";
@@ -22,15 +18,14 @@ import {
   actOnTaskMaintenance,
   authorizeTaskMaintenanceProposal,
   enableTaskMaintenance,
-  prepareTaskMaintenance,
   getTaskMaintenance,
+  prepareTaskMaintenance,
 } from "../../lib/pr-maintenance";
-import { PrMaintenancePanel } from "./PrMaintenancePanel";
-import { OrchestratorTaskDetail } from "./OrchestratorTaskDetail";
 import { buildRunViewModels } from "../../lib/orchestration-view";
 import { taskOverview } from "../../lib/task-overview";
+import { PrMaintenancePanel } from "./PrMaintenancePanel";
+import { OrchestratorTaskDetail } from "./OrchestratorTaskDetail";
 import { PrMaintenanceApprovalReview } from "./PrMaintenanceApprovalReview";
-import { ConversationTasks } from "./ConversationTasks";
 
 vi.mock("../../lib/pr-maintenance", () => ({
   getTaskMaintenance: vi.fn(),
@@ -42,6 +37,7 @@ vi.mock("../../lib/pr-maintenance", () => ({
 vi.mock("./ManagedWorktreePanel", () => ({ ManagedWorktreePanel: () => null }));
 
 const at = "2026-09-17T10:00:00.000Z";
+/** The task waits on a person for an unrelated review; PR maintenance must not care. */
 const task: Run = {
   id: "task",
   workspaceId: "workspace",
@@ -64,56 +60,83 @@ const task: Run = {
   createdAt: at,
   updatedAt: at,
 };
-const registration = () =>
+const identity = {
+  host: "github.com",
+  repositoryId: "123",
+  repository: "owner/repo",
+  prNumber: 7,
+  headRepositoryId: "123",
+  headRepository: "owner/repo",
+  headRef: "refs/heads/Fix",
+  baseRepositoryId: "123",
+  baseRepository: "owner/repo",
+  baseRef: "refs/heads/main",
+};
+/** The fields a v1 and a v2 record share. */
+const recordFields = {
+  id: "maintenance",
+  version: 4,
+  generation: 1,
+  identity,
+  leadSessionId: "lead",
+  taskId: task.id,
+  workerSessionId: "worker",
+  placementId: "placement",
+  checkoutKey: "checkout",
+  bindingGeneration: 1,
+  eligibilityEvidence:
+    "Helper v1 verified; Node credential and non-forcing publication verified",
+  renewedAt: at,
+  nextCheckAt: at,
+  authorization: {
+    id: "grant",
+    operatorId: "person",
+    issuedAt: at,
+    headSha: "a".repeat(40),
+    scope: {
+      baseline: "Keep the API",
+      verification: "Run regression tests",
+      publicationAuthorized: true,
+    },
+    budgets: { repairBatches: 3, answerBatches: 3, mutationAttempts: 100 },
+  },
+  counters: {},
+  createdAt: at,
+  updatedAt: at,
+};
+/** An enabled, idle registration: nothing to do and nothing pending. */
+const registration = (): PrMaintenanceRegistration =>
   PrMaintenanceRegistrationSchema.parse({
-    schemaVersion: 1,
-    id: "maintenance",
-    version: 4,
-    generation: 1,
-    identity: {
-      host: "github.com",
-      repositoryId: "123",
-      repository: "owner/repo",
-      prNumber: 7,
-      headRepositoryId: "123",
-      headRepository: "owner/repo",
-      headRef: "refs/heads/Fix",
-      baseRepositoryId: "123",
-      baseRepository: "owner/repo",
-      baseRef: "refs/heads/main",
-    },
-    leadSessionId: "lead",
-    taskId: task.id,
-    workerSessionId: "worker",
-    placementId: "placement",
-    checkoutKey: "checkout",
-    bindingGeneration: 1,
-    eligibilityEvidence:
-      "Helper v1 verified; Node credential and non-forcing publication verified",
-    lifecycle: "paused",
-    pauseReason: "Design decision",
-    renewedAt: at,
-    nextCheckAt: at,
-    authorization: {
-      id: "grant",
-      operatorId: "person",
-      issuedAt: at,
-      headSha: "a".repeat(40),
-      scope: {
-        baseline: "Keep the API",
-        verification: "Run regression tests",
-        publicationAuthorized: true,
-      },
-      budgets: { repairBatches: 3, answerBatches: 3, mutationAttempts: 100 },
-    },
-    counters: {},
-    createdAt: at,
-    updatedAt: at,
+    ...recordFields,
+    schemaVersion: 2,
+    lifecycle: "active",
   });
-const show = () =>
+const held = (kind: PrMaintenanceHoldKind = "paused"): PrMaintenanceRegistration => ({
+  ...registration(),
+  hold: {
+    kind,
+    reason: "Paused by the operator",
+    actor: "operator",
+    actorId: "person",
+    at,
+  },
+});
+const pendingDecision = (id = "decision", proposal = "Change the public API?") => ({
+  id,
+  version: 1,
+  proposal,
+  headSha: "a".repeat(40),
+  scope: "API compatibility",
+  state: "pending" as const,
+});
+const waiting = (id?: string, proposal?: string): PrMaintenanceRegistration => ({
+  ...registration(),
+  decision: pendingDecision(id, proposal),
+});
+const show = (run: Run = task) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
-      <PrMaintenancePanel run={task} sessions={[]} onChange={vi.fn()} />
+      <PrMaintenancePanel run={run} sessions={[]} onChange={vi.fn()} />
     </FluentProvider>,
   );
 
@@ -160,7 +183,7 @@ const proposal = () => {
 };
 
 const observed = () => {
-  const record = { ...registration(), lifecycle: "active" as const, pauseReason: "" };
+  const record = registration();
   const observation = PrMaintenanceObservationSchema.parse({
     identity: record.identity,
     attemptedAt: new Date().toISOString(),
@@ -210,15 +233,423 @@ const batch = (
     updatedAt: at,
   });
 
+const serve = (...records: PrMaintenanceRegistration[]) =>
+  vi.mocked(getTaskMaintenance).mockResolvedValue({ records, canAuthorize: true });
+
+const phases = () => screen.getByRole("list", { name: "PR maintenance phases" });
+const currentPhase = () =>
+  [...phases().querySelectorAll('[aria-current="step"]')].map((node) => node.textContent);
+
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.mocked(getTaskMaintenance).mockResolvedValue({
-    records: [registration()],
-    canAuthorize: true,
-  });
+  serve(held());
 });
 
 describe("PR maintenance task controls", () => {
+  it("shows exactly one current phase for each state of the simplified loop", async () => {
+    const reviewing: PrMaintenanceRegistration = {
+      ...registration(),
+      review: { id: "review", source: "manual", requestedAt: at },
+    };
+    const working: PrMaintenanceRegistration = {
+      ...registration(),
+      batches: [batch("accepted")],
+    };
+    const cases: [PrMaintenanceRegistration, string][] = [
+      [registration(), "Idle"],
+      [reviewing, "Reviewing"],
+      [working, "Working"],
+      [waiting(), "Waiting for Design Decision"],
+      [{ ...working, lifecycle: "merged" }, "Merged"],
+      [{ ...working, lifecycle: "closed" }, "Closed"],
+    ];
+    for (const [record, label] of cases) {
+      serve(record);
+      const rendered = show();
+      await screen.findByRole("list", { name: "PR maintenance phases" });
+      expect(currentPhase(), label).toEqual([label]);
+      rendered.unmount();
+    }
+  });
+
+  it("reports a hold beside the phase and offers one Resume that starts a review", async () => {
+    serve(held("stopped"));
+    vi.mocked(actOnTaskMaintenance).mockResolvedValue(registration());
+    show();
+    expect(await screen.findByText("Idle · Stopped")).toBeTruthy();
+    expect(currentPhase()).toEqual(["Idle"]);
+    expect(screen.getByText("On hold:")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Review now" })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "Routine work" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Resume maintenance" }));
+    await waitFor(() =>
+      expect(actOnTaskMaintenance).toHaveBeenCalledExactlyOnceWith(
+        task.id,
+        expect.objectContaining({ id: "maintenance", version: 4 }),
+        { action: "resume" },
+      ),
+    );
+    expect(await screen.findByText(/A fresh review starts now/)).toBeTruthy();
+  });
+
+  it("requests a manual review without cached evidence while the task awaits an unrelated review", async () => {
+    const record = registration();
+    expect(record.observation).toBeUndefined();
+    serve(record);
+    vi.mocked(actOnTaskMaintenance).mockResolvedValue(record);
+    show();
+    const review = await screen.findByRole("button", { name: "Review now" });
+    expect((review as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByText(/or use Review now/)).toBeTruthy();
+    fireEvent.click(review);
+    fireEvent.click(review);
+    await waitFor(() =>
+      expect(actOnTaskMaintenance).toHaveBeenCalledExactlyOnceWith(
+        task.id,
+        expect.objectContaining({ id: record.id, version: record.version }),
+        { action: "review", requestId: expect.any(String) },
+      ),
+    );
+    expect(await screen.findByText(/Review requested/)).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("pauses an active job explicitly and never offers budget renewal", async () => {
+    serve(registration());
+    vi.mocked(actOnTaskMaintenance).mockResolvedValue(held());
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Pause maintenance" }));
+    await waitFor(() =>
+      expect(actOnTaskMaintenance).toHaveBeenCalledWith(
+        task.id,
+        expect.objectContaining({ id: "maintenance" }),
+        { action: "pause", reason: "Paused by the operator" },
+      ),
+    );
+    expect(screen.queryByRole("button", { name: /Renew/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Continue/ })).toBeNull();
+  });
+
+  it("records design direction once and resumes without a second approval", async () => {
+    serve(waiting());
+    vi.mocked(actOnTaskMaintenance).mockResolvedValue(registration());
+    show();
+    const decision = await screen.findByRole("region", { name: "Design decision" });
+    expect(within(decision).getByText("Change the public API?")).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "Review now" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(within(decision).queryByRole("checkbox")).toBeNull();
+    const record = within(decision).getByRole("button", {
+      name: "Record direction and continue",
+    });
+    expect((record as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(within(decision).getByRole("textbox", { name: "Your direction" }), {
+      target: { value: " Keep the contract; restore validation only " },
+    });
+    fireEvent.click(record);
+    await waitFor(() =>
+      expect(actOnTaskMaintenance).toHaveBeenCalledExactlyOnceWith(
+        task.id,
+        expect.objectContaining({ id: "maintenance", version: 4 }),
+        {
+          action: "direction",
+          decisionId: "decision",
+          decisionVersion: 1,
+          direction: "Keep the contract; restore validation only",
+        },
+      ),
+    );
+    expect(
+      await screen.findByText(/Maintenance resumes with a fresh review/),
+    ).toBeTruthy();
+    expect(actOnTaskMaintenance).toHaveBeenCalledTimes(1);
+  });
+
+  it("never sends a draft written for decision A to a newly raised decision B", async () => {
+    serve(waiting("decision-A", "Proposal A: preserve the existing contract"));
+    vi.mocked(actOnTaskMaintenance).mockResolvedValue(registration());
+    const panel = (snapshotRevision: number) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenancePanel
+          run={task}
+          sessions={[]}
+          onChange={vi.fn()}
+          snapshotRevision={snapshotRevision}
+        />
+      </FluentProvider>
+    );
+    const rendered = render(panel(1));
+    fireEvent.change(await screen.findByRole("textbox", { name: "Your direction" }), {
+      target: { value: "Instructions for A only" },
+    });
+    serve({
+      ...waiting("decision-B", "Proposal B: replace the API"),
+      version: 9,
+    });
+    rendered.rerender(panel(2));
+    expect(await screen.findByText("Proposal B: replace the API")).toBeTruthy();
+    const decision = screen.getByRole("region", { name: "Design decision" });
+    expect(within(decision).getByRole("alert").textContent).toMatch(/decision changed/);
+    const send = within(decision).getByRole("button", {
+      name: "Record direction and continue",
+    });
+    expect((send as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(send);
+    expect(actOnTaskMaintenance).not.toHaveBeenCalled();
+    expect((within(decision).getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+      "Instructions for A only",
+    );
+    fireEvent.click(within(decision).getByRole("button", { name: "Discard draft" }));
+    fireEvent.change(within(decision).getByRole("textbox"), {
+      target: { value: "Replace it behind a flag" },
+    });
+    fireEvent.click(send);
+    await waitFor(() =>
+      expect(actOnTaskMaintenance).toHaveBeenCalledExactlyOnceWith(
+        task.id,
+        expect.objectContaining({ version: 9 }),
+        expect.objectContaining({
+          action: "direction",
+          decisionId: "decision-B",
+          direction: "Replace it behind a flag",
+        }),
+      ),
+    );
+  });
+
+  it("keeps the task review separate from PR maintenance decisions", async () => {
+    serve(waiting());
+    const review = vi.fn().mockResolvedValue(true);
+    const model = buildRunViewModels({
+      runs: [task],
+      stepsByRun: {},
+      sessions: [],
+    })[0]!;
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <OrchestratorTaskDetail
+          model={model}
+          notes={[]}
+          sessions={[]}
+          onBack={vi.fn()}
+          onOpenLead={vi.fn()}
+          onOpenWorker={vi.fn()}
+          onReview={review}
+          onArchive={vi.fn()}
+          onReopen={vi.fn()}
+          onDelete={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+    const stage = screen.getByRole("region", { name: "Current task stage" });
+    expect(
+      await within(stage).findByRole("heading", {
+        name: "PR: Waiting for Design Decision",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Review result" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).queryByRole("checkbox")).toBeNull();
+    expect(within(dialog).queryByText("Change the public API?")).toBeNull();
+    expect(within(dialog).getByText(/does not change PR maintenance/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(review).toHaveBeenCalledExactlyOnceWith(true, ""));
+  });
+
+  it("derives the task overview from one maintenance status", () => {
+    const model = (state: Run["state"]) =>
+      buildRunViewModels({
+        runs: [{ ...task, state }],
+        stepsByRun: {},
+        sessions: [],
+      })[0]!;
+    const view = (record: PrMaintenanceRegistration) => ({
+      records: [record],
+      canAuthorize: true,
+    });
+    // An idle PR never hides the task's own review.
+    expect(taskOverview(model("awaiting_human"), [], view(registration()))).toMatchObject(
+      {
+        title: "Ready for your review",
+        attention: true,
+      },
+    );
+    expect(taskOverview(model("awaiting_human"), [], view(waiting()))).toMatchObject({
+      title: "PR: Waiting for Design Decision",
+      attention: true,
+    });
+    expect(taskOverview(model("completed"), [], view(held()))).toMatchObject({
+      title: "PR: Idle · Paused",
+      attention: true,
+    });
+    expect(
+      taskOverview(
+        model("completed"),
+        [],
+        view({ ...registration(), batches: [batch("accepted")] }),
+      ),
+    ).toMatchObject({ title: "PR: Working", attention: false });
+    expect(
+      taskOverview(model("completed"), [], {
+        records: [registration()],
+        canAuthorize: true,
+        statusError: "Status unavailable",
+      }),
+    ).toMatchObject({ title: "PR maintenance status unavailable", attention: true });
+  });
+
+  it("keeps manual control and unknown delivery from enabling release", async () => {
+    const record = held("manual_control");
+    record.manualControl = {
+      operatorId: "supervisor",
+      takenAt: at,
+      commands: [
+        {
+          id: "manual",
+          digest: "input",
+          kind: "prompt",
+          operatorId: "supervisor",
+          eventSeqFrom: 0,
+          state: "unknown",
+          createdAt: at,
+        },
+      ],
+    };
+    serve(record);
+    show();
+    expect(
+      await screen.findByText(/a person is driving the retained worker/),
+    ).toBeTruthy();
+    expect(screen.getByText("Idle · Manual control")).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "Release maintenance" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(screen.getByRole("button", { name: "Resume maintenance" })).toBeTruthy();
+  });
+
+  it("reports unknown effects as reconciling and holds release until they settle", async () => {
+    const record = registration();
+    record.batches = [
+      {
+        ...batch("partial"),
+        effects: [
+          {
+            key: "pending-push",
+            kind: "push",
+            state: "uncertain",
+            headSha: "a".repeat(40),
+            actor: "worker",
+            actionIdentity: "attempt",
+            attempts: 1,
+          },
+        ],
+      },
+    ];
+    serve(record);
+    show();
+    expect(await screen.findByText("Idle · Reconciling")).toBeTruthy();
+    expect(screen.getByText(/Work or effects are still settling/)).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "Release maintenance" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+
+  it("counts only unique settled executed batches, not reservations or undispatched cancellations", async () => {
+    const record = observed();
+    record.counters = { ...record.counters, repairBatches: 29, answerBatches: 25 };
+    record.batches = [
+      batch("succeeded"),
+      batch("partial"),
+      batch("failed"),
+      { ...batch("cancelled"), executionNotDispatched: true },
+      {
+        ...batch("cancelled"),
+        id: "never-dispatched",
+        stepId: undefined,
+        attempt: undefined,
+      },
+      { ...batch("succeeded"), id: "duplicate-result" },
+    ];
+    serve(record);
+    show();
+    expect(await screen.findByText("3 settled worker batches")).toBeTruthy();
+    expect(screen.getByText(/no limit; repeated no-progress work/)).toBeTruthy();
+  });
+
+  it("separates the current PR from collapsed terminal and released history", async () => {
+    const active = observed();
+    const merged: PrMaintenanceRegistration = {
+      ...registration(),
+      id: "old-merged",
+      lifecycle: "merged",
+      identity: { ...identity, prNumber: 6 },
+    };
+    const released: PrMaintenanceRegistration = {
+      ...registration(),
+      id: "old-released",
+      ownershipReleasedAt: at,
+      identity: { ...identity, prNumber: 5 },
+    };
+    serve(merged, active, released);
+    show();
+    const region = await screen.findByRole("region", { name: "Current maintained PR" });
+    expect(within(region).getByRole("link").textContent).toBe("owner/repo #7");
+    const history = screen.getByText("Prior PR jobs (2)").closest("details")!;
+    expect(history.open).toBe(false);
+    expect(within(history).getByText("Merged")).toBeTruthy();
+    expect(within(history).getByText("Released")).toBeTruthy();
+    expect(document.querySelectorAll('[aria-current="step"]')).toHaveLength(1);
+    expect(
+      within(history).getAllByRole("button", { name: "Release maintenance" }),
+    ).toHaveLength(1);
+  });
+
+  it("offers repair authorization for a retained legacy observation-only job", async () => {
+    const record = registration();
+    record.authorization.scope.publicationAuthorized = false;
+    serve(record);
+    show();
+    const region = await screen.findByRole("region", { name: "Current maintained PR" });
+    expect(within(region).getByText("Repair authorization required")).toBeTruthy();
+    expect(
+      (within(region).getByRole("button", { name: "Review now" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Prepare repair authorization" }));
+    await waitFor(() =>
+      expect(prepareTaskMaintenance).toHaveBeenCalledWith(
+        task.id,
+        "https://github.com/owner/repo/pull/7",
+      ),
+    );
+  });
+
+  it("upgrades a v1 paused registration into one hold that a single Resume clears", async () => {
+    const legacy = PrMaintenanceRegistrationSchema.parse({
+      ...recordFields,
+      schemaVersion: 1,
+      lifecycle: "paused",
+      pauseReason: "Session stop or cancellation requested",
+    });
+    expect(legacy).toMatchObject({ schemaVersion: 2, lifecycle: "active" });
+    expect(legacy.hold?.kind).toBe("paused");
+    serve(legacy);
+    vi.mocked(actOnTaskMaintenance).mockResolvedValue(registration());
+    show();
+    expect(await screen.findByText("Idle · Paused")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Resume maintenance" }));
+    await waitFor(() =>
+      expect(actOnTaskMaintenance).toHaveBeenCalledExactlyOnceWith(
+        task.id,
+        expect.anything(),
+        { action: "resume" },
+      ),
+    );
+  });
+
   it("queues routine generated-artifact work on the current worker without a renewal dialog", async () => {
     const record = observed();
     vi.mocked(getTaskMaintenance).mockResolvedValue({
@@ -466,336 +897,6 @@ describe("PR maintenance task controls", () => {
     expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
   });
 
-  it.each([0, -60_000, 60_000])(
-    "expires displayed readiness at the proven Host boundary without polling (Node offset %d)",
-    async (offset) => {
-      vi.useFakeTimers();
-      vi.setSystemTime(new Date(at));
-      let rendered: ReturnType<typeof render> | undefined;
-      try {
-        const record = { ...observed(), observationHostAt: at };
-        record.observation.attemptedAt = new Date(Date.parse(at) + offset).toISOString();
-        vi.mocked(getTaskMaintenance).mockResolvedValue({
-          records: [record],
-          canAuthorize: true,
-        });
-        const model = buildRunViewModels({
-          runs: [{ ...task, state: "completed" }],
-          stepsByRun: {},
-          sessions: [],
-        })[0]!;
-        await act(async () => {
-          rendered = render(
-            <FluentProvider theme={fleetDarkTheme}>
-              <OrchestratorTaskDetail
-                model={model}
-                notes={[]}
-                sessions={[]}
-                onBack={vi.fn()}
-                onOpenLead={vi.fn()}
-                onOpenWorker={vi.fn()}
-                onReview={vi.fn()}
-                onArchive={vi.fn()}
-                onReopen={vi.fn()}
-                onDelete={vi.fn()}
-              />
-            </FluentProvider>,
-          );
-        });
-        expect(screen.getByRole("heading", { name: "PR ready to merge" })).toBeTruthy();
-        const reads = vi.mocked(getTaskMaintenance).mock.calls.length;
-        await act(async () => {
-          await vi.advanceTimersByTimeAsync(
-            PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1,
-          );
-        });
-        expect(screen.queryByRole("heading", { name: "PR ready to merge" })).toBeNull();
-        expect(screen.getByRole("heading", { name: "Checking PR status" })).toBeTruthy();
-        expect(vi.mocked(getTaskMaintenance).mock.calls.length).toBe(reads);
-      } finally {
-        rendered?.unmount();
-        vi.useRealTimers();
-      }
-    },
-  );
-
-  it("holds displayed readiness until the scheduled check is overdue, not for a fixed half hour", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date(at));
-    let rendered: ReturnType<typeof render> | undefined;
-    try {
-      // The heartbeat schedules the next look two hours out, as it does at night.
-      const record = {
-        ...observed(),
-        observationHostAt: at,
-        nextCheckAt: new Date(Date.parse(at) + 120 * 60_000).toISOString(),
-      };
-      vi.mocked(getTaskMaintenance).mockResolvedValue({
-        records: [record],
-        canAuthorize: true,
-      });
-      const model = buildRunViewModels({
-        runs: [{ ...task, state: "completed" }],
-        stepsByRun: {},
-        sessions: [],
-      })[0]!;
-      await act(async () => {
-        rendered = render(
-          <FluentProvider theme={fleetDarkTheme}>
-            <OrchestratorTaskDetail
-              model={model}
-              notes={[]}
-              sessions={[]}
-              onBack={vi.fn()}
-              onOpenLead={vi.fn()}
-              onOpenWorker={vi.fn()}
-              onReview={vi.fn()}
-              onArchive={vi.fn()}
-              onReopen={vi.fn()}
-              onDelete={vi.fn()}
-            />
-          </FluentProvider>,
-        );
-      });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(
-          PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1,
-        );
-      });
-      expect(screen.getByRole("heading", { name: "PR ready to merge" })).toBeTruthy();
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(120 * 60_000);
-      });
-      expect(screen.queryByRole("heading", { name: "PR ready to merge" })).toBeNull();
-      expect(screen.getByRole("heading", { name: "Checking PR status" })).toBeTruthy();
-    } finally {
-      rendered?.unmount();
-      vi.useRealTimers();
-    }
-  });
-
-  it.each(["merged", "closed"] as const)(
-    "keeps unsettled %s work in the top-level overview",
-    (lifecycle) => {
-      const record = { ...observed(), lifecycle, batches: [batch("accepted")] };
-      const model = buildRunViewModels({
-        runs: [{ ...task, state: "completed" }],
-        stepsByRun: {},
-        sessions: [],
-      })[0]!;
-      expect(
-        taskOverview(model, [], { records: [record], canAuthorize: true }),
-      ).toMatchObject({
-        title: `PR ${lifecycle}; reconciliation pending`,
-        attention: true,
-      });
-    },
-  );
-  it("shows one current graph stage and folds the detailed maintenance controls", async () => {
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [observed()],
-      canAuthorize: true,
-    });
-    render(
-      <FluentProvider theme={fleetDarkTheme}>
-        <PrMaintenancePanel run={task} sessions={[worker]} onChange={vi.fn()} compact />
-      </FluentProvider>,
-    );
-    const graph = await screen.findByRole("group", {
-      name: "PR maintenance progress graph",
-    });
-    expect(graph.querySelectorAll('[aria-current="step"]')).toHaveLength(1);
-    expect(
-      within(graph)
-        .getByRole("button", { name: "Ready: Ready to merge" })
-        .getAttribute("aria-current"),
-    ).toBe("step");
-    expect(
-      screen.getByText("Maintenance controls and evidence").closest("details"),
-    ).toHaveProperty("open", false);
-    fireEvent.click(within(graph).getByRole("button", { name: "Ready: Ready to merge" }));
-    expect(
-      within(screen.getByRole("dialog")).getByText(/Ready is not merged/),
-    ).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    fireEvent.click(screen.getByText("Maintenance controls and evidence"));
-    expect(screen.getByRole("button", { name: "Pause maintenance" })).toBeTruthy();
-  });
-
-  it("does not paint stale evidence as ready and keeps read-only repairs out of the graph", async () => {
-    const record = observed();
-    record.observation.attemptedAt = "2020-01-01T00:00:00.000Z";
-    record.authorization.scope.publicationAuthorized = false;
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [record],
-      canAuthorize: true,
-    });
-    render(
-      <FluentProvider theme={fleetDarkTheme}>
-        <PrMaintenancePanel run={task} sessions={[worker]} onChange={vi.fn()} compact />
-      </FluentProvider>,
-    );
-    const graph = await screen.findByRole("group", {
-      name: "PR maintenance progress graph",
-    });
-    expect(
-      within(graph)
-        .getByRole("button", { name: "PR linked: Repair authorization required" })
-        .getAttribute("aria-current"),
-    ).toBe("step");
-    expect(within(graph).queryByRole("button", { name: /Fix feedback/ })).toBeNull();
-    expect(screen.getByText("Legacy grant; repair authorization required")).toBeTruthy();
-  });
-
-  it("invalidates the visible ready state after a failed refresh without dropping a retained record", async () => {
-    const record = observed();
-    const onChange = vi.fn();
-    vi.mocked(getTaskMaintenance)
-      .mockResolvedValueOnce({ records: [record], canAuthorize: true })
-      .mockRejectedValue(new Error("The maintenance read failed"));
-    render(
-      <FluentProvider theme={fleetDarkTheme}>
-        <PrMaintenancePanel run={task} sessions={[worker]} onChange={onChange} compact />
-      </FluentProvider>,
-    );
-    await screen.findByRole("button", { name: "Ready: Ready to merge" });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh maintenance status" }));
-    expect(await screen.findByRole("alert")).toHaveProperty(
-      "textContent",
-      "The maintenance read failed",
-    );
-    const graph = screen.getByRole("group", { name: "PR maintenance progress graph" });
-    expect(
-      within(graph).queryByRole("button", { name: "Ready: Ready to merge" }),
-    ).toBeNull();
-    expect(onChange).toHaveBeenLastCalledWith({
-      records: [record],
-      canAuthorize: false,
-      statusError: "The maintenance read failed",
-    });
-  });
-
-  it("explains normal session manual takeover without publication authorization or Release", async () => {
-    const record = registration();
-    record.authorization.scope.publicationAuthorized = false;
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [record],
-      canAuthorize: false,
-    });
-    show();
-    expect(
-      await screen.findByText(/Send a normal prompt to the retained worker/),
-    ).toBeTruthy();
-    expect(
-      screen.getByText(/No Release or unattended publication grant is needed/),
-    ).toBeTruthy();
-    expect(
-      screen.getByText(/pending design decisions still need explicit direction/),
-    ).toBeTruthy();
-  });
-
-  it("shows persistent manual control and unknown delivery without enabling release", async () => {
-    const record = registration();
-    record.pauseReason = "manual_control";
-    record.manualControl = {
-      operatorId: "supervisor",
-      takenAt: at,
-      commands: [
-        {
-          id: "manual",
-          digest: "input",
-          kind: "prompt",
-          operatorId: "supervisor",
-          eventSeqFrom: 0,
-          state: "unknown",
-          createdAt: at,
-        },
-      ],
-    };
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [record],
-      canAuthorize: true,
-    });
-    show();
-    expect(
-      await screen.findByText(
-        /Manual supervisor control — unattended maintenance is paused/,
-      ),
-    ).toBeTruthy();
-    expect(screen.getByText(/Manual delivery has no correlated receipt/)).toBeTruthy();
-    expect(
-      (screen.getByRole("button", { name: /Release/ }) as HTMLButtonElement).disabled,
-    ).toBe(true);
-  });
-
-  it.each(["unknown", "accepted", "settled", "rejected"] as const)(
-    "preserves manual %s command gating in the Split page",
-    async (state) => {
-      const record = {
-        ...observed(),
-        lifecycle: "paused" as const,
-        pauseReason: "manual_control",
-      };
-      record.manualControl = {
-        operatorId: "supervisor",
-        takenAt: at,
-        commands: [
-          {
-            id: "manual",
-            digest: "input",
-            kind: "prompt",
-            operatorId: "supervisor",
-            eventSeqFrom: 0,
-            state,
-            createdAt: at,
-          },
-        ],
-      };
-      vi.mocked(getTaskMaintenance).mockResolvedValue({
-        records: [record],
-        canAuthorize: true,
-      });
-      const model = buildRunViewModels({
-        runs: [{ ...task, state: "completed" }],
-        stepsByRun: {},
-        sessions: [],
-      })[0]!;
-      expect(
-        taskOverview(model, [], { records: [record], canAuthorize: true }),
-      ).toMatchObject({
-        title: "Manual supervisor control",
-        attention: state === "unknown",
-      });
-      render(
-        <FluentProvider theme={fleetDarkTheme}>
-          <PrMaintenancePanel run={task} sessions={[worker]} onChange={vi.fn()} compact />
-        </FluentProvider>,
-      );
-      const graph = await screen.findByRole("group", {
-        name: "PR maintenance progress graph",
-      });
-      expect(
-        within(graph)
-          .getByRole("button", { name: "Reviews & checks: Manual control" })
-          .getAttribute("aria-current"),
-      ).toBe("step");
-      expect(
-        within(graph).queryByRole("button", { name: "Ready: Ready to merge" }),
-      ).toBeNull();
-      fireEvent.click(screen.getByText("Maintenance controls and evidence"));
-      const outstanding = state === "unknown" || state === "accepted";
-      for (const action of [
-        "Resume maintenance",
-        "Release maintenance",
-        "Renew maintenance budgets",
-      ]) {
-        expect(
-          (screen.getByRole("button", { name: action }) as HTMLButtonElement).disabled,
-        ).toBe(outstanding);
-      }
-    },
-  );
-
   it("does not authorize a legacy observation proposal and offers repair preparation instead", async () => {
     const pending = proposal();
     Object.assign(pending.registration.scope, {
@@ -830,73 +931,6 @@ describe("PR maintenance task controls", () => {
       expect(prepareTaskMaintenance).toHaveBeenCalledWith(task.id, undefined),
     );
     expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
-  });
-
-  it("shows a retained legacy job as ineligible and offers repair authorization without mutation renewal", async () => {
-    const record = observed();
-    Object.assign(record.authorization.scope, { publicationAuthorized: false });
-    record.observation.sources = [
-      {
-        id: "readonly-feedback",
-        revision: "one",
-        groupKey: "review",
-        evidence: "Synthetic feedback",
-      },
-    ];
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [record],
-      canAuthorize: true,
-    });
-    show();
-    const region = await screen.findByRole("region", { name: "Current maintained PR" });
-    expect(
-      within(region).getAllByText("Repair authorization required")[0]!.closest("details"),
-    ).toBeNull();
-    expect(
-      within(region).getByText(/Legacy observation-only maintenance is retired/),
-    ).toBeTruthy();
-    expect(
-      within(region).getByText(
-        /Prepare and review a repair proposal for this exact retained PR and worker/,
-      ),
-    ).toBeTruthy();
-    expect(
-      within(region).queryByRole("button", { name: "Renew maintenance budgets" }),
-    ).toBeNull();
-    expect(within(region).queryByText("Addressing feedback")).toBeNull();
-    expect(
-      within(region).getByText(
-        "Legacy grant; repair authorization required. No mutation allowance.",
-      ),
-    ).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Prepare repair authorization" }));
-    await waitFor(() =>
-      expect(prepareTaskMaintenance).toHaveBeenCalledWith(
-        task.id,
-        "https://github.com/owner/repo/pull/7",
-      ),
-    );
-  });
-
-  it("does not relabel an ineligible legacy grant as checking when status is unavailable", async () => {
-    const record = observed();
-    record.authorization.scope.publicationAuthorized = false;
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [record],
-      canAuthorize: false,
-      statusError: "Status unavailable",
-    });
-    show();
-    const region = await screen.findByRole("region", { name: "Current maintained PR" });
-    expect(within(region).queryByText("Checking")).toBeNull();
-    expect(
-      within(region).getByText(
-        /Prepare and review a repair proposal for this exact retained PR and worker/,
-      ),
-    ).toBeTruthy();
-    expect(
-      screen.getByRole("button", { name: "Prepare repair authorization" }),
-    ).toHaveProperty("disabled", true);
   });
 
   it.each([undefined, "https://github.com/example/synthetic/pull/42"])(
@@ -976,7 +1010,6 @@ describe("PR maintenance task controls", () => {
       ...registration(),
       identity: pending.registration.identity,
       lifecycle: "active" as const,
-      pauseReason: "",
     };
     vi.mocked(getTaskMaintenance)
       .mockResolvedValueOnce({ records: [], proposal: pending, canAuthorize: true })
@@ -1018,7 +1051,7 @@ describe("PR maintenance task controls", () => {
 
   it("reviews a prefilled proposal without copying JSON and authorizes only its captured reference", async () => {
     const pending = proposal();
-    const enabled = { ...registration(), lifecycle: "active" as const, pauseReason: "" };
+    const enabled = { ...registration(), lifecycle: "active" as const };
     vi.mocked(getTaskMaintenance)
       .mockResolvedValueOnce({ records: [], proposal: pending, canAuthorize: true })
       .mockResolvedValue({ records: [enabled], canAuthorize: true });
@@ -1128,7 +1161,6 @@ describe("PR maintenance task controls", () => {
       ...registration(),
       version: 9,
       lifecycle: "active" as const,
-      pauseReason: "",
       lastSuccessAt: "2026-09-18T08:00:00.000Z",
     };
     let finishRefresh!: () => void;
@@ -1143,78 +1175,6 @@ describe("PR maintenance task controls", () => {
     await act(async () => finishRefresh());
     expect(await screen.findByText(updated.lastSuccessAt)).toBeTruthy();
     expect(onChange).toHaveBeenLastCalledWith({ records: [updated], canAuthorize: true });
-  });
-
-  it("never retargets an open decision-A draft to newly arrived decision B", async () => {
-    const first = registration();
-    first.decision = {
-      id: "decision-A",
-      version: 1,
-      proposal: "Proposal A: preserve the existing contract",
-      headSha: "a".repeat(40),
-      scope: "Existing contract",
-      state: "pending",
-    };
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [first],
-      canAuthorize: true,
-    });
-    const review = vi.fn().mockResolvedValue(false);
-    const detail = (updatedAt: string) => (
-      <FluentProvider theme={fleetDarkTheme}>
-        <OrchestratorTaskDetail
-          model={
-            buildRunViewModels({
-              runs: [{ ...task, updatedAt }],
-              stepsByRun: {},
-              sessions: [],
-            })[0]!
-          }
-          notes={[]}
-          sessions={[]}
-          onBack={vi.fn()}
-          onOpenLead={vi.fn()}
-          onOpenWorker={vi.fn()}
-          onReview={review}
-          onArchive={vi.fn()}
-          onReopen={vi.fn()}
-          onDelete={vi.fn()}
-        />
-      </FluentProvider>
-    );
-    const rendered = render(detail(at));
-    fireEvent.click(await screen.findByRole("button", { name: "Review decision" }));
-    const dialog = screen.getByRole("dialog");
-    fireEvent.change(
-      within(dialog).getByRole("textbox", { name: "What needs changing?" }),
-      {
-        target: { value: "Instructions for A only" },
-      },
-    );
-    const second = {
-      ...first,
-      version: 9,
-      decision: {
-        ...first.decision,
-        id: "decision-B",
-        proposal: "Proposal B: replace the API",
-      },
-    };
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [second],
-      canAuthorize: true,
-    });
-    rendered.rerender(detail("2026-09-18T08:00:00.000Z"));
-    await screen.findByText(/decision-B v1/);
-    fireEvent.click(
-      within(dialog).getByRole("button", { name: "Send back with instructions" }),
-    );
-    expect(review).not.toHaveBeenCalled();
-    expect(within(dialog).getByText(first.decision.proposal)).toBeTruthy();
-    expect(within(dialog).getByRole("alert").textContent).toMatch(/changed|review/i);
-    expect((within(dialog).getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-      "Instructions for A only",
-    );
   });
 
   it("shows exact ref, unknown observation and versioned resume without an actor field", async () => {
@@ -1261,381 +1221,6 @@ describe("PR maintenance task controls", () => {
     ).toBe(true);
   });
 
-  it.each(["addressed", "already_satisfied"] as const)(
-    "refreshes detail and card together from feedback assessment through %s readiness",
-    async (outcome) => {
-      const record: PrMaintenanceRegistration = observed();
-      const repair = batch("accepted");
-      const source = repair.sources[0]!;
-      record.observation!.sources = [source];
-      delete record.readyFingerprint;
-      const work = RunStepSchema.parse({
-        id: repair.stepId,
-        runId: task.id,
-        stepKey: "repair",
-        title: "Repair feedback",
-        prompt: repair.prompt,
-        sessionId: worker.id,
-        placementId: worker.placementId,
-        state: "pending",
-        createdAt: at,
-        updatedAt: at,
-      });
-      const view = () => {
-        vi.mocked(getTaskMaintenance).mockResolvedValue({
-          records: [structuredClone(record)],
-          canAuthorize: true,
-        });
-        const models = buildRunViewModels({
-          runs: [{ ...task, state: "running" }],
-          stepsByRun: { [task.id]: [work] },
-          sessions: [worker],
-          maintenance: prMaintenanceTaskStatuses([record]),
-        });
-        return (
-          <FluentProvider theme={fleetDarkTheme}>
-            <ConversationTasks
-              models={models}
-              open
-              onToggle={vi.fn()}
-              onOpenRun={vi.fn()}
-              onOpenWorker={vi.fn()}
-              onNewRun={vi.fn()}
-            />
-            <OrchestratorTaskDetail
-              model={models[0]!}
-              snapshotRevision={record.version}
-              notes={[]}
-              sessions={[worker]}
-              onBack={vi.fn()}
-              onOpenLead={vi.fn()}
-              onOpenWorker={vi.fn()}
-              onReview={vi.fn()}
-              onArchive={vi.fn()}
-              onReopen={vi.fn()}
-              onDelete={vi.fn()}
-            />
-          </FluentProvider>
-        );
-      };
-      const rendered = render(view());
-      const expectStatus = async (title: string, label: string) => {
-        const detail = screen.getByRole("region", { name: "Current task stage" });
-        await within(detail).findByRole("heading", { name: title });
-        const cards = screen.getByRole("complementary", { name: "Conversation tasks" });
-        expect(within(cards).getByRole("img", { name: `PR · ${label}` })).toBeTruthy();
-      };
-      const refresh = () => {
-        record.version++;
-        rendered.rerender(view());
-      };
-      await expectStatus("PR: reviewing feedback", "Reviewing feedback");
-      record.batches = [
-        {
-          ...repair,
-          state: "prepared",
-          stepId: undefined,
-          attempt: undefined,
-        },
-      ];
-      refresh();
-      await expectStatus("PR: reviewing feedback", "Reviewing feedback");
-      record.batches = [repair];
-      refresh();
-      await expectStatus("PR: fixing feedback", "Fixing feedback");
-      work.state = "running";
-      refresh();
-      await expectStatus("PR: fixing feedback", "Fixing feedback");
-      work.state = "succeeded";
-      repair.state = "reconciling";
-      repair.executionSettled = true;
-      refresh();
-      await expectStatus("PR: reconciling effects", "Reconciling effects");
-      const finding = PrMaintenanceFindingSchema.parse({
-        source,
-        outcome: "incomplete",
-        stage: "published",
-        publishedCommit: record.observation!.headSha,
-        verifiedHeadSha: record.observation!.headSha,
-        evidence: ["Current HEAD verified; required reply still pending"],
-        nextAction: "Reconcile required response",
-      });
-      repair.state = "partial";
-      repair.findings = [finding];
-      record.findings = [finding];
-      refresh();
-      await expectStatus("Checking PR status", "Checking PR");
-      finding.outcome = outcome;
-      finding.stage = "resolved";
-      finding.responseIds = ["response"];
-      refresh();
-      await expectStatus("Checking PR status", "Checking PR");
-      record.readyFingerprint = record.observation!.fingerprint;
-      refresh();
-      await expectStatus("PR ready to merge", "Ready to merge");
-      expect(record.observation!.sources).toEqual([source]);
-      record.observation!.sources = [{ ...source, revision: "new-revision" }];
-      refresh();
-      await expectStatus("PR: reviewing feedback", "Reviewing feedback");
-    },
-  );
-
-  it.each([
-    ["ready", "Ready · not merged"],
-    ["triage", "Triaging feedback"],
-    ["addressing", "Addressing feedback"],
-    ["checks", "Waiting for checks"],
-    ["review", "Waiting for review"],
-    ["draft", "Draft PR"],
-    ["conflict", "Merge conflict"],
-    ["incomplete", "Check incomplete"],
-    ["recovery", "Recovering access"],
-    ["paused", "Paused"],
-    ["hold", "Needs human direction"],
-  ])("exposes exactly one current stage for %s", async (scenario, expected) => {
-    const record = observed();
-    if (scenario === "triage")
-      record.observation.sources = [
-        {
-          id: "new-feedback",
-          revision: "one",
-          groupKey: "review",
-          evidence: "Synthetic review",
-        },
-      ];
-    if (scenario === "addressing") record.batches = [batch("accepted")];
-    if (scenario === "checks") record.observation.checksComplete = false;
-    if (scenario === "review") record.observation.reviewsComplete = false;
-    if (scenario === "draft") record.lastAttempt.draft = true;
-    if (scenario === "conflict") record.lastAttempt.mergeability = "conflicting";
-    if (scenario === "incomplete")
-      record.lastAttempt = { ...record.lastAttempt, complete: false, failure: "network" };
-    if (scenario === "paused" || scenario === "hold")
-      Object.assign(record, { lifecycle: "paused", pauseReason: "Review required" });
-    if (scenario === "hold")
-      record.decision = {
-        id: "human",
-        version: 1,
-        state: "pending",
-        proposal: "Change the API?",
-        headSha: "a".repeat(40),
-        scope: "API",
-      };
-    if (scenario === "recovery") {
-      record.lastAttempt = {
-        ...record.lastAttempt,
-        complete: false,
-        failure: "incomplete",
-      };
-      record.incidents = [
-        PrMaintenanceIncidentSchema.parse({
-          id: "synthetic-incident",
-          sequence: 1,
-          kind: "capability",
-          error: "Provider helper unavailable",
-          lastError: "Provider helper unavailable",
-          observationKey: "synthetic-first",
-          lastObservationKey: "synthetic-latest",
-          createdAt: at,
-          updatedAt: at,
-          attempts: [],
-        }),
-      ];
-    }
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [record],
-      canAuthorize: true,
-    });
-    show();
-    const region = await screen.findByRole("region", { name: "Current maintained PR" });
-    const current = region.querySelectorAll('[aria-current="step"]');
-    expect(current).toHaveLength(1);
-    expect(current[0]?.textContent).toBe(expected);
-    expect(
-      within(region).getByRole("list", { name: "Maintenance loop stages" }),
-    ).toBeTruthy();
-    expect(region.querySelector("details")?.open).toBe(false);
-  });
-
-  it("never reports historical readiness as current after a failed or partial observation", async () => {
-    const record = observed();
-    record.lastSuccessAt = record.observation.attemptedAt;
-    record.lastAttempt = { ...record.observation, complete: false, failure: "network" };
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [record],
-      canAuthorize: true,
-    });
-    show();
-    const region = await screen.findByRole("region", { name: "Current maintained PR" });
-    expect(region.querySelector('[aria-current="step"]')?.textContent).toBe(
-      "Check incomplete",
-    );
-    expect(
-      within(region).getAllByText(
-        /prior success is not current validation|historical success is not current validation/,
-      ).length,
-    ).toBeGreaterThan(0);
-    expect(within(region).queryByText(/complete observation$/)).toBeNull();
-  });
-
-  it("separates current PR from collapsed terminal and released history without duplicate current stages", async () => {
-    const active = observed();
-    const merged = {
-      ...registration(),
-      id: "old-merged",
-      lifecycle: "merged" as const,
-      identity: { ...active.identity, prNumber: 6 },
-    };
-    const released = {
-      ...registration(),
-      id: "old-released",
-      ownershipReleasedAt: at,
-      identity: { ...active.identity, prNumber: 5 },
-    };
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [merged, active, released],
-      canAuthorize: true,
-    });
-    show();
-    const region = await screen.findByRole("region", { name: "Current maintained PR" });
-    expect(within(region).getByRole("link").textContent).toBe("owner/repo #7");
-    const history = screen.getByText("Prior PR jobs (2)").closest("details")!;
-    expect(history.open).toBe(false);
-    expect(within(history).getAllByRole("region", { name: /Prior PR job/ })).toHaveLength(
-      2,
-    );
-    fireEvent.click(within(history).getByText("Prior PR jobs (2)"));
-    expect(within(history).getByRole("link", { name: "owner/repo #6" })).toBeTruthy();
-    expect(within(history).getByRole("link", { name: "owner/repo #5" })).toBeTruthy();
-    expect(within(history).getAllByText(/0 completed maintenance rounds$/)).toHaveLength(
-      2,
-    );
-    expect(document.querySelectorAll('[aria-current="step"]')).toHaveLength(1);
-    expect(
-      within(history).getAllByRole("button", { name: "Release maintenance" }),
-    ).toHaveLength(1);
-  });
-
-  it("counts only unique settled executed batches, not reservations, cancellations before dispatch or provider iterations", async () => {
-    const record = observed();
-    record.counters = { ...record.counters, repairBatches: 29, answerBatches: 25 };
-    record.batches = [
-      batch("succeeded"),
-      batch("partial"),
-      batch("failed"),
-      { ...batch("cancelled"), executionNotDispatched: true },
-      {
-        ...batch("cancelled"),
-        id: "never-dispatched",
-        stepId: undefined,
-        attempt: undefined,
-      },
-      batch("accepted"),
-      { ...batch("succeeded"), id: "duplicate-result" },
-    ];
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [record],
-      canAuthorize: true,
-    });
-    show();
-    expect(
-      await screen.findByText("3 completed maintenance rounds · settled worker batches"),
-    ).toBeTruthy();
-  });
-
-  it.each(["merged", "closed"] as const)(
-    "keeps an unsettled %s owner visible with attention and exactly one current stage",
-    async (lifecycle) => {
-      const record = { ...registration(), lifecycle, pauseReason: "" };
-      record.batches = [batch("accepted")];
-      vi.mocked(getTaskMaintenance).mockResolvedValue({
-        records: [record],
-        canAuthorize: true,
-      });
-      show();
-      const region = await screen.findByRole("region", { name: "Current maintained PR" });
-      expect(region.closest("details")).toBeNull();
-      expect(within(region).getByText("Needs attention:")).toBeTruthy();
-      expect(
-        within(region).getByText(/Ownership is retained until reconciliation completes/),
-      ).toBeTruthy();
-      expect(region.querySelectorAll('[aria-current="step"]')).toHaveLength(1);
-      expect(region.querySelector('[aria-current="step"]')?.textContent).toBe(
-        lifecycle === "merged" ? "Merged" : "Closed",
-      );
-      expect(
-        (
-          within(region).getByRole("button", {
-            name: "Release maintenance",
-          }) as HTMLButtonElement
-        ).disabled,
-      ).toBe(true);
-      expect(screen.queryByText(/Prior PR jobs/)).toBeNull();
-      expect(
-        within(region).getByText(
-          "0 completed maintenance rounds · settled worker batches",
-        ),
-      ).toBeTruthy();
-    },
-  );
-
-  it.each(["effect-receipt", "incident-only"])(
-    "blocks resume, release and renewal while %s effects remain unknown",
-    async (source) => {
-      const record = registration();
-      record.batches = [
-        {
-          ...batch("partial"),
-          effects: [
-            {
-              key: "pending-push",
-              kind: "push",
-              state: "uncertain",
-              headSha: "a".repeat(40),
-              actor: "worker",
-              actionIdentity: "attempt",
-              attempts: 1,
-            },
-          ],
-        },
-      ];
-      if (source === "incident-only") {
-        record.batches = [];
-        record.incidents = [
-          PrMaintenanceIncidentSchema.parse({
-            id: "synthetic-effect-incident",
-            sequence: 1,
-            kind: "effects",
-            error: "Provider reply outcome is ambiguous",
-            lastError: "Provider reply outcome is ambiguous",
-            observationKey: "synthetic-effect-first",
-            lastObservationKey: "synthetic-effect-latest",
-            createdAt: at,
-            updatedAt: at,
-          }),
-        ];
-      }
-      vi.mocked(getTaskMaintenance).mockResolvedValue({
-        records: [record],
-        canAuthorize: true,
-      });
-      show();
-      const region = await screen.findByRole("region", { name: "Current maintained PR" });
-      expect(region.querySelector('[aria-current="step"]')?.textContent).toBe(
-        "Reconciling unknown effects",
-      );
-      for (const name of [
-        "Resume maintenance",
-        "Release maintenance",
-        "Renew maintenance budgets",
-      ]) {
-        expect(
-          (within(region).getByRole("button", { name }) as HTMLButtonElement).disabled,
-        ).toBe(true);
-      }
-    },
-  );
-
   it("requires a release reason and preserves the captured registration version", async () => {
     const record = registration();
     vi.mocked(actOnTaskMaintenance).mockResolvedValue(record);
@@ -1658,116 +1243,4 @@ describe("PR maintenance task controls", () => {
       ),
     );
   });
-
-  it("requires renewal confirmation and refuses a refreshed registration version", async () => {
-    const onChange = vi.fn();
-    const panel = (revision: number) => (
-      <FluentProvider theme={fleetDarkTheme}>
-        <PrMaintenancePanel
-          run={task}
-          sessions={[]}
-          onChange={onChange}
-          snapshotRevision={revision}
-        />
-      </FluentProvider>
-    );
-    const rendered = render(panel(1));
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Renew maintenance budgets" }),
-    );
-    const dialog = screen.getByRole("dialog");
-    expect(
-      within(dialog).getByText(/does not broaden design or publication authority/),
-    ).toBeTruthy();
-    expect(actOnTaskMaintenance).not.toHaveBeenCalled();
-    vi.mocked(getTaskMaintenance).mockResolvedValue({
-      records: [{ ...registration(), version: 5 }],
-      canAuthorize: true,
-    });
-    rendered.rerender(panel(2));
-    expect(await within(dialog).findByRole("alert")).toBeTruthy();
-    expect(
-      (
-        within(dialog).getByRole("button", {
-          name: "Authorize budget renewal",
-        }) as HTMLButtonElement
-      ).disabled,
-    ).toBe(true);
-    expect(actOnTaskMaintenance).not.toHaveBeenCalled();
-  });
-
-  it.each([false, true])(
-    "links bounded direction and explicit continuation=%s to the exact decision",
-    async (continueEligible) => {
-      const record = registration();
-      record.decision = {
-        id: "decision",
-        version: 2,
-        proposal: "Change the public API?",
-        headSha: "a".repeat(40),
-        scope: "API compatibility",
-        state: "pending",
-      };
-      vi.mocked(getTaskMaintenance).mockResolvedValue({
-        records: [record],
-        canAuthorize: true,
-      });
-      const review = vi.fn().mockResolvedValue(true);
-      const model = buildRunViewModels({
-        runs: [task],
-        stepsByRun: {},
-        sessions: [],
-      })[0]!;
-      render(
-        <FluentProvider theme={fleetDarkTheme}>
-          <OrchestratorTaskDetail
-            model={model}
-            notes={[]}
-            sessions={[]}
-            onBack={vi.fn()}
-            onOpenLead={vi.fn()}
-            onOpenWorker={vi.fn()}
-            onReview={review}
-            onArchive={vi.fn()}
-            onReopen={vi.fn()}
-            onDelete={vi.fn()}
-          />
-        </FluentProvider>,
-      );
-      fireEvent.click(await screen.findByRole("button", { name: "Review decision" }));
-      expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
-      fireEvent.change(screen.getByRole("textbox", { name: "What needs changing?" }), {
-        target: { value: "Keep the contract; restore validation only" },
-      });
-      const checkbox = within(screen.getByRole("dialog")).getByRole("checkbox", {
-        name: /continue/i,
-      });
-      expect((checkbox as HTMLInputElement).checked).toBe(false);
-      if (continueEligible) fireEvent.click(checkbox);
-      fireEvent.click(
-        screen.getByRole("button", {
-          name: continueEligible ? "Direct and continue" : "Send back with instructions",
-        }),
-      );
-      await waitFor(() =>
-        expect(review).toHaveBeenCalledWith(
-          false,
-          "Keep the contract; restore validation only",
-          {
-            recordId: "maintenance",
-            expectedVersion: 4,
-            decisionId: "decision",
-            decisionVersion: 2,
-            ...(continueEligible ? { continueEligible: true } : {}),
-          },
-        ),
-      );
-      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-      fireEvent.click(screen.getByText("Maintenance controls and evidence"));
-      expect(
-        (screen.getByRole("button", { name: "Resume maintenance" }) as HTMLButtonElement)
-          .disabled,
-      ).toBe(true);
-    },
-  );
 });

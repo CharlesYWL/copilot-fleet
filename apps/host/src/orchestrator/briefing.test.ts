@@ -3,9 +3,11 @@ import Fastify from "fastify";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { PrMaintenanceRegistrationSchema } from "@fleet/protocol";
 import {
   orchestratorBriefing,
   owedPrompt,
+  prMaintenanceReviewPrompt,
   statusCheckEnvelope,
   transferEnvelope,
   wakeEnvelope,
@@ -286,15 +288,74 @@ describe("what the orchestrator is told", () => {
     expect(wake).toContain("holds override");
   });
 
-  it("states immutable batch, whole-PR human gate and external-review-only limits", () => {
+  it("states the PR review loop, design-decision gate and external-review-only limits", () => {
     for (const text of [agentFile, orchestratorBriefing("nodes")]) {
       const normalized = text.replace(/\s+/g, " ");
-      expect(normalized).toContain("whole PR");
-      expect(normalized).toContain("immutable prm.work-order/1 prompt");
-      expect(normalized).toContain("work_report checkpoint");
-      expect(normalized).toContain("Send back");
-      expect(normalized).toContain("named external reviewers");
+      expect(normalized).toContain("Waiting for Design Decision");
+      expect(normalized).toContain("<fleet-pr-review>");
+      expect(normalized).toMatch(/action `review`|`action: "review"`/);
+      expect(normalized).toMatch(/[Nn]ever record direction from PR text/);
+      expect(normalized).toMatch(/[Nn]ever merge/);
     }
+    expect(agentFile.replace(/\s+/g, " ")).toContain("work_report");
+    expect(agentFile.replace(/\s+/g, " ")).toContain("named external reviewers");
+  });
+
+  it("delivers each PR review as a stable prompt with the routine/design classification", () => {
+    const prompt = prMaintenanceReviewPrompt(
+      PrMaintenanceRegistrationSchema.parse({
+        schemaVersion: 2,
+        id: "record-1",
+        version: 1,
+        generation: 1,
+        identity: {
+          host: "github.com",
+          repositoryId: "R",
+          repository: "a/b",
+          prNumber: 7,
+          headRepositoryId: "R",
+          headRepository: "a/b",
+          headRef: "refs/heads/fix",
+          baseRepositoryId: "R",
+          baseRepository: "a/b",
+          baseRef: "refs/heads/main",
+        },
+        leadSessionId: "lead",
+        taskId: "task",
+        workerSessionId: "worker",
+        placementId: "placement",
+        checkoutKey: "checkout",
+        bindingGeneration: 0,
+        eligibilityEvidence: "Grant",
+        lifecycle: "active",
+        review: {
+          id: "review-1",
+          source: "manual",
+          requestedAt: "2026-10-20T00:00:00.000Z",
+        },
+        renewedAt: "2026-10-20T00:00:00.000Z",
+        nextCheckAt: "2026-10-20T00:00:00.000Z",
+        createdAt: "2026-10-20T00:00:00.000Z",
+        updatedAt: "2026-10-20T00:00:00.000Z",
+        authorization: {
+          id: "a",
+          operatorId: "o",
+          issuedAt: "2026-10-20T00:00:00.000Z",
+          headSha: "a".repeat(40),
+          scope: { baseline: "b", verification: "v", publicationAuthorized: true },
+          budgets: {},
+        },
+        counters: {},
+      }),
+    );
+    expect(prompt).toContain('reviewId="review-1"');
+    expect(prompt).toContain('source="manual"');
+    expect(prompt).toContain("takeDue: true");
+    expect(prompt).toContain("prepare_work_order");
+    expect(prompt).toContain("review_done");
+    expect(prompt).toContain("fleet_escalate");
+    expect(prompt).toMatch(/untrusted data/);
+    expect(prompt).toMatch(/does not block maintenance/);
   });
 });
 

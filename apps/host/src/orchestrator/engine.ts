@@ -19,7 +19,11 @@ import {
   notificationAttemptKey,
   notificationAttemptKeyForStep,
 } from "../notifications/service.js";
-import { statusCheckEnvelope, wakeEnvelope } from "./briefing.js";
+import {
+  prMaintenanceReviewPrompt,
+  statusCheckEnvelope,
+  wakeEnvelope,
+} from "./briefing.js";
 import {
   isReadOnlyCategory,
   planNextActions,
@@ -195,8 +199,14 @@ export class OrchestratorEngine {
   tick(nowMs = Date.now()): void {
     this.service.messages.tick(true);
     this.service.commands.tick(nowMs);
-    if (this.store.prMaintenance.reconcileContinuations()) this.service.publishSnapshot();
-    this.service.cancelPausedPrMaintenance(new Date(nowMs).toISOString());
+    const at = new Date(nowMs).toISOString();
+    if (
+      this.store.prMaintenance.reconcileHandbacks() ||
+      this.store.prMaintenance.openDueReviews(at) ||
+      this.abandonStaleReviews()
+    )
+      this.service.publishSnapshot();
+    this.service.cancelPausedPrMaintenance(at);
     this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
     const runs = this.store.listRuns();
@@ -219,8 +229,32 @@ export class OrchestratorEngine {
     // Requests of runs that just closed, and expiry, are settled on every sweep.
     this.resume.reconcile(nowMs);
     this.wakeMaintenanceRecovery(nowMs);
-    this.wakeMaintenanceContinuations(nowMs);
+    this.wakeMaintenanceReviews(nowMs);
     this.remindIdleLeads(nowMs);
+  }
+
+  /**
+   * A review whose delivering lead turn ended without a conclusion is
+   * abandoned, so the next heartbeat or Review now opens a fresh one. Nothing
+   * is charged and nothing is held.
+   */
+  private abandonStaleReviews(): boolean {
+    let changed = false;
+    for (const stale of this.store.prMaintenance.staleReviews((leadId, key) => {
+      const lead = this.store.getSession(leadId);
+      const prompt = this.store.commands.promptByKey(leadId, key);
+      // Still queued or in flight, or the lead is mid-turn: not stale yet.
+      if (!prompt || !["settled", "orphaned", "rejected"].includes(prompt.state))
+        return true;
+      return lead?.state === "running" || lead?.state === "starting";
+    }))
+      changed =
+        this.store.prMaintenance.abandonReview(
+          stale.recordId,
+          stale.reviewId,
+          "The orchestrator turn ended before concluding this review; the next trigger reviews again.",
+        ) || changed;
+    return changed;
   }
 
   tickRun(runId: string, nowMs = Date.now()): void {
@@ -902,61 +936,53 @@ export class OrchestratorEngine {
     }
   }
 
-  private wakeMaintenanceContinuations(nowMs: number): void {
-    for (const record of this.store.prMaintenance.pendingContinuationWakes()) {
-      const intent = record.continuation!;
+  /**
+   * Delivers each open PR review to its orchestrator as one durable prompt.
+   *
+   * The prompt is keyed by review id, so a lost receipt, a Host restart or a
+   * repeated tick never delivers the same review twice, and concurrent
+   * heartbeat/manual triggers (which share one review) produce one turn.
+   */
+  private wakeMaintenanceReviews(nowMs: number): void {
+    for (const record of this.store.prMaintenance.pendingReviewWakes()) {
+      const review = record.review!;
       const lead = this.store.getSession(record.leadSessionId);
       if (
         !lead ||
-        lead.stopRequested ||
+        lead.runRole !== "lead" ||
         lead.cleanupRequested ||
         lead.dismissed ||
+        lead.stopRequested ||
         terminalSessionStates.has(lead.state) ||
         this.store.getSessionTransitionIntent(lead.id) ||
         !this.service.commands.durableLead(lead.id)
       )
+        // The review stays open and is delivered when the orchestrator runs again.
         continue;
-      const prompt = [
-        `Authenticated bounded continuation ${intent.id} for maintenance record ${record.id}, task ${record.taskId}.`,
-        intent.state === "handback"
-          ? "Selected manual turn has completed. Reconcile its exact execution and effects read-only; the Host alone decides when quiescent handback is safe. Do not dispatch while manual control is active."
-          : "Read the retained record and claim the existing bounded maintenance visit. Refresh complete provider metadata automatically before preparing or retrying the exact retained-worker batch; do not ask for another approval just to refresh expired or missing cache.",
-        record.decision?.state === "directed"
-          ? `Operator direction: ${record.decision.direction}`
-          : "",
-        ...record.workRequests
-          .filter((request) => request.state === "pending")
-          .map(
-            (request) =>
-              `Authenticated routine work ${request.id} (${request.createdAt}, operator ${request.operatorId}): ${request.direction}`,
-          ),
-        "Routine code, tests, documentation, CI, generated API reports and straightforward conflict integration within the accepted intent need no new design approval. Read the Host's operatorWorkSources and instruction history. Newer explicit operator direction supersedes only overlapping obsolete temporary restrictions; preserve unrelated still-applicable prohibitions and mutation grants. Escalate genuine semantic/design changes or ambiguous conflicts, not artifact regeneration.",
-        "If this compatible task completed while awaiting the requested work, use fleet_reopen_task under the existing maintenance grant after refreshing evidence, then continue its retained worker. This is not task acceptance or a new product approval; preserve criteria and history.",
-        "Reuse the retained worker, immutable accepted prompt and existing grant. No replacement, new rights, budget reset, PR merge or autocomplete. An exact-base conflict repair may integrate the target into the source branch by a non-forcing merge; preserve user work and stop on ambiguous choices. Independent Stop, access, identity and unresolved-effect holds win.",
-      ]
-        .filter(Boolean)
-        .join("\n");
+      const key = `pr-maintenance-review:${review.id}`;
       const queued = this.store.writeAtomically(() => {
         if (
-          !this.store.prMaintenance.markContinuationWake(
+          !this.store.prMaintenance.markReviewWake(
             record.id,
-            intent.id,
+            review.id,
+            key,
             new Date(nowMs).toISOString(),
           )
         )
           return false;
         this.service.commands.queueLeadPrompt(
           lead.id,
-          prompt,
-          `maintenance-continuation:${intent.id}:${intent.state}`,
+          prMaintenanceReviewPrompt(record),
+          key,
         );
         return true;
       });
-      if (queued && this.service.commands.durableLead(lead.id))
+      if (queued) {
+        this.promptedThisTick.add(lead.id);
         this.service.commands.pumpLead(lead.id);
+      }
     }
   }
-
   /**
    * Gives each idle Lead one read-only status check for its own active tasks,
    * at the times the operator's heartbeat schedule names.
@@ -985,8 +1011,10 @@ export class OrchestratorEngine {
       owned.push(run);
       activeByLead.set(run.leadSessionId, owned);
     }
-    for (const leadId of this.store.prMaintenance.wakeEligibleLeadIds()) {
-      if (!activeByLead.has(leadId)) activeByLead.set(leadId, []);
+    // Due PR reviews arrive as their own turns; only recovery rides the status check.
+    for (const pending of this.store.prMaintenance.pendingRecoveryWakes()) {
+      if (!activeByLead.has(pending.leadSessionId))
+        activeByLead.set(pending.leadSessionId, []);
     }
 
     for (const [leadSessionId, runs] of activeByLead) {
@@ -1038,11 +1066,6 @@ export class OrchestratorEngine {
         };
       });
 
-      const maintenance = this.store.prMaintenance.list({
-        leadSessionId: lead.id,
-        retainedOnly: true,
-        limit: 5,
-      });
       const recoveries = this.store.prMaintenance
         .pendingRecoveryWakes()
         .filter((pending) => pending.leadSessionId === lead.id)
@@ -1053,14 +1076,9 @@ export class OrchestratorEngine {
           {},
           following === undefined ? undefined : heartbeatIntervalLabel(following - due),
         ),
-        ...(maintenance.records.length
-          ? [
-              `PR maintenance records: ${maintenance.records.map((record) => record.id).join(", ")}${maintenance.nextCursor ? " (more in registry)" : ""}. Read fleet_get_pr_maintenance; reconcile unfinished work before claiming due PRs. This reminder does not reopen a task.`,
-            ]
-          : []),
         ...(recoveries.length
           ? [
-              `Observation recovery incidents: ${recoveries.map((pending) => `${pending.recordId} (${pending.incidentId})`).join(", ")}. Reserve alternate_attempt before read-only alternate evidence, then checkpoint alternate_observation. Existing wake limits and all holds still apply; never repeat a reserved attempt or replay dispatch.`,
+              `Observation recovery incidents: ${recoveries.map((pending) => `${pending.recordId} (${pending.incidentId})`).join(", ")}. Reserve alternate_attempt before read-only alternate evidence, then checkpoint alternate_observation. Never repeat a reserved attempt or replay dispatch.`,
             ]
           : []),
       ].join("\n\n");

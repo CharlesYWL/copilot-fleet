@@ -4537,6 +4537,18 @@ export class FleetStore {
     return row ? (JSON.parse(String(row.data)) as QueuedSessionMessage) : undefined;
   }
 
+  /** The operator message a durable lead delivery carried, including settled ones. */
+  queuedMessageByDeliveryKey(
+    sessionId: string,
+    deliveryKey: string,
+  ): QueuedSessionMessage | undefined {
+    const row = this.statement(
+      `SELECT data FROM session_message_queue
+       WHERE session_id=? AND json_extract(data,'$.deliveryKey')=? LIMIT 1`,
+    ).get(sessionId, deliveryKey);
+    return row ? (JSON.parse(String(row.data)) as QueuedSessionMessage) : undefined;
+  }
+
   saveQueuedMessage(message: QueuedSessionMessage): void {
     this.statement(
       `INSERT INTO session_message_queue(id,session_id,state,priority,data) VALUES(?,?,?,?,?)
@@ -5669,7 +5681,7 @@ export class FleetStore {
   ): Run | undefined {
     const run = this.getRun(id);
     if (!run) return run;
-    this.prMaintenance.pauseForTask(id, reason);
+    this.prMaintenance.stopForTask(id, reason);
     if (terminalRunStates.has(run.state)) return run;
     return this.transaction(() => {
       const now = new Date().toISOString();
@@ -6197,8 +6209,10 @@ export class FleetStore {
   ): FleetSession {
     const current = this.getSession(id);
     if (!current) throw new Error("Session not found");
-    if (controls.stopRequested || controls.dismissed)
-      this.prMaintenance.pauseForSession(id);
+    // Stop on the retained worker is explicit maintenance Stop; on the
+    // orchestrator it is not: maintenance continues when it next runs.
+    if ((controls.stopRequested || controls.dismissed) && current.runRole !== "lead")
+      this.prMaintenance.stopForSession(id);
     this.statement(
       `UPDATE sessions
        SET stop_requested=?,dismissed=?,updated_at=?

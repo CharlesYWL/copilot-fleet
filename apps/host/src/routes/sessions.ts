@@ -338,7 +338,6 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     const { id } = request.params as { id: string };
     const session = store.getSession(id);
     if (!session) return reply.code(404).send({ error: "Session not found" });
-    store.prMaintenance.pauseForSession(id, "Session cancellation requested");
     if (session.state !== "running") {
       return reply.code(409).send({ error: "Session is not running" });
     }
@@ -355,7 +354,8 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     const { id } = request.params as { id: string };
     const session = store.getSession(id);
     if (!session) return reply.code(404).send({ error: "Session not found" });
-    store.prMaintenance.pauseForSession(id, "Session Stop requested");
+    if (session.runRole !== "lead")
+      store.prMaintenance.stopForSession(id, "The retained worker was stopped.");
     // Idempotent: dismissing a corpse from the UI should not toast an error.
     if (terminalSessionStates.has(session.state)) {
       return reply.code(200).send({ ok: true, alreadyTerminal: true });
@@ -377,7 +377,8 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     if (!session) {
       return reply.code(404).send({ error: "Session not found" });
     }
-    store.prMaintenance.pauseForSession(id, "Session deletion requested");
+    if (session.runRole !== "lead")
+      store.prMaintenance.stopForSession(id, "The retained worker was deleted.");
     try {
       store.prMaintenance.assertAdmission({ sessionId: id, action: "cleanup" });
       if (terminalSessionStates.has(session.state)) {
@@ -397,7 +398,6 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     for (const session of before.filter((entry) =>
       terminalSessionStates.has(entry.state),
     )) {
-      store.prMaintenance.pauseForSession(session.id, "Ended-session cleanup requested");
       store.prMaintenance.assertAdmission({ sessionId: session.id, action: "cleanup" });
     }
     const removed = store.deleteEndedSessions();

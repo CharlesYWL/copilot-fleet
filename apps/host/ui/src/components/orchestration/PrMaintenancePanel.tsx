@@ -17,14 +17,12 @@ import {
   useRestoreFocusTarget,
 } from "@fluentui/react-components";
 import {
-  prMaintenanceProgress,
   parsePrMaintenanceUrl,
   prMaintenanceProviderLabel,
   prMaintenanceUrl,
   type FleetSession,
   type PrMaintenanceRegistration,
   type PrMaintenanceProposal,
-  type PrMaintenanceStage,
   type Run,
 } from "@fleet/protocol";
 import {
@@ -34,8 +32,13 @@ import {
   prepareTaskMaintenance,
   type TaskMaintenanceView,
 } from "../../lib/pr-maintenance";
-import { currentMaintenance, hasOutstandingWork } from "../../lib/task-overview";
-import { PrMaintenanceGraph } from "./PrMaintenanceGraph";
+import {
+  currentMaintenance,
+  hasOutstandingWork,
+  maintenanceNeedsPerson,
+  maintenanceStatusOf,
+} from "../../lib/task-overview";
+import { PrMaintenanceFlow } from "./PrMaintenanceFlow";
 import { PrMaintenanceProposalDialog } from "./PrMaintenanceProposalDialog";
 
 const useStyles = makeStyles({
@@ -113,88 +116,6 @@ const useStyles = makeStyles({
   error: { color: tokens.colorPaletteRedForeground1 },
 });
 
-const stageLabels: Record<PrMaintenanceStage, string> = {
-  released: "Released",
-  merged: "Merged",
-  closed: "Closed",
-  human_hold: "Needs human direction",
-  reconciling: "Reconciling unknown effects",
-  authorization_required: "Repair authorization required",
-  paused: "Paused",
-  recovering: "Recovering access",
-  blocked: "Blocked",
-  checking: "Awaiting current evidence",
-  addressing_review: "Addressing feedback",
-  triage: "Triaging feedback",
-  waiting_checks: "Waiting for checks",
-  waiting_review: "Waiting for review",
-  ready: "Ready · not merged",
-} as const;
-
-const nextActions: Record<PrMaintenanceStage, string> = {
-  released: "No further maintenance. Start a new proposal to maintain another PR.",
-  merged: "No further repairs. Release ownership after all work settles.",
-  closed: "No further repairs. Release ownership after all work settles.",
-  human_hold: "Send back with instructions to resolve the design decision.",
-  reconciling: "Reconcile pending work and effects before any further changes.",
-  authorization_required:
-    "Prepare and review a repair proposal for this exact retained PR and worker. Legacy observation authority cannot resume maintenance.",
-  paused: "Review the pause reason before resuming maintenance.",
-  recovering:
-    "Try a bounded alternate observation path; no repairs until evidence is complete.",
-  blocked: "Resolve the blocker and collect a complete, current observation.",
-  checking: "Collect a complete, current observation of the PR.",
-  addressing_review: "Finish the retained worker batch, then verify its changes.",
-  triage: "Review new feedback against the authorized scope.",
-  waiting_checks: "Wait for checks, then observe the current PR again.",
-  waiting_review: "Wait for review, then observe the current PR again.",
-  ready: "Monitor new commits and feedback. Merging remains a human action.",
-};
-
-function stageLabel(stage: PrMaintenanceStage, record: PrMaintenanceRegistration) {
-  if (stage === "paused" && record.manualControl && !record.manualControl.endedAt)
-    return "Manual supervisor control";
-  if (stage === "blocked") {
-    const incident = record.incidents.find((entry) => !entry.resolvedAt);
-    if (incident?.kind === "provider_denial") return "Provider access denied";
-    if (incident?.kind === "identity") return "Identity mismatch";
-    if (incident?.kind === "capability") return "Recovery limit reached";
-    if (record.lastAttempt?.draft) return "Draft PR";
-    if (record.lastAttempt?.mergeability === "conflicting") return "Merge conflict";
-    if (record.lastAttempt?.failure || !record.lastAttempt?.complete)
-      return "Check incomplete";
-  }
-  return stageLabels[stage];
-}
-
-function attentionReason(record: PrMaintenanceRegistration, stage: PrMaintenanceStage) {
-  const manual = record.manualControl?.commands.at(-1);
-  if (manual?.state === "unknown")
-    return "Manual delivery has no correlated receipt yet. Do not replay the request.";
-  if (manual?.state === "accepted")
-    return "Manual command accepted; wait for its completion receipt before another turn.";
-  if (["merged", "closed"].includes(record.lifecycle) && hasOutstandingWork(record))
-    return "The PR is terminal, but work or effects remain unsettled. Ownership is retained until reconciliation completes.";
-  if (stage === "reconciling")
-    return "Effects are not yet known. Do not repeat the action or release ownership.";
-  if (record.pauseReason) return record.pauseReason;
-  if (stage === "recovering")
-    return "The normal observation path is unavailable. Recovery is bounded.";
-  if (stage !== "blocked") return undefined;
-  const incident = record.incidents.find((entry) => !entry.resolvedAt);
-  if (incident?.kind === "provider_denial")
-    return "The provider denied access. Restore the existing authorized access before continuing.";
-  if (incident?.kind === "identity")
-    return "Provider evidence does not match the authorized PR. Human review is required.";
-  if (incident?.kind === "capability")
-    return "Bounded recovery attempts are exhausted. Review the last error before continuing.";
-  if (record.lastAttempt?.draft)
-    return "Draft PRs are not ready for maintenance repairs.";
-  if (record.lastAttempt?.mergeability === "conflicting")
-    return "The PR conflicts with its base branch.";
-  return "The latest check is incomplete or failed; historical success is not current validation.";
-}
-
 const batchStates = {
   prepared: "prepared, not dispatched",
   accepted: "in progress",
@@ -216,14 +137,6 @@ function checkTime(value: string) {
   });
 }
 
-const loopStages = [
-  "triage",
-  "addressing_review",
-  "waiting_checks",
-  "waiting_review",
-  "ready",
-] as const;
-
 const readOnlyNotice =
   "Legacy observation-only maintenance is retired. History and ownership are retained; authenticated repair authorization is required. No writes are authorized.";
 
@@ -234,6 +147,86 @@ function PrLink({ record }: { record: Pick<PrMaintenanceRegistration, "identity"
     </Link>
   );
 }
+
+type PendingDecision = NonNullable<PrMaintenanceRegistration["decision"]>;
+type DirectionDraft = { text: string; decisionKey: string };
+
+const decisionKeyOf = (decision: PendingDecision) => `${decision.id}:${decision.version}`;
+
+type DecisionDirectionProps = {
+  decision: PendingDecision;
+  draft: DirectionDraft;
+  disabled: boolean;
+  onDraftChange: (draft: DirectionDraft) => void;
+  onSubmit: (decision: PendingDecision, text: string) => void;
+};
+
+/**
+ * Answers the one pending design decision. A draft remembers the decision it
+ * was written for; if the orchestrator replaces that decision, the draft is
+ * kept but cannot be sent to the new one.
+ */
+const DecisionDirection = ({
+  decision,
+  draft,
+  disabled,
+  onDraftChange,
+  onSubmit,
+}: DecisionDirectionProps) => {
+  const styles = useStyles();
+  const decisionKey = decisionKeyOf(decision);
+  const retargeted = Boolean(draft.text.trim()) && draft.decisionKey !== decisionKey;
+  const handleDraftChange = (text: string) =>
+    onDraftChange({
+      text,
+      decisionKey: draft.text.trim() ? draft.decisionKey : decisionKey,
+    });
+  const handleDiscardDraft = () => onDraftChange({ text: "", decisionKey });
+  const handleSubmit = () => {
+    const text = draft.text.trim();
+    if (!text || retargeted) return;
+    onSubmit(decision, text);
+  };
+  return (
+    <section aria-label="Design decision" className={styles.attention}>
+      <p>
+        <strong>Waiting for Design Decision: </strong>
+        {decision.proposal}
+      </p>
+      {retargeted ? (
+        <p role="alert" className={styles.error}>
+          The decision changed while you were writing. Your draft was not sent; read the
+          new question, then discard the draft to answer it.
+        </p>
+      ) : null}
+      <Field
+        label="Your direction"
+        hint="Name the chosen approach and its limits. Recording it resumes maintenance with a fresh review; you can also answer in the orchestrator conversation."
+      >
+        <Textarea
+          rows={3}
+          value={draft.text}
+          disabled={disabled}
+          onChange={(_, data) => handleDraftChange(data.value)}
+        />
+      </Field>
+      <div className={styles.actions}>
+        <Button
+          appearance="primary"
+          disabled={disabled || retargeted || !draft.text.trim()}
+          onClick={handleSubmit}
+        >
+          Record direction and continue
+        </Button>
+        {retargeted ? (
+          <Button disabled={disabled} onClick={handleDiscardDraft}>
+            Discard draft
+          </Button>
+        ) : null}
+      </div>
+    </section>
+  );
+};
 
 export function PrMaintenancePanel({
   run,
@@ -263,14 +256,21 @@ export function PrMaintenancePanel({
   const [proposal, setProposal] = useState<PrMaintenanceProposal>();
   const [confirmed, setConfirmed] = useState(false);
   const [release, setRelease] = useState<PrMaintenanceRegistration>();
-  const [renew, setRenew] = useState<PrMaintenanceRegistration>();
   const [releaseReason, setReleaseReason] = useState("");
   const [message, setMessage] = useState("");
   const [routineWork, setRoutineWork] = useState("");
+  /** The draft and the exact decision it answers, so a draft never retargets. */
+  const [direction, setDirection] = useState({ text: "", decisionKey: "" });
   const pendingAction = useRef(false);
-  const routineRequest = useRef<
-    { recordId: string; direction: string; id: string } | undefined
-  >(undefined);
+  /** One stable key per intent, so an uncertain HTTP retry is idempotent. */
+  const requestKeys = useRef(new Map<string, string>());
+  const requestKey = (intent: string) => {
+    const existing = requestKeys.current.get(intent);
+    if (existing) return existing;
+    const key = crypto.randomUUID();
+    requestKeys.current.set(intent, key);
+    return key;
+  };
 
   useEffect(() => {
     let active = true;
@@ -279,12 +279,12 @@ export function PrMaintenancePanel({
       setView(undefined);
       setProposal(undefined);
       setRelease(undefined);
-      setRenew(undefined);
       setConfirmed(false);
       setMessage("");
       setPrUrl("");
       setRoutineWork("");
-      routineRequest.current = undefined;
+      setDirection({ text: "", decisionKey: "" });
+      requestKeys.current.clear();
       onChange(undefined);
     }
     void getTaskMaintenance(run.id)
@@ -328,7 +328,6 @@ export function PrMaintenancePanel({
       await action();
       setProposal(undefined);
       setRelease(undefined);
-      setRenew(undefined);
       setConfirmed(false);
       setMessage(successMessage);
       setRefreshKey((current) => current + 1);
@@ -346,31 +345,32 @@ export function PrMaintenancePanel({
   const current = records.find(
     (record) =>
       !record.ownershipReleasedAt &&
-      (["active", "paused"].includes(record.lifecycle) || hasOutstandingWork(record)),
+      (record.lifecycle === "active" || hasOutstandingWork(record)),
   );
   const history = records.filter((record) => record !== current);
   const retained = records.some((record) => !record.ownershipReleasedAt);
   const legacyRetained = current && !current.authorization.scope.publicationAuthorized;
   const blocksPreparation = retained && !legacyRetained;
-  const observedProgress = current ? prMaintenanceProgress(current, nowMs) : undefined;
-  const currentProgress =
-    observedProgress &&
-    view?.statusError &&
-    observedProgress.stage !== "authorization_required"
-      ? { ...observedProgress, stage: "checking" as const }
-      : observedProgress;
   const graphRecord = currentMaintenance(records);
-  const effective = graphRecord && view?.effectiveStates?.[graphRecord.id];
+  const status = current ? maintenanceStatusOf(current, view) : undefined;
   const latestBatch = current?.batches.reduce<
     PrMaintenanceRegistration["batches"][number] | undefined
   >(
     (latest, batch) => (!latest || batch.updatedAt >= latest.updatedAt ? batch : latest),
     undefined,
   );
-  const attention =
-    current && currentProgress
-      ? attentionReason(current, currentProgress.stage)
-      : undefined;
+  /** Settled worker executions, once per step; never reservations or undispatched batches. */
+  const completedRounds = current
+    ? new Set(
+        current.batches
+          .filter(
+            (batch) =>
+              batch.stepId && batch.executionSettled && !batch.executionNotDispatched,
+          )
+          .map((batch) => batch.stepId),
+      ).size
+    : 0;
+  void nowMs;
   const changed = (record: PrMaintenanceRegistration) =>
     !records.some((entry) => entry.id === record.id && entry.version === record.version);
   let invalidUrl = false;
@@ -385,17 +385,54 @@ export function PrMaintenancePanel({
   const controls = (record: PrMaintenanceRegistration) => {
     if (record.ownershipReleasedAt) return null;
     const outstanding = hasOutstandingWork(record);
-    const held = record.decision?.state === "pending";
+    const recordStatus = maintenanceStatusOf(record, view);
+    const active = record.lifecycle === "active";
+    const canAct = !busy && Boolean(view?.canAuthorize);
     return (
       <div className={styles.actions}>
-        {record.lifecycle === "active" ? (
+        {active && !record.hold ? (
           <Button
-            disabled={busy || !view?.canAuthorize}
+            appearance={recordStatus.phase === "idle" ? "primary" : "secondary"}
+            disabled={
+              !canAct ||
+              !record.authorization.scope.publicationAuthorized ||
+              recordStatus.phase === "waiting_for_decision"
+            }
+            onClick={() =>
+              void execute(
+                () =>
+                  actOnTaskMaintenance(run.id, record, {
+                    action: "review",
+                    requestId: requestKey(`review:${record.id}:${record.version}`),
+                  }),
+                "Review requested. The orchestrator refreshes the PR and decides what to do next.",
+              )
+            }
+          >
+            Review now
+          </Button>
+        ) : null}
+        {record.hold ? (
+          <Button
+            appearance="primary"
+            disabled={!canAct || !record.authorization.scope.publicationAuthorized}
+            onClick={() =>
+              void execute(
+                () => actOnTaskMaintenance(run.id, record, { action: "resume" }),
+                "Maintenance resumed. A fresh review starts now.",
+              )
+            }
+          >
+            Resume maintenance
+          </Button>
+        ) : active ? (
+          <Button
+            disabled={!canAct}
             onClick={() =>
               void execute(() =>
                 actOnTaskMaintenance(run.id, record, {
                   action: "pause",
-                  reason: "Paused by the authenticated task operator",
+                  reason: "Paused by the operator",
                 }),
               )
             }
@@ -403,35 +440,9 @@ export function PrMaintenancePanel({
             Pause maintenance
           </Button>
         ) : null}
-        {record.lifecycle === "paused" ? (
-          <Button
-            disabled={
-              busy ||
-              !view?.canAuthorize ||
-              held ||
-              outstanding ||
-              !record.authorization.scope.publicationAuthorized
-            }
-            onClick={() =>
-              void execute(() =>
-                actOnTaskMaintenance(run.id, record, {
-                  action: "resume",
-                  ...(record.decision?.state === "directed"
-                    ? {
-                        decisionId: record.decision.id,
-                        decisionVersion: record.decision.version,
-                      }
-                    : {}),
-                }),
-              )
-            }
-          >
-            Resume maintenance
-          </Button>
-        ) : null}
         <Button
           {...restoreFocusTarget}
-          disabled={busy || !view?.canAuthorize || outstanding}
+          disabled={!canAct || outstanding}
           onClick={() => {
             setError("");
             setRelease(record);
@@ -440,19 +451,6 @@ export function PrMaintenancePanel({
         >
           Release maintenance
         </Button>
-        {record.authorization.scope.publicationAuthorized &&
-        ["active", "paused"].includes(record.lifecycle) ? (
-          <Button
-            {...restoreFocusTarget}
-            disabled={busy || !view?.canAuthorize || outstanding || held}
-            onClick={() => {
-              setError("");
-              setRenew(record);
-            }}
-          >
-            Renew maintenance budgets
-          </Button>
-        ) : null}
       </div>
     );
   };
@@ -500,32 +498,11 @@ export function PrMaintenancePanel({
             : "Verification reference"}
         </dt>
         <dd>{record.authorization.scope.verification}</dd>
-        <dt>Remaining limits</dt>
+        <dt>Activity</dt>
         <dd>
-          {!record.authorization.scope.publicationAuthorized ? (
-            "Legacy grant; repair authorization required. No mutation allowance."
-          ) : (
-            <>
-              {Math.max(
-                0,
-                record.authorization.budgets.repairBatches -
-                  record.counters.repairBatches,
-              )}{" "}
-              repairs ·{" "}
-              {Math.max(
-                0,
-                record.authorization.budgets.answerBatches -
-                  record.counters.answerBatches,
-              )}{" "}
-              answers ·{" "}
-              {Math.max(
-                0,
-                record.authorization.budgets.mutationAttempts -
-                  record.counters.mutationAttempts,
-              )}{" "}
-              mutation attempts
-            </>
-          )}
+          {record.counters.repairBatches} repair and {record.counters.answerBatches}{" "}
+          answer batches · {record.counters.dispatchesSinceDirection} since the last
+          direction (no limit; repeated no-progress work becomes a design decision)
         </dd>
         <dt>Prior successful check</dt>
         <dd>{record.lastSuccessAt || "Unknown — no successful observation"}</dd>
@@ -555,11 +532,14 @@ export function PrMaintenancePanel({
       aria-label="PR maintenance"
     >
       <h2>PR maintenance</h2>
-      {effective ? (
-        <p role="status">
-          <strong>{effective.status.replaceAll("_", " ")}</strong>
+      {status ? (
+        <p
+          role="status"
+          className={maintenanceNeedsPerson(status) ? styles.attention : undefined}
+        >
+          <strong>{status.label}</strong>
           {" — "}
-          {effective.reason} {effective.action}
+          {status.reason} {status.action}
         </p>
       ) : null}
       {error ? (
@@ -569,15 +549,25 @@ export function PrMaintenancePanel({
       ) : null}
       {message ? <p role="status">{message}</p> : null}
       {!view && !error ? <p role="status">Loading maintenance status…</p> : null}
-      {compact && graphRecord ? (
-        <details open={!effective}>
-          <summary>Recorded maintenance lifecycle (audit)</summary>
-          <PrMaintenanceGraph
-            record={graphRecord}
-            nowMs={nowMs}
-            unavailable={Boolean(view?.statusError)}
-          />
-        </details>
+      {status ? <PrMaintenanceFlow status={status} /> : null}
+      {current && status?.phase === "waiting_for_decision" && current.decision ? (
+        <DecisionDirection
+          decision={current.decision}
+          draft={direction}
+          disabled={busy || !view?.canAuthorize}
+          onDraftChange={setDirection}
+          onSubmit={(decision, text) =>
+            void execute(async () => {
+              await actOnTaskMaintenance(run.id, current, {
+                action: "direction",
+                decisionId: decision.id,
+                decisionVersion: decision.version,
+                direction: text,
+              });
+              setDirection({ text: "", decisionKey: "" });
+            }, "Direction recorded. Maintenance resumes with a fresh review.")
+          }
+        />
       ) : null}
       {compact && view && !graphRecord && !error ? (
         <p className={styles.muted}>
@@ -594,12 +584,12 @@ export function PrMaintenancePanel({
             {view?.proposal && !current
               ? "Review maintenance proposal"
               : graphRecord
-                ? "Maintenance controls and evidence"
+                ? "Routine work, controls and evidence"
                 : "Set up PR maintenance"}
           </summary>
         ) : null}
         <p className={styles.muted}>
-          Bounded repairs on the retained worker. Ready is not merged; maintenance never
+          Routine fixes on the retained worker. Ready is not merged; maintenance never
           merges or force-pushes.
         </p>
         {view?.unsupportedReason ? <p role="status">{view.unsupportedReason}</p> : null}
@@ -609,73 +599,8 @@ export function PrMaintenancePanel({
           </p>
         ) : null}
 
-        {current && currentProgress ? (
+        {current && status ? (
           <section aria-label="Current maintained PR">
-            <p>
-              Send a normal prompt to the retained worker, or use its Resume button, to
-              take manual control. No Release or unattended publication grant is needed.
-              Ongoing takeover stays paused. Select one-turn handback in the prompt
-              composer to return control only after completion and fresh effect checks.
-              The pending design decisions still need explicit direction. In-flight or
-              unknown effects must settle first.
-            </p>
-            {current.authorization.scope.publicationAuthorized &&
-            current.lifecycle === "active" ? (
-              <>
-                <Field
-                  label="Routine work"
-                  hint="Use the same retained worker for code, tests, docs, CI, generated API reports or straightforward conflicts within the accepted intent. Only design changes need another decision. Metadata refreshes automatically."
-                >
-                  <Textarea
-                    rows={3}
-                    value={routineWork}
-                    disabled={
-                      busy || !view?.canAuthorize || current.decision?.state === "pending"
-                    }
-                    onChange={(_, data) => setRoutineWork(data.value)}
-                  />
-                </Field>
-                <Button
-                  disabled={
-                    busy ||
-                    !view?.canAuthorize ||
-                    !routineWork.trim() ||
-                    current.decision?.state === "pending"
-                  }
-                  onClick={() => {
-                    const direction = routineWork.trim();
-                    if (
-                      !routineRequest.current ||
-                      routineRequest.current.recordId !== current.id ||
-                      routineRequest.current.direction !== direction
-                    )
-                      routineRequest.current = {
-                        recordId: current.id,
-                        direction,
-                        id: crypto.randomUUID(),
-                      };
-                    const requestId = routineRequest.current.id;
-                    void execute(async () => {
-                      await actOnTaskMaintenance(run.id, current, {
-                        action: "work",
-                        requestId,
-                        direction,
-                      });
-                      setRoutineWork("");
-                      routineRequest.current = undefined;
-                    }, "Routine work queued on the retained worker; metadata will refresh automatically.");
-                  }}
-                >
-                  Queue routine work
-                </Button>
-              </>
-            ) : null}
-            {current.manualControl && !current.manualControl.endedAt ? (
-              <p role="status">
-                Manual supervisor control — unattended maintenance is paused. This is not
-                PR readiness, publication authorization, or design approval.
-              </p>
-            ) : null}
             <p className={styles.muted}>Current maintained PR</p>
             <h3>
               <PrLink record={current} />
@@ -685,37 +610,44 @@ export function PrMaintenancePanel({
                 <strong>Repair authorization required</strong> — {readOnlyNotice}
               </p>
             ) : null}
-            {!compact && !effective ? (
-              <ol className={styles.rail} aria-label="Maintenance loop stages">
-                {[
-                  ...(!loopStages.some((stage) => stage === currentProgress.stage)
-                    ? [currentProgress.stage]
-                    : []),
-                  ...loopStages.filter(
-                    (stage) =>
-                      current.authorization.scope.publicationAuthorized ||
-                      stage !== "addressing_review" ||
-                      currentProgress.stage === stage,
-                  ),
-                ].map((stage) => (
-                  <li
-                    key={stage}
-                    aria-current={stage === currentProgress.stage ? "step" : undefined}
-                    className={mergeClasses(
-                      styles.stage,
-                      stage === currentProgress.stage && styles.currentStage,
-                    )}
-                  >
-                    {stageLabel(stage, current)}
-                  </li>
-                ))}
-              </ol>
+            {controls(current)}
+            {current.authorization.scope.publicationAuthorized &&
+            current.lifecycle === "active" &&
+            !current.hold ? (
+              <>
+                <Field
+                  label="Routine work"
+                  hint="Ask the retained worker for code, tests, docs, CI, generated artifacts or a straightforward conflict within the accepted intent. A review starts immediately; only design changes need a decision."
+                >
+                  <Textarea
+                    rows={3}
+                    value={routineWork}
+                    disabled={busy || !view?.canAuthorize}
+                    onChange={(_, data) => setRoutineWork(data.value)}
+                  />
+                </Field>
+                <Button
+                  disabled={busy || !view?.canAuthorize || !routineWork.trim()}
+                  onClick={() => {
+                    const text = routineWork.trim();
+                    const requestId = requestKey(`work:${current.id}:${text}`);
+                    void execute(async () => {
+                      await actOnTaskMaintenance(run.id, current, {
+                        action: "work",
+                        requestId,
+                        direction: text,
+                      });
+                      setRoutineWork("");
+                    }, "Routine work queued; a review starts now.");
+                  }}
+                >
+                  Queue routine work
+                </Button>
+              </>
             ) : null}
-            <p>
-              {currentProgress.completedIterations} completed maintenance rounds · settled
-              worker batches
-            </p>
             <dl className={styles.metadata}>
+              <dt>Completed rounds</dt>
+              <dd>{completedRounds} settled worker batches</dd>
               <dt>Last action</dt>
               <dd>
                 {latestBatch
@@ -732,55 +664,38 @@ export function PrMaintenancePanel({
                   "Not checked yet"
                 )}
                 {current.lastAttempt?.complete && !current.lastAttempt.failure
-                  ? " · complete observation"
-                  : " · incomplete or unavailable; prior success is not current validation"}
+                  ? " · complete"
+                  : current.lastAttempt
+                    ? " · incomplete; the next review refreshes it"
+                    : ""}
               </dd>
-              <dt>Next action</dt>
-              <dd>{effective?.action ?? nextActions[currentProgress.stage]}</dd>
-              <dt>Next check</dt>
+              <dt>Next heartbeat</dt>
               <dd>
-                {effective ? (
-                  effective.reason
-                ) : [
-                    "human_hold",
-                    "reconciling",
-                    "paused",
-                    "merged",
-                    "closed",
-                    "authorization_required",
-                  ].includes(currentProgress.stage) ? (
-                  "On hold until the current blocker is resolved."
-                ) : currentProgress.stage === "addressing_review" ? (
-                  "After the retained worker finishes its repair turn."
-                ) : (
+                {status.phase === "idle" && !status.hold ? (
                   <>
                     <time dateTime={current.nextCheckAt}>
                       {checkTime(current.nextCheckAt)}
                     </time>{" "}
-                    · orchestrator heartbeat, best effort
+                    · or use Review now
                   </>
+                ) : (
+                  "Not scheduled while reviewing, working, waiting or on hold."
                 )}
               </dd>
             </dl>
-            {attention && !effective ? (
-              <p className={styles.attention}>
-                <strong>Needs attention: </strong>
-                {attention}
-              </p>
-            ) : null}
-            {current.decision?.state === "pending" ? (
-              <p className={styles.attention}>
-                {current.decision.proposal} Use Send back with instructions below. Approve
-                task and generic Reopen cannot authorize this design change.
+            {current.manualControl && !current.manualControl.endedAt ? (
+              <p role="status">
+                Manual control: a person is driving the retained worker. Choose one-turn
+                handback in the prompt composer to resume automatically after that turn,
+                or Resume maintenance when done.
               </p>
             ) : null}
             {hasOutstandingWork(current) ? (
               <p>
-                Work or effects are still pending. Resume, release and renewal stay
-                blocked until reconciled.
+                Work or effects are still settling. Release waits until they are
+                reconciled; nothing is replayed.
               </p>
             ) : null}
-            {controls(current)}
             {details(current)}
           </section>
         ) : null}
@@ -894,7 +809,7 @@ export function PrMaintenancePanel({
           <details className={styles.details}>
             <summary>Prior PR jobs ({history.length})</summary>
             {history.map((record) => {
-              const progress = prMaintenanceProgress(record);
+              const recordStatus = maintenanceStatusOf(record, view);
               return (
                 <section
                   className={styles.historyJob}
@@ -904,14 +819,10 @@ export function PrMaintenancePanel({
                   <h3>
                     <PrLink record={record} />
                   </h3>
-                  <p>
-                    {stageLabel(progress.stage, record)} · {progress.completedIterations}{" "}
-                    completed maintenance rounds
-                  </p>
+                  <p>{recordStatus.label}</p>
                   {!record.authorization.scope.publicationAuthorized ? (
                     <p>Legacy observation grant; no repair authorization.</p>
                   ) : null}
-                  {record.pauseReason ? <p>{record.pauseReason}</p> : null}
                   {controls(record)}
                   {details(record)}
                 </section>
@@ -954,64 +865,6 @@ export function PrMaintenancePanel({
           }
         />
       ) : null}
-
-      <Dialog
-        open={Boolean(renew)}
-        onOpenChange={(_, data) => !busy && !data.open && setRenew(undefined)}
-      >
-        <DialogSurface>
-          <DialogBody>
-            <DialogTitle>Renew the same maintenance scope?</DialogTitle>
-            <DialogContent>
-              {error ? (
-                <p role="alert">
-                  {error} Close this dialog and refresh before authorizing again.
-                </p>
-              ) : null}
-              {renew && changed(renew) ? (
-                <p role="alert">
-                  This job changed. Close and review its current state before renewing.
-                </p>
-              ) : null}
-              <p>
-                This starts a new allowance for the exact existing PR, worker and scope.
-                It does not broaden design or publication authority, erase iteration
-                history, or resume a pause.
-              </p>
-              {renew ? (
-                <>
-                  <p>
-                    <PrLink record={renew} />
-                  </p>
-                  <p>{renew.authorization.scope.baseline}</p>
-                  <p>
-                    Renew to {renew.authorization.budgets.repairBatches} repair batches,{" "}
-                    {renew.authorization.budgets.answerBatches} answer batches and{" "}
-                    {renew.authorization.budgets.mutationAttempts} mutation attempts.
-                  </p>
-                </>
-              ) : null}
-            </DialogContent>
-            <DialogActions>
-              <Button disabled={busy} onClick={() => setRenew(undefined)}>
-                Cancel
-              </Button>
-              <Button
-                disabled={busy || !view?.canAuthorize || !renew || changed(renew)}
-                appearance="primary"
-                onClick={() =>
-                  renew &&
-                  void execute(() =>
-                    actOnTaskMaintenance(run.id, renew, { action: "renew" }),
-                  )
-                }
-              >
-                Authorize budget renewal
-              </Button>
-            </DialogActions>
-          </DialogBody>
-        </DialogSurface>
-      </Dialog>
 
       <Dialog
         open={Boolean(release)}

@@ -201,15 +201,14 @@ describe("conversation tasks", () => {
           {
             taskId: "a",
             recordId: "job",
-            stage: "waiting_review",
             prUrl: "https://github.com/example/repo/pull/1",
-            manualControl: false,
+            status: { phase: "reviewing", label: "Reviewing", reason: "r", action: "a" },
           },
         ],
       }),
     });
 
-    expect(screen.getByRole("img", { name: "PR · Waiting for review" })).toBeTruthy();
+    expect(screen.getByRole("img", { name: "PR · Reviewing" })).toBeTruthy();
     fireEvent.click(screen.getByRole("combobox", { name: "Filter tasks by status" }));
     fireEvent.click(screen.getByRole("option", { name: "PR maintenance" }));
     expect(screen.getByRole("button", { name: /Alpha task/ })).toBeTruthy();

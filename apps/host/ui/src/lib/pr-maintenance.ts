@@ -3,21 +3,14 @@ import type {
   PrMaintenanceOperatorAction,
   PrMaintenanceRegistration,
   PrMaintenanceProposal,
-  PrMaintenanceEffectiveState,
+  PrMaintenanceStatus,
 } from "@fleet/protocol";
 import { api } from "../hooks/useFleet";
 
-export type MaintenanceReviewReference = {
-  recordId: string;
-  expectedVersion: number;
-  decisionId: string;
-  decisionVersion: number;
-  continueEligible?: boolean;
-};
-
 export type TaskMaintenanceView = {
   records: PrMaintenanceRegistration[];
-  effectiveStates?: Record<string, PrMaintenanceEffectiveState>;
+  /** The Host's single authoritative status per record. */
+  statuses?: Record<string, PrMaintenanceStatus>;
   proposal?: PrMaintenanceProposal;
   canAuthorize: boolean;
   unsupportedReason?: string;

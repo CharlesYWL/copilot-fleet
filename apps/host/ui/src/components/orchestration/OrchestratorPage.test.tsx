@@ -161,13 +161,38 @@ describe("orchestrator views", () => {
   });
 
   it.each([
-    ["awaiting_lead", "waiting_review", false, "PR · Waiting for review", "queued"],
-    ["completed", "ready", false, "PR · Ready to merge", "done"],
-    ["awaiting_lead", "blocked", false, "PR · Blocked", "waiting-for-permission"],
-    ["awaiting_lead", "paused", true, "PR · Manual control", "idle"],
+    [
+      "awaiting_lead",
+      { phase: "reviewing", label: "Reviewing", reason: "r", action: "a" },
+      "PR · Reviewing",
+      "running",
+    ],
+    [
+      "completed",
+      { phase: "idle", label: "Idle", reason: "r", action: "a" },
+      "PR · Idle",
+      "idle",
+    ],
+    [
+      "awaiting_lead",
+      {
+        phase: "waiting_for_decision",
+        label: "Waiting for Design Decision",
+        reason: "r",
+        action: "a",
+      },
+      "PR · Waiting for Design Decision",
+      "waiting-for-permission",
+    ],
+    [
+      "awaiting_lead",
+      { phase: "idle", label: "Idle · Paused", reason: "r", action: "a", hold: "paused" },
+      "PR · Idle · Paused",
+      "waiting-for-permission",
+    ],
   ] as const)(
-    "shows a %s task's PR maintenance (%s) instead of its parked run state",
-    (state, stage, manualControl, label, visualState) => {
+    "shows a %s task's PR maintenance (%o) instead of its parked run state",
+    (state, maintenanceStatus, label, visualState) => {
       const [model] = buildRunViewModels({
         runs: [run({ state })],
         stepsByRun: {},
@@ -176,9 +201,8 @@ describe("orchestrator views", () => {
           {
             taskId: "r1",
             recordId: "job",
-            stage,
             prUrl: "https://github.com/example/repo/pull/1",
-            manualControl,
+            status: maintenanceStatus,
           },
         ],
       });
@@ -198,9 +222,13 @@ describe("orchestrator views", () => {
         {
           taskId: "r1",
           recordId: "job",
-          stage: "ready",
           prUrl: "https://github.com/example/repo/pull/1",
-          manualControl: false,
+          status: {
+            phase: "waiting_for_decision",
+            label: "Waiting for Design Decision",
+            reason: "r",
+            action: "a",
+          },
         },
       ],
     });

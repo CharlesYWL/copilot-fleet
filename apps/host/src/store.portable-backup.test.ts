@@ -154,22 +154,14 @@ describe("stable tunnel backup settings", () => {
       },
       "authenticated-operator",
     );
-    record = source.prMaintenance.holdForDecision(
-      lead.id,
-      record.id,
-      record.version,
-      {
-        id: "decision-1",
-        version: 1,
-        proposal: "Keep existing API?",
-        scope: "Null contract",
-        headSha: "a".repeat(40),
-      },
-      () => {
-        source.advanceRunToReview(task.id);
-        source.appendRunNote(task.id, 0, "Maintenance human decision");
-      },
-    );
+    record = source.prMaintenance.holdForDecision(lead.id, record.id, record.version, {
+      id: "decision-1",
+      version: 1,
+      proposal: "Keep existing API?",
+      scope: "Null contract",
+      headSha: "a".repeat(40),
+    });
+    source.appendRunNote(task.id, 0, "Maintenance human decision");
     source.prMaintenance.beginWake(lead.id, "wake-1");
     source.prMaintenance.chargeWake(lead.id, "wake-1", { requests: 9, milliseconds: 2 });
     const target = secured(setup());
@@ -178,8 +170,8 @@ describe("stable tunnel backup settings", () => {
       security: source.exportSecurityBackup(),
     });
     const restored = target.prMaintenance.get(record.id)!;
-    expect(restored.lifecycle).toBe("paused");
-    expect(restored.pauseReason).toContain("restore");
+    expect(restored.hold?.kind).toBe("paused");
+    expect(restored.hold?.reason).toMatch(/restore/i);
     expect(restored.authorization).toEqual(record.authorization);
     expect(restored.decision).toEqual(record.decision);
     expect(restored.generation).toBe(record.generation);

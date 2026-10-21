@@ -164,14 +164,12 @@ describe("stageOf", () => {
 });
 
 describe("buildRunViewModels", () => {
-  it("attaches a task's PR maintenance and ages out stale observations", () => {
+  it("attaches a task's PR maintenance status exactly as the Host computed it", () => {
     const status = {
       taskId: "r1",
       recordId: "job",
-      stage: "waiting_review" as const,
       prUrl: "https://github.com/example/repo/pull/1",
-      manualControl: false,
-      freshUntil: later(30),
+      status: { phase: "idle" as const, label: "Idle", reason: "r", action: "a" },
     };
     const input = {
       runs: [run({ state: "awaiting_lead" }), run({ id: "r2" })],
@@ -188,19 +186,13 @@ describe("buildRunViewModels", () => {
     );
     expect(taskStatusLabel(maintained!)).toBe(PR_MAINTENANCE_STATUS_LABEL);
 
-    const [stale] = build({
+    // Time alone never changes the status: stale evidence is not a state.
+    const [later31] = build({
       ...input,
       runs: [input.runs[0]!],
       nowMs: Date.parse(later(31)),
     });
-    expect(stale?.maintenance).toEqual({
-      taskId: "r1",
-      recordId: "job",
-      stage: "checking",
-      prUrl: status.prUrl,
-      manualControl: false,
-    });
-    expect(status.stage).toBe("waiting_review");
+    expect(later31?.maintenance).toEqual(status);
   });
 
   it("files a maintained task that needs a person under its run state", () => {
@@ -212,14 +204,13 @@ describe("buildRunViewModels", () => {
         {
           taskId: "r1",
           recordId: "job",
-          stage: "checking",
           prUrl: "https://github.com/example/repo/pull/1",
-          manualControl: false,
+          status: { phase: "reviewing", label: "Reviewing", reason: "r", action: "a" },
         },
       ],
     });
 
-    expect(model?.maintenance?.stage).toBe("checking");
+    expect(model?.maintenance?.status.phase).toBe("reviewing");
     expect(taskStatusLabel(model!)).toBe("Needs you");
   });
 
@@ -548,9 +539,8 @@ describe("labels", () => {
         {
           taskId: "maintained",
           recordId: "record-1",
-          stage: "waiting_review",
           prUrl: "https://github.com/example/repo/pull/7",
-          manualControl: false,
+          status: { phase: "reviewing", label: "Reviewing", reason: "r", action: "a" },
         },
       ],
     });

@@ -145,15 +145,9 @@ export function PrMaintenanceProposalDialog({
               <dd>{candidate.scope.verification}</dd>
               <dt>Limits</dt>
               <dd>
-                {readOnly ? (
-                  "Unsupported legacy proposal; prepare repair authorization."
-                ) : (
-                  <>
-                    {candidate.budgets.repairBatches} repairs ·{" "}
-                    {candidate.budgets.answerBatches} answers ·{" "}
-                    {candidate.budgets.mutationAttempts} mutation attempts
-                  </>
-                )}
+                {readOnly
+                  ? "Unsupported legacy proposal; prepare repair authorization."
+                  : "No batch limit. A finding that keeps failing, or five batches without your direction, becomes a design decision."}
               </dd>
               <dt>Allowed responses</dt>
               <dd>

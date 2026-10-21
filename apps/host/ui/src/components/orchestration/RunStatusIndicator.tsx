@@ -1,6 +1,6 @@
 import { Button, makeStyles, mergeClasses } from "@fluentui/react-components";
 import { Dismiss12Regular } from "@fluentui/react-icons";
-import type { PrMaintenanceStage, PrMaintenanceTaskStatus } from "@fleet/protocol";
+import type { PrMaintenanceStatus, PrMaintenanceTaskStatus } from "@fleet/protocol";
 import { useState } from "react";
 import type { RunViewModel } from "../../lib/orchestration-view";
 import {
@@ -13,7 +13,6 @@ import {
   type StatusDescriptor,
   type StatusState,
 } from "../../lib/status-visuals";
-import { maintenanceStageLabels } from "../../lib/task-overview";
 import { StatusIndicator } from "../StatusIndicator";
 
 export const FAILED_STEP_DISMISS_PREFIX = "fleet.ui.run.failed-step.";
@@ -61,28 +60,22 @@ const rememberDismissedFailures = (runId: string, tokens: readonly string[]) => 
   }
 };
 
-/** Amber where maintenance waits on a person, as the task overview says. */
-const maintenanceVisualState: Record<PrMaintenanceStage, StatusState> = {
-  checking: "queued",
-  triage: "queued",
-  addressing_review: "queued",
-  waiting_checks: "queued",
-  waiting_review: "queued",
-  recovering: "resumable",
-  ready: "done",
-  merged: "done",
-  closed: "stopped",
-  released: "stopped",
-  human_hold: "waiting-for-permission",
-  reconciling: "waiting-for-permission",
-  authorization_required: "waiting-for-permission",
-  paused: "waiting-for-permission",
-  blocked: "waiting-for-permission",
-};
+/**
+ * Amber only where maintenance waits on a person: a design decision or a hold
+ * they must clear. Reviewing and Working are activity, Idle is calm.
+ */
+export function maintenanceVisualState(status: PrMaintenanceStatus): StatusState {
+  if (status.phase === "waiting_for_decision") return "waiting-for-permission";
+  if (status.hold === "reconciling") return "resumable";
+  if (status.hold) return "waiting-for-permission";
+  if (status.phase === "working" || status.phase === "reviewing") return "running";
+  if (status.phase === "merged") return "done";
+  if (status.phase === "closed" || status.phase === "released") return "stopped";
+  return "idle";
+}
 
 export function maintenanceStatusLabel(status: PrMaintenanceTaskStatus): string {
-  if (status.effective) return `PR · ${status.effective.status.replaceAll("_", " ")}`;
-  return `PR · ${status.manualControl ? "Manual control" : maintenanceStageLabels[status.stage]}`;
+  return `PR · ${status.status.label}`;
 }
 
 /**
@@ -93,19 +86,18 @@ export function maintenanceStatusLabel(status: PrMaintenanceTaskStatus): string 
  * which one is blocking an agent right now.
  */
 export function runVisual(model: RunViewModel): StatusDescriptor {
-  if (model.maintenance?.effective) {
-    const effective = model.maintenance.effective.status;
+  // A design decision or a hold only the person can clear is the most
+  // actionable thing on the card; everything else defers to the task first.
+  const maintenance = model.maintenance?.status;
+  if (
+    maintenance &&
+    model.run.state !== "awaiting_human" &&
+    (maintenance.phase === "waiting_for_decision" ||
+      (maintenance.hold && maintenance.hold !== "reconciling"))
+  ) {
     return {
-      ...statusDescriptor(
-        effective === "needs_decision"
-          ? "waiting-for-permission"
-          : effective === "released"
-            ? "stopped"
-            : effective === "running" || effective === "running_manually"
-              ? "running"
-              : "idle",
-      ),
-      label: maintenanceStatusLabel(model.maintenance),
+      ...statusDescriptor(maintenanceVisualState(maintenance)),
+      label: maintenanceStatusLabel(model.maintenance!),
     };
   }
   if ((model.stoppingSteps ?? 0) > 0) {
@@ -149,11 +141,7 @@ export function runVisual(model: RunViewModel): StatusDescriptor {
   // keeps working on the PR whatever the run row says.
   if (model.maintenance) {
     return {
-      ...statusDescriptor(
-        model.maintenance.manualControl
-          ? "idle"
-          : maintenanceVisualState[model.maintenance.stage],
-      ),
+      ...statusDescriptor(maintenanceVisualState(model.maintenance.status)),
       label: maintenanceStatusLabel(model.maintenance),
     };
   }

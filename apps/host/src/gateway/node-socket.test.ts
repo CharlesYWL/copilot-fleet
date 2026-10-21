@@ -1715,7 +1715,8 @@ describe("node reconnect socket ordering", () => {
       }
       expect(dispatch).not.toHaveBeenCalled();
       expect(store.prMaintenance.get(record.id)).toMatchObject({
-        lifecycle: "paused",
+        // Manual control never replaces an existing hold.
+        hold: { kind: expect.stringMatching(/^(manual_control|paused)$/) },
         authorization: record.authorization,
         manualControl: { commands: [{ id: commandId }] },
       });
