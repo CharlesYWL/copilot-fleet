@@ -19,6 +19,8 @@
 
 [快速开始](#快速开始) · [功能](#功能) · [工作原理](#工作原理) · [文档](docs/guide/README.md) · [完整中文参考](docs/zh-CN/reference.md)
 
+**[▶ 在 VibeHub 上试玩交互式演示](https://vibehub.microsoft.com/app/copilot-fleet/)**：真实界面连接模拟的机群，直接在浏览器中运行（需要 Microsoft 登录）
+
 <br />
 
 <img src="docs/screenshots/monitor-wall.png" alt="Copilot Fleet 总览：多个工作区和节点上的会话，每张卡片实时滚动各自的对话。" width="960" />
