@@ -19,6 +19,8 @@ Self-hosted · one outbound connection per machine · your Copilot login never l
 
 [Quick start](#quick-start) · [Features](#features) · [How it works](#how-it-works) · [Docs](docs/guide/README.md) · [Security](docs/guide/security.md)
 
+**[▶ Try the interactive demo on VibeHub](https://vibehub.microsoft.com/app/copilot-fleet/)**: the real UI against a simulated fleet, right in your browser (Microsoft sign-in required)
+
 <br />
 
 <img src="docs/screenshots/monitor-wall.png" alt="The Copilot Fleet overview: sessions across several workspaces and nodes, each card streaming its own transcript live." width="960" />
