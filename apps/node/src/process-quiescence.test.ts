@@ -2,11 +2,14 @@ import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import {
   killPosixProcessGroup,
+  killTrackedProcessGroups,
   spawnManagedProcess,
   stopProcessTree,
+  trackProcessGroup,
 } from "./process-quiescence.js";
 
-describe("Windows process quiescence", () => {
+describe("managed process quiescence", () => {
+  // Windows-only: the agent launcher uses a shell only for npm .cmd shims there.
   it.skipIf(process.platform !== "win32")(
     "preserves shell-launch argument boundaries inside the managed job",
     async () => {
@@ -24,6 +27,31 @@ describe("Windows process quiescence", () => {
       } finally {
         await stopProcessTree(child, true);
       }
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "escalates to SIGKILL for a managed descendant that ignores SIGTERM",
+    async () => {
+      const child = spawnManagedProcess(
+        process.execPath,
+        [
+          "-e",
+          'const c=require("node:child_process").spawn(process.execPath,["-e","process.on(\\"SIGTERM\\",()=>{});setInterval(()=>{},1000)"],{stdio:"ignore"});console.log(String(c.pid));setInterval(()=>{},1000)',
+        ],
+        {},
+      );
+      const descendant = await new Promise<number>((resolve, reject) => {
+        child.stdout.once("data", (chunk: Buffer) =>
+          resolve(Number(chunk.toString().trim())),
+        );
+        child.once("exit", () => reject(new Error("Exited before readiness")));
+      });
+      await stopProcessTree(child, true);
+      expect(() => process.kill(descendant, 0)).toThrow(
+        expect.objectContaining({ code: "ESRCH" }),
+      );
     },
     30_000,
   );
@@ -69,42 +97,38 @@ describe("Windows process quiescence", () => {
     30_000,
   );
 
-  it.skipIf(process.platform !== "win32")(
-    "preserves stdin bytes sent during managed startup",
-    async () => {
-      const child = spawnManagedProcess(
-        process.execPath,
-        [
-          "-e",
-          'process.stdin.once("data",(data)=>{process.stdout.write(data);process.exit(0)})',
-        ],
-        { windowsHide: true },
-      );
-      const output: Buffer[] = [];
-      child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
-      child.stdin.write('{"request":"early ACP initialize"}\n');
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(
-            () => reject(new Error("Managed stdin did not arrive")),
-            10_000,
-          );
-          child.once("close", () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-        expect(Buffer.concat(output).toString()).toBe(
-          '{"request":"early ACP initialize"}\n',
+  it("preserves stdin bytes sent during managed startup", async () => {
+    const child = spawnManagedProcess(
+      process.execPath,
+      [
+        "-e",
+        'process.stdin.once("data",(data)=>{process.stdout.write(data);process.exit(0)})',
+      ],
+      { windowsHide: true },
+    );
+    const output: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
+    child.stdin.write('{"request":"early ACP initialize"}\n');
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("Managed stdin did not arrive")),
+          10_000,
         );
-      } finally {
-        await stopProcessTree(child, true);
-      }
-    },
-    30_000,
-  );
+        child.once("close", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+      expect(Buffer.concat(output).toString()).toBe(
+        '{"request":"early ACP initialize"}\n',
+      );
+    } finally {
+      await stopProcessTree(child, true);
+    }
+  }, 30_000);
 
-  it.skipIf(process.platform !== "win32").each([0, 7])(
+  it.each([0, 7])(
     "verifies a naturally exited managed process (%i) and its orphaned grandchild",
     async (code) => {
       const child = spawnManagedProcess(
@@ -137,27 +161,24 @@ describe("Windows process quiescence", () => {
     30_000,
   );
 
-  it.skipIf(process.platform !== "win32")(
-    "stops a live managed job and verifies every process before returning",
-    async () => {
-      const child = spawnManagedProcess(
-        process.execPath,
-        ["-e", 'console.log("ready");setTimeout(()=>{},30000)'],
-        { windowsHide: true },
-      );
-      try {
-        await new Promise<void>((resolve, reject) => {
-          child.stdout.once("data", () => resolve());
-          child.once("exit", () => reject(new Error("Job exited before readiness")));
-        });
-        await stopProcessTree(child, true);
-        expect(child.exitCode).not.toBeNull();
-      } finally {
-        await stopProcessTree(child, true);
-      }
-    },
-    30_000,
-  );
+  it("stops a live managed job and verifies every process before returning", async () => {
+    const child = spawnManagedProcess(
+      process.execPath,
+      ["-e", 'console.log("ready");setTimeout(()=>{},30000)'],
+      { windowsHide: true },
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.stdout.once("data", () => resolve());
+        child.once("exit", () => reject(new Error("Job exited before readiness")));
+      });
+      await stopProcessTree(child, true);
+      // A job exits with a code; a POSIX group member ends on a signal.
+      expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+    } finally {
+      await stopProcessTree(child, true);
+    }
+  }, 30_000);
 
   it.skipIf(process.platform !== "win32")(
     "waits for the ACP-shaped process and its shell descendant to exit",
@@ -234,6 +255,40 @@ describe("POSIX process quiescence", () => {
       expect(() => process.kill(descendant, 0)).toThrow(
         expect.objectContaining({ code: "ESRCH" }),
       );
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "kills tracked groups on exit, and forgets a group once its leader exits",
+    async () => {
+      const spawnGroup = () =>
+        spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000)"], {
+          detached: true,
+          stdio: "ignore",
+        });
+      const exited = spawnGroup();
+      const running = spawnGroup();
+      try {
+        trackProcessGroup(exited);
+        trackProcessGroup(running);
+        const exitedPid = exited.pid!;
+        await new Promise<void>((resolve) => {
+          exited.once("exit", () => resolve());
+          process.kill(exitedPid, "SIGKILL");
+        });
+
+        const closed = new Promise<void>((resolve) =>
+          running.once("exit", () => resolve()),
+        );
+        killTrackedProcessGroups();
+        await closed;
+        expect(running.signalCode).toBe("SIGKILL");
+      } finally {
+        for (const child of [exited, running]) {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        }
+      }
     },
     30_000,
   );

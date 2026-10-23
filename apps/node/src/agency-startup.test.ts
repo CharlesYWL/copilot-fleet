@@ -61,6 +61,10 @@ vi.mock("node:child_process", async (importOriginal) => ({
   spawn: vi.fn(),
 }));
 vi.mock("./process-quiescence.js", () => ({
+  // Children here are fakes; process-group ownership is covered by
+  // agent-process-group.test.ts against real processes.
+  OWN_PROCESS_GROUP: false,
+  trackProcessGroup: vi.fn(),
   spawnManagedProcess: vi.fn(),
   stopProcessTree: vi.fn(async (child: ChildProcess) => {
     child.kill();

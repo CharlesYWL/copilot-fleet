@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { win32 } from "node:path";
+import { join, posix, win32 } from "node:path";
 import process from "node:process";
 
 const ACTIONS = new Set([
@@ -100,12 +100,43 @@ export function windowsSid() {
   return sid;
 }
 
+/**
+ * The account a login service belongs to: a Windows SID, or `uid:<n>` on
+ * Linux and macOS. Root is refused there, as LocalSystem is on Windows; the
+ * service runs agents with the user's own credentials, never as root.
+ */
+export function accountId(platform = process.platform) {
+  if (platform === "win32") return windowsSid();
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new Error("Cannot establish the current user.");
+  if (uid === 0)
+    throw new Error("Login startup must run as your normal user account, not root.");
+  return `uid:${uid}`;
+}
+
+const isWindowsAccount = (value) =>
+  /^S-\d+(?:-\d+)+$/.test(value || "") &&
+  !["S-1-5-18", "S-1-5-19", "S-1-5-20"].includes(value);
+const isPosixAccount = (value) => /^uid:[1-9]\d*$/.test(value || "");
+
 export function taskName(kind, sid) {
   const suffix = createHash("sha256").update(sid).digest("hex").slice(0, 12);
+  if (isPosixAccount(sid)) return `copilot-fleet-${kind}`;
   return `CopilotFleet${kind === "host" ? "Host" : "Node"}Login-${suffix}`;
 }
 
-export function loginDirectory(kind, env = process.env) {
+export function loginDirectory(kind, env = process.env, platform = process.platform) {
+  if (platform !== "win32") {
+    // XDG state, the right home for a service's manifest and runtime log.
+    const base =
+      env.XDG_STATE_HOME && posix.isAbsolute(env.XDG_STATE_HOME)
+        ? env.XDG_STATE_HOME
+        : env.HOME && posix.isAbsolute(env.HOME)
+          ? posix.join(env.HOME, ".local", "state")
+          : undefined;
+    if (!base) throw new Error("A normal user profile with HOME is required.");
+    return posix.join(base, "copilot-fleet", "login", kind);
+  }
   if (!env.LOCALAPPDATA || !win32.isAbsolute(env.LOCALAPPDATA)) {
     throw new Error("A normal Windows user profile with LOCALAPPDATA is required.");
   }
@@ -121,17 +152,21 @@ export function captureEnvironment(env = process.env) {
 }
 
 export function validateManifest(value, sid) {
+  const posixAccount = isPosixAccount(sid);
   if (
     !value ||
     value.schemaVersion !== 1 ||
     !["host", "node"].includes(value.kind) ||
-    !/^S-\d+(?:-\d+)+$/.test(value.accountSid || "") ||
-    ["S-1-5-18", "S-1-5-19", "S-1-5-20"].includes(value.accountSid) ||
+    !(posixAccount
+      ? isPosixAccount(value.accountSid)
+      : isWindowsAccount(value.accountSid)) ||
     value.accountSid !== sid ||
     value.taskName !== taskName(value.kind, sid)
   ) {
-    throw new Error("Login-start manifest does not belong to this Windows user.");
+    throw new Error("Login-start manifest does not belong to this user account.");
   }
+  // Absolute paths for the platform the manifest was written on.
+  const absolutePath = posixAccount ? /^\// : /^(?:[a-z]:[\\/]|\\\\[^\\/]+\\[^\\/]+)/i;
   for (const field of [
     "repositoryPath",
     "nodePath",
@@ -141,7 +176,7 @@ export function validateManifest(value, sid) {
   ]) {
     if (
       typeof value[field] !== "string" ||
-      !/^(?:[a-z]:[\\/]|\\\\[^\\/]+\\[^\\/]+)/i.test(value[field]) ||
+      !absolutePath.test(value[field]) ||
       /[\0\r\n"]/.test(value[field])
     )
       throw new Error(`Invalid login-start ${field}.`);
@@ -181,7 +216,7 @@ export function readManifest(path, sid) {
 }
 
 export function assertIdleNode(directory, alive = processAlive) {
-  const lock = win32.join(directory, "node.lock");
+  const lock = join(directory, "node.lock");
   if (!existsSync(lock)) return;
   const pid = Number(readFileSync(lock, "utf8").trim());
   if (!Number.isInteger(pid) || pid <= 0)

@@ -83,6 +83,24 @@ tenant ID and opens the setup tour immediately. A normal fresh
 public sign-in needs a registered public client/config supplied by the operator
 or publisher; this repository does not bundle a working public default.
 
+### Linux notes
+
+The Host and Node run on Linux with the same features as on Windows: plain and
+managed (worktree) sessions, remote commands, Node and Host updates, and a login
+service. The differences:
+
+- **Remote commands** run in `/bin/sh` (shown as **POSIX sh**) instead of Windows
+  PowerShell 5.1. See [Approved remote commands](orchestration.md#approved-remote-commands).
+- **Process ownership** uses process groups instead of Windows Job Objects. A
+  tool that detaches itself with `setsid()` is not tracked; see
+  [managed worktree isolation](../managed-worktree-isolation.md).
+- **Login startup** uses a `systemd --user` unit; see
+  [Linux login startup](../linux-login-startup.md). Without systemd (for example
+  plain WSL), run `npm start`, which updates and restarts the Host and Node
+  itself.
+
+macOS uses the same code paths but is not tested, and has no login service.
+
 After enrolling a local Node, use the combined development command below to
 keep the tunnel in a separate process while editing:
 

@@ -2,18 +2,35 @@ import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, realpath, rename, rm, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   COMMAND_OBSERVATION_CLOCK_ENV,
   CommandObservationClockSchema,
+  type CommandShell,
   type commandObservationClock,
 } from "@fleet/protocol";
 import {
   COMMAND_SUPERVISOR_ERROR_LIMIT,
   commandSupervisorScript,
 } from "./command-supervisor-native.js";
+import { posixProcessStartTime } from "./posix-process-identity.js";
 
 const execute = promisify(execFile);
+const windows = process.platform === "win32";
+/**
+ * The POSIX supervisor: a dependency-free module compiled beside this one.
+ * Under the test runner this module is TypeScript source, so the runner is
+ * too, and Node loads it with type stripping.
+ */
+const POSIX_RUNNER = fileURLToPath(
+  new URL(
+    import.meta.url.endsWith(".ts")
+      ? "./command-supervisor-posix-runner.ts"
+      : "./command-supervisor-posix-runner.js",
+    import.meta.url,
+  ),
+);
 const MAX_SCRIPT_BYTES = 16 * 1024;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 const PREPARE_TIMEOUT_MS = 30_000;
@@ -161,10 +178,13 @@ async function sameIdentity(
       (a.root.pid === b.root?.pid && a.root.creationTime === b.root.creationTime)) &&
     // Windows 8.3 names, long names and junction aliases can identify the same
     // directory. Never relax process/attempt identity to compensate for spelling.
-    (await realpath(a.directory)).toLowerCase() ===
-      (await realpath(b.directory)).toLowerCase()
+    samePathSpelling(await realpath(a.directory), await realpath(b.directory))
   );
 }
+
+/** Windows paths compare case-insensitively; POSIX paths are case-sensitive. */
+const samePathSpelling = (left: string, right: string): boolean =>
+  windows ? left.toLowerCase() === right.toLowerCase() : left === right;
 
 function validResult(value: unknown): value is CommandProcessResult {
   if (
@@ -327,8 +347,12 @@ async function scriptFile(path: string, source: string): Promise<void> {
 }
 
 async function trustedShell(): Promise<string> {
-  if (process.platform !== "win32")
-    throw new Error("Command supervision requires Windows.");
+  if (!windows) {
+    // The system shell at its fixed location, never PATH, cwd or a request field.
+    const canonical = await realpath("/bin/sh");
+    if (!(await stat(canonical)).isFile()) throw new Error("/bin/sh is missing.");
+    return canonical;
+  }
   // This is OS installation metadata, never PATH, cwd, a request field, or pwsh.
   const root = process.env.SystemRoot ?? "C:\\Windows";
   if (!isAbsolute(root))
@@ -339,6 +363,11 @@ async function trustedShell(): Promise<string> {
     throw new Error("Windows PowerShell is missing.");
   return canonical;
 }
+
+/** The shell this platform's supervisor runs, as the protocol names it. */
+export const nativeCommandShell: CommandShell = windows
+  ? "windows-powershell-5.1"
+  : "posix-sh";
 
 function checkArguments(shell: string, args: readonly string[]): void {
   // Conservatively below both Win32's 32767 and cmd's 8191 limits. User scripts
@@ -353,6 +382,16 @@ async function secureDirectory(
   shell: string,
 ): Promise<CommandProcessIdentity["parent"]> {
   await mkdir(directory, { mode: 0o700 }); // Nonrecursive and exclusive: never reuse an attempt.
+  if (!windows) {
+    // 0700 under the umask is owner-only already; prove it rather than assume.
+    const info = await stat(directory);
+    if (info.uid !== process.getuid!() || (info.mode & 0o077) !== 0)
+      throw new Error("Attempt directory is not private to this user.");
+    const creationTime = posixProcessStartTime(process.pid);
+    if (!creationTime)
+      throw new Error("Could not establish Node parent creation identity.");
+    return { pid: process.pid, creationTime };
+  }
   const fixedCode = [
     "$ErrorActionPreference='Stop'",
     "if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -lt 1) { throw 'Windows PowerShell 5.1 required' }",
@@ -445,24 +484,16 @@ async function tailOutput(
   return progress;
 }
 
-async function prepare(
+/**
+ * Compiles and starts the Windows PowerShell Job Object supervisor.
+ * Behaviour is unchanged from before POSIX support; it only moved here.
+ */
+async function launchWindowsSupervisor(
   input: CommandProcessInput,
+  manifest: Manifest,
   shellPath: string,
-): Promise<PreparedCommandProcess> {
-  validate(input);
-  if (!(await stat(input.cwd)).isDirectory())
-    throw new Error("Command cwd is not a directory.");
-  const parent = await secureDirectory(input.directory, shellPath);
-  input = { ...input, directory: await realpath(input.directory) };
-  const manifest: Manifest = {
-    ...input,
-    version: 1,
-    shellPath,
-    parent,
-    jobId: `Local\\fleet-command-${randomUUID()}`,
-    controlId: randomUUID(),
-    commandSha256: createHash("sha256").update(input.command, "utf8").digest("hex"),
-  };
+  baseEnv: NodeJS.ProcessEnv,
+): Promise<ChildProcess> {
   await mkdir(join(input.directory, "compiler"), { mode: 0o700 });
   await scriptFile(join(input.directory, "command.ps1"), input.command);
   // Capture status immediately. In particular, Windows PowerShell -File alone
@@ -491,17 +522,10 @@ async function prepare(
   ];
   checkArguments(shellPath, args);
   const supervisorEnv = {
-    ...Object.fromEntries(
-      Object.entries(process.env).filter(
-        ([key]) => key.toUpperCase() !== COMMAND_OBSERVATION_CLOCK_ENV,
-      ),
-    ),
+    ...baseEnv,
+    // Add-Type's compiler scratch belongs to this exact attempt, not shared TEMP.
     TEMP: join(input.directory, "compiler"),
     TMP: join(input.directory, "compiler"),
-    // Never inherit a clock from a parent shell or a different command.
-    [COMMAND_OBSERVATION_CLOCK_ENV]: input.observationClock
-      ? JSON.stringify(CommandObservationClockSchema.parse(input.observationClock))
-      : "",
   };
   // PowerShell's policy gates the fixed compiler bootstrap as well as the user
   // script. The generated executable is private, absolute, and contains no user
@@ -515,16 +539,94 @@ async function prepare(
   });
   const launcher = join(input.directory, "supervisor.exe");
   checkArguments(launcher, []);
-  const child: ChildProcess = spawn(launcher, [], {
+  return spawn(launcher, [], {
     cwd: input.directory,
     windowsHide: true,
     // Escape libuv's parent-lifetime job, NOT the command's no-breakaway job.
     // DETACHED_PROCESS works for this native launcher, unlike PowerShell 5.1.
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
-    // Add-Type's compiler scratch belongs to this exact attempt, not shared TEMP.
     env: supervisorEnv,
   });
+}
+
+/**
+ * The POSIX wrapper `/bin/sh` runs as the command's root.
+ *
+ * It blocks on fd 3 until the supervisor opens the gate after durable release;
+ * EOF there (cancellation, expiry or a dead supervisor) exits without running
+ * anything. User code then runs as a separate script, so `set -e`, `exit` or a
+ * syntax error inside it cannot skip the wrapper's status capture. Stdin is
+ * EOF from birth, as on Windows.
+ */
+const POSIX_INVOKE = [
+  "#!/bin/sh",
+  "IFS= read -r fleet_gate <&3 || exit 125",
+  "exec 3<&- </dev/null",
+  // $1 is the trusted shell path the supervisor ran this wrapper with.
+  `exec "$1" "$(dirname "$0")/command.sh"`,
+].join("\n");
+
+/** Starts the POSIX supervisor detached, so it outlives a Node crash. */
+async function launchPosixSupervisor(
+  input: CommandProcessInput,
+  manifest: Manifest,
+  supervisorEnv: NodeJS.ProcessEnv,
+): Promise<ChildProcess> {
+  await durableFile(join(input.directory, "command.sh"), input.command);
+  await durableFile(join(input.directory, "invoke.sh"), `${POSIX_INVOKE}\n`);
+  await durableFile(join(input.directory, "manifest.json"), JSON.stringify(manifest));
+  return spawn(
+    process.execPath,
+    [
+      // TypeScript source only under the test runner; the build is plain JS.
+      ...(POSIX_RUNNER.endsWith(".ts") ? ["--import", "tsx"] : []),
+      POSIX_RUNNER,
+      input.directory,
+    ],
+    {
+      cwd: input.directory,
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: supervisorEnv,
+    },
+  );
+}
+
+async function prepare(
+  input: CommandProcessInput,
+  shellPath: string,
+): Promise<PreparedCommandProcess> {
+  validate(input);
+  if (!(await stat(input.cwd)).isDirectory())
+    throw new Error("Command cwd is not a directory.");
+  const parent = await secureDirectory(input.directory, shellPath);
+  input = { ...input, directory: await realpath(input.directory) };
+  const manifest: Manifest = {
+    ...input,
+    version: 1,
+    shellPath,
+    parent,
+    jobId: windows
+      ? `Local\\fleet-command-${randomUUID()}`
+      : `posix-pgroup-${randomUUID()}`,
+    controlId: randomUUID(),
+    commandSha256: createHash("sha256").update(input.command, "utf8").digest("hex"),
+  };
+  const supervisorEnv = {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([key]) => key.toUpperCase() !== COMMAND_OBSERVATION_CLOCK_ENV,
+      ),
+    ),
+    // Never inherit a clock from a parent shell or a different command.
+    [COMMAND_OBSERVATION_CLOCK_ENV]: input.observationClock
+      ? JSON.stringify(CommandObservationClockSchema.parse(input.observationClock))
+      : "",
+  };
+  const child = windows
+    ? await launchWindowsSupervisor(input, manifest, shellPath, supervisorEnv)
+    : await launchPosixSupervisor(input, manifest, supervisorEnv);
   let closed = false;
   let diagnostic = Buffer.alloc(0);
   child.stderr?.on("data", (bytes: Buffer) => {
@@ -650,19 +752,32 @@ async function prepare(
   };
 }
 
-let readiness:
-  Promise<{ supported: boolean; reason: string; shellPath?: string }> | undefined;
+let readiness: Promise<CommandSupervisorReadiness> | undefined;
+
+export type CommandSupervisorReadiness = {
+  supported: boolean;
+  reason: string;
+  shellPath?: string;
+  /** The shells the supervisor proved it can run; empty when unsupported. */
+  shells: CommandShell[];
+};
+
+const READINESS_PROBE: Record<CommandShell, string> = {
+  "windows-powershell-5.1": "[Console]::Write('fleet-command-ready'); exit 0",
+  "posix-sh": "printf fleet-command-ready",
+};
+const READINESS_REASON: Record<CommandShell, string> = {
+  "windows-powershell-5.1":
+    "Windows PowerShell 5.1 suspended Job Object supervision verified.",
+  "posix-sh": "POSIX sh process-group supervision verified.",
+};
 
 /**
  * Fixed code, the actual supervisor, actual job assignment and verified emptiness.
  * Cached for this Node lifetime; every prepare still compiles under current policy.
  * This is process ownership, not a sandbox against code running as the same OS user.
  */
-export function commandSupervisorReadiness(): Promise<{
-  supported: boolean;
-  reason: string;
-  shellPath?: string;
-}> {
+export function commandSupervisorReadiness(): Promise<CommandSupervisorReadiness> {
   readiness ??= (async () => {
     const directory = resolve(`.command-supervisor-readiness-${randomUUID()}`);
     try {
@@ -673,7 +788,7 @@ export function commandSupervisorReadiness(): Promise<{
           attemptId: randomUUID(),
           directory,
           cwd: process.cwd(),
-          command: "[Console]::Write('fleet-command-ready'); exit 0",
+          command: READINESS_PROBE[nativeCommandShell],
           timeoutMs: 10_000,
           startExpiresAt: new Date(Date.now() + 60_000).toISOString(),
         },
@@ -694,11 +809,12 @@ export function commandSupervisorReadiness(): Promise<{
       }
       return {
         supported: true,
-        reason: "Windows PowerShell 5.1 suspended Job Object supervision verified.",
+        reason: READINESS_REASON[nativeCommandShell],
         shellPath,
+        shells: [nativeCommandShell],
       };
     } catch (error) {
-      return { supported: false, reason: (error as Error).message };
+      return { supported: false, reason: (error as Error).message, shells: [] };
     } finally {
       const receipt = await readCommandProcessReceipt(directory).catch(() => null);
       // A failed probe with uncertain ownership is deliberately left for inspection.

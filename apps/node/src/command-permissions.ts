@@ -23,13 +23,18 @@ import {
 
 export const DEFAULT_COMMAND_PERMISSION_RULES: CommandPermissionRule[] = [
   { id: "builtin-cd", commandKey: "cd", command: "cd", path: "*", builtin: true },
-  {
-    id: "builtin-set-location",
-    commandKey: "set-location",
-    command: "set-location",
-    path: "*",
-    builtin: true,
-  },
+  // PowerShell's own name for cd; POSIX shells have no such command.
+  ...(process.platform === "win32"
+    ? [
+        {
+          id: "builtin-set-location",
+          commandKey: "set-location",
+          command: "set-location",
+          path: "*",
+          builtin: true,
+        },
+      ]
+    : []),
 ];
 
 const EXECUTABLE_PIN = /^(.*) @sha256:([a-f0-9]{64})$/;
@@ -489,10 +494,13 @@ function concreteCommandIdentity(
     const executable = resolveExecutable(name, cwd);
     if (!isAbsolute(executable.path) || !/^[a-f0-9]{64}$/.test(executable.fingerprint))
       throw new Error("Resolver did not supply a concrete executable identity.");
-    if (
-      !/^npm(?:\.(?:exe|com|cmd|ps1))?$/.test(name) &&
-      ![".exe", ".com"].includes(extname(executable.path).toLowerCase())
-    )
+    const isNpm = /^npm(?:\.(?:exe|com|cmd|ps1))?$/.test(name);
+    // Windows decides by extension; a POSIX resolver reports whether the file
+    // it pinned is a compiled program (ELF/Mach-O) rather than a script.
+    const native =
+      executable.native ??
+      [".exe", ".com"].includes(extname(executable.path).toLowerCase());
+    if (!isNpm && !native)
       throw new Error(
         "Script launchers are Once-only unless the known npm task identity is explicit.",
       );

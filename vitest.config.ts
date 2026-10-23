@@ -13,6 +13,7 @@ const processSuites = [
   "apps/node/src/command-execution-manager.test.ts",
   "apps/node/src/command-storage.test.ts",
   "apps/node/src/command-supervisor.test.ts",
+  "apps/node/src/command-supervisor-posix.test.ts",
   "apps/node/src/managed-worktrees.test.ts",
   "packages/protocol/src/updater.integration.test.ts",
   "scripts/launcher.integration.test.js",

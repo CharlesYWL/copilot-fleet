@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMMAND_EXECUTION_CAPABILITY,
   COMMAND_PERMISSIONS_CAPABILITY,
+  POSIX_COMMAND_SHELL_CAPABILITY,
   COMMAND_LIMITS,
   PR_MAINTENANCE_WAKE_LIMITS,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
@@ -266,6 +267,25 @@ function setup(path = ":memory:") {
     result,
   };
 }
+
+describe("POSIX command shell negotiation", () => {
+  it("confirms posix-sh only to Nodes that advertise it, and admits posix-sh requests", () => {
+    const f = setup();
+    expect(f.connect(f.node.id, capabilities)).not.toHaveProperty("posixCommandShell");
+    expect(
+      f.connect(f.node.id, [...capabilities, POSIX_COMMAND_SHELL_CAPABILITY]),
+    ).toMatchObject({ posixCommandShell: true });
+
+    f.service.commands.handleNodeMessage(f.node.id, {
+      type: "command_execution_inventory",
+      readiness: { ...readiness, shells: ["posix-sh"] },
+      executions: [],
+    });
+    expect(() => f.request()).toThrow();
+    const execution = f.request({ shell: "posix-sh", command: "printf ok" });
+    expect(execution.shell).toBe("posix-sh");
+  });
+});
 
 describe("Node-owned command permissions", () => {
   const permissionCapabilities = [...capabilities, COMMAND_PERMISSIONS_CAPABILITY];

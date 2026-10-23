@@ -687,8 +687,14 @@ directory. Those targets are refused rather than placed in a separate exclusion
 namespace. Actual journal and native-supervisor files, as well as output rows,
 count toward admission storage limits; low free space refuses new work.
 
-The initial shell is explicitly **Windows PowerShell 5.1**
-(`windows-powershell-5.1`). Each execution has a fresh, noninteractive shell and
+Each Node runs commands in one shell, reported in its readiness: **Windows
+PowerShell 5.1** (`windows-powershell-5.1`) on Windows, and **POSIX sh**
+(`posix-sh`, the system `/bin/sh`) on Linux and macOS. The Orchestrator is told
+which shell each target supports and must write the script for it; a request for
+a shell the target does not list is refused. The script's exit status is that of
+its last command (`set -e` is not imposed), and stdin is `/dev/null`. A Linux or
+macOS Node offers `posix-sh` only when its Host is new enough to understand it.
+Each execution has a fresh, noninteractive shell and
 a separate starting directory. Git and `npm run` work there; `cd` and variables
 do not persist to later executions. Scripts are limited to 16 KiB of UTF-8 text,
 with a five-minute default and one-hour maximum runtime. An unstarted request

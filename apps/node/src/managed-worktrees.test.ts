@@ -2131,11 +2131,12 @@ describe("real Git managed task worktrees", { timeout: 180_000 }, () => {
     ).stdout.trim();
     const stalePath = join(tree.path, "moved");
     await writeFile(join(gitDirectory, "gitdir"), join(stalePath, ".git"));
-    expect(
+    // Older Git reports the gitdir file verbatim; newer Git strips "/.git".
+    expect([stalePath, join(stalePath, ".git")]).toContain(
       parseWorktreeRegistry(
         (await git.run(source, ["worktree", "list", "--porcelain", "-z"])).stdout,
       ).find((entry) => entry.branch === tree.branchRef)?.path,
-    ).toBe(join(stalePath, ".git"));
+    );
 
     const reconciled = await operation(manager, tree, "reconcile");
 

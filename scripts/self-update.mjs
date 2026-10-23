@@ -23,7 +23,7 @@ import { closeSync, openSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { loginDirectory, readManifest, windowsSid } from "./login-service.mjs";
+import { accountId, loginDirectory, readManifest, windowsSid } from "./login-service.mjs";
 
 const checkoutRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -188,14 +188,17 @@ function commandError(error) {
 export function schedule(
   options,
   {
-    sid = windowsSid(),
+    sid,
     exec = execFileSync,
     nodePath = process.execPath,
     root = checkoutRoot,
     platform = process.platform,
   } = {},
 ) {
-  if (platform !== "win32") throw new Error("The login service exists only on Windows.");
+  if (platform === "linux") return scheduleLinux(options, { exec, nodePath, root });
+  if (platform !== "win32")
+    throw new Error("The login service exists only on Windows and Linux.");
+  sid ??= windowsSid();
   const taskName = updateTaskName(sid);
   const schtasks = win32.join(system32(), "schtasks.exe");
   const definition = taskXml({
@@ -226,10 +229,60 @@ export function schedule(
   return { ok: true, taskName };
 }
 
-/** The Host task's saved PATH and profile, which Task Scheduler does not give this one. */
+/** The transient systemd unit an update runs in; one per update id. */
+export function linuxUpdateUnit(updateId) {
+  return `copilot-fleet-update-${updateId}`;
+}
+
+/**
+ * Linux counterpart of the one-off task: a transient `systemd --user` unit.
+ *
+ * The Host's own unit stops its whole control group when it restarts, so the
+ * update cannot be a child of the Host. `systemd-run --user` starts it in a
+ * separate unit that outlives that restart; `--collect` removes the unit when
+ * it finishes, which plays the part of the Windows task deleting itself.
+ */
+function scheduleLinux(options, { exec, nodePath, root }) {
+  const unit = linuxUpdateUnit(options.updateId);
+  exec(
+    "systemd-run",
+    [
+      "--user",
+      `--unit=${unit}`,
+      "--collect",
+      "--quiet",
+      `--working-directory=${root}`,
+      "--",
+      nodePath,
+      join(root, "scripts", "self-update.mjs"),
+      "run",
+      "--status",
+      options.statusFile,
+      "--update-id",
+      options.updateId,
+      "--restart",
+      options.restart,
+      ...(options.runningRevision ? ["--running-revision", options.runningRevision] : []),
+    ],
+    { stdio: "pipe", timeout: 60_000 },
+  );
+  return { ok: true, taskName: unit };
+}
+
+/** The Host service's saved PATH and profile, which the update's own context lacks. */
 function hostTaskEnvironment() {
-  return readManifest(join(loginDirectory("host"), "manifest.json"), windowsSid())
+  return readManifest(join(loginDirectory("host"), "manifest.json"), accountId())
     .environment;
+}
+
+/** Deletes the one-off update task; a transient systemd unit collects itself. */
+function removeUpdateTask() {
+  if (process.platform !== "win32") return;
+  execFileSync(
+    win32.join(system32(), "schtasks.exe"),
+    ["/Delete", "/TN", updateTaskName(windowsSid()), "/F"],
+    { windowsHide: true, stdio: "ignore", timeout: 60_000 },
+  );
 }
 
 /**
@@ -311,12 +364,7 @@ export async function run(
     loadUpdater = () => import("@fleet/protocol/updater"),
     environment = hostTaskEnvironment,
     restart = restartServices,
-    removeTask = () =>
-      execFileSync(
-        win32.join(system32(), "schtasks.exe"),
-        ["/Delete", "/TN", updateTaskName(windowsSid()), "/F"],
-        { windowsHide: true, stdio: "ignore", timeout: 60_000 },
-      ),
+    removeTask = removeUpdateTask,
   } = {},
 ) {
   const logPath = join(dirname(options.statusFile), "self-update.log");

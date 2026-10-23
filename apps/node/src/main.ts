@@ -28,6 +28,7 @@ import {
   COMMAND_EXECUTION_CAPABILITY,
   COMMAND_PERMISSIONS_CAPABILITY,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
+  POSIX_COMMAND_SHELL_CAPABILITY,
   SESSION_FILES_CAPABILITY,
   COMMAND_LIMITS,
   CommandExecutionHostMessageSchema,
@@ -437,6 +438,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let sealedConnection = false;
   let commandExecutionsNegotiated = false;
   let commandPermissionsNegotiated = false;
+  let posixCommandShellNegotiated = false;
   let leadDeliveryNegotiated = false;
   /**
    * Stops the liveness watchdog on whichever socket is current.
@@ -792,6 +794,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       sealed: sealedConnection && !!channel,
       negotiated: commandExecutionsNegotiated,
       permissions: commandPermissionsNegotiated,
+      posixShell: posixCommandShellNegotiated,
       nodeId: credentials.nodeId,
       hostId:
         credentials.authProtocol === MUTUAL_AUTH_PROTOCOL ? credentials.host.hostId : "",
@@ -1376,6 +1379,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     sealedConnection = session !== undefined;
     commandExecutionsNegotiated = false;
     commandPermissionsNegotiated = false;
+    posixCommandShellNegotiated = false;
     leadDeliveryNegotiated = false;
     // Registered before the close handler below so the watchdog is gone before
     // anything decides what to do about the disconnection.
@@ -1386,6 +1390,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         channel = undefined;
         commandExecutionsNegotiated = false;
         commandPermissionsNegotiated = false;
+        posixCommandShellNegotiated = false;
         leadDeliveryNegotiated = false;
       }
     });
@@ -1410,7 +1415,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           ...(session ? [DURABLE_LEAD_DELIVERY_CAPABILITY] : []),
           // Receipt reconciliation remains available after local opt-out or readiness failure.
           ...(session
-            ? [COMMAND_EXECUTION_CAPABILITY, COMMAND_PERMISSIONS_CAPABILITY]
+            ? [
+                COMMAND_EXECUTION_CAPABILITY,
+                COMMAND_PERMISSIONS_CAPABILITY,
+                POSIX_COMMAND_SHELL_CAPABILITY,
+              ]
             : []),
           // File bytes only ever cross a sealed channel.
           ...(session ? [SESSION_FILES_CAPABILITY] : []),
@@ -1528,6 +1537,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           !!session && !!channel && frame.value.durableLeadDelivery;
         commandPermissionsNegotiated =
           commandExecutionsNegotiated && frame.value.commandPermissions;
+        posixCommandShellNegotiated =
+          commandExecutionsNegotiated && frame.value.posixCommandShell === true;
         sessionConsoleSupported = !!channel && frame.value.sessionConsole === true;
         usageNegotiated = !!channel && frame.value.usageSnapshots === true;
         usageInFlight = false;
@@ -2138,4 +2149,8 @@ if (process.env.NODE_ENV !== "test") {
   };
   process.once("SIGINT", terminate);
   process.once("SIGTERM", terminate);
+  // Agents lead their own process groups on Linux and macOS, so closing the
+  // terminal no longer hangs them up directly: the Node has to stop them. The
+  // supervisor also forwards SIGHUP here.
+  if (process.platform !== "win32") process.once("SIGHUP", terminate);
 }

@@ -9,7 +9,7 @@ import { finished } from "node:stream/promises";
 import { setTimeout, clearTimeout } from "node:timers";
 import { pathToFileURL } from "node:url";
 import { Buffer } from "node:buffer";
-import { assertIdleNode, readManifest, windowsSid } from "./login-service.mjs";
+import { accountId, assertIdleNode, readManifest } from "./login-service.mjs";
 
 export function frameRpc(request) {
   const body = JSON.stringify(request);
@@ -456,10 +456,9 @@ export async function run(manifest, options = {}) {
     await log.write(
       `\n${new Date().toISOString()} [login-start] Starting ${manifest.kind} as ${manifest.accountSid}\n`,
     );
-    if (
-      manifest.kind === "node" &&
-      (process.platform === "win32" || options.processManager)
-    ) {
+    // Managed process ownership exists on every platform now: a Job Object on
+    // Windows, a verified process group on Linux and macOS.
+    if (manifest.kind === "node") {
       return await runRecoveringNode(manifest, entry, log, nodeId, options);
     }
     const child = spawn(manifest.nodePath, [entry, ...manifest.runtimeArgs], {
@@ -491,7 +490,7 @@ export async function main(argv = process.argv.slice(2)) {
   ) {
     throw new Error("Usage: login-service-runner.mjs <manifest> [--probe <result>]");
   }
-  const manifest = readManifest(manifestPath, windowsSid());
+  const manifest = readManifest(manifestPath, accountId());
   Object.assign(process.env, manifest.environment);
   process.chdir(manifest.repositoryPath);
   if (flag === "--probe") {

@@ -72,6 +72,24 @@ separate sign-ins.
 See [Windows login startup](../windows-login-startup.md) for options, lifecycle
 details, credential caveats, and all historical design references.
 
+## Linux login startup
+
+On Linux the same `npm run service -- ...` commands install a **`systemd --user`**
+unit per workload (`copilot-fleet-host.service`, `copilot-fleet-node.service`)
+instead of a scheduled task. It runs as your normal account, starts at login,
+and also at boot once lingering is enabled
+(`sudo loginctl enable-linger "$USER"`). Root is refused.
+
+```bash
+npm run service -- node install --existing-node
+npm run service -- host+node status
+```
+
+It needs a running systemd user manager. Plain WSL and containers usually have
+none: enable `systemd=true` in `/etc/wsl.conf`, or run `npm start` under the
+launcher, which also updates and restarts the Host and Node. See
+[Linux login startup](../linux-login-startup.md) for details.
+
 ## Windows Node (PowerShell)
 
 Install Node.js, then run `copilot update` and `copilot login` as the same OS

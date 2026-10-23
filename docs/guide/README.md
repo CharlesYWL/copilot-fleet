@@ -22,8 +22,9 @@ Deeper design records: [ARCHITECTURE.md](../../ARCHITECTURE.md),
 [orchestration lifecycle](../orchestration-lifecycle.md),
 [managed worktree isolation](../managed-worktree-isolation.md),
 [Node session console](../node-session-console.md),
-[session usage snapshots](../session-usage-design.md), and
-[Windows login startup](../windows-login-startup.md).
+[session usage snapshots](../session-usage-design.md),
+[Windows login startup](../windows-login-startup.md), and
+[Linux login startup](../linux-login-startup.md).
 
 ## Feature map
 
@@ -41,6 +42,7 @@ Deeper design records: [ARCHITECTURE.md](../../ARCHITECTURE.md),
   and [following a moved Host URL](nodes.md#following-the-host-to-a-new-url).
 - **Connect or maintain machines:** [Windows Node](nodes.md#windows-node-powershell),
   [Windows login startup](nodes.md#windows-login-startup),
+  [Linux login startup](nodes.md#linux-login-startup),
   [Node command-line flags](nodes.md#node-command-line-flags),
   [Node config page](nodes.md#node-config-page),
   [keeping nodes up to date](operations.md#keeping-nodes-up-to-date),

@@ -1,7 +1,11 @@
 import { spawn } from "node:child_process";
 import { WorktreeConflict } from "@fleet/protocol";
 import type { CheckoutLease } from "./checkout-locks.js";
-import { stopProcessTree } from "./process-quiescence.js";
+import {
+  OWN_PROCESS_GROUP,
+  stopProcessTree,
+  trackProcessGroup,
+} from "./process-quiescence.js";
 
 export class GitFailure extends Error {
   constructor(
@@ -47,11 +51,16 @@ export class GitRunner {
     const child = spawn("git", ["--no-pager", ...args], {
       cwd,
       env,
-      detached: process.platform !== "win32",
+      detached: OWN_PROCESS_GROUP,
       shell: false,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    trackProcessGroup(child);
+    // Git may exit before reading its input (a usage error, or a command that
+    // never reads stdin). The exit status is authoritative, so a broken pipe
+    // here is not a second failure: without a listener it crashes the Node.
+    child.stdin.on("error", () => {});
     child.stdin.end(options.stdin ?? "");
     if (child.pid) options.lease?.processStarted(child.pid);
     return new Promise<GitResult>((resolve, reject) => {

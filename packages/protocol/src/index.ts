@@ -1644,6 +1644,11 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
     commandPermissions: z.boolean().default(false),
     durableLeadDelivery: z.boolean().default(false),
     /**
+     * Whether this Host accepts `posix-sh` commands and readiness. Older Hosts
+     * omit it, and a Node then offers no shell rather than one they reject.
+     */
+    posixCommandShell: z.boolean().optional(),
+    /**
      * Confirms this Host deferred reconciliation for the advertised outbox.
      *
      * Older Hosts omit it, so a newer Node flushes its events without sending

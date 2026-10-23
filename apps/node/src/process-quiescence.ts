@@ -1,17 +1,43 @@
 import {
   execFile,
   type ChildProcess,
+  type ChildProcessWithoutNullStreams,
   type SpawnOptionsWithoutStdio,
 } from "node:child_process";
 import { promisify } from "node:util";
 import { Transform } from "node:stream";
 import { jobScript, spawnWindowsJob } from "./windows-process-job.js";
+import {
+  processGroupAlive,
+  spawnPosixGroup,
+  stopProcessGroup,
+  waitForGroupExit,
+} from "./posix-process-group.js";
 
 const execute = promisify(execFile);
-const jobs = new WeakMap<
-  ChildProcess,
-  { name: string; closed: Promise<void>; verified: () => boolean }
->();
+
+/**
+ * How a managed child's whole tree is stopped and proven gone.
+ *
+ * `stop` asks the tree to end; `verified` reports whether emptiness was proven.
+ * On Windows the proof is the supervisor's stderr line after the Job Object
+ * drains; on POSIX it is the kernel reporting the process group empty.
+ */
+type ManagedOwnership = {
+  closed: Promise<void>;
+  verified: () => boolean;
+  stop: () => Promise<void>;
+};
+const jobs = new WeakMap<ChildProcess, ManagedOwnership>();
+
+/**
+ * How long a managed POSIX tree may take to empty once its leader exits.
+ *
+ * Mirrors the Windows supervisor, which terminates the job when the root
+ * exits and then waits for it to drain. Background work an agent leaves
+ * behind does not outlive the agent's session.
+ */
+const POSIX_LEADER_EXIT_DRAIN_MS = 1_000;
 
 export function killPosixProcessGroup(
   pid: number,
@@ -22,6 +48,50 @@ export function killPosixProcessGroup(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
   }
+}
+
+/**
+ * Whether a child should lead its own process group.
+ *
+ * On Linux and macOS the tree is stopped by signalling the group, which only
+ * exists if the child was spawned detached. Otherwise the child shares this
+ * process's group, the group kill finds nothing, and the agent and everything
+ * it started survive the stop. Windows uses taskkill or a Job Object instead.
+ */
+export const OWN_PROCESS_GROUP = process.platform !== "win32";
+
+const liveProcessGroups = new Set<number>();
+let exitCleanupInstalled = false;
+
+/** Kills every tracked group; for this process's own exit, so it never throws. */
+export function killTrackedProcessGroups(): void {
+  for (const pid of liveProcessGroups) {
+    try {
+      killPosixProcessGroup(pid);
+    } catch {
+      // Exiting anyway; a group that cannot be signalled cannot be helped here.
+    }
+  }
+  liveProcessGroups.clear();
+}
+
+/**
+ * Remembers a detached child's group until the child exits.
+ *
+ * A detached group no longer receives the terminal's Ctrl-C and is not taken
+ * down with this process, so an exit without a clean shutdown (a crash, or
+ * `process.exit` on a fatal error) would otherwise leave agents running with
+ * nobody to stop them. The group is dropped when its leader exits, so a PID the
+ * system has since reused is never signalled.
+ */
+export function trackProcessGroup(child: ChildProcess): void {
+  if (!OWN_PROCESS_GROUP || !child.pid) return;
+  const pid = child.pid;
+  liveProcessGroups.add(pid);
+  child.once("exit", () => liveProcessGroups.delete(pid));
+  if (exitCleanupInstalled) return;
+  exitCleanupInstalled = true;
+  process.once("exit", killTrackedProcessGroups);
 }
 
 function quiescenceStderr(proof: string, verified: () => void): Transform {
@@ -77,9 +147,17 @@ export function spawnManagedProcess(
   command: string,
   args: readonly string[],
   options: SpawnOptionsWithoutStdio,
-) {
-  if (process.platform !== "win32")
-    throw new Error("Managed ACP requires verified Windows Job Object ownership.");
+): ChildProcessWithoutNullStreams {
+  return process.platform === "win32"
+    ? spawnWindowsManaged(command, args, options)
+    : spawnPosixManaged(command, args, options);
+}
+
+function spawnWindowsManaged(
+  command: string,
+  args: readonly string[],
+  options: SpawnOptionsWithoutStdio,
+): ChildProcessWithoutNullStreams {
   const { child, job, proof } = spawnWindowsJob(command, args, options);
   let verified = false;
   child.stderr = child.stderr.pipe(
@@ -89,7 +167,64 @@ export function spawnManagedProcess(
   );
   child.stdio[2] = child.stderr;
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
-  jobs.set(child, { name: job, closed, verified: () => verified });
+  jobs.set(child, {
+    closed,
+    verified: () => verified,
+    stop: async () => {
+      await execute("powershell.exe", jobScript(`[FleetJob]::Stop('${job}')`), {
+        windowsHide: true,
+        timeout: 15_000,
+      }).catch(() => {
+        // A concurrent natural exit may destroy the job before OpenJobObject.
+        // Only the supervisor's proof decides whether release is safe.
+      });
+    },
+  });
+  return child;
+}
+
+/**
+ * The POSIX counterpart of a Job Object: the child leads a new process group.
+ *
+ * When the leader exits, whatever it left behind in its group is ended and the
+ * group is checked empty, as the Windows supervisor terminates and drains its
+ * job. `closed` resolves only once that check has run, so a lease is never
+ * released while the leader's descendants could still write to the checkout.
+ */
+function spawnPosixManaged(
+  command: string,
+  args: readonly string[],
+  options: SpawnOptionsWithoutStdio,
+): ChildProcessWithoutNullStreams {
+  const child = spawnPosixGroup(command, args, {
+    ...options,
+    stdio: ["pipe", "pipe", "pipe"],
+  }) as ChildProcessWithoutNullStreams;
+  const pgid = child.pid;
+  let verified = false;
+  const verify = async () => {
+    if (!pgid) return;
+    verified =
+      (await waitForGroupExit(pgid, POSIX_LEADER_EXIT_DRAIN_MS)) ||
+      (await stopProcessGroup(pgid, { graceMs: 0 }));
+  };
+  const closed = new Promise<void>((resolve) => {
+    child.once("close", () => void verify().finally(resolve));
+    // A spawn that failed never had a group, so there is nothing to own.
+    child.once("error", () => {
+      if (!pgid) {
+        verified = true;
+        resolve();
+      }
+    });
+  });
+  jobs.set(child, {
+    closed,
+    verified: () => verified,
+    stop: async () => {
+      if (pgid && processGroupAlive(pgid)) await stopProcessGroup(pgid);
+    },
+  });
   return child;
 }
 
@@ -105,15 +240,8 @@ export async function stopProcessTree(
     try {
       // A natural exit also empties the job, including orphaned grandchildren.
       // Missing proof (e.g. a killed supervisor) is never inferred from a PID.
-      if (child.exitCode === null && child.signalCode === null && !job.verified()) {
-        await execute("powershell.exe", jobScript(`[FleetJob]::Stop('${job.name}')`), {
-          windowsHide: true,
-          timeout: 15_000,
-        }).catch(() => {
-          // A concurrent natural exit may destroy the job before OpenJobObject.
-          // Only the supervisor's proof below decides whether release is safe.
-        });
-      }
+      if (child.exitCode === null && child.signalCode === null && !job.verified())
+        await job.stop();
       await Promise.race([
         job.closed,
         new Promise<never>((_, reject) => {
