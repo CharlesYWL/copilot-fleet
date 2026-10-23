@@ -269,6 +269,22 @@ vi.mock("./command-execution-manager.js", () => ({
   },
 }));
 vi.mock("./command-supervisor-adapter.js", () => ({ nativeCommandSupervisor: {} }));
+vi.mock("./corp-direct-diagnosis.js", () => ({
+  checkCorpDirectHost: vi.fn(async () => ({
+    kind: "network-intercepted",
+    summary: "Blocked between regions",
+    message: "A network device between this Node and the Host at 10.0.5.136 answers.",
+    checkedAt: "2026-10-23T00:00:00.000Z",
+  })),
+}));
+vi.mock("./devtunnel-diagnosis.js", () => ({
+  checkDevTunnelHost: vi.fn(async () => ({
+    kind: "tunnel-not-hosted",
+    summary: "Host is not running",
+    message: "No Host is attached to dev tunnel fleet-route.usw2.",
+    checkedAt: "2026-10-23T00:00:00.000Z",
+  })),
+}));
 
 beforeEach(() => {
   testConfigDirectory = resolvePath(`.fleet-main-config-${randomUUID()}`);
@@ -354,6 +370,111 @@ it.each(["corp-direct", "devtunnel", "direct"] as const)(
         type: "hello",
         connection: expected,
       });
+    } finally {
+      await runtime.shutdown();
+      for (const listener of process.listeners("exit"))
+        if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  },
+);
+
+it.each(["corp-direct", "devtunnel", "direct"] as const)(
+  "explains on the config page why a %s Node cannot reach its Host, once per outage",
+  async (mode) => {
+    vi.useFakeTimers();
+    vi.stubEnv("FLEET_MOCK_AGENT", "1");
+    vi.stubEnv("FLEET_DEVTUNNEL_ID", mode === "devtunnel" ? "fleet-route.usw2" : "");
+    vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { loadSettings } = await import("./settings.js");
+    const { loadCredentials } = await import("./config.js");
+    const { checkCorpDirectHost } = await import("./corp-direct-diagnosis.js");
+    const { checkDevTunnelHost } = await import("./devtunnel-diagnosis.js");
+    const { TEST_TLS_CERTIFICATE } =
+      await import("../../../packages/protocol/dist/test-tls-fixture.js");
+    vi.mocked(loadSettings).mockResolvedValueOnce({
+      ...settingsFromEnv({}),
+      hostUrl: "https://fleet.example.com",
+      ...(mode === "corp-direct"
+        ? {
+            corpDirect: {
+              hostUrl: "https://10.0.5.136:8787",
+              caCertificate: TEST_TLS_CERTIFICATE,
+            },
+          }
+        : {}),
+    });
+    vi.mocked(loadCredentials).mockResolvedValueOnce({
+      hostUrl: credentials.hostUrl,
+      nodeId: credentials.nodeId,
+      name: credentials.name,
+      authProtocol: "legacy-secret",
+      secret: "synthetic-route-secret",
+    });
+    if (mode === "corp-direct") {
+      const direct = await import("./corp-direct.js");
+      vi.spyOn(direct, "startCorpDirectForward").mockResolvedValue({
+        url: "http://127.0.0.1:19001",
+        stop: vi.fn(async () => {}),
+      });
+    }
+    if (mode === "devtunnel") {
+      const dev = await import("./devtunnel.js");
+      vi.spyOn(dev, "connectDevTunnel").mockResolvedValue({
+        url: "http://127.0.0.1:19002",
+        stop: vi.fn(),
+        recycle: vi.fn(),
+        rebuildNow: vi.fn(),
+      });
+    }
+    const exits = process.listeners("exit");
+    const { main } = await import("./main.js");
+    const runtime = await main([]);
+    const failDial = async (index: number) => {
+      sockets[index]!.emit("error", new Error("Unexpected server response: 502"));
+      sockets[index]!.emit("close", 1006);
+      await vi.advanceTimersByTimeAsync(2_000);
+    };
+    const warnings = () =>
+      (configOptions.recentLogs?.() ?? []).filter((entry) => entry.level === "warn");
+    try {
+      await failDial(0);
+      await failDial(1);
+      const problem = configOptions.getStatus().hostProblem;
+      if (mode === "corp-direct") {
+        expect(checkCorpDirectHost).toHaveBeenCalledOnce();
+        expect(checkCorpDirectHost).toHaveBeenCalledWith("https://10.0.5.136:8787");
+        expect(checkDevTunnelHost).not.toHaveBeenCalled();
+        expect(problem).toMatchObject({ kind: "network-intercepted" });
+        // The loopback helper is not where the Host is, so the outage line
+        // names the Host's private address instead.
+        const noHostLines = consoleLog.mock.calls
+          .map(([line]) => String(line))
+          .filter((line) => line.includes("No Host at"));
+        expect(noHostLines).toHaveLength(1);
+        expect(noHostLines[0]).toContain("https://10.0.5.136:8787");
+      } else if (mode === "devtunnel") {
+        expect(checkDevTunnelHost).toHaveBeenCalledOnce();
+        expect(checkDevTunnelHost).toHaveBeenCalledWith("fleet-route.usw2");
+        expect(checkCorpDirectHost).not.toHaveBeenCalled();
+        expect(problem).toMatchObject({ kind: "tunnel-not-hosted" });
+      } else {
+        expect(checkCorpDirectHost).not.toHaveBeenCalled();
+        expect(checkDevTunnelHost).not.toHaveBeenCalled();
+        expect(problem).toMatchObject({ kind: "host-connection-failed" });
+        expect(problem?.message).toContain("Unexpected server response: 502");
+      }
+      if (mode !== "direct")
+        expect(
+          warnings().filter((entry) => entry.message === problem?.message),
+        ).toHaveLength(1);
+
+      // A welcome ends the outage, and the page stops showing its cause.
+      const socket = sockets.at(-1)!;
+      await socket.open();
+      await socket.receive({ type: "welcome", nodeId: credentials.nodeId });
+      expect(configOptions.getStatus().hostProblem).toBeUndefined();
     } finally {
       await runtime.shutdown();
       for (const listener of process.listeners("exit"))

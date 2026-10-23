@@ -33,6 +33,7 @@ const NODE_SETTINGS = {
 let stored;
 let posted;
 let connected;
+let hostProblem;
 
 const reply = (body) => Promise.resolve({ ok: true, json: async () => body });
 
@@ -41,6 +42,7 @@ const respond = (path, init) => {
     nodeId: "abcdef0123456789",
     version: "0.3.0",
     connected,
+    ...(hostProblem ? { hostProblem } : {}),
     activeSessions: 0,
     mockAgent: false,
     devTunnel: null,
@@ -88,6 +90,7 @@ beforeEach(() => {
   stored = { ...NODE_SETTINGS };
   posted = [];
   connected = true;
+  hostProblem = undefined;
   vi.stubGlobal("fetch", vi.fn(respond));
   vi.useFakeTimers();
 });
@@ -373,6 +376,31 @@ describe("node settings form", () => {
 
     expect($("conn").textContent).toBe("Not connected");
     expect($("hostUrl").value).toBe("https://elsewhere.example.com");
+  });
+
+  it("says why the Host cannot be reached, and clears it once connected", async () => {
+    await startPage();
+    expect($("hostProblem").classList.contains("hidden")).toBe(true);
+
+    connected = false;
+    hostProblem = {
+      kind: "network-intercepted",
+      summary: "Blocked between regions",
+      message: "A network device between this Node and the Host at 10.0.5.136 answers.",
+      checkedAt: "2026-10-23T00:00:00.000Z",
+    };
+    await poll();
+
+    expect($("conn").textContent).toBe("Not connected: Blocked between regions");
+    expect($("hostProblem").classList.contains("hidden")).toBe(false);
+    expect($("hostProblem").textContent).toBe(hostProblem.message);
+
+    connected = true;
+    hostProblem = undefined;
+    await poll();
+
+    expect($("conn").textContent).toBe("Connected to Host");
+    expect($("hostProblem").classList.contains("hidden")).toBe(true);
   });
 
   it("sends the edits only when Save is pressed", async () => {
