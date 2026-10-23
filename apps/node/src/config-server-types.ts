@@ -17,11 +17,14 @@ import type { PathCheck } from "./path-check.js";
 import type { DiscoveredCopilotSession, SessionPreview } from "./copilot-sessions.js";
 import type { Settings } from "./settings.js";
 import type { NodeSessionConsole } from "./session-console.js";
+import type { HostConnectionProblem } from "./host-connection-problem.js";
 
 export type ConfigStatus = {
   nodeId: string;
   version: string;
   connected: boolean;
+  /** Why the Host cannot be reached; present only while disconnected. */
+  hostProblem?: HostConnectionProblem;
   activeSessions: number;
   mockAgent: boolean;
   devTunnel?: { id: string; url: string };

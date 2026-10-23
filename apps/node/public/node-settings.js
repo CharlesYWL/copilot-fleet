@@ -42,8 +42,18 @@ export const initNodeSettings = () => {
         ? "Falls back to " + fallbacks.join(", ") + " if this address stops answering."
         : "";
     const status = data.status;
+    const problem = status.connected ? undefined : status.hostProblem;
     $("dot").className = "dot " + (status.connected ? "on" : "off");
-    $("conn").textContent = status.connected ? "Connected to Host" : "Not connected";
+    $("conn").textContent = status.connected
+      ? "Connected to Host"
+      : problem
+        ? "Not connected: " + problem.summary
+        : "Not connected";
+    const banner = $("hostProblem");
+    banner.classList.toggle("hidden", !problem);
+    const bannerText = problem ? problem.message : "";
+    // Rewriting identical text every poll would make screen readers repeat it.
+    if (banner.textContent !== bannerText) banner.textContent = bannerText;
     $("meta").textContent =
       "node " +
       status.nodeId.slice(0, 8) +

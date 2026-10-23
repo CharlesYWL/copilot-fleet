@@ -7,6 +7,12 @@ import { mkdir, open, rm, stat } from "node:fs/promises";
 import WebSocket from "ws";
 import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
 import { startCorpDirectForward, type CorpDirectForward } from "./corp-direct.js";
+import { checkCorpDirectHost } from "./corp-direct-diagnosis.js";
+import { checkDevTunnelHost } from "./devtunnel-diagnosis.js";
+import type {
+  HostConnectionProblem,
+  HostConnectionProblemKind,
+} from "./host-connection-problem.js";
 import { ensureGithubAuth } from "./github-auth.js";
 import {
   HostHandshakeFrameSchema,
@@ -163,6 +169,14 @@ const RECOVERED_COMMAND_OWNERSHIP =
  * while the operator is still looking at the screen.
  */
 const UNREACHABLE_DIALS_BEFORE_RECYCLE = 3;
+/**
+ * How often an ongoing outage is re-diagnosed.
+ *
+ * A Dev Box that wakes from hibernation moves from "unreachable" to "Host not
+ * running" to connected, and the config page should follow it, but a check
+ * per two-second dial would spawn the Dev Tunnels CLI far too often.
+ */
+const HOST_CHECK_INTERVAL_MS = 30_000;
 
 export type NodeRuntime = { shutdown: () => Promise<void> };
 
@@ -399,6 +413,82 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let unreachableDials = 0;
   /** Whether this outage has already reported that there is nowhere to rotate. */
   let strandedReported = false;
+  /**
+   * Why the Host cannot be reached, shown on the config page while disconnected.
+   *
+   * In Corp direct and Dev Tunnel modes the WebSocket dials a local forward, so
+   * its own error ("Unexpected server response: 502") is the same whether the
+   * Host is stopped or a firewall is in the way. A separate check of the real
+   * route fills this in.
+   */
+  let hostProblem: HostConnectionProblem | undefined;
+  /** The check in progress, so two never run at once. */
+  let hostCheck: Promise<void> | undefined;
+  let lastHostCheckAt = 0;
+  /** The last diagnosis logged this outage, so a repeat does not flood the log. */
+  let reportedHostProblem: HostConnectionProblemKind | undefined;
+  /** Bumped on every welcome, so a check that finishes after it is discarded. */
+  let connectionGeneration = 0;
+
+  const recordHostProblem = (problem: HostConnectionProblem): void => {
+    hostProblem = problem;
+    if (reportedHostProblem === problem.kind) return;
+    reportedHostProblem = problem.kind;
+    warn(problem.message);
+  };
+
+  const clearHostProblem = (): void => {
+    connectionGeneration += 1;
+    hostProblem = undefined;
+    reportedHostProblem = undefined;
+    lastHostCheckAt = 0;
+  };
+
+  /**
+   * Works out why a dial never reached the Host, without holding up the retry.
+   *
+   * Runs detached from the close handler: a check takes seconds and must never
+   * change reconnect timing, rotation, or crash the Node if it fails.
+   */
+  const diagnoseHostConnection = (attemptUrl: string, dialError?: string): void => {
+    if (tunnelMode === "direct") {
+      // The socket dialed the Host itself, so its own error is the real one.
+      hostProblem = {
+        kind: "host-connection-failed",
+        summary: "Cannot reach the Host",
+        message: `This Node cannot reach the Host at ${attemptUrl}${dialError ? ` (${dialError})` : ""}. Check that the Host is running and that the Host URL is correct.`,
+        checkedAt: new Date().toISOString(),
+      };
+      return;
+    }
+    if (hostCheck || Date.now() - lastHostCheckAt < HOST_CHECK_INTERVAL_MS) return;
+    const corpHostUrl =
+      tunnelMode === "corp-direct" ? settings.corpDirect?.hostUrl : undefined;
+    const tunnelId = tunnelMode === "devtunnel" ? devTunnelId : undefined;
+    if (!corpHostUrl && !tunnelId) return;
+    lastHostCheckAt = Date.now();
+    const generation = connectionGeneration;
+    const routeName = corpHostUrl ?? `dev tunnel ${tunnelId}`;
+    hostCheck = (
+      corpHostUrl ? checkCorpDirectHost(corpHostUrl) : checkDevTunnelHost(tunnelId!)
+    )
+      .then((problem) => {
+        if (generation !== connectionGeneration || shuttingDown) return;
+        recordHostProblem(problem);
+      })
+      .catch((error: unknown) => {
+        if (generation !== connectionGeneration || shuttingDown) return;
+        recordHostProblem({
+          kind: "host-connection-failed",
+          summary: "Cannot reach the Host",
+          message: `This Node cannot reach the Host through ${routeName}, and checking why failed: ${errorMessage(error)}`,
+          checkedAt: new Date().toISOString(),
+        });
+      })
+      .finally(() => {
+        hostCheck = undefined;
+      });
+  };
 
   /**
    * Where agents read this node's current Fleet name. Installed once the config
@@ -991,6 +1081,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   function reconnect(): void {
     usageNegotiated = false;
     usageInFlight = false;
+    // The address or route may have changed, so the last diagnosis may be stale.
+    clearHostProblem();
     consoleSlot.current?.disconnected();
     if (reconnectTimer) clearTimeout(reconnectTimer);
     dialUrl = firstDialUrl(settings, credentials.hostUrl, tunnelMode);
@@ -1252,6 +1344,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       nodeId: credentials.nodeId,
       version: VERSION,
       connected: socket?.readyState === WebSocket.OPEN,
+      ...(hostProblem && socket?.readyState !== WebSocket.OPEN ? { hostProblem } : {}),
       activeSessions: router.activeSessionIds.length,
       mockAgent,
       commandExecution: commands.readiness,
@@ -1355,6 +1448,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // Distinguishes "this address does not reach the Host" from "the Host hung
     // up on us", which is what decides whether to try a different address.
     let welcomed = false;
+    /** What the socket reported, kept for a direct dial's status line. */
+    let dialError: string | undefined;
     /**
      * The Node's half of the handshake, while it is still running.
      *
@@ -1521,6 +1616,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       }
       if (frame.value.type === "welcome") {
         welcomed = true;
+        clearHostProblem();
         acknowledgeOutbox = frame.value.acknowledgeOutbox;
         commandExecutionsNegotiated =
           !!session && !!channel && frame.value.commandExecutions;
@@ -1871,6 +1967,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // Host was reached — keeps a working address from being blamed for a
       // problem that is not its own.
       if (!welcomed) {
+        diagnoseHostConnection(attemptUrl, dialError);
         const candidate = nextHostUrl(settings, attemptUrl, tunnelMode);
         if (!sameHostUrl(candidate, attemptUrl)) {
           log(`No Host at ${attemptUrl}; trying ${candidate} next`);
@@ -1884,11 +1981,19 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           // "trying X next" line is missing — which is not something a log
           // should ask of whoever is reading it at the time.
           strandedReported = true;
-          warn(
-            tunnelMode === "devtunnel"
-              ? `No Host at ${attemptUrl}, which is the only address a node behind \`devtunnel connect ${devTunnelId}\` can use — retrying it while the tunnel is rebuilt. Check that the Host is hosting that tunnel.`
-              : `No Host at ${attemptUrl}, and it is the only address this node knows — retrying it until the Host returns. Add another Host URL on the node config page to give this node somewhere to fall back to.`,
-          );
+          // Corp direct dials its own loopback helper, so "No Host at
+          // 127.0.0.1" would point the operator at the wrong machine; the
+          // diagnosis above names the Host's real address instead.
+          if (tunnelMode === "corp-direct")
+            log(
+              `No Host at ${settings.corpDirect?.hostUrl ?? attemptUrl}; checking why and retrying until it answers.`,
+            );
+          else
+            warn(
+              tunnelMode === "devtunnel"
+                ? `No Host at ${attemptUrl}, which is the only address a node behind \`devtunnel connect ${devTunnelId}\` can use — retrying it while the tunnel is rebuilt. Check that the Host is hosting that tunnel.`
+                : `No Host at ${attemptUrl}, and it is the only address this node knows — retrying it until the Host returns. Add another Host URL on the node config page to give this node somewhere to fall back to.`,
+            );
         }
         // Repeated silence from a dev tunnel's forwarded port is the only
         // reliable sign that the tunnel died: its local listener keeps
@@ -1907,6 +2012,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
     });
     active.on("error", (error) => {
+      dialError = error.message;
       errorLog(`Host connection error: ${error.message}`);
     });
   }
