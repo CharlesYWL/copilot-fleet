@@ -833,10 +833,12 @@ export function commandSupervisorReadiness(): Promise<CommandSupervisorReadiness
 
 export async function prepareCommandProcess(
   input: CommandProcessInput,
+  /** Tests only: run a specific POSIX shell, as a host whose /bin/sh is that shell would. */
+  shellPathForTest?: string,
 ): Promise<PreparedCommandProcess> {
   validate(input);
   const ready = await commandSupervisorReadiness();
   if (!ready.supported || !ready.shellPath)
     throw new Error(`Command execution is unsupported: ${ready.reason}`);
-  return prepare(input, ready.shellPath);
+  return prepare(input, shellPathForTest ?? ready.shellPath);
 }

@@ -7,6 +7,7 @@ import process from "node:process";
 import {
   enableLinger,
   linuxTaskAction,
+  probeCommand,
   systemdAvailable,
   unitFile,
   unitName,
@@ -124,6 +125,62 @@ describe.skipIf(process.platform === "win32")("systemd user unit files", () => {
 });
 
 describe("systemd user unit control", () => {
+  it("runs the install preflight inside the user manager, not the installing shell", () => {
+    const [command, args] = probeCommand({
+      nodePath: "/usr/bin/node",
+      runnerPath: manifest.runnerPath,
+      manifestPath,
+      resultPath: "/state/probe.json",
+      kind: "node",
+      cwd: manifest.repositoryPath,
+    });
+    expect(command).toBe("systemd-run");
+    expect(args.slice(0, 1)).toEqual(["--user"]);
+    expect(args).toEqual(expect.arrayContaining(["--wait", "--collect", "--pipe"]));
+    expect(args.some((arg) => arg.startsWith("--unit=copilot-fleet-probe-node-"))).toBe(
+      true,
+    );
+    expect(args).toContain(`--working-directory=${manifest.repositoryPath}`);
+    // Never forwards this shell's variables: no --setenv, no -E.
+    expect(args.some((arg) => /^(?:-E|--setenv)/.test(arg))).toBe(false);
+    expect(args.slice(args.indexOf("--") + 1)).toEqual([
+      "/usr/bin/node",
+      manifest.runnerPath,
+      manifestPath,
+      "--probe",
+      "/state/probe.json",
+    ]);
+  });
+
+  it.skipIf(
+    process.platform !== "linux" ||
+      spawnSync("systemctl", ["--user", "show-environment"], { stdio: "ignore" })
+        .status !== 0,
+  )("does not give the probe a token exported only in this terminal", () => {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-probe-env-"));
+    directories.push(directory);
+    const out = join(directory, "env.json");
+    const script = join(directory, "dump.mjs");
+    writeFileSync(
+      script,
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(out)}, JSON.stringify({ token: process.env.FLEET_PROBE_TERMINAL_ONLY ?? null }));\n`,
+    );
+    const [command, args] = probeCommand({
+      nodePath: process.execPath,
+      runnerPath: script,
+      manifestPath: "unused",
+      resultPath: "unused",
+      kind: "node",
+      cwd: directory,
+    });
+    const run = spawnSync(command, args, {
+      env: { ...process.env, FLEET_PROBE_TERMINAL_ONLY: "secret" },
+      stdio: "ignore",
+    });
+    expect(run.status).toBe(0);
+    expect(JSON.parse(readFileSync(out, "utf8"))).toEqual({ token: null });
+  });
+
   it("stop also disables, like the Windows task; start re-enables", () => {
     const { systemctl, calls } = fakeSystemctl({
       LoadState: "loaded",

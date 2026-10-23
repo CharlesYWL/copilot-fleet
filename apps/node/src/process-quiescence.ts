@@ -190,6 +190,10 @@ function spawnWindowsManaged(
  * group is checked empty, as the Windows supervisor terminates and drains its
  * job. `closed` resolves only once that check has run, so a lease is never
  * released while the leader's descendants could still write to the checkout.
+ *
+ * The check starts on `exit`, not `close`. `close` also waits for stdio to end,
+ * and a surviving descendant holds those pipes open, so waiting for it would
+ * wait on the very process the cleanup is meant to end.
  */
 function spawnPosixManaged(
   command: string,
@@ -202,14 +206,21 @@ function spawnPosixManaged(
   }) as ChildProcessWithoutNullStreams;
   const pgid = child.pid;
   let verified = false;
-  const verify = async () => {
+  const verify = async (): Promise<void> => {
     if (!pgid) return;
-    verified =
-      (await waitForGroupExit(pgid, POSIX_LEADER_EXIT_DRAIN_MS)) ||
-      (await stopProcessGroup(pgid, { graceMs: 0 }));
+    try {
+      verified =
+        (await waitForGroupExit(pgid, POSIX_LEADER_EXIT_DRAIN_MS)) ||
+        (await stopProcessGroup(pgid, { graceMs: 0 }));
+    } catch {
+      // A signal that cannot be delivered (EPERM, say) proves nothing about the
+      // group. Ownership stays unverified, which keeps the checkout locked for
+      // reconciliation, and nothing escapes as an unhandled rejection.
+      verified = false;
+    }
   };
   const closed = new Promise<void>((resolve) => {
-    child.once("close", () => void verify().finally(resolve));
+    child.once("exit", () => void verify().then(resolve));
     // A spawn that failed never had a group, so there is nothing to own.
     child.once("error", () => {
       if (!pgid) {

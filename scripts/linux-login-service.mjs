@@ -77,6 +77,43 @@ export function unitFile(manifest, manifestPath) {
   ].join("\n");
 }
 
+/**
+ * The command that runs the install-time preflight as the service would run.
+ *
+ * The probe must not inherit the installing terminal: a token exported only
+ * there (`GH_TOKEN`, say) would pass authentication that the unit, started by
+ * the user manager without it, then fails. `systemd-run --user` starts the
+ * probe in a transient unit of that same manager, so it sees exactly the
+ * manager's environment plus what the manifest saves, as the service does.
+ */
+export function probeCommand({
+  nodePath,
+  runnerPath,
+  manifestPath,
+  resultPath,
+  kind,
+  cwd,
+}) {
+  return [
+    "systemd-run",
+    [
+      "--user",
+      `--unit=copilot-fleet-probe-${kind}-${process.pid}-${Date.now()}`,
+      "--wait",
+      "--collect",
+      "--quiet",
+      "--pipe",
+      `--working-directory=${cwd}`,
+      "--",
+      nodePath,
+      runnerPath,
+      manifestPath,
+      "--probe",
+      resultPath,
+    ],
+  ];
+}
+
 export function defaultSystemctl(args, options = {}) {
   return execFileSync("systemctl", ["--user", ...args], {
     encoding: "utf8",

@@ -68,10 +68,32 @@ describe("conservative command permission identity", () => {
     ["where.exe git", "where.exe git"],
     ["custom-tool.exe inspect 'literal path'", "custom-tool.exe inspect 'literal path'"],
     ["cd 'C:\\local folder'", "cd"],
-    ["Set-Location .", "set-location"],
   ])("normalizes %s without collapsing subcommands", (script, commandKey) => {
     expect(commandPermissionIdentity(script).commandKey).toBe(commandKey);
   });
+
+  it.skipIf(process.platform !== "win32")(
+    "folds executable case on Windows, whose command lookup ignores it",
+    () => {
+      expect(commandPermissionIdentity("Set-Location .").commandKey).toBe("set-location");
+      expect(commandPermissionIdentity("CD .").commandKey).toBe("cd");
+      expect(commandPermissionIdentity("GIT status").commandKey).toBe("git status");
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "keeps executable case on POSIX, where CD and GIT are different programs",
+    () => {
+      // `CD` is not the shell's cd builtin: it is whatever file of that name is on PATH.
+      expect(commandPermissionIdentity("CD .").commandKey).toBe("CD .");
+      expect(commandPermissionIdentity("GIT status").commandKey).toBe("GIT status");
+      expect(commandPermissionIdentity("git status").commandKey).toBe("git status");
+      // PowerShell's Set-Location has no meaning to /bin/sh: an ordinary program name.
+      expect(commandPermissionIdentity("set-location .").commandKey).toBe(
+        "set-location .",
+      );
+    },
+  );
 
   it.each([
     "git status; git reset --hard",
@@ -602,6 +624,28 @@ describe("Node-owned permission grants", () => {
       f.permissions.authorize(request, cwd, "once", true, prepared),
     ).rejects.toThrow("revoked");
   });
+
+  it.skipIf(process.platform === "win32")(
+    "gives a differently cased POSIX program neither the cd builtin nor another program's grant",
+    async () => {
+      const f = fixture(DEFAULT_COMMAND_PERMISSION_RULES);
+      // `CD` on PATH is a separate program; it must not inherit cd's builtin approval.
+      const upperCd = f.permissions.evaluate({ ...request, command: "CD ." }, cwd);
+      expect(upperCd.grantedBy).toBeUndefined();
+      expect(upperCd.ruleId).toBeUndefined();
+      expect(f.resolveExecutable).toHaveBeenCalledWith("CD", cwd);
+      // Approving `git` does not approve `GIT`, which is pinned under its own name.
+      await f.permissions.authorize(request, cwd, "always", false);
+      const upperGit = f.permissions.evaluate(
+        { ...request, command: "GIT status --short" },
+        cwd,
+      );
+      expect(upperGit.grantedBy).toBeUndefined();
+      // Not recognised as Git, so its flags stay part of its own identity.
+      expect(upperGit.commandKey).toBe(`GIT status --short @sha256:${fingerprint}`);
+      expect(f.resolveExecutable).toHaveBeenCalledWith("GIT", cwd);
+    },
+  );
 
   it("only authorizes literal standalone local builtin navigation, and removal takes effect", async () => {
     const f = fixture(DEFAULT_COMMAND_PERMISSION_RULES);

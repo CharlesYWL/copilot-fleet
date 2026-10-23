@@ -21,8 +21,9 @@
  * holds the write end, and it writes that byte after `release.json`; until
  * then no user code runs, which is the role CREATE_SUSPENDED plays on Windows.
  *
- * Dependency-free on purpose (Node built-ins only): it is spawned as a plain
- * script and must start even if the Node's own module graph cannot load.
+ * Dependency-free on purpose (Node built-ins and two small sibling modules that
+ * use only built-ins): it is spawned as a plain script and must start even if
+ * the Node's own module graph cannot load.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import {
@@ -36,6 +37,7 @@ import {
 import { join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { posixProcessStartTime } from "./posix-process-identity.js";
+import { posixShellEnvironment } from "./posix-shell-environment.js";
 
 const OUTPUT_LIMIT = 10 * 1024 * 1024;
 const ERROR_LIMIT = 2048;
@@ -252,7 +254,7 @@ export async function runSupervisor(directory: string): Promise<void> {
       cwd: manifest.cwd,
       detached: true,
       stdio: ["ignore", "pipe", "pipe", "pipe"],
-      env: process.env,
+      env: posixShellEnvironment(process.env),
     });
     const gateStream = root.stdio[3] as NodeJS.WritableStream & {
       destroy(): void;

@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -28,6 +29,7 @@ import { ensureNodeGithubAuth } from "./login-service-runner.mjs";
 import {
   SYSTEMD_UNAVAILABLE,
   linuxTaskAction,
+  probeCommand,
   systemdAvailable,
   unitDirectory,
   unitName,
@@ -69,14 +71,28 @@ function platformService() {
     controller: (kind) => join(unitDirectory(), unitName(kind)),
     invoke: (action, manifestPath) =>
       linuxTaskAction(action, readManifest(manifestPath, accountId()), manifestPath),
-    // A user unit runs in this user's environment, so the runner's preflight
-    // proves the same credentials when run directly from here.
+    // Probe inside the user manager, not this terminal, so credentials that
+    // exist only here (an exported GH_TOKEN) cannot pass for the service.
     probe: (_invoke, directory, manifestPath, nodePath, runnerPath) => {
       const resultPath = join(directory, "probe.json");
-      const run = spawnSync(nodePath, [runnerPath, manifestPath, "--probe", resultPath], {
+      rmSync(resultPath, { force: true });
+      const manifest = readManifest(manifestPath, accountId());
+      const [command, args] = probeCommand({
+        nodePath,
+        runnerPath,
+        manifestPath,
+        resultPath,
+        kind: manifest.kind,
+        cwd: manifest.repositoryPath,
+      });
+      const run = spawnSync(command, args, {
         stdio: ["ignore", "inherit", "inherit"],
       });
       if (run.error) throw run.error;
+      if (!existsSync(resultPath))
+        throw new Error(
+          `The service preflight did not run in the systemd user manager (exit ${run.status}).`,
+        );
       return JSON.parse(readFileSync(resultPath, "utf8"));
     },
     startsWhen:
@@ -408,7 +424,14 @@ async function manage(options, sid, requestedKind, service) {
       manifest.nodePath,
       manifest.runnerPath,
     );
-    if (!proof.ok) throw new Error(proof.error || "The logged-in task preflight failed.");
+    if (!proof.ok)
+      throw new Error(
+        `${proof.error || "The logged-in task preflight failed."}${
+          windows
+            ? ""
+            : " The service runs without this terminal's environment: credentials exported only here (GH_TOKEN, GITHUB_TOKEN) are not available to it. Sign in with `gh auth login` instead."
+        }`,
+      );
     console.log("Same-user authentication preflight succeeded.");
   };
   if (nodeSetup) {

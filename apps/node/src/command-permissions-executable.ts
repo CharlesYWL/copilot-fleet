@@ -9,6 +9,7 @@ import {
   statSync,
 } from "node:fs";
 import { isAbsolute, join, normalize, relative, sep } from "node:path";
+import { posixShellEnvironment } from "./posix-shell-environment.js";
 
 export type PermissionExecutable = {
   path: string;
@@ -106,15 +107,15 @@ export function compiledProgram(path: string): boolean {
  * data, never inserted into code.
  *
  * Windows asks a fresh, profile-free PowerShell. POSIX asks `/bin/sh`'s
- * `command -v` with no startup files (`ENV`/`BASH_ENV` cleared): an absolute
- * path is an executable on PATH, anything else (builtin, function, alias,
- * keyword) has no file to pin and is refused.
+ * `command -v` in the same sanitized environment commands run in (no startup
+ * files, no imported functions): an absolute path is an executable on PATH,
+ * anything else (builtin, function, alias, keyword) has no file to pin and is
+ * refused.
  */
 export const resolvePermissionExecutable: PermissionExecutableResolver = (name, cwd) => {
   if (!isPermissionExecutableName(name))
     throw new Error("Executable permission resolution requires a literal command name.");
   if (process.platform !== "win32") {
-    const { ENV: _env, BASH_ENV: _bashEnv, ...environment } = process.env;
     const output = execFileSync(
       "/bin/sh",
       ["-c", 'command -v -- "$FLEET_PERMISSION_EXECUTABLE"'],
@@ -124,7 +125,7 @@ export const resolvePermissionExecutable: PermissionExecutableResolver = (name, 
         timeout: 2000,
         maxBuffer: 16 * 1024,
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...environment, FLEET_PERMISSION_EXECUTABLE: name },
+        env: { ...posixShellEnvironment(process.env), FLEET_PERMISSION_EXECUTABLE: name },
       },
     ).trim();
     if (!output.startsWith("/"))

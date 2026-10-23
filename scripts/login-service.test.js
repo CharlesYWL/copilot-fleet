@@ -123,6 +123,14 @@ describe("manifest and profile", () => {
       PATH: "C:\\Tools",
     });
   });
+  it("keeps a custom XDG_STATE_HOME, so the Host finds its service manifest", () => {
+    const env = { HOME: "/home/me", XDG_STATE_HOME: "/srv/state" };
+    expect(captureEnvironment(env)).toMatchObject({ XDG_STATE_HOME: "/srv/state" });
+    // The service resolves its directory from the saved environment alone.
+    expect(loginDirectory("host", captureEnvironment(env), "linux")).toBe(
+      loginDirectory("host", env, "linux"),
+    );
+  });
   it("handles Path casing and separates workloads and users", () => {
     expect(captureEnvironment({ Path: "C:\\Tools" })).toEqual({ PATH: "C:\\Tools" });
     expect(

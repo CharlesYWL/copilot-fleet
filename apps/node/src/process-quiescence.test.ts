@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   killPosixProcessGroup,
   killTrackedProcessGroups,
@@ -255,6 +255,100 @@ describe("POSIX process quiescence", () => {
       expect(() => process.kill(descendant, 0)).toThrow(
         expect.objectContaining({ code: "ESRCH" }),
       );
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "ends a managed descendant that holds the leader's pipes open after the leader exits",
+    async () => {
+      // The shell exits at once; `sleep` inherits stdout and stderr, so the
+      // child's `close` event would not fire until it ends by itself.
+      const child = spawnManagedProcess(
+        "/bin/sh",
+        ["-c", 'sleep 60 & echo "$!"; exit 0'],
+        {},
+      );
+      const descendant = await new Promise<number>((resolve, reject) => {
+        child.stdout.once("data", (chunk: Buffer) =>
+          resolve(Number(chunk.toString().trim())),
+        );
+        child.once("error", reject);
+      });
+      try {
+        expect(descendant).toBeGreaterThan(0);
+        // The reported scenario: the leader is gone, its descendant is not.
+        if (child.exitCode === null && child.signalCode === null)
+          await new Promise((resolve) => child.once("exit", resolve));
+        expect(() => process.kill(descendant, 0)).not.toThrow();
+        const started = Date.now();
+        await stopProcessTree(child, true);
+        expect(Date.now() - started).toBeLessThan(10_000);
+        expect(() => process.kill(descendant, 0)).toThrow(
+          expect.objectContaining({ code: "ESRCH" }),
+        );
+      } finally {
+        try {
+          process.kill(descendant, "SIGKILL");
+        } catch {
+          // Already gone, which is the expected outcome.
+        }
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "keeps ownership unverified, without an unhandled rejection, when the group cannot be signalled",
+    async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on("unhandledRejection", onUnhandled);
+      const realKill = process.kill.bind(process);
+      const child = spawnManagedProcess(
+        "/bin/sh",
+        ["-c", 'sleep 60 & echo "$!"; exit 0'],
+        {},
+      );
+      const descendant = await new Promise<number>((resolve, reject) => {
+        child.stdout.once("data", (chunk: Buffer) =>
+          resolve(Number(chunk.toString().trim())),
+        );
+        child.once("error", reject);
+      });
+      const pgid = child.pid!;
+      // Probing the group still works; delivering a real signal to it fails.
+      const kill = vi
+        .spyOn(process, "kill")
+        .mockImplementation((pid: number, signal?: string | number) => {
+          if (pid === -pgid && signal !== 0)
+            throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+          return realKill(pid, signal);
+        });
+      try {
+        // The leader has exited by itself, so only the exit-time cleanup acts.
+        if (child.exitCode === null && child.signalCode === null)
+          await new Promise((resolve) => child.once("exit", resolve));
+        await expect(stopProcessTree(child, true)).rejects.toThrow(
+          "reconciliation is required",
+        );
+        // Give any stray rejection a chance to surface before checking.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(unhandled).toEqual([]);
+      } finally {
+        kill.mockRestore();
+        process.off("unhandledRejection", onUnhandled);
+        try {
+          realKill(-pgid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+        try {
+          realKill(descendant, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
     },
     30_000,
   );

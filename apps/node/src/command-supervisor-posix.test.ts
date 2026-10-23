@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +21,7 @@ const posix = describe.skipIf(process.platform === "win32");
 const roots: string[] = [];
 const commands: PreparedCommandProcess[] = [];
 const delay = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
+const bashPath = ["/bin/bash", "/usr/bin/bash"].find((path) => existsSync(path));
 
 async function fixture() {
   const root = resolve(process.cwd(), `.command-supervisor-posix-${randomUUID()}`);
@@ -112,6 +114,31 @@ posix("POSIX command supervisor", () => {
     });
     await expect(stat(marker)).rejects.toThrow();
     await expect(prepared.release()).rejects.toThrow();
+  });
+
+  it.skipIf(!bashPath)("does not run Bash startup files before release", async () => {
+    const { root, cwd } = await fixture();
+    const marker = join(root, "startup-ran");
+    const startup = join(root, "startup.sh");
+    await writeFile(startup, `printf ran > '${marker}'\n`);
+    const saved = process.env.BASH_ENV;
+    // The supervisor inherits the Node's environment; a /bin/sh that is Bash
+    // reads BASH_ENV before reaching the gate unless it is removed.
+    process.env.BASH_ENV = startup;
+    try {
+      const prepared = await prepareCommandProcess(input(root, cwd, "true"), bashPath);
+      commands.push(prepared);
+      await delay(500);
+      await prepared.cancel();
+      expect(await prepared.result).toMatchObject({
+        reason: "cancelled",
+        started: false,
+      });
+      await expect(stat(marker)).rejects.toThrow();
+    } finally {
+      if (saved === undefined) delete process.env.BASH_ENV;
+      else process.env.BASH_ENV = saved;
+    }
   });
 
   it("kills background descendants when the root exits and records forced cleanup", async () => {

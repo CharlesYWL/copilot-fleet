@@ -24,6 +24,10 @@ const ENVIRONMENT_KEYS = new Set([
   "GH_HOST",
   "XDG_CONFIG_HOME",
   "XDG_DATA_HOME",
+  // Where the Linux service keeps its manifest. The Host finds that manifest
+  // through the same variable to recognise it was service-started, so a custom
+  // value set only in the installing shell must reach the service as well.
+  "XDG_STATE_HOME",
   "GIT_CONFIG_GLOBAL",
   "FLEET_NODE_CONFIG_DIR",
   "FLEET_COPILOT_COMMAND",

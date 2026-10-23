@@ -61,6 +61,20 @@ const interpreters =
 const literalKey = (args: readonly string[]): string =>
   args.map((arg) => (/\s/.test(arg) ? `'${arg}'` : arg)).join(" ");
 
+/**
+ * The executable name as the command's shell will look it up.
+ *
+ * Windows command lookup ignores case, so `GIT` and `git` are one program and
+ * share a key. POSIX lookup does not: `CD` or `GIT` on PATH is a different file
+ * from `cd`/`git`, so its case is kept and it gets its own identity and pin.
+ */
+const executableName = (name: string): string =>
+  process.platform === "win32" ? name.toLowerCase() : name;
+
+/** Directory navigation: `cd` everywhere, PowerShell's `Set-Location` only on Windows. */
+const isDirectoryChange = (executable: string): boolean =>
+  executable === "cd" || (process.platform === "win32" && executable === "set-location");
+
 export function permissionPath(path: string): string {
   const value = normalize(path);
   return process.platform === "win32" ? value.toLowerCase() : value;
@@ -87,7 +101,7 @@ function literalArguments(command: string, wildcard = false): string[] | undefin
 
 function literalInvocation(command: string, wildcard = false): string | undefined {
   const args = literalArguments(command, wildcard);
-  return args ? literalKey([args[0]!.toLowerCase(), ...args.slice(1)]) : undefined;
+  return args ? literalKey([executableName(args[0]!), ...args.slice(1)]) : undefined;
 }
 
 /** Anchored '*' matching with forward-only literal searches, not regex backtracking. */
@@ -253,9 +267,9 @@ export function commandPermissionIdentity(command: string): {
     return once(
       "Executable paths, expressions, and unknown command identities are not reusable.",
     );
-  const executable = args[0]!.toLowerCase();
-  const tool = executable.replace(/\.(?:exe|com|cmd|ps1)$/, "");
-  if (executable === "cd" || executable === "set-location") {
+  const executable = executableName(args[0]!);
+  const tool = executable.replace(/\.(?:exe|com|cmd|ps1)$/i, "");
+  if (isDirectoryChange(executable)) {
     const path = args[1];
     if (
       args.length !== 2 ||
@@ -412,9 +426,7 @@ export async function validateCommandPermissionRules(
       }
       const existingPin = EXECUTABLE_PIN.exec(rule.commandKey);
       const invocation = rule.command ?? existingPin?.[1] ?? rule.commandKey;
-      const command = ["cd", "set-location"].includes(invocation)
-        ? `${invocation} .`
-        : invocation;
+      const command = isDirectoryChange(invocation) ? `${invocation} .` : invocation;
       if (
         rule.path.includes("*") &&
         rule.match === "command" &&
@@ -488,7 +500,7 @@ function concreteCommandIdentity(
   resolveExecutable: PermissionExecutableResolver,
 ): ReturnType<typeof commandPermissionIdentity> {
   const key = identity.commandKey;
-  if (!key || ["cd", "set-location"].includes(key)) return identity;
+  if (!key || isDirectoryChange(key)) return identity;
   try {
     const name = key.split(" ")[0]!;
     const executable = resolveExecutable(name, cwd);
