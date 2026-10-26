@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Copilot Fleet · Port forward requests</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #eb6c36;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1100px; width: 100%; padding: 0 1.25rem; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Flowchart · Diagram Design</p>
+    <h1>Agent forward requests — agents ask, people approve</h1>
+
+    <svg viewBox="0 0 960 776" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="port-forwarding-approval-title port-forwarding-approval-desc">
+      <title id="port-forwarding-approval-title">Agent forward requests — agents ask, people approve</title>
+      <desc id="port-forwarding-approval-desc">Flowchart: an orchestrator's port forward request is refused unless the feature is enabled and the port belongs to the session. Exact-localhost requests always go to the human approval prompt; other requests are approved automatically only when an always-allow rule matches. An approved request allocates a Host port and becomes an active forward, and the lead is told the outcome either way.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+      </defs>
+
+      <rect width="960" height="776" fill="#f5f5f5"/>
+
+      <!-- Connectors (before nodes) -->
+      <!-- Start -> D1 -->
+      <line x1="200" y1="120" x2="200" y2="150" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- D1 yes -> D2 -->
+      <line x1="200" y1="232" x2="200" y2="270" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="208" y="244" width="28" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="222" y="253" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">YES</text>
+
+      <!-- D1 no -> Refused -->
+      <line x1="288" y1="192" x2="662" y2="192" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="460" y="172" width="24" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="472" y="181" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NO</text>
+
+      <!-- D2 yes -> Approval (exact-localhost always human) -->
+      <line x1="288" y1="312" x2="382" y2="312" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <rect x="320" y="292" width="28" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="334" y="301" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">YES</text>
+
+      <!-- D2 no -> D3 -->
+      <line x1="200" y1="352" x2="200" y2="390" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="208" y="364" width="24" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="220" y="373" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NO</text>
+
+      <!-- D3 no -> Approval (bottom) -->
+      <path d="M 288,432 H 472 Q 480,432 480,424 V 342" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="368" y="412" width="24" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="380" y="421" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NO</text>
+
+      <!-- D3 yes -> Allocate -->
+      <line x1="200" y1="472" x2="200" y2="526" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="208" y="492" width="28" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="222" y="501" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">YES</text>
+
+      <!-- Approval -> D4 -->
+      <line x1="576" y1="312" x2="670" y2="312" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- D4 deny -> Refused -->
+      <line x1="760" y1="272" x2="760" y2="218" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="768" y="238" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="784" y="247" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">DENY</text>
+
+      <!-- D4 allow -> Allocate -->
+      <path d="M 760,352 V 548 Q 760,556 752,556 H 306" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="508" y="536" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="528" y="545" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ALLOW</text>
+
+      <!-- Allocate -> Active -->
+      <line x1="200" y1="584" x2="200" y2="638" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- Nodes -->
+      <!-- Start -->
+      <rect x="88" y="72" width="224" height="48" rx="20" fill="#f5f5f5"/>
+      <rect x="88" y="72" width="224" height="48" rx="20" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="200" y="93" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Lead requests a forward</text>
+      <text x="200" y="109" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">fleet_request_port_forward</text>
+
+      <!-- D1 -->
+      <polygon points="200,152 288,192 200,232 112,192" fill="#f5f5f5"/>
+      <polygon points="200,152 288,192 200,232 112,192" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="200" y="189" fill="#2d3142" font-size="12" font-weight="500" font-family="'Geist', sans-serif" text-anchor="middle">Enabled, and</text>
+      <text x="200" y="204" fill="#2d3142" font-size="12" font-weight="500" font-family="'Geist', sans-serif" text-anchor="middle">port owned?</text>
+
+      <!-- D2 -->
+      <polygon points="200,272 288,312 200,352 112,312" fill="#f5f5f5"/>
+      <polygon points="200,272 288,312 200,352 112,312" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="200" y="316" fill="#2d3142" font-size="12" font-weight="500" font-family="'Geist', sans-serif" text-anchor="middle">Exact-localhost?</text>
+
+      <!-- D3 -->
+      <polygon points="200,392 288,432 200,472 112,432" fill="#f5f5f5"/>
+      <polygon points="200,392 288,432 200,472 112,432" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="200" y="429" fill="#2d3142" font-size="12" font-weight="500" font-family="'Geist', sans-serif" text-anchor="middle">Always-allow</text>
+      <text x="200" y="444" fill="#2d3142" font-size="12" font-weight="500" font-family="'Geist', sans-serif" text-anchor="middle">rule matches?</text>
+
+      <!-- Approval prompt (focal) -->
+      <rect x="384" y="284" width="192" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="384" y="284" width="192" height="56" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <text x="480" y="309" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Approval prompt</text>
+      <text x="480" y="325" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">with command approvals</text>
+
+      <!-- D4 -->
+      <polygon points="760,272 848,312 760,352 672,312" fill="#f5f5f5"/>
+      <polygon points="760,272 848,312 760,352 672,312" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="760" y="316" fill="#2d3142" font-size="12" font-weight="500" font-family="'Geist', sans-serif" text-anchor="middle">Approved?</text>
+
+      <!-- Refused -->
+      <rect x="664" y="168" width="192" height="48" rx="20" fill="#f5f5f5"/>
+      <rect x="664" y="168" width="192" height="48" rx="20" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="760" y="189" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Refused</text>
+      <text x="760" y="205" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">lead woken with reason</text>
+
+      <!-- Allocate -->
+      <rect x="96" y="528" width="208" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="96" y="528" width="208" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="200" y="553" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Allocate + bind</text>
+      <text x="200" y="569" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Host port, or named conflict</text>
+
+      <!-- Active -->
+      <rect x="96" y="640" width="208" height="48" rx="20" fill="#f5f5f5"/>
+      <rect x="96" y="640" width="208" height="48" rx="20" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="200" y="661" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Forward active</text>
+      <text x="200" y="677" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">lead woken with URL</text>
+
+      <!-- Legend -->
+      <line x1="48" y1="716" x2="912" y2="716" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="48" y="732" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <rect x="48" y="744" width="32" height="16" rx="8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="88" y="756" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Start or end</text>
+
+      <rect x="196" y="744" width="32" height="16" rx="3" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="236" y="756" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Step</text>
+
+      <polygon points="320,744 332,752 320,760 308,752" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="344" y="756" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Decision</text>
+
+      <rect x="436" y="744" width="32" height="16" rx="3" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <text x="476" y="756" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Human gate (an agent never approves)</text>
+
+      <line x1="700" y1="752" x2="728" y2="752" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <text x="736" y="756" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Never auto-approved</text>
+    </svg>
+  </div>
+</body>
+</html>

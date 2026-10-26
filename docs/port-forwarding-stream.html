@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Copilot Fleet · Opening a forwarded stream</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #eb6c36;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1100px; width: 100%; padding: 0 1.25rem; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Sequence · Diagram Design</p>
+    <h1>Opening one forwarded stream — check first, then dial</h1>
+
+    <svg viewBox="0 0 960 704" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="port-forwarding-stream-title port-forwarding-stream-desc">
+      <title id="port-forwarding-stream-title">Opening one forwarded stream — check first, then dial</title>
+      <desc id="port-forwarding-stream-desc">Sequence diagram: a browser opens a TCP connection to the Host listener; the Host pauses it, mints a one-time ticket and stream key, and sends a sealed open-stream frame to the Node. The Node checks its policy and connects to the dev server on loopback. If the dev server accepts, the Node dials a new connection to the Host, which verifies the ticket and splices bytes in both directions; if not, the Node reports a refusal code and the Host resets the browser's connection.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="960" height="704" fill="#f5f5f5"/>
+
+      <!-- Lifelines -->
+      <line x1="120" y1="112" x2="120" y2="616" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="360" y1="112" x2="360" y2="616" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="600" y1="112" x2="600" y2="616" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="840" y1="112" x2="840" y2="616" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <!-- ALT fragment frame -->
+      <rect x="96" y="336" width="528" height="264" rx="4" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.22)" stroke-width="1"/>
+      <line x1="104" y1="496" x2="616" y2="496" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <rect x="96" y="336" width="40" height="16" rx="2" fill="#f5f5f5" stroke="rgba(45,49,66,0.22)" stroke-width="1"/>
+      <text x="116" y="348" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">ALT</text>
+      <text x="148" y="364" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.04em">[dev server accepted]</text>
+      <text x="112" y="520" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.04em">[refused · closed · not owned]</text>
+
+      <!-- Activation bars -->
+      <rect x="356" y="144" width="8" height="448" fill="rgba(45,49,66,0.06)" stroke="#4f5d75" stroke-width="0.8"/>
+      <rect x="596" y="224" width="8" height="336" fill="rgba(45,49,66,0.06)" stroke="#4f5d75" stroke-width="0.8"/>
+      <rect x="836" y="304" width="8" height="24" fill="rgba(45,49,66,0.06)" stroke="#4f5d75" stroke-width="0.8"/>
+
+      <!-- 1. Browser -> Host: TCP connect -->
+      <line x1="124" y1="152" x2="352" y2="152" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="204" y="132" width="72" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="240" y="141" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TCP CONNECT</text>
+
+      <!-- 2. Host self: pause, mint ticket + key -->
+      <path d="M 364,176 H 392 Q 400,176 400,184 V 188 Q 400,196 392,196 H 364" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="416" y="184" fill="#2d3142" font-size="9" font-family="'Geist Mono', monospace">PAUSE · MINT TICKET + KEY</text>
+      <text x="416" y="198" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">single use · 30 s · one stream</text>
+
+      <!-- 3. Host -> Node: sealed open-stream frame -->
+      <line x1="364" y1="232" x2="592" y2="232" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <rect x="440" y="212" width="80" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="480" y="221" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">OPEN STREAM S</text>
+
+      <!-- 4. Node self: check policy -->
+      <path d="M 604,256 H 632 Q 640,256 640,264 V 268 Q 640,276 632,276 H 604" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="656" y="264" fill="#2d3142" font-size="9" font-family="'Geist Mono', monospace">CHECK POLICY</text>
+      <text x="656" y="278" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">loopback · deny list · owned</text>
+
+      <!-- 5. Node -> Dev server: connect -->
+      <line x1="604" y1="312" x2="832" y2="312" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="680" y="292" width="80" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="720" y="301" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">CONNECT :4200</text>
+
+      <!-- 6. Node -> Host: dial new connection (headline) -->
+      <line x1="596" y1="392" x2="368" y2="392" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <rect x="436" y="372" width="88" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="480" y="381" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NODE DIALS IN</text>
+
+      <!-- 7. Host self: verify + splice -->
+      <path d="M 364,416 H 392 Q 400,416 400,424 V 428 Q 400,436 392,436 H 364" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="416" y="424" fill="#2d3142" font-size="9" font-family="'Geist Mono', monospace">VERIFY PROOF · SPLICE</text>
+      <text x="416" y="438" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">sealed with stream key K</text>
+
+      <!-- 8. Host -> Browser: bytes flow -->
+      <line x1="352" y1="468" x2="128" y2="468" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="204" y="448" width="72" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="240" y="457" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BYTES FLOW</text>
+
+      <!-- 9. Node -> Host: refusal (return) -->
+      <path d="M 596,548 H 368" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <rect x="436" y="528" width="88" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="480" y="537" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REFUSED + CODE</text>
+
+      <!-- 10. Host -> Browser: reset -->
+      <line x1="352" y1="580" x2="128" y2="580" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="208" y="560" width="64" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="240" y="569" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TCP RESET</text>
+
+      <!-- Actors (drawn after messages) -->
+      <rect x="48" y="56" width="144" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="48" y="56" width="144" height="56" rx="6" fill="rgba(79,93,117,0.10)" stroke="#7a8399" stroke-width="1"/>
+      <rect x="56" y="64" width="32" height="12" rx="2" fill="transparent" stroke="rgba(122,131,153,0.40)" stroke-width="0.8"/>
+      <text x="72" y="73" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">USER</text>
+      <text x="120" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Browser</text>
+      <text x="120" y="106" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Host machine</text>
+
+      <rect x="280" y="56" width="160" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="280" y="56" width="160" height="56" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <rect x="288" y="64" width="32" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="304" y="73" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
+      <text x="360" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fleet Host</text>
+      <text x="360" y="106" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">listener + splice</text>
+
+      <rect x="520" y="56" width="160" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="520" y="56" width="160" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="528" y="64" width="32" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="544" y="73" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NODE</text>
+      <text x="600" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fleet Node</text>
+      <text x="600" y="106" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">worker VM</text>
+
+      <rect x="768" y="56" width="144" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="768" y="56" width="144" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="776" y="64" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="790" y="73" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">JOB</text>
+      <text x="840" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Dev server</text>
+      <text x="840" y="106" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ng serve · :4200</text>
+
+      <!-- Legend -->
+      <line x1="48" y1="640" x2="912" y2="640" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="48" y="656" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <line x1="48" y1="680" x2="76" y2="680" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="84" y="683" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">TCP or local step</text>
+
+      <line x1="228" y1="680" x2="256" y2="680" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <text x="264" y="683" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Sealed control frame</text>
+
+      <line x1="420" y1="680" x2="448" y2="680" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <text x="456" y="683" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">New per-stream connection</text>
+
+      <line x1="644" y1="680" x2="672" y2="680" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <text x="680" y="683" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Refusal reply</text>
+    </svg>
+  </div>
+</body>
+</html>

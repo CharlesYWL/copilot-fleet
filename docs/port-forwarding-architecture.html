@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Copilot Fleet · Port forwarding architecture</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #eb6c36;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1100px; width: 100%; padding: 0 1.25rem; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Architecture · Diagram Design</p>
+    <h1>Port forwarding — one outbound connection per stream</h1>
+
+    <svg viewBox="0 0 960 528" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="port-forwarding-architecture-title port-forwarding-architecture-desc">
+      <title id="port-forwarding-architecture-title">Port forwarding — one outbound connection per stream</title>
+      <desc id="port-forwarding-architecture-desc">Architecture diagram: a browser on the Host machine connects to a Host port listener on 127.0.0.1:4200. For each connection the Host sends a sealed open-stream frame over the existing Node channel; the worker's Fleet Node connects to the dev server on its own loopback, then dials a new outbound connection to the Host's stream endpoint, which the Host splices to the browser's connection. Nothing listens on the worker.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-both" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto-start-reverse"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="960" height="528" fill="#f5f5f5"/>
+
+      <!-- Zones -->
+      <rect x="32" y="72" width="440" height="368" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <rect x="48" y="76" width="96" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="96" y="85" fill="rgba(45,49,66,0.40)" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">HOST MACHINE</text>
+
+      <rect x="552" y="72" width="376" height="368" rx="8" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <rect x="568" y="76" width="80" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="608" y="85" fill="rgba(45,49,66,0.40)" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">WORKER VM</text>
+
+      <!-- Connectors (before nodes) -->
+      <!-- a. Browser -> Port listener -->
+      <line x1="208" y1="152" x2="278" y2="152" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="228" y="132" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="244" y="141" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TCP</text>
+
+      <!-- b. Port listener <-> Stream endpoint (splice) -->
+      <line x1="360" y1="188" x2="360" y2="228" stroke="#4f5d75" stroke-width="1.2" marker-start="url(#arrow-both)" marker-end="url(#arrow-both)"/>
+      <rect x="368" y="202" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="388" y="211" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SPLICE</text>
+
+      <!-- d. Fleet Node dials Stream endpoint (headline) -->
+      <line x1="600" y1="264" x2="442" y2="264" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <rect x="480" y="244" width="80" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="520" y="253" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">DIAL + TICKET</text>
+
+      <!-- c. Node channel -> Fleet Node (sealed control frame) -->
+      <line x1="440" y1="376" x2="598" y2="376" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <rect x="480" y="356" width="80" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="520" y="365" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">OPEN STREAM S</text>
+
+      <!-- e. Fleet Node -> Dev server (loopback) -->
+      <line x1="680" y1="232" x2="680" y2="186" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="688" y="202" width="52" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="714" y="211" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">LOOPBACK</text>
+
+      <!-- Nodes -->
+      <!-- Browser (input) -->
+      <rect x="64" y="120" width="144" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="64" y="120" width="144" height="64" rx="6" fill="rgba(79,93,117,0.10)" stroke="#7a8399" stroke-width="1"/>
+      <rect x="72" y="128" width="32" height="12" rx="2" fill="transparent" stroke="rgba(122,131,153,0.40)" stroke-width="0.8"/>
+      <text x="88" y="137" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">USER</text>
+      <text x="136" y="160" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Browser</text>
+      <text x="136" y="176" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">on the Host machine</text>
+
+      <!-- Port listener (focal) -->
+      <rect x="280" y="120" width="160" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="280" y="120" width="160" height="64" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <rect x="288" y="128" width="32" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="304" y="137" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
+      <text x="360" y="160" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Port listener</text>
+      <text x="360" y="176" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">127.0.0.1:4200</text>
+
+      <!-- Stream endpoint -->
+      <rect x="280" y="232" width="160" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="280" y="232" width="160" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="288" y="240" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="302" y="249" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">WSS</text>
+      <text x="360" y="272" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Stream endpoint</text>
+      <text x="360" y="288" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/ws/port-stream</text>
+
+      <!-- Node channel (existing) -->
+      <rect x="280" y="344" width="160" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="280" y="344" width="160" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="288" y="352" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="302" y="361" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">WSS</text>
+      <text x="360" y="384" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Node channel</text>
+      <text x="360" y="400" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/ws/node · existing</text>
+
+      <!-- Dev server -->
+      <rect x="600" y="120" width="160" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="600" y="120" width="160" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="608" y="128" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="622" y="137" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">JOB</text>
+      <text x="680" y="160" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Dev server</text>
+      <text x="680" y="176" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ng serve · :4200</text>
+
+      <!-- Fleet Node -->
+      <rect x="600" y="232" width="160" height="176" rx="6" fill="#f5f5f5"/>
+      <rect x="600" y="232" width="160" height="176" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="608" y="240" width="32" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="624" y="249" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NODE</text>
+      <text x="680" y="324" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fleet Node</text>
+      <text x="680" y="340" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">dials out only</text>
+
+      <!-- Legend -->
+      <line x1="32" y1="464" x2="928" y2="464" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="32" y="480" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <line x1="32" y1="500" x2="60" y2="500" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="68" y="503" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Local TCP on one machine</text>
+
+      <line x1="232" y1="500" x2="260" y2="500" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <text x="268" y="503" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">Sealed control frame on the existing channel</text>
+
+      <line x1="532" y1="500" x2="560" y2="500" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <text x="568" y="503" fill="#4f5d75" font-size="9" font-family="'Geist', sans-serif">New outbound connection per stream, sealed with key K</text>
+    </svg>
+  </div>
+</body>
+</html>
