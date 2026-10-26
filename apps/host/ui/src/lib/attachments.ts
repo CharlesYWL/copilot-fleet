@@ -109,6 +109,11 @@ export function isImageAttachment(attachment: PromptAttachment): boolean {
   return attachment.mimeType.startsWith("image/");
 }
 
+/** The attachment as something an `<img>` can show, without another read of the file. */
+export function attachmentDataUrl(attachment: PromptAttachment): string {
+  return `data:${attachment.mimeType};base64,${attachment.data}`;
+}
+
 /** Strips the composer's handle back off, leaving what the wire expects. */
 export function toWireAttachments(
   drafts: readonly DraftAttachment[],

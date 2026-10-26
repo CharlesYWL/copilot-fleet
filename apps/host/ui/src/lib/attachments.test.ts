@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MAX_ATTACHMENTS_PER_PROMPT } from "@fleet/protocol";
 import {
   acceptAttachment,
+  attachmentDataUrl,
   attachmentSizeLabel,
   base64FromDataUrl,
   isImageAttachment,
@@ -177,6 +178,14 @@ describe("isImageAttachment", () => {
     expect(isImageAttachment({ name: "a", mimeType: "text/plain", data: "A" })).toBe(
       false,
     );
+  });
+});
+
+describe("attachmentDataUrl", () => {
+  it("puts back the prefix an <img> needs to show the bytes", () => {
+    expect(
+      attachmentDataUrl({ name: "a.png", mimeType: "image/png", data: "AAAB" }),
+    ).toBe("data:image/png;base64,AAAB");
   });
 });
 
