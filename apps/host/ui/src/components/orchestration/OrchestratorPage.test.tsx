@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import {
   RunPolicySchema,
@@ -617,6 +617,35 @@ describe("task detail", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
 
     expect(props.onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows progress while a task is being deleted", async () => {
+    let finishDelete: (ok: boolean) => void = () => {};
+    const onDelete = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finishDelete = resolve;
+        }),
+    );
+    const model = models([run({ id: "r1", state: "completed" })])[0]!;
+    detail({ model, onDelete });
+
+    fireEvent.click(screen.getByRole("button", { name: "Task details" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByRole("status").textContent).toContain(
+      "Deleting the task and closing its sessions",
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Deleting…" }).hasAttribute("disabled"),
+    ).toBe(true);
+
+    await act(async () => finishDelete(false));
+
+    expect(within(dialog).queryByRole("status")).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "Delete task" })).toBeTruthy();
   });
 
   it("names the conversation the task is assigned to and offers to move it", () => {

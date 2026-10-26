@@ -9,6 +9,7 @@ import {
   DialogTitle,
   Field,
   Link,
+  Spinner,
   Textarea,
   makeStyles,
   mergeClasses,
@@ -255,6 +256,13 @@ const useStyles = makeStyles({
     overflowWrap: "anywhere",
   },
   error: { color: statusVisuals.danger.foreground },
+  deleteProgress: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    marginTop: "12px",
+    color: tokens.colorNeutralForeground2,
+  },
 });
 
 export type OrchestratorTaskDetailProps = {
@@ -823,6 +831,12 @@ export const OrchestratorTaskDetail = ({
                 Archive instead if the record is worth keeping. Retained PR ownership or
                 unsettled effects block deletion until explicitly released.
               </p>
+              {busy ? (
+                <div className={styles.deleteProgress} role="status" aria-live="polite">
+                  <Spinner size="tiny" aria-hidden />
+                  <span>Deleting the task and closing its sessions…</span>
+                </div>
+              ) : null}
             </DialogContent>
             <DialogActions>
               <Button disabled={busy} onClick={() => setDeleteOpen(false)}>
@@ -831,6 +845,7 @@ export const OrchestratorTaskDetail = ({
               <Button
                 appearance="primary"
                 disabled={busy}
+                {...(busy ? { icon: <Spinner size="tiny" aria-hidden /> } : {})}
                 onClick={() => {
                   setBusy(true);
                   void onDelete()
@@ -840,7 +855,7 @@ export const OrchestratorTaskDetail = ({
                     .finally(() => setBusy(false));
                 }}
               >
-                Delete task
+                {busy ? "Deleting…" : "Delete task"}
               </Button>
             </DialogActions>
           </DialogBody>
