@@ -1542,6 +1542,29 @@ describe("settleUpdateOnReconnect", () => {
     expect(stages()).toEqual(["checking", "building", "restarting", "up_to_date"]);
   });
 
+  it("finishes an update whose restarting report was lost with the connection", () => {
+    // Seen live: four Nodes last reported "building", came back on the new
+    // build, and spun in every browser until the page was reloaded.
+    const { service, node, browser, stages } = updating();
+    service.publishNodeUpdate(node.nodeId, "building", "Building");
+
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+
+    expect(stages()).toEqual(["checking", "building", "up_to_date"]);
+    expect(browser.sent.at(-1)?.detail).toBe("Updated to abcdef123456");
+    expect(service.nodeUpdateInFlight(node.nodeId)).toBe(false);
+  });
+
+  it("keeps waiting when a node reconnects mid-build on its old revision", () => {
+    const { service, node, stages } = updating();
+    service.publishNodeUpdate(node.nodeId, "building", "Building");
+
+    service.settleUpdateOnReconnect(node.nodeId, "node1111");
+
+    expect(stages()).toEqual(["checking", "building"]);
+    expect(service.nodeUpdateInFlight(node.nodeId)).toBe(true);
+  });
+
   it("reports an unchanged revision as a failed restart rather than success", () => {
     const { service, node, browser, stages } = updating();
     service.publishNodeUpdate(node.nodeId, "restarting", "Restarting");
@@ -1579,7 +1602,9 @@ describe("settleUpdateOnReconnect", () => {
     service.publishNodeUpdate(node.nodeId, "restarting", "Old restart", {
       updateId: "old-update",
     });
-    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+    // On its old build: had the stale "restarting" been taken, this reconnect
+    // would settle the update as a failed restart.
+    service.settleUpdateOnReconnect(node.nodeId, "node1111");
     expect(stages()).toEqual(["checking"]);
   });
 });
