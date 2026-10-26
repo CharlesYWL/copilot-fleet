@@ -2265,12 +2265,22 @@ export class FleetService {
    */
   settleUpdateOnReconnect(nodeId: string, revision: string | undefined): void {
     const update = this.updatesInFlight.get(nodeId);
-    // A tunnel reconnect during install/build is not a completed restart.
-    if (!update?.restarting) return;
+    if (!update) return;
     const landed = revision?.trim();
     const expected = update.expectedRevision;
     const matches = (left: string, right: string) =>
       left.slice(0, 12) === right.slice(0, 12);
+    // "restarting" is sent moments before the Node tears its connection down,
+    // and over a relay it can be lost with it: the Node comes back on the new
+    // build while the Host last heard "building", and browsers spin until a
+    // reload. A Node reads its revision once, at start, so returning on a
+    // different one than it was asked to update from means a new process is
+    // running — the restart happened even though it was never announced.
+    const relaunched = Boolean(
+      landed && update.previousRevision && !matches(landed, update.previousRevision),
+    );
+    // A tunnel reconnect during install/build is not a completed restart.
+    if (!update.restarting && !relaunched) return;
     if (
       !landed ||
       (expected
