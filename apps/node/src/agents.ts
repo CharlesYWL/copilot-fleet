@@ -202,6 +202,11 @@ export interface SessionAgent {
    * agent, so without this the guess stands until the turn happens to end.
    */
   resync(): void;
+  /**
+   * Moves the event counter past numbers handed out elsewhere for this
+   * session, so the agent's next event cannot reuse one.
+   */
+  advanceSequence?(atLeast: number): void;
 }
 
 /** Startup failed without verified cleanup; the caller must retain and stop this agent. */
@@ -429,6 +434,10 @@ abstract class SequencedAgent {
     sequenceOffset = 0,
   ) {
     this.sequence = sequenceOffset;
+  }
+
+  advanceSequence(atLeast: number): void {
+    this.sequence = Math.max(this.sequence, atLeast);
   }
 
   protected emit(type: SessionEvent["type"], payload: Record<string, unknown>): void {

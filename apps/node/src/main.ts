@@ -125,6 +125,7 @@ import { CheckoutLocks } from "./checkout-locks.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 import { UsageJournal } from "./usage-journal.js";
 import { EventOutbox } from "./outbox.js";
+import { FileFollowerStore, NativeSessionFollower } from "./native-session-sync.js";
 import { NODE_CAPABILITIES } from "./node-capabilities.js";
 import { startHealthSampler } from "./health.js";
 import {
@@ -545,6 +546,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
   let usageNegotiated = false;
+  /**
+   * Follows Copilot's own logs for turns taken outside Fleet. Copilot-only:
+   * the mock agent writes no native log, and Hermes keeps its own store.
+   */
+  const nativeFollower: NativeSessionFollower | undefined = mockAgent
+    ? undefined
+    : new NativeSessionFollower({
+        store: new FileFollowerStore(join(configDirectory(), "native-session-sync.json")),
+        fleetTurnActive: (sessionId) => router.sessionTurnActive(sessionId),
+        reserveSequences: (sessionId, count) => router.reserveSequences(sessionId, count),
+        send: (message) => send(message),
+      });
   let usageInFlight = false;
   let usageJournal: UsageJournal | undefined;
   try {
@@ -834,6 +847,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       admission,
       repositories,
       leadDeliveries,
+      ...(nativeFollower
+        ? {
+            beforeResume: (sessionId: string) => nativeFollower.catchUp(sessionId),
+            nativeSession: (sessionId: string, agentSessionId: string | undefined) => {
+              if (agentSessionId) void nativeFollower.track(sessionId, agentSessionId);
+              else nativeFollower.untrack(sessionId);
+            },
+            launchingNative: (sessionId: string) => nativeFollower.claim(sessionId),
+            turnEnded: (sessionId: string) =>
+              void nativeFollower.fleetTurnEnded(sessionId),
+          }
+        : {}),
       deleteInactiveSession: async (agentSessionId, inactiveBefore, beforeDelete) => {
         if (mockAgent) {
           await beforeDelete();
@@ -1081,6 +1106,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   function reconnect(): void {
     usageNegotiated = false;
     usageInFlight = false;
+    nativeFollower?.disconnect();
     // The address or route may have changed, so the last diagnosis may be stale.
     clearHostProblem();
     consoleSlot.current?.disconnected();
@@ -1408,6 +1434,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   function connect(): void {
     usageNegotiated = false;
     usageInFlight = false;
+    nativeFollower?.disconnect();
     router.setMcpAvailable(false);
     const auth = credentials;
     /*
@@ -1628,6 +1655,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         usageNegotiated = !!channel && frame.value.usageSnapshots === true;
         usageInFlight = false;
         pumpUsage();
+        if (frame.value.nativeSessionSync === true)
+          void nativeFollower?.load().then(() => nativeFollower.connect());
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
         if (socket !== active || active.readyState !== WebSocket.OPEN) return;
@@ -1663,6 +1692,14 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           warn(errorMessage(error));
           active.close(1008, "Invalid usage acknowledgment");
         }
+        return;
+      }
+      if (frame.value.type === "native_session_import_ack") {
+        nativeFollower?.acknowledge(
+          frame.value.importId,
+          frame.value.status,
+          frame.value.throughSequence,
+        );
         return;
       }
       if (frame.value.type === "session_console_response") {
@@ -1916,6 +1953,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // A settings change swaps the socket out; the stale one must not tear down
       // agents or schedule a retry against the URL we just left.
       if (socket !== active || shuttingDown) return;
+      nativeFollower?.disconnect();
       sessionConsole?.disconnected();
       if (code === AUTH_FAILED_CLOSE_CODE) {
         sessionConsole?.unavailable(
@@ -2183,6 +2221,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         () => releaseLiveness(),
         () => configServer.close(),
         () => sessionConsole?.close(),
+        () => nativeFollower?.close(),
         () => recovery,
         () => commands.cancelAll("Node shutdown requested."),
         () => socket?.close(),

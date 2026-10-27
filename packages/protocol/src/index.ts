@@ -607,6 +607,23 @@ export const SessionSchema = z.object({
    */
   stopRequested: z.boolean().optional(),
   /**
+   * Another process on the session's Node — typically `copilot --resume` in a
+   * terminal — currently holds this conversation open.
+   *
+   * Kept apart from `state` on purpose: state drives task settlement,
+   * capacity and auto-resume, and a terminal turn must trigger none of them.
+   * Fleet refuses its own prompts and resumes while this is set, because the
+   * two processes would write one conversation with different context.
+   */
+  externalAttachment: z
+    .object({
+      pids: z.array(z.number().int().positive()).max(16),
+      active: z.boolean(),
+      since: z.string().datetime(),
+    })
+    .nullable()
+    .optional(),
+  /**
    * Visibility is not execution state. Dismissed orchestrators retain their
    * transcript, runs, and late events and can be restored independently.
    */
@@ -1470,6 +1487,36 @@ export type NodeReady = z.infer<typeof NodeReadySchema>;
 export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("usage_snapshots"), snapshots: UsageSnapshotBatchSchema }),
   z.object({
+    type: z.literal("native_session_import"),
+    /** Echoed in `native_session_import_ack`; the Node advances its cursor on it. */
+    importId: z.string().uuid(),
+    sessionId: z.string().min(1),
+    /** Turns taken outside Fleet, already normalized, in native order. */
+    events: z
+      .array(
+        z.object({
+          eventId: z.string().min(1).max(400),
+          type: z.enum([
+            "system",
+            "agent_text",
+            "agent_thought",
+            "tool",
+            "turn_complete",
+          ]),
+          payload: z.record(z.string(), z.unknown()),
+          createdAt: z.string().datetime(),
+          /**
+           * Present only while Fleet's own process is live, numbered from its
+           * counter so the two cannot collide. Absent: the Host numbers it.
+           */
+          sequence: z.number().int().positive().optional(),
+        }),
+      )
+      .max(512),
+    /** `undefined` leaves it unchanged; `null` clears it. */
+    attachment: SessionSchema.shape.externalAttachment,
+  }),
+  z.object({
     type: z.literal("session_console_request"),
     requestId: z.string().uuid(),
     request: ConsoleRequestSchema,
@@ -1592,6 +1639,18 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("usage_ack"),
     throughSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   }),
+  z.object({
+    type: z.literal("native_session_import_ack"),
+    importId: z.string().uuid(),
+    /**
+     * `stored`: committed (or already present). `unknown_session`: the Host
+     * has no such session for this Node; stop following it. `retry`: not now
+     * (history is synchronizing); send it again later.
+     */
+    status: z.enum(["stored", "unknown_session", "retry"]),
+    /** The session's highest event sequence after this import. */
+    throughSequence: z.number().int().nonnegative().optional(),
+  }),
   z.object({ type: z.literal("session_console_resync") }),
   z.object({
     type: z.literal("session_console_queue"),
@@ -1639,6 +1698,8 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("welcome"),
     usageSnapshots: z.boolean().optional(),
     sessionConsole: z.boolean().optional(),
+    /** This Host accepts `native_session_import`; see NATIVE_SESSION_SYNC_CAPABILITY. */
+    nativeSessionSync: z.boolean().optional(),
     nodeId: z.string().min(1),
     commandExecutions: z.boolean().default(false),
     commandPermissions: z.boolean().default(false),
@@ -1791,6 +1852,14 @@ export const SESSION_RETENTION_CAPABILITY = "session-retention";
 
 /** A Node that retains reconnect batches until `outbox_flush_ack`. */
 export const OUTBOX_ACK_CAPABILITY = "outbox-ack";
+
+/**
+ * A Node that follows Copilot's native session logs and sends turns taken
+ * outside Fleet as `native_session_import`. The Host must advertise it back in
+ * `welcome` before the Node sends one: an older Host closes the socket on a
+ * message type it does not know.
+ */
+export const NATIVE_SESSION_SYNC_CAPABILITY = "native-session-sync";
 
 /**
  * A Node that re-runs session-console synchronization when sent

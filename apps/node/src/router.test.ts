@@ -46,6 +46,67 @@ const START_DEFAULTS: Pick<
 > = { yolo: false, mcpServers: [], agent: "", readOnly: false, config: [] };
 
 describe("CommandRouter", () => {
+  it("refuses a resume while another process holds the native conversation", async () => {
+    const factory = new MockAgentFactory();
+    const start = vi.spyOn(factory, "start");
+    const warn = vi.fn();
+    const router = new CommandRouter(
+      factory,
+      2,
+      () => {},
+      async (path) => path,
+      undefined,
+      undefined,
+      warn,
+      {
+        beforeResume: async () => ({ throughSequence: 9, externalPids: [4242] }),
+      },
+    );
+    const result = await router.route(
+      NodeCommandSchema.parse({
+        type: "resume_session",
+        commandId: "resume-held",
+        sessionId: "held",
+        localPath: "C:\\repo",
+        agentSessionId: "native-held",
+      }),
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      fatal: false,
+      error: expect.stringContaining("pid 4242"),
+    });
+    expect(start).not.toHaveBeenCalled();
+    expect(router.activeSessionIds).toEqual([]);
+  });
+
+  it("numbers a resumed agent above imported outside turns", async () => {
+    const factory = new MockAgentFactory();
+    const start = vi.spyOn(factory, "start");
+    const router = new CommandRouter(
+      factory,
+      2,
+      () => {},
+      async (path) => path,
+      undefined,
+      undefined,
+      undefined,
+      { beforeResume: async () => ({ throughSequence: 40, externalPids: [] }) },
+    );
+    expect(
+      await router.route(
+        NodeCommandSchema.parse({
+          type: "resume_session",
+          commandId: "resume-free",
+          sessionId: "free",
+          localPath: "C:\\repo",
+          agentSessionId: "native-free",
+          sequenceOffset: 12,
+        }),
+      ),
+    ).toMatchObject({ ok: true });
+    expect(start.mock.calls[0]?.[3]).toMatchObject({ sequenceOffset: 40 });
+  });
   it("never forwards Hermes native IDs to Copilot deletion", async () => {
     const deleteInactiveSession = vi.fn();
     const router = new CommandRouter(

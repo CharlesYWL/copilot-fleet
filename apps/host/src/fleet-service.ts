@@ -36,6 +36,7 @@ import {
   type NodeCommand,
   type NodeHealth,
   type NodeConnection,
+  type NodeToHostMessage,
   type NodeUpdateStage,
   type Notification,
   type Placement,
@@ -99,6 +100,12 @@ import {
  * to the Host.
  */
 export const ORCHESTRATOR_AGENT = "fleet-orchestrator";
+
+/**
+ * Imported events up to this many are pushed to browsers one by one, like
+ * live output. A larger batch is a backlog; open views refetch instead.
+ */
+const NATIVE_IMPORT_LIVE_LIMIT = 64;
 
 /** `Omit` over a union has to be distributed, or the discriminant collapses. */
 type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
@@ -1253,6 +1260,13 @@ export class FleetService {
     if (!session) return { ok: false, status: 404, error: "Session not found" };
     if (this.console.blocked(session.nodeId))
       return { ok: false, status: 409, error: "Node history is synchronizing" };
+    if (session.externalAttachment)
+      return {
+        ok: false,
+        status: 409,
+        error:
+          "This conversation is open in another Copilot process on its node. Close it there before resuming it in Fleet.",
+      };
     // A request the ended agent left open must not hold the resume hostage.
     if (this.store.getNode(session.nodeId)?.online)
       this.withdrawOrphanedPermissions(session.id);
@@ -1500,6 +1514,13 @@ export class FleetService {
     if (manual && this.isSupervisorRetry(sessionId, manual)) return { ok: true };
     if (session.stopRequested)
       return { ok: false, status: 409, error: "Session is stopping" };
+    if (session.externalAttachment)
+      return {
+        ok: false,
+        status: 409,
+        error:
+          "This conversation is open in another Copilot process on its node (for example a terminal). Close it there first, so the two do not write one conversation with different context.",
+      };
     if (session.state !== "idle")
       return { ok: false, status: 409, error: "Session must be idle" };
     if (!manual)
@@ -2441,6 +2462,7 @@ export class FleetService {
         (session) =>
           session.state === "failed" &&
           session.agentSessionId &&
+          !session.externalAttachment &&
           !session.stopRequested &&
           !session.dismissed &&
           !this.sessionRetention.shouldExpire(session),
@@ -2599,6 +2621,47 @@ export class FleetService {
 
   handleEvent(event: SessionEvent): boolean {
     return this.handleEventResult(event).outcome === "accepted";
+  }
+
+  /**
+   * Records turns taken on a session outside Fleet, and who holds it now.
+   *
+   * Imported events are numbered here and tagged `historyReplay`, so the
+   * transcript shows them while orchestration, settlement and message
+   * delivery ignore them — a terminal turn is not the answer to anything Fleet
+   * asked. They are still published one by one through the ordinary path so
+   * open browsers and transcript projections advance in order.
+   */
+  importNativeSession(
+    nodeId: string,
+    input: Extract<NodeToHostMessage, { type: "native_session_import" }>,
+  ): { status: "stored" | "unknown_session" | "retry"; throughSequence?: number } {
+    const session = this.store.getSession(input.sessionId);
+    if (!session || session.nodeId !== nodeId) return { status: "unknown_session" };
+    // Reconnect replay owns ordering until it finishes; imports wait behind it.
+    if (this.console.blocked(nodeId)) return { status: "retry" };
+    const { stored, updated } = this.store.writeAtomically(() => ({
+      stored: this.store.appendImportedEvents(session.id, input.events),
+      updated:
+        input.attachment === undefined
+          ? undefined
+          : this.store.setExternalAttachment(session.id, input.attachment),
+    }));
+    if (stored.length > NATIVE_IMPORT_LIVE_LIMIT) {
+      // A backlog (a long terminal session caught up at once): one reset makes
+      // open views refetch a page, instead of validating and pushing
+      // hundreds of messages to every browser.
+      this.transcripts.invalidate(session.id);
+    } else {
+      for (const event of stored) {
+        const transcript = this.transcripts.apply(event);
+        this.broadcast({ type: "event", event, ...(transcript ? { transcript } : {}) });
+      }
+    }
+    const latest =
+      updated ?? (stored.length > 0 ? this.store.getSession(session.id) : undefined);
+    if (latest) this.publishSession(latest);
+    return { status: "stored", throughSequence: this.store.maxEventSequence(session.id) };
   }
 
   handleEventResult(event: SessionEvent): EventHandlingResult {

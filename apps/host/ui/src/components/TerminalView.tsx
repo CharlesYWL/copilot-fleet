@@ -1212,6 +1212,20 @@ export const TerminalView = ({
                 YOLO
               </Badge>
             )}
+            {session.externalAttachment && (
+              <Badge
+                appearance="tint"
+                color="informative"
+                size="small"
+                role="status"
+                title={`Open in another Copilot process on ${session.nodeName} (pid ${session.externalAttachment.pids.join(", ")}) since ${new Date(session.externalAttachment.since).toLocaleTimeString()}. Its turns are copied here; Fleet prompts wait until it closes.`}
+                aria-label={`Open in a terminal on ${session.nodeName}${session.externalAttachment.active ? ", working" : ""}`}
+              >
+                {session.externalAttachment.active
+                  ? "Terminal · working"
+                  : "Open in terminal"}
+              </Badge>
+            )}
             {session.runRole === "lead" && (
               <Badge appearance="outline" size="small">
                 {agentKindLabels[session.agentParams?.kind ?? "copilot"]}
