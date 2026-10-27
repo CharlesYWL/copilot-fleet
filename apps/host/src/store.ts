@@ -925,6 +925,11 @@ export class FleetStore {
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("runs", "workspace_binding", "TEXT NOT NULL DEFAULT '{}'");
     this.addColumnIfMissing("sessions", "execution_binding", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing(
+      "sessions",
+      "external_attachment",
+      "TEXT NOT NULL DEFAULT ''",
+    );
     this.addColumnIfMissing("run_steps", "execution_binding", "TEXT NOT NULL DEFAULT ''");
     this.migrateRunWorkspaceSpecs();
     this.addColumnIfMissing(
@@ -6443,6 +6448,70 @@ export class FleetStore {
   }
 
   /**
+   * Records whether some process outside Fleet holds this session open.
+   *
+   * Returns the updated session only when the value changed, so a Node that
+   * repeats itself does not cause a broadcast.
+   */
+  setExternalAttachment(
+    sessionId: string,
+    attachment: FleetSession["externalAttachment"],
+  ): FleetSession | undefined {
+    const current = this.getSession(sessionId);
+    if (!current) return undefined;
+    const next = attachment ? JSON.stringify(attachment) : "";
+    const previous = current.externalAttachment
+      ? JSON.stringify(current.externalAttachment)
+      : "";
+    if (next === previous) return undefined;
+    this.statement("UPDATE sessions SET external_attachment=? WHERE id=?").run(
+      next,
+      sessionId,
+    );
+    return this.getSession(sessionId);
+  }
+
+  /**
+   * Appends turns imported from a Copilot native log, numbering them after
+   * everything already recorded for the session.
+   *
+   * The Node cannot number them: Fleet's own agent may be writing the same
+   * session at the same moment, and only this table knows the true end. An
+   * event id already present is skipped, which is what makes re-importing a
+   * native line (after a Node restart) harmless. Runs in the caller's
+   * transaction when there is one.
+   */
+  appendImportedEvents(
+    sessionId: string,
+    events: readonly (Pick<SessionEvent, "eventId" | "type" | "payload" | "createdAt"> & {
+      sequence?: number | undefined;
+    })[],
+  ): SessionEvent[] {
+    return this.transactionIfNeeded(() => {
+      const stored: SessionEvent[] = [];
+      const exists = this.statement("SELECT 1 FROM events WHERE event_id=?");
+      for (const input of events) {
+        if (exists.get(input.eventId)) continue;
+        const event: SessionEvent = {
+          eventId: input.eventId,
+          type: input.type,
+          createdAt: input.createdAt,
+          sessionId,
+          // A Node-reserved number keeps a live agent's counter and these
+          // apart; without one, this table's end is the only safe place.
+          sequence: input.sequence ?? this.maxEventSequence(sessionId) + 1,
+          payload: { ...input.payload, historyReplay: true },
+        };
+        if (this.appendEvent(event).stored) stored.push(event);
+      }
+      // `historyReplay` keeps settlement and wakes away from these, but they
+      // are real use: a session worked on in a terminal is not abandoned.
+      if (stored.length > 0) this.touchSessionActivity(sessionId);
+      return stored;
+    });
+  }
+
+  /**
    * Estimated Node-to-Host clock offset at an event sequence boundary.
    *
    * Both timestamps describe the same event, so their difference can safely
@@ -6820,6 +6889,9 @@ function sessionFromRow(row: Row): FleetSession {
     dismissed: Boolean(row.dismissed),
     favorite: Boolean(row.favorite),
     readOnly: Boolean(row.read_only),
+    externalAttachment: row.external_attachment
+      ? JSON.parse(String(row.external_attachment))
+      : null,
   });
 }
 

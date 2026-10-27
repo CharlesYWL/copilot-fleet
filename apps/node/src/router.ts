@@ -79,6 +79,17 @@ export type CommandRouterOptions = {
     inactiveBefore: number,
     beforeDelete: () => Promise<void>,
   ) => Promise<void>;
+  /**
+   * Imports turns taken outside Fleet before a resume, and answers the Host's
+   * highest sequence afterwards so the new process numbers above them.
+   */
+  beforeResume?: (sessionId: string) => Promise<number | undefined>;
+  /** A native conversation is now Fleet's, or no longer is. */
+  nativeSession?: (sessionId: string, agentSessionId: string | undefined) => void;
+  /** Fleet is about to launch its own process on this native conversation. */
+  launchingNative?: (sessionId: string) => void;
+  /** One of Fleet's own turns ended. */
+  turnEnded?: (sessionId: string) => void;
 };
 
 type SessionActivity = {
@@ -177,6 +188,31 @@ export class CommandRouter {
 
   get activeSessionIds(): string[] {
     return [...this.slots.keys()];
+  }
+
+  /**
+   * Whether Fleet's own process is mid-turn in this session, so lines Copilot
+   * writes now are already in Fleet's live stream.
+   */
+  sessionTurnActive(sessionId: string): boolean {
+    const slot = this.slots.get(sessionId);
+    // No process yet (a resume still importing outside turns): nothing is Fleet's.
+    if (!slot?.agent) return false;
+    return slot.initializing || slot.agent.busy || !!slot.refreshing;
+  }
+
+  /**
+   * Takes `count` sequence numbers from a live session's counter, for events
+   * imported from outside Fleet while Fleet's own process is running. Answers
+   * undefined when nothing is live, and the Host numbers them instead.
+   */
+  reserveSequences(sessionId: string, count: number): number | undefined {
+    const slot = this.slots.get(sessionId);
+    if (!slot?.agent || slot.initializing) return undefined;
+    const first = slot.sequenceOffset + 1;
+    slot.sequenceOffset += count;
+    slot.agent.advanceSequence?.(slot.sequenceOffset);
+    return first;
   }
 
   /** Where a live session is working, working directory first; empty otherwise. */
@@ -938,6 +974,18 @@ export class CommandRouter {
       if (command.type === "resume_session") {
         slot.agentSessionId = command.agentSessionId;
         slot.activity.agentSessionId = command.agentSessionId;
+        // Terminal turns since Fleet last ran this conversation are imported
+        // first, so they precede everything the resumed process says.
+        try {
+          const through = await this.options.beforeResume?.(command.sessionId);
+          if (through !== undefined)
+            slot.sequenceOffset = Math.max(slot.sequenceOffset, through);
+        } catch (error) {
+          this.warn(
+            `session ${command.sessionId.slice(0, 8)}: could not import outside activity before resume: ${String(error)}`,
+          );
+        }
+        this.options.launchingNative?.(command.sessionId);
       }
       const agent = await this.factory
         .start(
@@ -955,7 +1003,8 @@ export class CommandRouter {
                     }
                   : {}),
                 additionalDirectories,
-                sequenceOffset: command.sequenceOffset,
+                // Includes any imported terminal turns, which the Host numbered.
+                sequenceOffset: slot.sequenceOffset,
                 yolo: command.yolo,
                 agencyMode: command.agencyMode ?? false,
                 ...(command.contextTier ? { contextTier: command.contextTier } : {}),
@@ -1253,7 +1302,10 @@ export class CommandRouter {
     if (agentSession?.agentSessionId) {
       slot.agentSessionId = agentSession.agentSessionId;
       slot.activity.agentSessionId = agentSession.agentSessionId;
+      this.options.nativeSession?.(sessionId, agentSession.agentSessionId);
     }
+    if (event.type === "turn_complete" && !event.payload.historyReplay)
+      this.options.turnEnded?.(sessionId);
     const config = eventPayload(event, "config");
     for (const option of config?.options ?? []) {
       if (option.currentValue !== undefined) {
@@ -1572,6 +1624,7 @@ export class CommandRouter {
     signal?.throwIfAborted();
     if (this.slots.get(sessionId) !== slot || slot.stopping || this.draining)
       throw new CommandRefused("Session is being stopped");
+    this.options.launchingNative?.(sessionId);
     let replaying = true;
     try {
       const next = await this.factory.start(

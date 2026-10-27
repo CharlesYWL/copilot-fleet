@@ -4,6 +4,7 @@ import {
   AUTH_FAILED_CLOSE_CODE,
   AuthenticatedEnvelopeSchema,
   INVALID_MESSAGE_CLOSE_CODE,
+  NATIVE_SESSION_SYNC_CAPABILITY,
   NodeFirstFrameSchema,
   NodeProofSchema,
   NodeToHostMessageSchema,
@@ -230,6 +231,9 @@ export function registerNodeGateway(
       const sessionConsole =
         input.link instanceof SealedNodeLink &&
         inventory.capabilities.includes(SESSION_CONSOLE_CAPABILITY);
+      const nativeSessionSync = inventory.capabilities.includes(
+        NATIVE_SESSION_SYNC_CAPABILITY,
+      );
       if (sessionConsole)
         service.console.attach(
           nodeId,
@@ -290,6 +294,7 @@ export function registerNodeGateway(
         type: "welcome",
         ...(usageSnapshots ? { usageSnapshots: true } : {}),
         ...(sessionConsole ? { sessionConsole: true } : {}),
+        ...(nativeSessionSync ? { nativeSessionSync: true } : {}),
         nodeId,
         reconcileAfterOutbox: awaitingOutboxFlush,
         acknowledgeOutbox,
@@ -332,6 +337,28 @@ export function registerNodeGateway(
             return;
           }
           void service.console.handle(nodeId, message.requestId, message.request);
+          return;
+        }
+        if (message.type === "native_session_import") {
+          if (!nativeSessionSync) {
+            socket.close(1008, "Native session sync was not negotiated");
+            return;
+          }
+          let result: ReturnType<FleetService["importNativeSession"]>;
+          try {
+            result = service.importNativeSession(nodeId, message);
+          } catch (error) {
+            app.log.warn(
+              { nodeId, sessionId: message.sessionId, err: error },
+              "Could not store a native session import",
+            );
+            result = { status: "retry" };
+          }
+          service.send(input.link, {
+            type: "native_session_import_ack",
+            importId: message.importId,
+            ...result,
+          });
           return;
         }
         const ownership = nodeMessageOwnership(nodeId, message, (id) =>
