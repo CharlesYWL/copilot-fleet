@@ -12,7 +12,7 @@ tags:
 **Area**: Node agent launch, Host scheduling and settings, protocol  
 **Engineer**: Not assigned  
 **Driver / Approver**: Charles Yin, repository owner  
-**Status**: Design approved in conversation on 2026-10-26; written spec under review; not implemented  
+**Status**: Design approved in conversation; written spec under review; not implemented  
 **Date**: 2026-10-26  
 **Source baseline**: `daed730` on `main` (drafted at `3456c2a`; rechecked against `daed730`)  
 **Work item**: Not supplied
@@ -25,7 +25,7 @@ tags:
 | Earlier harness exploration | [2026-08-18-orchestrator-harness-choice.md](2026-08-18-orchestrator-harness-choice.md) |
 | Earlier compile-time plugin plan (tunnels, not implemented) | [2026-08-20-tunnel-plugin-decoupling.md](../plans/2026-08-20-tunnel-plugin-decoupling.md) |
 | Worker execution profiles | [2026-10-12-experimental-worker-model-routing.md](2026-10-12-experimental-worker-model-routing.md) |
-| Task Node binding (draft, may land first) | [2026-10-26-task-node-binding-design.md](2026-10-26-task-node-binding-design.md) |
+| Task Node binding (designed in #104, not implemented) | [2026-10-26-task-node-binding-design.md](2026-10-26-task-node-binding-design.md) |
 | Architecture | [ARCHITECTURE.md](../../../ARCHITECTURE.md) |
 | ACP initialization and capabilities | [agentclientprotocol.com/protocol/initialization](https://agentclientprotocol.com/protocol/initialization) |
 | ACP session config options | [agentclientprotocol.com/protocol/v1/session-config-options](https://agentclientprotocol.com/protocol/v1/session-config-options) |
@@ -385,10 +385,10 @@ core and compares the whole `agentParams` value instead of naming Hermes.
   profile's agent kind for the step's role (`worker` or `reviewer`). If none
   qualifies, the dispatch is refused with the reason, the same way an unknown
   profile is refused today. A Copilot worker is never substituted.
-- If the task Node binding design (#104) lands first, a task's workers can run
-  only on its bound Node. The agent-kind check then applies to that one Node,
-  and a refusal names both facts: the task's bound Node, and that the Node does
-  not offer the profile's agent kind.
+- If task Node binding (designed in #104) is implemented first, a task's
+  workers can run only on its bound Node. The agent-kind check then applies to
+  that one Node, and a refusal names both facts: the task's bound Node, and
+  that the Node does not offer the profile's agent kind.
 - The profile's model list in Settings reads the model catalog reported by that
   agent kind.
 - A worker keeps its stored agent kind and parameters for follow-ups and
