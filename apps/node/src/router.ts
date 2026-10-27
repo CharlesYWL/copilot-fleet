@@ -80,10 +80,13 @@ export type CommandRouterOptions = {
     beforeDelete: () => Promise<void>,
   ) => Promise<void>;
   /**
-   * Imports turns taken outside Fleet before a resume, and answers the Host's
-   * highest sequence afterwards so the new process numbers above them.
+   * Imports turns taken outside Fleet before a resume. Answers the Host's
+   * highest sequence afterwards, so the new process numbers above them, and
+   * whatever process outside Fleet holds the conversation at this moment.
    */
-  beforeResume?: (sessionId: string) => Promise<number | undefined>;
+  beforeResume?: (
+    sessionId: string,
+  ) => Promise<{ throughSequence?: number; externalPids: number[] }>;
   /** A native conversation is now Fleet's, or no longer is. */
   nativeSession?: (sessionId: string, agentSessionId: string | undefined) => void;
   /** Fleet is about to launch its own process on this native conversation. */
@@ -976,15 +979,28 @@ export class CommandRouter {
         slot.activity.agentSessionId = command.agentSessionId;
         // Terminal turns since Fleet last ran this conversation are imported
         // first, so they precede everything the resumed process says.
+        let caught: Awaited<
+          ReturnType<NonNullable<CommandRouterOptions["beforeResume"]>>
+        >;
         try {
-          const through = await this.options.beforeResume?.(command.sessionId);
-          if (through !== undefined)
-            slot.sequenceOffset = Math.max(slot.sequenceOffset, through);
+          caught = (await this.options.beforeResume?.(command.sessionId)) ?? {
+            externalPids: [],
+          };
         } catch (error) {
+          caught = { externalPids: [] };
           this.warn(
             `session ${command.sessionId.slice(0, 8)}: could not import outside activity before resume: ${String(error)}`,
           );
         }
+        // Checked on the node, now: the Host's view comes from the last poll,
+        // and a terminal may have attached since. Two processes writing one
+        // conversation each work from context missing the other's turns.
+        if (caught.externalPids.length > 0)
+          throw new CommandRefused(
+            `This conversation is open in another Copilot process on this node (pid ${caught.externalPids.join(", ")}). Close it there before resuming in Fleet.`,
+          );
+        if (caught.throughSequence !== undefined)
+          slot.sequenceOffset = Math.max(slot.sequenceOffset, caught.throughSequence);
         this.options.launchingNative?.(command.sessionId);
       }
       const agent = await this.factory

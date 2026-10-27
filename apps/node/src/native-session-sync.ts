@@ -73,6 +73,12 @@ export type NativeCursor = {
   offset: number;
   /** File identity at `offset`; a replaced or truncated log restarts from 0. */
   identity?: string;
+  /**
+   * The line at `offset` is longer than the line limit: skip bytes until its
+   * newline instead of buffering it. Lets a huge line be crossed over several
+   * bounded passes rather than reread from its start forever.
+   */
+  discarding?: boolean;
 };
 
 export type NativeReadResult = {
@@ -140,11 +146,15 @@ export async function readNativeEvents(
     const info = await file.stat();
     const identity = fileIdentity(info);
     let offset = cursor.offset;
-    if ((cursor.identity && cursor.identity !== identity) || info.size < offset)
+    let discarding = cursor.discarding === true;
+    if ((cursor.identity && cursor.identity !== identity) || info.size < offset) {
       offset = 0;
-    if (info.size === offset) return empty({ offset, identity });
+      discarding = false;
+    }
+    if (info.size === offset)
+      return empty({ offset, identity, ...(discarding ? { discarding } : {}) });
 
-    const end = Math.min(info.size, offset + maxBytes);
+    const budgetEnd = Math.min(info.size, offset + maxBytes);
     const events: NativeEvent[] = [];
     let linesSeen = 0;
     let linesParsed = 0;
@@ -153,11 +163,15 @@ export async function readNativeEvents(
     let pending: Buffer[] = [];
     let pendingBytes = 0;
     const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
-    while (position < end) {
+    // A pass that has not finished a single line keeps reading past its budget
+    // until that line ends (or proves oversized and is skipped). Stopping at
+    // the budget instead would reread the same line start forever.
+    const stopAt = () => (consumed === offset ? info.size : budgetEnd);
+    while (position < stopAt()) {
       const { bytesRead } = await file.read({
         buffer,
         offset: 0,
-        length: Math.min(buffer.length, end - position),
+        length: Math.min(buffer.length, stopAt() - position),
         position,
       });
       if (bytesRead === 0) break;
@@ -165,11 +179,29 @@ export async function readNativeEvents(
       let start = 0;
       while (start < chunk.length) {
         const newline = chunk.indexOf(10, start);
+        if (discarding) {
+          // Inside an oversized line: nothing to keep until its newline.
+          if (newline < 0) {
+            consumed = position + chunk.length;
+            break;
+          }
+          discarding = false;
+          linesSeen += 1;
+          consumed = position + newline + 1;
+          start = newline + 1;
+          continue;
+        }
         if (newline < 0) {
           const rest = chunk.subarray(start);
-          // Only the start of an oversized line is kept: enough for its type.
-          if (pendingBytes < MAX_LINE_BYTES) pending.push(Buffer.from(rest));
           pendingBytes += rest.length;
+          if (pendingBytes > MAX_LINE_BYTES) {
+            // Too long to import: commit to skipping it, so the next pass
+            // resumes past these bytes instead of rereading them.
+            pending = [];
+            pendingBytes = 0;
+            discarding = true;
+            consumed = position + chunk.length;
+          } else pending.push(Buffer.from(rest));
           break;
         }
         const tail = chunk.subarray(start, newline);
@@ -210,7 +242,7 @@ export async function readNativeEvents(
     }
     return {
       events,
-      cursor: { offset: consumed, identity },
+      cursor: { offset: consumed, identity, ...(discarding ? { discarding } : {}) },
       bytesRead: position - offset,
       linesSeen,
       linesParsed,
@@ -460,7 +492,16 @@ export type ImportMessage = {
   attachment?: ExternalAttachment | null;
 };
 
-type FollowedRecord = { nativeSessionId: string; cursor: NativeCursor };
+type FollowedRecord = {
+  nativeSessionId: string;
+  cursor: NativeCursor;
+  /**
+   * Log bytes up to here are Fleet's own turns, already in the transcript.
+   * Saved with the cursor: a restart between a Fleet turn ending and the next
+   * pass must not reread that turn and import it as outside history.
+   */
+  ownedThrough?: number;
+};
 
 /** Durable followed-session list and cursors. */
 export interface FollowerStore {
@@ -619,10 +660,10 @@ export class NativeSessionFollower {
           isSafeNativeSessionId(record.nativeSessionId) &&
           !this.followed.has(fleetSessionId)
         )
-          this.followed.set(
-            fleetSessionId,
-            this.freshState(record.nativeSessionId, record.cursor),
-          );
+          this.followed.set(fleetSessionId, {
+            ...this.freshState(record.nativeSessionId, record.cursor),
+            ownedThrough: record.ownedThrough ?? 0,
+          });
     });
     return this.loaded;
   }
@@ -687,7 +728,9 @@ export class NativeSessionFollower {
     const state = this.followed.get(fleetSessionId);
     if (!state) return;
     const info = await stat(this.logPath(state)).catch(() => undefined);
-    if (info) state.ownedThrough = Math.max(state.ownedThrough, info.size);
+    if (!info || info.size <= state.ownedThrough) return;
+    state.ownedThrough = info.size;
+    this.persist();
   }
 
   /** The Host connection is up and has negotiated imports. */
@@ -767,26 +810,45 @@ export class NativeSessionFollower {
    * store it, for a caller about to put Fleet's own process to work on it.
    *
    * Answers the highest sequence the Host is known to have assigned, so a
-   * resumed agent can number its events above the imported ones.
+   * resumed agent can number its events above the imported ones, and any
+   * process outside Fleet holding the conversation right now — checked here,
+   * not taken from the last pass, because a terminal can attach between
+   * passes and the Host only knows what the last pass reported.
    */
-  async catchUp(fleetSessionId: string): Promise<number | undefined> {
+  async catchUp(
+    fleetSessionId: string,
+  ): Promise<{ throughSequence?: number; externalPids: number[] }> {
+    const answer = (externalPids: number[]) => {
+      const throughSequence = this.hostSequences.get(fleetSessionId);
+      return {
+        ...(throughSequence !== undefined ? { throughSequence } : {}),
+        externalPids,
+      };
+    };
     const state = this.followed.get(fleetSessionId);
-    if (!state || !this.connected) return this.hostSequences.get(fleetSessionId);
+    if (!state) return answer([]);
     await this.running;
-    await this.settled(fleetSessionId);
-    // Drained to the end, one bounded read at a time, so nothing the terminal
-    // wrote is left to arrive after the resumed process starts talking.
-    const deadline = Date.now() + CATCH_UP_LIMIT_MS;
-    while (this.followed.get(fleetSessionId) === state && Date.now() < deadline) {
-      state.lastSize = -1;
-      const before = state.cursor.offset;
-      await this.syncOne(fleetSessionId, state, emptyStats());
+    if (this.connected) {
       await this.settled(fleetSessionId);
-      const info = await stat(this.logPath(state)).catch(() => undefined);
-      if (!info || state.cursor.offset >= info.size || state.cursor.offset === before)
-        break;
+      // Drained to the end, one bounded read at a time, so nothing the
+      // terminal wrote is left to arrive after the resumed process talks.
+      const deadline = Date.now() + CATCH_UP_LIMIT_MS;
+      while (this.followed.get(fleetSessionId) === state && Date.now() < deadline) {
+        state.lastSize = -1;
+        const before = state.cursor.offset;
+        await this.syncOne(fleetSessionId, state, emptyStats());
+        await this.settled(fleetSessionId);
+        const info = await stat(this.logPath(state)).catch(() => undefined);
+        if (!info || state.cursor.offset >= info.size || state.cursor.offset === before)
+          break;
+      }
     }
-    return this.hostSequences.get(fleetSessionId);
+    // Fleet has no process on this session yet, so every live holder is
+    // someone else's. A remembered Fleet pid still alive could be a reused pid
+    // or a previous process still exiting; either way the resume must wait.
+    state.claimingUntil = 0;
+    state.fleetPids.clear();
+    return answer(await this.externalHolders(state));
   }
 
   private freshState(nativeSessionId: string, cursor: NativeCursor): FollowState {
@@ -814,7 +876,11 @@ export class NativeSessionFollower {
       new Map(
         [...this.followed].map(([id, state]) => [
           id,
-          { nativeSessionId: state.nativeSessionId, cursor: state.cursor },
+          {
+            nativeSessionId: state.nativeSessionId,
+            cursor: state.cursor,
+            ...(state.ownedThrough > 0 ? { ownedThrough: state.ownedThrough } : {}),
+          },
         ]),
       ),
     );
@@ -895,23 +961,30 @@ export class NativeSessionFollower {
       stats.linesSeen += read.linesSeen;
       stats.linesParsed += read.linesParsed;
       const fleetTurn = this.options.fleetTurnActive(fleetSessionId);
+      // A replaced log restarts at 0; an ownership mark from the old file
+      // would hide the new file's outside turns.
+      if (read.cursor.identity !== state.cursor.identity && state.cursor.identity)
+        state.ownedThrough = 0;
       const theirs = fleetTurn
         ? []
         : read.events.filter((event) => event.end > state.ownedThrough);
       externalWrite =
         !fleetTurn && read.bytesRead > 0 && read.cursor.offset > state.ownedThrough;
-      if (fleetTurn)
-        state.ownedThrough = Math.max(state.ownedThrough, read.cursor.offset);
+      if (fleetTurn && read.cursor.offset > state.ownedThrough) {
+        state.ownedThrough = read.cursor.offset;
+        this.persist();
+      }
       next = read.cursor;
       // Translate native events until one message is full; the cursor stops
       // just past the last native line taken, and the rest waits a pass.
       for (const [index, native] of theirs.entries()) {
         const translated = translateNativeEvents([native], fleetSessionId);
         if (events.length + translated.length > MAX_IMPORT_EVENTS) {
-          // Resume at the start of this native line: the previous one's end.
+          // Resume at the start of this native line: the previous one's end,
+          // which is a line boundary, so nothing is being skipped there.
           next = {
-            ...read.cursor,
             offset: theirs[index - 1]?.end ?? state.cursor.offset,
+            ...(read.cursor.identity ? { identity: read.cursor.identity } : {}),
           };
           break;
         }

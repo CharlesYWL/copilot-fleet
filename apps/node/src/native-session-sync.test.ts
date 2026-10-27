@@ -3,6 +3,7 @@ import { appendFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  FileFollowerStore,
   MemoryFollowerStore,
   NativeSessionFollower,
   lineType,
@@ -325,7 +326,101 @@ describe("NativeSessionFollower", () => {
       check();
     });
     follower.acknowledge(sent[0]!.importId, "stored", 157);
-    await expect(caught).resolves.toBe(157);
+    await expect(caught).resolves.toEqual({ throughSequence: 157, externalPids: [] });
     expect((await stat(path)).size).toBeGreaterThan(0);
+  });
+
+  it("reports a terminal that attached since the last pass when catching up", async () => {
+    await follower.track(fleetId, nativeId);
+    await connect();
+    // Attaches between passes: no poll has seen it, so the Host does not know.
+    await lock(terminalPid);
+    const acknowledging = setInterval(ackAll, 1);
+    try {
+      await expect(follower.catchUp(fleetId)).resolves.toMatchObject({
+        externalPids: [terminalPid],
+      });
+    } finally {
+      clearInterval(acknowledging);
+    }
+  });
+
+  it("does not trust a remembered Fleet pid when catching up for a resume", async () => {
+    await lock(fleetPid);
+    await follower.track(fleetId, nativeId);
+    await connect();
+    // Fleet's process is gone, but its pid is alive again: reused, or still
+    // exiting. Either way a resume must not start beside it.
+    await expect(follower.catchUp(fleetId)).resolves.toMatchObject({
+      externalPids: [fleetPid],
+    });
+  });
+
+  it("crosses a line longer than one pass's byte budget", async () => {
+    follower = new NativeSessionFollower({
+      copilotHome: home,
+      store: new MemoryFollowerStore(),
+      fleetTurnActive: () => false,
+      reserveSequences: () => undefined,
+      send: (message) => {
+        sent.push(message);
+        return true;
+      },
+      alive: () => false,
+      maxBytesPerPass: 64 * 1024,
+    });
+    await follower.track(fleetId, nativeId);
+    await connect();
+    // 9 MiB: over the line limit and over a hundred passes' budget.
+    const huge = `${JSON.stringify({ type: "tool.execution_complete", data: { blob: "x".repeat(9 * 1024 * 1024) }, id: "huge", timestamp: "2026-10-26T20:00:00.000Z" })}\n`;
+    await appendFile(path, huge + userTurn("after the big one"));
+    for (let pass = 0; pass < 200 && sent.length === 0; pass++) await follower.poll();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.events[0]!.payload.text).toBe("User: after the big one");
+  });
+
+  it("keeps the Fleet-owned boundary across a restart", async () => {
+    const directoryStore = join(home, "state", "follower.json");
+    const open = () => {
+      const created = new NativeSessionFollower({
+        copilotHome: home,
+        store: new FileFollowerStore(directoryStore, 0),
+        fleetTurnActive: () => false,
+        reserveSequences: () => undefined,
+        send: (message) => {
+          sent.push(message);
+          return true;
+        },
+        alive: () => false,
+      });
+      return created;
+    };
+    follower = open();
+    await follower.track(fleetId, nativeId);
+    await connect();
+    // A Fleet turn is written and ends; the Node stops before the next pass.
+    await appendFile(path, userTurn("fleet prompt"));
+    await follower.fleetTurnEnded(fleetId);
+    await follower.close();
+
+    follower = open();
+    await follower.load();
+    follower.connect(60_000);
+    await follower.poll();
+    await follower.poll();
+    expect(sent.flatMap((message) => message.events)).toEqual([]);
+  });
+
+  it("reads past an oversized line within a single read", async () => {
+    const huge = `${JSON.stringify({ type: "user.message", data: { content: "y".repeat(9 * 1024 * 1024) }, id: "big", timestamp: "2026-10-26T20:00:00.000Z" })}\n`;
+    await writeFile(path, huge + userTurn("next"));
+    const read = await readNativeEvents(path, { offset: 0 });
+    // The oversized prompt is skipped whole; the next turn's prompt is read.
+    expect(
+      read.events
+        .filter((event) => event.type === "user.message")
+        .map((event) => event.data.content),
+    ).toEqual(["next"]);
+    expect(read.cursor.discarding).toBeUndefined();
   });
 });
