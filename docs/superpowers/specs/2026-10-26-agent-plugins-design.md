@@ -12,9 +12,9 @@ tags:
 **Area**: Node agent launch, Host scheduling and settings, protocol  
 **Engineer**: Not assigned  
 **Driver / Approver**: Charles Yin, repository owner  
-**Status**: Design approved in conversation on 2026-10-26; not implemented  
+**Status**: Design approved in conversation on 2026-10-26; written spec under review; not implemented  
 **Date**: 2026-10-26  
-**Source baseline**: `3456c2a` on `main`  
+**Source baseline**: `daed730` on `main` (drafted at `3456c2a`; rechecked against `daed730`)  
 **Work item**: Not supplied
 
 ## Related documents
@@ -25,6 +25,7 @@ tags:
 | Earlier harness exploration | [2026-08-18-orchestrator-harness-choice.md](2026-08-18-orchestrator-harness-choice.md) |
 | Earlier compile-time plugin plan (tunnels, not implemented) | [2026-08-20-tunnel-plugin-decoupling.md](../plans/2026-08-20-tunnel-plugin-decoupling.md) |
 | Worker execution profiles | [2026-10-12-experimental-worker-model-routing.md](2026-10-12-experimental-worker-model-routing.md) |
+| Task Node binding (draft, may land first) | [2026-10-26-task-node-binding-design.md](2026-10-26-task-node-binding-design.md) |
 | Architecture | [ARCHITECTURE.md](../../../ARCHITECTURE.md) |
 | ACP initialization and capabilities | [agentclientprotocol.com/protocol/initialization](https://agentclientprotocol.com/protocol/initialization) |
 | ACP session config options | [agentclientprotocol.com/protocol/v1/session-config-options](https://agentclientprotocol.com/protocol/v1/session-config-options) |
@@ -181,6 +182,7 @@ type AgentManifest = {
     unattended: "launch-flag" | "auto-approve" | "none";
     nativeHistoryCleanup: boolean;
     nativeStateFiles: boolean;   // the plugin can name the native session folder downloads may read
+    nativeLogSync: boolean;      // the plugin can import turns taken outside Fleet from the agent's own log
     adoptExisting: boolean;      // can attach to an existing native conversation
     images: boolean;             // accepts image prompt blocks
     usage: { context: boolean; tokens: boolean; credits: boolean };
@@ -251,6 +253,12 @@ with these changes:
   manifest declares `nativeStateFiles`. Copilot moves today's
   `<COPILOT_HOME>/session-state/<id>` rule from `apps/node/src/session-files.ts`
   here, so session downloads stop special-casing Copilot.
+- New optional `followNativeLog(nativeSessionId)`, present only when the
+  manifest declares `nativeLogSync`. Copilot moves today's
+  `NativeSessionFollower` (`apps/node/src/native-session-sync.ts`) behind it.
+  The core starts following a session only when its plugin provides the hook,
+  so a non-Copilot session is never matched against Copilot's
+  `session-state` folder.
 - `usage`, `configOptions`, `setConfigOption`, `stderrLogLevel`, `rollover` and
   `tracksUnpromptedWork` remain optional hooks.
 
@@ -309,7 +317,7 @@ Rules:
 - Generic agents report context usage from ACP `usage_update` notifications.
   Token and credit totals stay unknown (`?`) unless a code plugin reads the
   agent's own records. `nativeHistoryCleanup`, `nativeStateFiles`,
-  `adoptExisting` and `rollover` are false.
+  `nativeLogSync`, `adoptExisting` and `rollover` are false.
 - An invalid file is logged and listed with its exact validation error on the
   Node config page and in Settings → Agents. It never stops the Node from
   starting.
@@ -319,6 +327,7 @@ Rules:
 | Today | After |
 | --- | --- |
 | `apps/node/src/agent-kinds/copilot*.ts`, Agency launch (`copilot-launch.ts`), credits and `/context` reader, native-session deletion in `copilot-sessions.ts` and the router | `apps/node/src/plugins/copilot/` |
+| Native session log sync (`native-session-sync.ts`, merged in #105), wired in `main.ts` for every session; its router hooks (`beforeResume`, `nativeSession`, `launchingNative`, `turnEnded`) | Copilot plugin's `followNativeLog` hook. The router keeps the generic hook points and calls them only for sessions whose manifest declares `nativeLogSync` |
 | `apps/node/src/agent-kinds/hermes*.ts`, Hermes checks in `router.ts` (delete refusal, profile change refusal), Hermes branch in `usage-totals.ts` | `apps/node/src/plugins/hermes/`; `profile` becomes a declared parameter |
 | `createAgentKind` switch, `detectAgentKinds` in `agent-kinds/index.ts` | `apps/node/src/plugins/registry.ts` |
 | Generic helpers (`findAgentCommand`, `agentOutput`, `copilotSpawnTarget`) | `@fleet/plugin-api` (search and probe) and the core (spawn target) |
@@ -376,6 +385,10 @@ core and compares the whole `agentParams` value instead of naming Hermes.
   profile's agent kind for the step's role (`worker` or `reviewer`). If none
   qualifies, the dispatch is refused with the reason, the same way an unknown
   profile is refused today. A Copilot worker is never substituted.
+- If the task Node binding design (#104) lands first, a task's workers can run
+  only on its bound Node. The agent-kind check then applies to that one Node,
+  and a refusal names both facts: the task's bound Node, and that the Node does
+  not offer the profile's agent kind.
 - The profile's model list in Settings reads the model catalog reported by that
   agent kind.
 - A worker keeps its stored agent kind and parameters for follow-ups and
