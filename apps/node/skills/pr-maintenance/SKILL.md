@@ -51,7 +51,8 @@ a heartbeat and a manual trigger share one review, so you never see duplicates.
    For a finite helper command, pass `observationClaim` as `maintenanceObservation`
    to `fleet_run_command` and use the absolute `observationAllowance.deadlineAt`.
    The Node injects the approved preparation clock; do not translate it.
-2. Checkpoint the exact helper observation (or `fallback` with its error string).
+2. The Host ingests claim-bound Fleet commands before the completion/review wake. Read the updated record; recover with `fleet_checkpoint_pr_maintenance` using only `{executionId}` (no observation/version relay; replays are no-ops).
+   Otherwise checkpoint the exact helper observation (or `fallback` with its error string) using `{recordId, expectedVersion, checkpoint}`.
    An incomplete read concludes the review as failed; the next trigger retries
    from the persisted scan. Provider 401/403 sets the `access` hold.
 3. If a batch settled but is not yet reported, checkpoint `work_report` first.
@@ -246,9 +247,8 @@ entry path grants neither new credentials nor repair authority.
 
 ### Registered recovery
 
-Helper failure is not a successful observation and not permission to bypass a
-hold. Preserve its exact sanitized error and actual incomplete observation with
-`fleet_checkpoint_pr_maintenance`:
+Helper failure is not a successful observation or permission to bypass a hold. Claim-bound commands use Host ingestion; recover with only `{executionId}`, not a second fallback.
+Otherwise preserve the exact sanitized error and incomplete observation with `fleet_checkpoint_pr_maintenance`:
 `checkpoint: {kind: "fallback", error, observation}`. The checkpoint `error` is
 a **string**, not the helper's error object. Map an actual helper result exactly:
 

@@ -1060,6 +1060,10 @@ describe("packaged maintenance resources", () => {
     const skill = readFileSync(join(assets, "SKILL.md"), "utf8");
     const contract = readFileSync(join(assets, "helper-contract.md"), "utf8");
     const ado = readFileSync(join(assets, "ado-contract.md"), "utf8");
+    expect(skill).toContain("before the completion/review wake");
+    expect(contract).toContain("**only** `{executionId}`");
+    expect(contract).toContain("**without** a claim-bound Fleet execution");
+    expect(contract).not.toContain("{recordId,expectedVersion,executionId,checkpoint:");
     // Stale or missing cached evidence starts a refresh; it never rejects intent.
     expect(skill).toMatch(/Stale or missing cached evidence starts a\s+refresh/);
     expect(contract).toMatch(

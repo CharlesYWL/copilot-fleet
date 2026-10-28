@@ -675,20 +675,47 @@ export const GetPrMaintenanceSchema = z
   })
   .strict();
 
-export const CheckpointPrMaintenanceSchema = z
+const LegacyCheckpointPrMaintenanceSchema = z
   .object({
     recordId: z.string().min(1),
     expectedVersion: z.number().int().positive(),
     checkpoint: PrMaintenanceCheckpointSchema,
+  })
+  .strict();
+
+export const CheckpointPrMaintenanceSchema = LegacyCheckpointPrMaintenanceSchema.partial()
+  .extend({
     executionId: z
       .string()
       .uuid()
       .optional()
       .describe(
-        "For an observation from a claim-bound finite command: verify exact persisted stdout and reconcile its original reservation across lead turns. Fresh observations can refresh a prepared, undispatched batch at the same head; in-flight execution/effects still block promotion. An observed head change supersedes undispatched preparation and refunds it. Not authority for new reads or repairs.",
+        "Recovery for a claim-bound finite helper command: supply ONLY executionId. The Host derives the exact observation from persisted stdout and admits it once against its original reservation, across turns/restarts and record version churn. Normal settlement does this before waking the lead. Fresh observations can refresh a prepared, undispatched batch at the same head; in-flight execution/effects still block promotion. An observed head change supersedes undispatched preparation and refunds it. Not authority for new reads or repairs.",
       ),
   })
-  .strict();
+  .strict()
+  .superRefine((input, ctx) => {
+    if (input.executionId) {
+      if (
+        input.recordId !== undefined ||
+        input.expectedVersion !== undefined ||
+        input.checkpoint !== undefined
+      )
+        ctx.addIssue({
+          code: "custom",
+          message: "Execution receipt recovery accepts only executionId.",
+        });
+    } else {
+      const parsed = LegacyCheckpointPrMaintenanceSchema.safeParse(input);
+      if (!parsed.success)
+        for (const issue of parsed.error.issues)
+          ctx.addIssue({
+            code: "custom",
+            message: issue.message,
+            path: issue.path,
+          });
+    }
+  });
 
 /**
  * Ending a task that is not going to be handed over.
@@ -1368,7 +1395,7 @@ export class FleetTools {
             allowance: registry.remainingWake(this.leadSessionId, wakeId),
             instruction: recovery
               ? "Recovery review claimed. Read the incident, reserve alternate_attempt BEFORE authorized alternate provider I/O, then checkpoint alternate_observation. Do not rerun the failed helper just to satisfy this claim."
-              : "Review claimed. Run the helper once now with observationAllowance.deadlineAt unchanged (for a Fleet command, pass observationClaim as maintenanceObservation at creation) and checkpoint its exact observation. Then classify: prepare_work_order + fleet_follow_up for routine work, fleet_escalate for a genuine design decision, or review_done when nothing is actionable.",
+              : "Review claimed. Run the helper once now with observationAllowance.deadlineAt unchanged. For a Fleet command, pass observationClaim as maintenanceObservation at creation; the Host ingests its exact stdout before the completion wake (recover with only executionId). Without a Fleet execution, checkpoint the exact observation with recordId, expectedVersion and checkpoint. Then classify: prepare_work_order + fleet_follow_up for routine work, fleet_escalate for a genuine design decision, or review_done when nothing is actionable.",
           };
         });
       }
@@ -1420,25 +1447,19 @@ export class FleetTools {
   }
 
   checkpointPrMaintenance(
-    input: z.infer<typeof CheckpointPrMaintenanceSchema>,
+    request: z.infer<typeof CheckpointPrMaintenanceSchema>,
   ): ToolResult {
     return this.maintenanceResult(() => {
+      const parsed = CheckpointPrMaintenanceSchema.parse(request);
       const record = this.store.writeAtomically(() => {
         const registry = this.store.prMaintenance;
-        if (input.executionId) {
-          if (input.checkpoint.kind !== "observation")
-            throw new PrMaintenanceError(
-              "invalid_receipt",
-              "Execution receipts only admit exact observation evidence.",
-            );
+        if (parsed.executionId) {
           return registry.checkpointObservationReceipt(
             this.leadSessionId,
-            input.recordId,
-            input.expectedVersion,
-            input.executionId,
-            input.checkpoint.observation,
+            parsed.executionId,
           );
         }
+        const input = LegacyCheckpointPrMaintenanceSchema.parse(parsed);
         if (input.checkpoint.kind === "prepare_work_order") {
           return this.prepareWorkOrder(
             input.recordId,

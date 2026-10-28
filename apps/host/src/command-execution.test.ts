@@ -38,7 +38,7 @@ import { FleetService } from "./fleet-service.js";
 import { SealedNodeLink } from "./gateway/node-channel.js";
 import { HostIdentityService } from "./auth/host-identity.js";
 import { OrchestratorEngine } from "./orchestrator/engine.js";
-import { FleetTools } from "./orchestrator/tools.js";
+import { CheckpointPrMaintenanceSchema, FleetTools } from "./orchestrator/tools.js";
 import { LeadTokens } from "./orchestrator/lead-tokens.js";
 import { mcpRoutes } from "./orchestrator/mcp-routes.js";
 import { commandExecutionRoutes } from "./routes/command-executions.js";
@@ -2914,6 +2914,7 @@ describe("PR maintenance with durable commands", () => {
       },
       patch: Partial<CommandReceipt> = {},
       bytes: Buffer = Buffer.from(JSON.stringify(result)),
+      interruptBeforeTick = false,
     ) => {
       let sequence = 0;
       for (let offset = 0; offset < bytes.length; offset += 16_384) {
@@ -2931,6 +2932,9 @@ describe("PR maintenance with durable commands", () => {
           }),
         ).toBe(true);
       }
+      const tick = interruptBeforeTick
+        ? vi.spyOn(f.service.commands, "tick").mockImplementationOnce(() => {})
+        : undefined;
       expect(
         f.result(execution, {
           state: result.complete ? "succeeded" : "failed",
@@ -2940,6 +2944,7 @@ describe("PR maintenance with durable commands", () => {
           ...patch,
         }),
       ).toBe(true);
+      tick?.mockRestore();
       return bytes.length;
     };
     const completionTurn = () => {
@@ -2953,11 +2958,8 @@ describe("PR maintenance with durable commands", () => {
       );
       return completion.delivery.deliveryId;
     };
-    const checkpoint = (observation: PrMaintenanceObservation) => ({
-      recordId: record.id,
-      expectedVersion: record.version,
+    const checkpoint = () => ({
       executionId: execution.id,
-      checkpoint: { kind: "observation", observation },
     });
     return {
       f,
@@ -3012,6 +3014,268 @@ describe("PR maintenance with durable commands", () => {
     };
   }
 
+  it("keeps the legacy non-execution schema and accepts only executionId for receipt recovery", () => {
+    const executionId = randomUUID();
+    const legacy = {
+      recordId: randomUUID(),
+      expectedVersion: 1,
+      checkpoint: { kind: "observation", observation: deadlineResult().observation },
+    };
+    expect(CheckpointPrMaintenanceSchema.parse(legacy)).toEqual(legacy);
+    expect(CheckpointPrMaintenanceSchema.parse({ executionId })).toEqual({ executionId });
+    for (const invalid of [
+      {},
+      { recordId: legacy.recordId },
+      { ...legacy, expectedVersion: undefined },
+      { ...legacy, checkpoint: undefined },
+      { ...legacy, expectedVersion: 0 },
+      { ...legacy, executionId },
+      { executionId, recordId: legacy.recordId },
+      { executionId: "not-an-execution" },
+      { executionId, observation: legacy.checkpoint.observation },
+    ])
+      expect(CheckpointPrMaintenanceSchema.safeParse(invalid).success).toBe(false);
+  });
+
+  it("admits once before the completion wake despite review version churn, then never replays over later work", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const result = await observeFixture(fixtureInput(new Date().toISOString()));
+    h.f.store.prMaintenance.operatorAction(
+      h.record.id,
+      h.record.version,
+      { action: "review", requestId: randomUUID() },
+      "operator",
+    );
+    const before = h.f.store.prMaintenance.get(h.record.id)!;
+    expect(before.version).toBeGreaterThan(h.record.version);
+    const queue = h.f.service.commands.queueLeadPrompt.bind(h.f.service.commands);
+    const wake = vi
+      .spyOn(h.f.service.commands, "queueLeadPrompt")
+      .mockImplementation((...args) => {
+        expect(h.f.store.prMaintenance.get(h.record.id)?.observation).toEqual(
+          result.observation,
+        );
+        expect(
+          h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+            .observationClaims[0]?.receiptHash,
+        ).toBeTruthy();
+        return queue(...args);
+      });
+    h.finish(result);
+    expect(h.f.store.prMaintenance.get(h.record.id)?.version).toBe(before.version + 1);
+    expect(wake).toHaveBeenCalledTimes(1);
+    new OrchestratorEngine(h.f.service).tick();
+    expect(wake).toHaveBeenCalledTimes(2);
+    expect(
+      wake.mock.calls.some(([, prompt]) => prompt.includes("<fleet-pr-review")),
+    ).toBe(true);
+    const admitted = h.f.store.prMaintenance.get(h.record.id)!;
+    h.completionTurn();
+    h.f.service.commands.tick();
+    h.f.service.commands.tick();
+    expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(admitted);
+    const paused = h.f.store.prMaintenance.operatorAction(
+      admitted.id,
+      admitted.version,
+      { action: "pause", reason: "New operator direction after admission" },
+      "operator",
+    );
+    for (let replay = 0; replay < 3; replay++) {
+      const saved = await h.call("fleet_checkpoint_pr_maintenance", {
+        executionId: h.execution.id,
+      });
+      expect(saved.ok, saved.text).toBe(true);
+      expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(paused);
+    }
+    expect(wake).toHaveBeenCalledTimes(2);
+    expect(
+      h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+        .requests,
+    ).toBe(39);
+  });
+
+  it.each(["tool", "tick"] as const)(
+    "recovers persisted stdout after interruption/restart via %s without relayed evidence",
+    async (recovery) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const path = receiptPath();
+      const h = await observationCommand(path);
+      const result = deadlineResult();
+      h.finish(result, {}, undefined, true);
+      expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+      expect(h.f.store.commands.reserved(h.f.lead.id)).toBeUndefined();
+      stores.splice(stores.indexOf(h.f.store), 1);
+      h.f.store.close();
+      const store = open(path);
+      const service = new FleetService(store, log, "receipt-recovery");
+      const call = await h.connect(store, service);
+      store.prMaintenance.checkpoint(h.f.lead.id, h.record.id, h.record.version, {
+        kind: "reconcile",
+        progress: false,
+        evidence: "A later review changed the version before recovery.",
+      });
+      if (recovery === "tick") service.commands.tick();
+      const saved = await call("fleet_checkpoint_pr_maintenance", {
+        executionId: h.execution.id,
+      });
+      expect(saved.ok, saved.text).toBe(true);
+      const admitted = store.prMaintenance.get(h.record.id)!;
+      expect(admitted.lastAttempt).toEqual(result.observation);
+      expect(admitted.version).toBe(h.record.version + 2);
+      expect(
+        store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId),
+      ).toMatchObject({
+        requests: 39,
+        visits: 1,
+        observationClaims: [
+          {
+            recordId: h.record.id,
+            generation: h.record.generation,
+            executionId: h.execution.id,
+            attemptId: h.execution.attemptId,
+            receiptHash: expect.any(String),
+          },
+        ],
+      });
+      service.commands.tick();
+      expect(store.prMaintenance.get(h.record.id)).toEqual(admitted);
+      expect(service.commands.list()).toHaveLength(1);
+      expect(store.commands.prompts()).toHaveLength(0);
+    },
+  );
+
+  it("retries persistence failure before waking, and replays remain no-ops after record and claim scope mutation/restart", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const path = receiptPath();
+    const h = await observationCommand(path);
+    const result = deadlineResult();
+    const ingest = vi.spyOn(h.f.store.prMaintenance, "checkpointObservationReceipt");
+    ingest.mockImplementationOnce(() => {
+      throw new Error("Injected admission persistence interruption");
+    });
+    expect(() => h.finish(result)).toThrow("Injected admission persistence interruption");
+    expect(h.f.store.commands.get(h.execution.id)?.outputComplete).toBe(true);
+    expect(h.f.store.commands.reserved(h.f.lead.id)).toBeUndefined();
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+    ingest.mockRestore();
+    h.f.service.commands.tick();
+    h.completionTurn();
+    const admitted = h.f.store.prMaintenance.get(h.record.id)!;
+    const db = new DatabaseSync(path);
+    try {
+      const changed = structuredClone(admitted);
+      changed.generation++;
+      changed.authorization.headSha = "c".repeat(40);
+      db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+        JSON.stringify(changed),
+        changed.id,
+      );
+      const wake = h.f.store.prMaintenance.beginWake(
+        h.f.lead.id,
+        h.first.delivery.deliveryId,
+      );
+      wake.observationClaims[0]!.scopeKey = "c".repeat(64);
+      db.prepare(
+        "UPDATE pr_maintenance_wakes SET data=? WHERE lead_session_id=? AND wake_id=?",
+      ).run(JSON.stringify(wake), h.f.lead.id, h.first.delivery.deliveryId);
+    } finally {
+      db.close();
+    }
+    const changed = h.f.store.prMaintenance.get(h.record.id)!;
+    stores.splice(stores.indexOf(h.f.store), 1);
+    h.f.store.close();
+    const store = open(path);
+    const service = new FleetService(store, log, "admitted-replay");
+    const call = await h.connect(store, service);
+    for (let replay = 0; replay < 3; replay++) {
+      service.commands.tick();
+      const replayed = await call("fleet_checkpoint_pr_maintenance", {
+        executionId: h.execution.id,
+      });
+      expect(replayed.ok, replayed.text).toBe(true);
+      expect(store.prMaintenance.get(h.record.id)).toEqual(changed);
+    }
+    expect(store.commands.prompts()).toHaveLength(1);
+  });
+
+  it("waits for terminal-before-output evidence before both completion and review wakes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const result = deadlineResult();
+    result.observation.evidence += " UTF-8 evidence: café";
+    const bytes = Buffer.from(JSON.stringify(result));
+    const split = bytes.indexOf(Buffer.from("é")) + 1;
+    expect(
+      h.f.result(h.execution, {
+        state: "failed",
+        exitCode: 2,
+        finalOutputSeq: 2,
+        settledAt: new Date().toISOString(),
+      }),
+    ).toBe(true);
+    const engine = new OrchestratorEngine(h.f.service);
+    engine.tick();
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+    expect(h.f.store.commands.prompts()).toHaveLength(0);
+    expect(h.f.store.prMaintenance.pendingReviewWakes()).toEqual([]);
+    for (const [sequence, data] of [
+      [2, bytes.subarray(split)],
+      [1, bytes.subarray(0, split)],
+    ] as const) {
+      expect(
+        h.f.service.commands.handleNodeMessage(h.f.node.id, {
+          type: "command_execution_output",
+          event: {
+            executionId: h.execution.id,
+            attemptId: h.execution.attemptId,
+            sequence,
+            stream: "stdout",
+            data: data.toString("base64"),
+            at: new Date().toISOString(),
+          },
+        }),
+      ).toBe(true);
+      if (sequence === 2) {
+        expect(h.f.store.commands.prompts()).toHaveLength(0);
+        expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+      }
+    }
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toEqual(
+      result.observation,
+    );
+    expect(h.f.store.commands.prompts()).toHaveLength(1);
+    const admitted = h.f.store.prMaintenance.get(h.record.id)!;
+    h.f.service.commands.tick();
+    expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(admitted);
+  });
+
+  it("never admits delayed command evidence over a newer observation", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const result = deadlineResult();
+    h.finish(result, {}, undefined, true);
+    vi.setSystemTime(Date.now() + 10_000);
+    const newer = deadlineResult().observation;
+    const current = h.f.store.prMaintenance.checkpoint(
+      h.f.lead.id,
+      h.record.id,
+      h.record.version,
+      { kind: "observation", observation: newer },
+    );
+    for (let replay = 0; replay < 2; replay++) {
+      const denied = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
+      expect(denied.ok).toBe(false);
+      expect(denied.text).toContain("stale_observation");
+      h.f.service.commands.tick();
+      expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(current);
+    }
+    expect(
+      h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+        .observationClaims[0]?.receiptHash,
+    ).toBeUndefined();
+  });
+
   it.each([0, 100, 101])(
     "keeps the full 100-request reservation charged when a command receipt reports %i used",
     async (requestsConsumed) => {
@@ -3024,10 +3288,7 @@ describe("PR maintenance with durable commands", () => {
       result.requestsConsumed = result.observation.requestsConsumed = requestsConsumed;
       h.finish(result);
       h.completionTurn();
-      const saved = await h.call(
-        "fleet_checkpoint_pr_maintenance",
-        h.checkpoint(result.observation),
-      );
+      const saved = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
       expect(saved.ok, saved.text).toBe(requestsConsumed <= 100);
       expect(
         h.f.store.prMaintenance.remainingWake(h.f.lead.id, h.first.delivery.deliveryId)
@@ -3405,12 +3666,8 @@ describe("PR maintenance with durable commands", () => {
       elapsedMs: 80_000,
     });
     vi.setSystemTime(claimAt + 150_000);
-    h.finish(result, {}, stdout);
-    h.completionTurn();
-    const denied = await h.call(
-      "fleet_checkpoint_pr_maintenance",
-      h.checkpoint(result.observation),
-    );
+    h.finish(result, {}, stdout, true);
+    const denied = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
     expect(denied.ok).toBe(false);
     expect(denied.text).toContain("receipt_allowance");
     expect(h.f.store.prMaintenance.get(h.record.id)?.observation).toBeUndefined();
@@ -3499,8 +3756,7 @@ describe("PR maintenance with durable commands", () => {
           ),
         },
       );
-      h.finish(result, {}, stdout);
-      h.completionTurn();
+      h.finish(result, {}, stdout, true);
       if (kind === "unaccepted")
         vi.spyOn(h.f.store.commands, "preparationClock").mockReturnValue({
           ...h.f.store.commands.preparationClock(h.execution.id)!,
@@ -3515,10 +3771,7 @@ describe("PR maintenance with durable commands", () => {
         if (kind === "missing") delete descriptor.observationBudget;
         h.f.store.commands.update(execution.id, execution.version, { descriptor });
       }
-      const denied = await h.call(
-        "fleet_checkpoint_pr_maintenance",
-        h.checkpoint(result.observation),
-      );
+      const denied = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
       expect(denied.ok).toBe(false);
       expect(denied.text).toMatch(/receipt_(clock|incomplete)/);
       expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(h.record);
@@ -3560,14 +3813,8 @@ describe("PR maintenance with durable commands", () => {
     }
     const retrieved = Buffer.concat(chunks);
     expect(retrieved).toEqual(stdout);
-    const args = h.checkpoint(JSON.parse(retrieved.toString("utf8")).observation);
-    const stale = await call("fleet_checkpoint_pr_maintenance", {
-      ...args,
-      expectedVersion: h.record.version + 1,
-    });
-    expect(stale.ok).toBe(false);
-    expect(stale.text).toContain("version_conflict");
-    expect(store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+    const args = h.checkpoint();
+    expect(store.prMaintenance.get(h.record.id)?.lastAttempt).toEqual(result.observation);
     const saved = await call("fleet_checkpoint_pr_maintenance", args);
     expect(saved.ok, saved.text).toBe(true);
     expect(JSON.stringify(store.prMaintenance.get(h.record.id)?.lastAttempt)).toBe(
@@ -3600,7 +3847,7 @@ describe("PR maintenance with durable commands", () => {
       },
     });
     expect(changed.ok).toBe(false);
-    expect(changed.text).toContain("receipt_mismatch");
+    expect(changed.text).toContain("only executionId");
     const record = store.prMaintenance.get(h.record.id)!;
     const dispatch = await call("fleet_checkpoint_pr_maintenance", {
       recordId: record.id,
@@ -3682,13 +3929,7 @@ describe("PR maintenance with durable commands", () => {
         result.observation,
       );
       expect(() =>
-        restored.prMaintenance.checkpointObservationReceipt(
-          h.f.lead.id,
-          h.record.id,
-          store.prMaintenance.get(h.record.id)!.version,
-          h.execution.id,
-          result.observation,
-        ),
+        restored.prMaintenance.checkpointObservationReceipt(h.f.lead.id, h.execution.id),
       ).toThrow();
     },
   );
@@ -3790,12 +4031,8 @@ describe("PR maintenance with durable commands", () => {
           actionableFingerprint: "changed-fingerprint",
         }[field];
       expect(JSON.stringify(result.observation)).toBe(original);
-      h.finish(result);
-      h.completionTurn();
-      const denied = await h.call(
-        "fleet_checkpoint_pr_maintenance",
-        h.checkpoint(result.observation),
-      );
+      h.finish(result, {}, undefined, true);
+      const denied = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
       expect(denied.ok, denied.text).toBe(false);
       expect(denied.text).toMatch(/receipt_(invalid|mismatch)/);
       expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(h.record);
@@ -3862,11 +4099,24 @@ describe("PR maintenance with durable commands", () => {
     h.finish(result, patch);
     if (mismatch === "changed-inline")
       result.observation.evidence = "changed after stdout";
-    const denied = await h.call(
-      "fleet_checkpoint_pr_maintenance",
-      h.checkpoint(result.observation),
-    );
+    const denied = await h.call("fleet_checkpoint_pr_maintenance", {
+      ...h.checkpoint(),
+      ...(mismatch === "changed-inline"
+        ? { checkpoint: { kind: "observation", observation: result.observation } }
+        : {}),
+    });
     expect(denied.ok, denied.text).toBe(false);
+    if (mismatch === "changed-inline") {
+      expect(denied.text).toContain("only executionId");
+      expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt?.evidence).not.toBe(
+        result.observation.evidence,
+      );
+      expect(
+        h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+          .observationClaims[0]?.receiptHash,
+      ).toBeTruthy();
+      return;
+    }
     expect(denied.text).toMatch(/receipt_(allowance|mismatch|incomplete)/);
     expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(h.record);
     expect(
@@ -3884,10 +4134,7 @@ describe("PR maintenance with durable commands", () => {
     vi.setSystemTime(Date.now() + 120_001);
     h.finish(result);
     h.completionTurn();
-    const denied = await h.call(
-      "fleet_checkpoint_pr_maintenance",
-      h.checkpoint(result.observation),
-    );
+    const denied = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
     expect(denied.ok).toBe(false);
     expect(denied.text).toContain("receipt_allowance");
     expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(h.record);
@@ -3917,8 +4164,7 @@ describe("PR maintenance with durable commands", () => {
       h.finish(result);
       h.completionTurn();
       const saved = await h.call("fleet_checkpoint_pr_maintenance", {
-        ...h.checkpoint(result.observation),
-        expectedVersion: held.version,
+        ...h.checkpoint(),
       });
       expect(saved.ok, saved.text).toBe(true);
       const after = h.f.store.prMaintenance.get(held.id)!;
@@ -3959,8 +4205,7 @@ describe("PR maintenance with durable commands", () => {
     h.finish(result);
     h.completionTurn();
     const saved = await h.call("fleet_checkpoint_pr_maintenance", {
-      ...h.checkpoint(result.observation),
-      expectedVersion: held.version,
+      ...h.checkpoint(),
     });
     expect(saved.ok, saved.text).toBe(true);
     const after = h.f.store.prMaintenance.get(held.id)!;
@@ -4086,13 +4331,7 @@ describe("PR maintenance with durable commands", () => {
       );
       expect(restored.prMaintenance.get(record.id)?.hold?.kind).toBe("paused");
       expect(() =>
-        restored.prMaintenance.checkpointObservationReceipt(
-          h.f.lead.id,
-          record.id,
-          record.version,
-          h.execution.id,
-          result.observation,
-        ),
+        restored.prMaintenance.checkpointObservationReceipt(h.f.lead.id, h.execution.id),
       ).toThrow();
     },
   );
@@ -4106,8 +4345,12 @@ describe("PR maintenance with durable commands", () => {
     vi.setSystemTime(Date.now() + result.elapsedMs);
     h.finish(result);
     const nextTurn = h.completionTurn();
-    const args = h.checkpoint(result.observation);
-    const { executionId: _id, ...unbound } = args;
+    const args = h.checkpoint();
+    const unbound = {
+      recordId: h.record.id,
+      expectedVersion: h.f.store.prMaintenance.get(h.record.id)!.version,
+      checkpoint: { kind: "observation", observation: result.observation },
+    };
     const oldPath = await h.call("fleet_checkpoint_pr_maintenance", unbound);
     expect(oldPath.ok).toBe(false);
     expect(oldPath.text).toContain("visit_required");
@@ -4144,7 +4387,7 @@ describe("PR maintenance with durable commands", () => {
       },
     });
     expect(changed.ok).toBe(false);
-    expect(changed.text).toContain("receipt_mismatch");
+    expect(changed.text).toContain("only executionId");
   });
 
   it.each(["deadline", "large", "complete"] as const)(
@@ -4235,14 +4478,13 @@ describe("PR maintenance with durable commands", () => {
         new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)),
       );
       expect(JSON.stringify(retrieved.observation)).toBe(serialized);
-      const args = h.checkpoint(retrieved.observation);
+      const args = h.checkpoint();
       if (kind === "large") {
         expect(pages).toBe(5);
-        expect(Buffer.byteLength(JSON.stringify(args))).toBe(291_850);
       } else if (kind === "complete") {
         expect(pages).toBe(3);
-        expect(Buffer.byteLength(JSON.stringify(args))).toBe(34_259);
       }
+      expect(args).toEqual({ executionId: h.execution.id });
       const saved = await call("fleet_checkpoint_pr_maintenance", args);
       expect(saved.ok, saved.text).toBe(true);
       expect(JSON.stringify(JSON.parse(saved.text).lastAttempt)).toBe(serialized);
@@ -4275,10 +4517,7 @@ describe("PR maintenance with durable commands", () => {
     h.completionTurn();
     // Completion can be late; only the attempt itself must fit the original deadline.
     vi.setSystemTime(Date.now() + 130_000);
-    const saved = await h.call(
-      "fleet_checkpoint_pr_maintenance",
-      h.checkpoint(result.observation),
-    );
+    const saved = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
     expect(saved.ok, saved.text).toBe(true);
     const record = h.f.store.prMaintenance.get(h.record.id)!;
     const batch = {
@@ -4473,13 +4712,9 @@ describe("PR maintenance with durable commands", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const h = await observationCommand();
     const result = await observeFixture(fixtureInput(new Date().toISOString()));
-    h.finish(result);
-    h.completionTurn();
+    h.finish(result, {}, undefined, true);
     vi.setSystemTime(Date.now() + 31 * 60_000);
-    const saved = await h.call(
-      "fleet_checkpoint_pr_maintenance",
-      h.checkpoint(result.observation),
-    );
+    const saved = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
     expect(saved.ok, saved.text).toBe(true);
     const record = h.f.store.prMaintenance.get(h.record.id)!;
     expect(record.lastAttempt).toEqual(result.observation);
@@ -4499,15 +4734,11 @@ describe("PR maintenance with durable commands", () => {
     const record = restored.prMaintenance.get(h.record.id)!;
     expect(record.hold?.kind).toBe("paused");
     expect(() =>
-      restored.prMaintenance.checkpointObservationReceipt(
-        h.f.lead.id,
-        record.id,
-        record.version,
-        h.execution.id,
-        result.observation,
-      ),
+      restored.prMaintenance.checkpointObservationReceipt(h.f.lead.id, h.execution.id),
     ).toThrow();
-    expect(restored.prMaintenance.get(record.id)?.lastAttempt).toBeUndefined();
+    expect(restored.prMaintenance.get(record.id)?.lastAttempt).toEqual(
+      result.observation,
+    );
     expect(restored.prMaintenance.exportBackup().wakes).toEqual(
       backup.prMaintenance?.wakes,
     );
@@ -4628,10 +4859,7 @@ describe("PR maintenance with durable commands", () => {
         break;
     }
     h.finish(result, patch, bytes);
-    const denied = await h.call(
-      "fleet_checkpoint_pr_maintenance",
-      h.checkpoint(result.observation),
-    );
+    const denied = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
     expect(denied.ok, denied.text).toBe(false);
     expect(denied.text).toContain(expected);
     expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
@@ -4644,7 +4872,7 @@ describe("PR maintenance with durable commands", () => {
   it("rejects unknown, inflight, wrong-owner and wrong-record execution claims", async () => {
     const h = await observationCommand();
     const result = deadlineResult();
-    const args = h.checkpoint(result.observation);
+    const args = h.checkpoint();
     const inflight = await h.call("fleet_checkpoint_pr_maintenance", args);
     expect(inflight.ok).toBe(false);
     expect(inflight.text).toContain("receipt_incomplete");
@@ -4665,15 +4893,11 @@ describe("PR maintenance with durable commands", () => {
     ])
       expect((await h.call("fleet_checkpoint_pr_maintenance", wrong)).ok).toBe(false);
     expect(() =>
-      h.f.store.prMaintenance.checkpointObservationReceipt(
-        randomUUID(),
-        h.record.id,
-        h.record.version,
-        h.execution.id,
-        result.observation,
-      ),
+      h.f.store.prMaintenance.checkpointObservationReceipt(randomUUID(), h.execution.id),
     ).toThrow("owned execution");
-    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toEqual(
+      result.observation,
+    );
   });
 
   it("rejects a helper snapshot from another generation despite an unchanged observation", async () => {
@@ -4682,30 +4906,20 @@ describe("PR maintenance with durable commands", () => {
     result.snapshot.generation++;
     h.finish(result);
     h.completionTurn();
-    const denied = await h.call(
-      "fleet_checkpoint_pr_maintenance",
-      h.checkpoint(result.observation),
-    );
+    const denied = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
     expect(denied.ok).toBe(false);
     expect(denied.text).toContain("receipt_mismatch");
     expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
   });
 
-  it("rolls back observation and claim hash together; stale-version retry can only save the same exact result", async () => {
+  it("rolls back observation and claim hash together; recovery tolerates record version churn", async () => {
     const h = await observationCommand();
     const result = deadlineResult();
-    h.finish(result);
-    h.completionTurn();
-    const args = h.checkpoint(result.observation);
+    h.finish(result, {}, undefined, true);
+    const args = h.checkpoint();
     expect(() =>
       h.f.store.writeAtomically(() => {
-        h.f.store.prMaintenance.checkpointObservationReceipt(
-          h.f.lead.id,
-          h.record.id,
-          h.record.version,
-          h.execution.id,
-          result.observation,
-        );
+        h.f.store.prMaintenance.checkpointObservationReceipt(h.f.lead.id, h.execution.id);
         throw new Error("Injected enclosing transaction rollback");
       }),
     ).toThrow("Injected enclosing transaction rollback");
@@ -4724,13 +4938,7 @@ describe("PR maintenance with durable commands", () => {
       },
     });
     expect(reconciled.ok, reconciled.text).toBe(true);
-    const stale = await h.call("fleet_checkpoint_pr_maintenance", args);
-    expect(stale.ok).toBe(false);
-    expect(stale.text).toContain("version_conflict");
-    const saved = await h.call("fleet_checkpoint_pr_maintenance", {
-      ...args,
-      expectedVersion: JSON.parse(reconciled.text).version,
-    });
+    const saved = await h.call("fleet_checkpoint_pr_maintenance", args);
     expect(saved.ok, saved.text).toBe(true);
     expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toEqual(
       result.observation,
@@ -4754,8 +4962,7 @@ describe("PR maintenance with durable commands", () => {
     const path = join(directory, "host.sqlite");
     const h = await observationCommand(path);
     const result = deadlineResult();
-    h.finish(result);
-    h.completionTurn();
+    h.finish(result, {}, undefined, true);
     if (drift === "paused") {
       h.f.store.prMaintenance.set(h.f.lead.id, {
         id: h.record.id,
@@ -4837,8 +5044,7 @@ describe("PR maintenance with durable commands", () => {
     }
     const current = h.f.store.prMaintenance.get(h.record.id)!;
     const saved = await h.call("fleet_checkpoint_pr_maintenance", {
-      ...h.checkpoint(result.observation),
-      expectedVersion: current.version,
+      ...h.checkpoint(),
     });
     if (["paused", "human-design", "released"].includes(drift)) {
       expect(saved.ok, saved.text).toBe(true);
