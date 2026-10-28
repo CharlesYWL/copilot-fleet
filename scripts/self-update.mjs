@@ -13,6 +13,9 @@
  *   node scripts/self-update.mjs schedule --status <file> --update-id <id> --restart <host+node|host> [--running-revision <sha>]
  *   node scripts/self-update.mjs run      (the same options; what the task runs)
  *
+ * On Linux `schedule` adds `--manifest <path>`: the Host manifest the Host itself
+ * resolved, which the transient unit cannot find without the Host's environment.
+ *
  * `schedule` prints one JSON line: `{"ok":true,...}` or `{"ok":false,"error":...}`.
  */
 import console from "node:console";
@@ -37,7 +40,7 @@ export function parseArguments(argv) {
   const [action, ...rest] = argv;
   if (action !== "schedule" && action !== "run") {
     throw new Error(
-      "Usage: self-update.mjs <schedule|run> --status <file> --update-id <id> --restart <host+node|host> [--running-revision <sha>]",
+      "Usage: self-update.mjs <schedule|run> --status <file> --update-id <id> --restart <host+node|host> [--running-revision <sha>] [--manifest <path>]",
     );
   }
   const options = { action };
@@ -46,6 +49,7 @@ export function parseArguments(argv) {
     "--update-id": "updateId",
     "--restart": "restart",
     "--running-revision": "runningRevision",
+    "--manifest": "manifestPath",
   };
   for (let index = 0; index < rest.length; index += 2) {
     const name = names[rest[index]];
@@ -64,6 +68,9 @@ export function parseArguments(argv) {
   }
   if (!RESTART_KINDS.includes(options.restart)) {
     throw new Error(`--restart must be one of ${RESTART_KINDS.join(", ")}`);
+  }
+  if (options.manifestPath !== undefined && !isAbsolute(options.manifestPath)) {
+    throw new Error("--manifest must be an absolute path");
   }
   if (
     options.runningRevision !== undefined &&
@@ -193,9 +200,11 @@ export function schedule(
     nodePath = process.execPath,
     root = checkoutRoot,
     platform = process.platform,
+    manifestPath,
   } = {},
 ) {
-  if (platform === "linux") return scheduleLinux(options, { exec, nodePath, root });
+  if (platform === "linux")
+    return scheduleLinux(options, { exec, nodePath, root, manifestPath });
   if (platform !== "win32")
     throw new Error("The login service exists only on Windows and Linux.");
   sid ??= windowsSid();
@@ -242,8 +251,12 @@ export function linuxUpdateUnit(updateId) {
  * separate unit that outlives that restart; `--collect` removes the unit when
  * it finishes, which plays the part of the Windows task deleting itself.
  */
-function scheduleLinux(options, { exec, nodePath, root }) {
+function scheduleLinux(options, { exec, nodePath, root, manifestPath }) {
   const unit = linuxUpdateUnit(options.updateId);
+  // The user manager does not have the Host's environment, so a custom
+  // XDG_STATE_HOME known only to the Host would send the update to the default
+  // directory. This process runs in the Host's environment and resolves it.
+  manifestPath ??= options.manifestPath ?? join(loginDirectory("host"), "manifest.json");
   exec(
     "systemd-run",
     [
@@ -263,16 +276,24 @@ function scheduleLinux(options, { exec, nodePath, root }) {
       "--restart",
       options.restart,
       ...(options.runningRevision ? ["--running-revision", options.runningRevision] : []),
+      "--manifest",
+      manifestPath,
     ],
     { stdio: "pipe", timeout: 60_000 },
   );
   return { ok: true, taskName: unit };
 }
 
-/** The Host service's saved PATH and profile, which the update's own context lacks. */
-function hostTaskEnvironment() {
-  return readManifest(join(loginDirectory("host"), "manifest.json"), accountId())
-    .environment;
+/**
+ * The Host service's saved PATH and profile, which the update's own context lacks.
+ * Read from the manifest path `schedule` passed, when it passed one: this
+ * process may not share the Host's XDG_STATE_HOME.
+ */
+function hostTaskEnvironment(options = {}) {
+  return readManifest(
+    options.manifestPath ?? join(loginDirectory("host"), "manifest.json"),
+    accountId(),
+  ).environment;
 }
 
 /** Deletes the one-off update task; a transient systemd unit collects itself. */
@@ -374,7 +395,7 @@ export async function run(
   };
   try {
     try {
-      Object.assign(process.env, environment());
+      Object.assign(process.env, environment(options));
     } catch (error) {
       log(
         `Could not load the Host task's environment (${error.message}); using this one`,

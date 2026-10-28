@@ -35,6 +35,7 @@ import {
   writeSync,
 } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
+import { constants as osConstants } from "node:os";
 import { fileURLToPath } from "node:url";
 import { posixProcessStartTime } from "./posix-process-identity.js";
 import { posixShellEnvironment } from "./posix-shell-environment.js";
@@ -411,19 +412,13 @@ export async function runSupervisor(directory: string): Promise<void> {
   }
 }
 
-const SIGNALS: Partial<Record<NodeJS.Signals, number>> = {
-  SIGHUP: 1,
-  SIGINT: 2,
-  SIGQUIT: 3,
-  SIGABRT: 6,
-  SIGKILL: 9,
-  SIGSEGV: 11,
-  SIGPIPE: 13,
-  SIGALRM: 14,
-  SIGTERM: 15,
-};
-function signalNumber(signal: NodeJS.Signals): number {
-  return SIGNALS[signal] ?? 0;
+/**
+ * The platform's own number for a signal, so `128 + n` matches what a shell
+ * reports for the same death (SIGUSR1 is 10 on Linux, 30 on macOS). Exported
+ * for tests.
+ */
+export function signalNumber(signal: NodeJS.Signals): number {
+  return (osConstants.signals as Partial<Record<NodeJS.Signals, number>>)[signal] ?? 0;
 }
 
 const invokedDirectly =

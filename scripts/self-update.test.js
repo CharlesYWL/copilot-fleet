@@ -193,6 +193,7 @@ describe("self-update", () => {
       nodePath: "/usr/bin/node",
       root: "/srv/fleet",
       platform: "linux",
+      manifestPath: "/custom/state/copilot-fleet/login/host/manifest.json",
     });
     expect(result).toEqual({ ok: true, taskName: linuxUpdateUnit(options.updateId) });
     const [file, args] = exec.mock.calls[0];
@@ -215,7 +216,46 @@ describe("self-update", () => {
       "host+node",
       "--running-revision",
       "abc123def456",
+      // The unit lacks the Host's environment, so it is told where the manifest is.
+      "--manifest",
+      "/custom/state/copilot-fleet/login/host/manifest.json",
     ]);
+    // The unit's own invocation parses back to the same manifest.
+    expect(
+      parseArguments(["run", ...args.slice(args.indexOf("--status"))]),
+    ).toMatchObject({
+      manifestPath: "/custom/state/copilot-fleet/login/host/manifest.json",
+    });
+  });
+
+  it("reads the Host environment from the manifest path it was given", async () => {
+    const status = join(directory(), "self-update.json");
+    const environment = vi.fn(() => ({}));
+    await run(
+      {
+        ...parseArguments(["run", ...valid, "--manifest", statusFile]),
+        statusFile: status,
+      },
+      {
+        root: "C:\\Fleet",
+        loadUpdater: async () => ({
+          applyUpdate: async () => ({ stage: "up_to_date", detail: "" }),
+          runCommand: vi.fn(),
+        }),
+        environment,
+        restart: vi.fn(),
+        removeTask: vi.fn(),
+      },
+    );
+    expect(environment).toHaveBeenCalledWith(
+      expect.objectContaining({ manifestPath: statusFile }),
+    );
+  });
+
+  it("refuses a relative manifest path", () => {
+    expect(() =>
+      parseArguments(["run", ...valid, "--manifest", "manifest.json"]),
+    ).toThrow("--manifest must be an absolute path");
   });
 
   it("refuses to schedule where there is no login service", () => {

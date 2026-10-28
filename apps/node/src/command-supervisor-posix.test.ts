@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { constants as osConstants } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { signalNumber } from "./command-supervisor-posix-runner.js";
 import {
   commandSupervisorReadiness,
   prepareCommandProcess,
@@ -217,6 +219,38 @@ posix("POSIX command supervisor", () => {
     expect(await readFile(join(prepared.identity.directory, "stdout.bin"), "utf8")).toBe(
       "",
     );
+  });
+
+  it("reports 128 + the platform's number for a signal death, including SIGUSR1", async () => {
+    expect(signalNumber("SIGUSR1")).toBe(osConstants.signals.SIGUSR1);
+    expect(signalNumber("SIGTERM")).toBe(15);
+    const { root, cwd } = await fixture();
+    const prepared = await start(input(root, cwd, "kill -USR1 $$"));
+    await prepared.release();
+    expect((await prepared.result).exitCode).toBe(128 + osConstants.signals.SIGUSR1);
+  });
+
+  it("does not run a PATH program before the approved command", async () => {
+    const { root, cwd } = await fixture();
+    const bin = join(root, "hostile-bin");
+    await mkdir(bin);
+    const marker = join(root, "hijacked");
+    // A writable PATH directory offering its own dirname must never be run.
+    for (const name of ["dirname", "basename", "cat"]) {
+      const path = join(bin, name);
+      await writeFile(path, `#!/bin/sh\nprintf ${name} >> '${marker}'\n`);
+      await chmod(path, 0o755);
+    }
+    const saved = process.env.PATH;
+    process.env.PATH = `${bin}:${saved ?? ""}`;
+    try {
+      const prepared = await start(input(root, cwd, "cd ."));
+      await prepared.release();
+      expect(await prepared.result).toMatchObject({ exitCode: 0, reason: "exited" });
+    } finally {
+      process.env.PATH = saved;
+    }
+    await expect(stat(marker)).rejects.toThrow();
   });
 
   it("outlives a crashed Node, then stops the command and records parent loss", async () => {

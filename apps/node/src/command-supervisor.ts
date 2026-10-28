@@ -563,8 +563,11 @@ const POSIX_INVOKE = [
   "#!/bin/sh",
   "IFS= read -r fleet_gate <&3 || exit 125",
   "exec 3<&- </dev/null",
-  // $1 is the trusted shell path the supervisor ran this wrapper with.
-  `exec "$1" "$(dirname "$0")/command.sh"`,
+  // $1 is the trusted shell path the supervisor ran this wrapper with, and $0
+  // this wrapper's absolute path. Only builtins and parameter expansion run
+  // here: a PATH lookup (dirname, say) would let a writable PATH directory run
+  // its own program before the approved command, outside that command's identity.
+  `exec "$1" "\${0%/*}/command.sh"`,
 ].join("\n");
 
 /** Starts the POSIX supervisor detached, so it outlives a Node crash. */

@@ -173,6 +173,26 @@ function state(kind, systemctl) {
 }
 
 /**
+ * Where this workload's unit file lives.
+ *
+ * The path saved at install (`controllerPath`) wins: XDG_CONFIG_HOME in a later
+ * shell may differ, and rebuilding the path from it would miss the real unit,
+ * so uninstall would neither stop nor remove it yet still report success. The
+ * environment decides only for a manifest without a usable saved path.
+ */
+export function unitPath(manifest, env = process.env) {
+  const unit = unitName(manifest.kind);
+  const saved = manifest.controllerPath;
+  if (
+    typeof saved === "string" &&
+    posix.isAbsolute(saved) &&
+    posix.basename(saved) === unit
+  )
+    return saved;
+  return posix.join(unitDirectory(env), unit);
+}
+
+/**
  * Performs one action on a workload's unit. `manifest` must already be valid.
  * Returns `{ installed, active, enabled, taskName, ... }` like the Windows task.
  */
@@ -183,7 +203,7 @@ export function linuxTaskAction(
   { systemctl = defaultSystemctl, env = process.env, linger = enableLinger } = {},
 ) {
   const unit = unitName(manifest.kind);
-  const path = posix.join(unitDirectory(env), unit);
+  const path = unitPath(manifest, env);
   const result = (extra = {}) => ({
     ...state(manifest.kind, systemctl),
     taskName: unit,
@@ -194,7 +214,7 @@ export function linuxTaskAction(
     case "status":
       return result();
     case "register": {
-      mkdirSync(unitDirectory(env), { recursive: true });
+      mkdirSync(posix.dirname(path), { recursive: true });
       writeFileSync(path, unitFile(manifest, manifestPath), { mode: 0o644 });
       systemctl(["daemon-reload"]);
       systemctl(["enable", unit]);

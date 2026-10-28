@@ -1,4 +1,8 @@
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   processGroupAlive,
@@ -61,6 +65,49 @@ describe("POSIX process-group ownership (unit)", () => {
 });
 
 describe.skipIf(process.platform === "win32")("POSIX process-group ownership", () => {
+  it("keeps Node alive until a SIGTERM-ignoring member is killed and verified", async () => {
+    // A group whose only member ignores SIGTERM, as a stubborn agent child would.
+    const victim = spawn("/bin/sh", ["-c", 'trap "" TERM; exec sleep 30'], {
+      detached: true,
+      stdio: "ignore",
+    });
+    const pgid = victim.pid!;
+    const directory = mkdtempSync(join(tmpdir(), "fleet-stop-group-"));
+    const script = join(directory, "stop.mjs");
+    // Nothing else holds this Node open: stopping the group is its only work,
+    // as it is during shutdown once listeners and sockets have closed.
+    writeFileSync(
+      script,
+      `import { stopProcessGroup } from ${JSON.stringify(
+        pathToFileURL(fileURLToPath(new URL("./posix-process-group.ts", import.meta.url)))
+          .href,
+      )};\nstopProcessGroup(Number(process.argv[2]), { graceMs: 300 }).then((ok) => console.log(String(ok)));\n`,
+    );
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const output = await new Promise<string>((resolve, reject) => {
+        const worker = spawn(
+          process.execPath,
+          ["--import", "tsx", script, String(pgid)],
+          { stdio: ["ignore", "pipe", "inherit"] },
+        );
+        let text = "";
+        worker.stdout.on("data", (chunk: Buffer) => (text += chunk.toString()));
+        worker.once("error", reject);
+        worker.once("close", () => resolve(text.trim()));
+      });
+      expect(output).toBe("true");
+      expect(processGroupAlive(pgid)).toBe(false);
+    } finally {
+      try {
+        process.kill(-pgid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("waits for a real group, including a grandchild, to empty", async () => {
     const leader = spawn(
       process.execPath,

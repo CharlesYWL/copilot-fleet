@@ -125,6 +125,27 @@ Linux: a systemd user unit (~/.config/systemd/user/copilot-fleet-*.service) that
 login, and at boot when lingering is enabled (loginctl enable-linger). Without a systemd
 user manager (e.g. WSL without systemd), run \`npm start\` under the launcher instead.`;
 
+/**
+ * The npm CLI script to build with, run by this same node.
+ *
+ * `npm run service` sets npm_execpath to the npm actually running, which covers
+ * distribution layouts such as /usr/bin/node with
+ * /usr/share/nodejs/npm/bin/npm-cli.js. Only an existing npm-cli.js is used, as
+ * the launcher does; otherwise npm is looked for beside node: node_modules/npm
+ * on Windows, lib/node_modules/npm on POSIX.
+ */
+export function npmCli({
+  env = process.env,
+  execPath = process.execPath,
+  exists = existsSync,
+} = {}) {
+  return [
+    env.npm_execpath,
+    join(dirname(execPath), "node_modules", "npm", "bin", "npm-cli.js"),
+    join(dirname(execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+  ].find((path) => path && /npm-cli\.js$/i.test(path) && exists(path));
+}
+
 export function logPosition(path) {
   try {
     return statSync(path);
@@ -340,22 +361,10 @@ async function manage(options, sid, requestedKind, service) {
     if (status.installed) invoke("stop");
   }
   if (options.build) {
-    // npm ships beside node: node_modules/npm on Windows, lib/node_modules/npm on POSIX.
-    const npm = [
-      join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
-      join(
-        dirname(process.execPath),
-        "..",
-        "lib",
-        "node_modules",
-        "npm",
-        "bin",
-        "npm-cli.js",
-      ),
-    ].find((path) => existsSync(path));
+    const npm = npmCli();
     if (!npm)
       throw new Error(
-        "Cannot locate npm beside the node executable. Build manually and use --no-build.",
+        "Cannot locate npm (npm_execpath, or beside the node executable). Build manually and use --no-build.",
       );
     const build = spawnSync(
       process.execPath,

@@ -76,22 +76,51 @@ export function killTrackedProcessGroups(): void {
 }
 
 /**
- * Remembers a detached child's group until the child exits.
+ * Remembers a detached child's group until the group is empty.
  *
  * A detached group no longer receives the terminal's Ctrl-C and is not taken
  * down with this process, so an exit without a clean shutdown (a crash, or
  * `process.exit` on a fatal error) would otherwise leave agents running with
- * nobody to stop them. The group is dropped when its leader exits, so a PID the
- * system has since reused is never signalled.
+ * nobody to stop them. That includes descendants still running after their
+ * leader exits, while asynchronous cleanup is underway, so the group is kept
+ * until the kernel reports it empty, not merely until the leader exits. The
+ * kernel does not reuse a PID while it still names a process group, so a group
+ * kept this way is never someone else's.
  */
 export function trackProcessGroup(child: ChildProcess): void {
   if (!OWN_PROCESS_GROUP || !child.pid) return;
   const pid = child.pid;
   liveProcessGroups.add(pid);
-  child.once("exit", () => liveProcessGroups.delete(pid));
+  child.once("exit", () => forgetWhenEmpty(pid));
   if (exitCleanupInstalled) return;
   exitCleanupInstalled = true;
   process.once("exit", killTrackedProcessGroups);
+}
+
+/** How often a tracked group whose leader has exited is checked for emptiness. */
+const EMPTY_GROUP_POLL_MS = 250;
+
+function forgetWhenEmpty(pgid: number): void {
+  if (!liveProcessGroups.has(pgid)) return;
+  let alive: boolean;
+  try {
+    alive = processGroupAlive(pgid);
+  } catch {
+    // An answer the kernel would not give proves nothing; keep the group.
+    alive = true;
+  }
+  if (!alive) {
+    liveProcessGroups.delete(pgid);
+    return;
+  }
+  // Bookkeeping only: this must not keep the Node alive, and the exit handler
+  // kills whatever is still tracked if it exits first.
+  setTimeout(() => forgetWhenEmpty(pgid), EMPTY_GROUP_POLL_MS).unref();
+}
+
+/** Whether a group is still remembered for exit cleanup; for tests. */
+export function processGroupTracked(pgid: number): boolean {
+  return liveProcessGroups.has(pgid);
 }
 
 function quiescenceStderr(proof: string, verified: () => void): Transform {

@@ -1587,14 +1587,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       if (frame.value.type === "session_console_grant") {
         // A grant the Node cannot accept affects that one session. Thrown here,
         // inside an async socket handler, it would end the whole Node process.
+        // The session is blocked rather than left running on the grant the Host
+        // just replaced; the others continue.
         try {
           if (sessionConsoleSupported) sessionConsole?.grant(frame.value.grant);
         } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
           errorLog(
-            `Session console grant for ${frame.value.grant.session.id} was refused: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+            `Session console grant for ${frame.value.grant.session.id} was refused: ${reason}`,
           );
+          sessionConsole?.refuseGrant(frame.value.grant.session.id, reason);
         }
         return;
       }

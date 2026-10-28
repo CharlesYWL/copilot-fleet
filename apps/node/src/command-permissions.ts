@@ -377,13 +377,31 @@ export function commandPermissionIdentity(command: string): {
   };
 }
 
+/**
+ * Builtin rules an older Fleet saved that this platform no longer defines.
+ *
+ * Settings from before PowerShell's `Set-Location` became Windows-only carry
+ * `builtin-set-location` on Linux and macOS too. It authorizes nothing there,
+ * so it is dropped when rules are validated (a restore, say) rather than
+ * rejecting the backup, and it is never reinterpreted as a POSIX executable.
+ */
+function obsoleteBuiltin(rule: CommandPermissionRule): boolean {
+  return (
+    rule.builtin === true &&
+    rule.id === "builtin-set-location" &&
+    rule.commandKey === "set-location" &&
+    !DEFAULT_COMMAND_PERMISSION_RULES.some((builtin) => builtin.id === rule.id)
+  );
+}
+
 export async function validateCommandPermissionRules(
   input: readonly CommandPermissionRule[],
   resolveExecutable: PermissionExecutableResolver = resolvePermissionExecutable,
 ): Promise<CommandPermissionRule[]> {
   const ids = new Set<string>();
+  const current = input.filter((rule) => !obsoleteBuiltin(rule));
   return Promise.all(
-    input.map(async (inputRule) => {
+    current.map(async (inputRule) => {
       const rule = CommandPermissionRuleSchema.parse(inputRule);
       if (ids.has(rule.id))
         throw new Error("Command permission rule IDs must be unique.");

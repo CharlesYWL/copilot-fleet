@@ -11,6 +11,7 @@ import {
   systemdAvailable,
   unitFile,
   unitName,
+  unitPath,
 } from "./linux-login-service.mjs";
 
 const directories = [];
@@ -121,6 +122,56 @@ describe.skipIf(process.platform === "win32")("systemd user unit files", () => {
     expect(() =>
       linuxTaskAction("uninstall", manifest, manifestPath, options),
     ).not.toThrow();
+  });
+
+  it("stops and removes the installed unit even when XDG_CONFIG_HOME has changed", () => {
+    const installedConfig = mkdtempSync(join(tmpdir(), "fleet-systemd-"));
+    const laterConfig = mkdtempSync(join(tmpdir(), "fleet-systemd-later-"));
+    directories.push(installedConfig, laterConfig);
+    const controllerPath = join(
+      installedConfig,
+      "systemd",
+      "user",
+      "copilot-fleet-node.service",
+    );
+    const installed = { ...manifest, controllerPath };
+    linuxTaskAction("register", installed, manifestPath, {
+      systemctl: fakeSystemctl().systemctl,
+      env: { XDG_CONFIG_HOME: installedConfig },
+      linger: () => ({}),
+    });
+    const { systemctl, calls } = fakeSystemctl();
+    linuxTaskAction("uninstall", installed, manifestPath, {
+      systemctl,
+      env: { XDG_CONFIG_HOME: laterConfig },
+    });
+    expect(existsSync(controllerPath)).toBe(false);
+    expect(calls).toContain("disable --now copilot-fleet-node.service");
+    expect(calls).toContain("daemon-reload");
+  });
+});
+
+describe("systemd unit location", () => {
+  it("prefers the saved unit path, and uses the environment only without one", () => {
+    expect(
+      unitPath(
+        {
+          kind: "host",
+          controllerPath: "/old/config/systemd/user/copilot-fleet-host.service",
+        },
+        { XDG_CONFIG_HOME: "/new/config" },
+      ),
+    ).toBe("/old/config/systemd/user/copilot-fleet-host.service");
+    expect(unitPath({ kind: "host" }, { XDG_CONFIG_HOME: "/new/config" })).toBe(
+      "/new/config/systemd/user/copilot-fleet-host.service",
+    );
+    // A saved path for another unit is not trusted as this workload's unit.
+    expect(
+      unitPath(
+        { kind: "host", controllerPath: "/old/systemd/user/other.service" },
+        { XDG_CONFIG_HOME: "/new/config" },
+      ),
+    ).toBe("/new/config/systemd/user/copilot-fleet-host.service");
   });
 });
 

@@ -15,8 +15,12 @@ import {
  * same role the Job Object's active-process count plays on Windows.
  */
 
-const sleep = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms).unref());
+/**
+ * Referenced on purpose: stopping and verifying a group is required work. An
+ * unreferenced timer lets Node exit mid-cleanup once the leader and its pipes
+ * are gone, before SIGKILL reaches a member that ignored SIGTERM.
+ */
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 type Signal = (pid: number, signal: NodeJS.Signals | 0) => boolean;
 

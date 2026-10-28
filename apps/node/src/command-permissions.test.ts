@@ -626,6 +626,30 @@ describe("Node-owned permission grants", () => {
   });
 
   it.skipIf(process.platform === "win32")(
+    "restores settings that still carry the old Set-Location builtin, without authorizing it",
+    async () => {
+      const legacy = [
+        ...DEFAULT_COMMAND_PERMISSION_RULES,
+        {
+          id: "builtin-set-location",
+          commandKey: "set-location",
+          command: "set-location",
+          path: "*",
+          builtin: true,
+        },
+      ];
+      const f = fixture([]);
+      const restored = await validateCommandPermissionRules(legacy, f.resolveExecutable);
+      expect(restored.map((rule) => rule.id)).toEqual(["builtin-cd"]);
+      // Dropped, not reinterpreted as a pinned POSIX program.
+      expect(f.resolveExecutable).not.toHaveBeenCalledWith(
+        "set-location",
+        expect.anything(),
+      );
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
     "gives a differently cased POSIX program neither the cd builtin nor another program's grant",
     async () => {
       const f = fixture(DEFAULT_COMMAND_PERMISSION_RULES);

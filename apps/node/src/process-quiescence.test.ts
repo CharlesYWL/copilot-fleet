@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   killPosixProcessGroup,
   killTrackedProcessGroups,
+  processGroupTracked,
   spawnManagedProcess,
   stopProcessTree,
   trackProcessGroup,
@@ -252,6 +253,17 @@ describe("POSIX process quiescence", () => {
       });
 
       await stopProcessTree(child);
+      // SIGKILL is immediate, but the orphan is reaped by init asynchronously,
+      // and kill(pid, 0) still finds a zombie; under load that takes a moment.
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        try {
+          process.kill(descendant, 0);
+        } catch {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
       expect(() => process.kill(descendant, 0)).toThrow(
         expect.objectContaining({ code: "ESRCH" }),
       );
@@ -354,7 +366,7 @@ describe("POSIX process quiescence", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "kills tracked groups on exit, and forgets a group once its leader exits",
+    "kills tracked groups on exit, and forgets a group once it is empty",
     async () => {
       const spawnGroup = () =>
         spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000)"], {
@@ -371,6 +383,7 @@ describe("POSIX process quiescence", () => {
           exited.once("exit", () => resolve());
           process.kill(exitedPid, "SIGKILL");
         });
+        expect(processGroupTracked(exitedPid)).toBe(false);
 
         const closed = new Promise<void>((resolve) =>
           running.once("exit", () => resolve()),
@@ -381,6 +394,48 @@ describe("POSIX process quiescence", () => {
       } finally {
         for (const child of [exited, running]) {
           if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        }
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "keeps a group whose leader exited while a descendant still runs, and kills it on exit",
+    async () => {
+      const leader = spawn(
+        process.execPath,
+        [
+          "-e",
+          'const c=require("node:child_process").spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"});c.unref();console.log(c.pid)',
+        ],
+        { detached: true, stdio: ["ignore", "pipe", "ignore"] },
+      );
+      const pgid = leader.pid!;
+      let descendant = 0;
+      try {
+        trackProcessGroup(leader);
+        descendant = await new Promise<number>((resolve, reject) => {
+          leader.stdout!.once("data", (chunk: Buffer) =>
+            resolve(Number(chunk.toString().trim())),
+          );
+          leader.once("error", reject);
+        });
+        await new Promise<void>((resolve) => {
+          if (leader.exitCode !== null) resolve();
+          else leader.once("exit", () => resolve());
+        });
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        // The leader is gone but the group is not, so exit cleanup still owns it.
+        expect(processGroupTracked(pgid)).toBe(true);
+        killTrackedProcessGroups();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(() => process.kill(descendant, 0)).toThrow();
+      } finally {
+        try {
+          process.kill(-pgid, "SIGKILL");
+        } catch {
+          // Already gone.
         }
       }
     },
