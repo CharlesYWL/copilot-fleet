@@ -23,13 +23,18 @@ import {
 
 export const DEFAULT_COMMAND_PERMISSION_RULES: CommandPermissionRule[] = [
   { id: "builtin-cd", commandKey: "cd", command: "cd", path: "*", builtin: true },
-  {
-    id: "builtin-set-location",
-    commandKey: "set-location",
-    command: "set-location",
-    path: "*",
-    builtin: true,
-  },
+  // PowerShell's own name for cd; POSIX shells have no such command.
+  ...(process.platform === "win32"
+    ? [
+        {
+          id: "builtin-set-location",
+          commandKey: "set-location",
+          command: "set-location",
+          path: "*",
+          builtin: true,
+        },
+      ]
+    : []),
 ];
 
 const EXECUTABLE_PIN = /^(.*) @sha256:([a-f0-9]{64})$/;
@@ -55,6 +60,20 @@ const interpreters =
   /^(?:powershell|powershell_ise|pwsh|cmd|command|sh|bash|dash|zsh|fish|ksh|csh|tcsh|ash|busybox|env|xargs|node|nodejs|npx|pnpx|python\d*|py|perl|ruby|php|java|javaw|js|jsc|csi|r|rscript|wscript|cscript|mshta|msiexec|installutil|regasm|regsvcs|lua|luajit|tclsh|wish|deno|bun|tsx|ts-node|rundll32|regsvr32|runas|sudo|doas|ssh|psexec|schtasks|wmic|forfiles)$/i;
 const literalKey = (args: readonly string[]): string =>
   args.map((arg) => (/\s/.test(arg) ? `'${arg}'` : arg)).join(" ");
+
+/**
+ * The executable name as the command's shell will look it up.
+ *
+ * Windows command lookup ignores case, so `GIT` and `git` are one program and
+ * share a key. POSIX lookup does not: `CD` or `GIT` on PATH is a different file
+ * from `cd`/`git`, so its case is kept and it gets its own identity and pin.
+ */
+const executableName = (name: string): string =>
+  process.platform === "win32" ? name.toLowerCase() : name;
+
+/** Directory navigation: `cd` everywhere, PowerShell's `Set-Location` only on Windows. */
+const isDirectoryChange = (executable: string): boolean =>
+  executable === "cd" || (process.platform === "win32" && executable === "set-location");
 
 export function permissionPath(path: string): string {
   const value = normalize(path);
@@ -82,7 +101,7 @@ function literalArguments(command: string, wildcard = false): string[] | undefin
 
 function literalInvocation(command: string, wildcard = false): string | undefined {
   const args = literalArguments(command, wildcard);
-  return args ? literalKey([args[0]!.toLowerCase(), ...args.slice(1)]) : undefined;
+  return args ? literalKey([executableName(args[0]!), ...args.slice(1)]) : undefined;
 }
 
 /** Anchored '*' matching with forward-only literal searches, not regex backtracking. */
@@ -248,9 +267,9 @@ export function commandPermissionIdentity(command: string): {
     return once(
       "Executable paths, expressions, and unknown command identities are not reusable.",
     );
-  const executable = args[0]!.toLowerCase();
-  const tool = executable.replace(/\.(?:exe|com|cmd|ps1)$/, "");
-  if (executable === "cd" || executable === "set-location") {
+  const executable = executableName(args[0]!);
+  const tool = executable.replace(/\.(?:exe|com|cmd|ps1)$/i, "");
+  if (isDirectoryChange(executable)) {
     const path = args[1];
     if (
       args.length !== 2 ||
@@ -358,13 +377,31 @@ export function commandPermissionIdentity(command: string): {
   };
 }
 
+/**
+ * Builtin rules an older Fleet saved that this platform no longer defines.
+ *
+ * Settings from before PowerShell's `Set-Location` became Windows-only carry
+ * `builtin-set-location` on Linux and macOS too. It authorizes nothing there,
+ * so it is dropped when rules are validated (a restore, say) rather than
+ * rejecting the backup, and it is never reinterpreted as a POSIX executable.
+ */
+function obsoleteBuiltin(rule: CommandPermissionRule): boolean {
+  return (
+    rule.builtin === true &&
+    rule.id === "builtin-set-location" &&
+    rule.commandKey === "set-location" &&
+    !DEFAULT_COMMAND_PERMISSION_RULES.some((builtin) => builtin.id === rule.id)
+  );
+}
+
 export async function validateCommandPermissionRules(
   input: readonly CommandPermissionRule[],
   resolveExecutable: PermissionExecutableResolver = resolvePermissionExecutable,
 ): Promise<CommandPermissionRule[]> {
   const ids = new Set<string>();
+  const current = input.filter((rule) => !obsoleteBuiltin(rule));
   return Promise.all(
-    input.map(async (inputRule) => {
+    current.map(async (inputRule) => {
       const rule = CommandPermissionRuleSchema.parse(inputRule);
       if (ids.has(rule.id))
         throw new Error("Command permission rule IDs must be unique.");
@@ -407,9 +444,7 @@ export async function validateCommandPermissionRules(
       }
       const existingPin = EXECUTABLE_PIN.exec(rule.commandKey);
       const invocation = rule.command ?? existingPin?.[1] ?? rule.commandKey;
-      const command = ["cd", "set-location"].includes(invocation)
-        ? `${invocation} .`
-        : invocation;
+      const command = isDirectoryChange(invocation) ? `${invocation} .` : invocation;
       if (
         rule.path.includes("*") &&
         rule.match === "command" &&
@@ -483,16 +518,19 @@ function concreteCommandIdentity(
   resolveExecutable: PermissionExecutableResolver,
 ): ReturnType<typeof commandPermissionIdentity> {
   const key = identity.commandKey;
-  if (!key || ["cd", "set-location"].includes(key)) return identity;
+  if (!key || isDirectoryChange(key)) return identity;
   try {
     const name = key.split(" ")[0]!;
     const executable = resolveExecutable(name, cwd);
     if (!isAbsolute(executable.path) || !/^[a-f0-9]{64}$/.test(executable.fingerprint))
       throw new Error("Resolver did not supply a concrete executable identity.");
-    if (
-      !/^npm(?:\.(?:exe|com|cmd|ps1))?$/.test(name) &&
-      ![".exe", ".com"].includes(extname(executable.path).toLowerCase())
-    )
+    const isNpm = /^npm(?:\.(?:exe|com|cmd|ps1))?$/.test(name);
+    // Windows decides by extension; a POSIX resolver reports whether the file
+    // it pinned is a compiled program (ELF/Mach-O) rather than a script.
+    const native =
+      executable.native ??
+      [".exe", ".com"].includes(extname(executable.path).toLowerCase());
+    if (!isNpm && !native)
       throw new Error(
         "Script launchers are Once-only unless the known npm task identity is explicit.",
       );

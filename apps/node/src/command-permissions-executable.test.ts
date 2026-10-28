@@ -110,3 +110,52 @@ describe("concrete command executable identity", () => {
     },
   );
 });
+
+describe.skipIf(process.platform === "win32")("POSIX command executable identity", () => {
+  it("resolves the real Git on PATH to a pinned compiled program", () => {
+    const f = fixture();
+    const executable = resolvePermissionExecutable("git", f.cwd);
+    expect(executable.path).toMatch(/^\/.*\/git$/);
+    expect(executable.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(executable.native).toBe(true);
+    expect(resolvePermissionExecutable("git", f.cwd)).toEqual(executable);
+  });
+
+  it("marks a #! script on PATH as not a compiled program", () => {
+    const f = fixture();
+    const tools = join(f.directory, "tools");
+    mkdirSync(tools);
+    writeFileSync(join(tools, "fleet-script-tool"), "#!/bin/sh\nexit 0\n", {
+      mode: 0o755,
+    });
+    vi.stubEnv("PATH", `${tools}${delimiter}${process.env.PATH ?? ""}`);
+    expect(resolvePermissionExecutable("fleet-script-tool", f.cwd).native).toBe(false);
+  });
+
+  it("refuses shell builtins, which have no file to pin", () => {
+    const f = fixture();
+    expect(() => resolvePermissionExecutable("export", f.cwd)).toThrow(
+      "Ambiguous command identity",
+    );
+  });
+
+  it("detects a checkout-local PATH shadow without executing it", () => {
+    const f = fixture();
+    const marker = join(f.cwd, "must-not-exist");
+    const shadow = join(f.cwd, "git");
+    writeFileSync(shadow, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+    vi.stubEnv("PATH", `${f.cwd}${delimiter}${process.env.PATH ?? ""}`);
+    expect(() => resolvePermissionExecutable("git", f.cwd)).toThrow("shadow executable");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("does not run shell startup files named by ENV", () => {
+    const f = fixture();
+    const marker = join(f.cwd, "startup-ran");
+    const startup = join(f.directory, "startup.sh");
+    writeFileSync(startup, `touch '${marker}'\n`);
+    vi.stubEnv("ENV", startup);
+    resolvePermissionExecutable("git", f.cwd);
+    expect(existsSync(marker)).toBe(false);
+  });
+});

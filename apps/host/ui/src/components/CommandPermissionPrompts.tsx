@@ -12,6 +12,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import {
+  COMMAND_SHELL_LABELS,
   CommandExecutionSchema,
   commandApprovalExpiresAt,
   errorMessage,
@@ -161,7 +162,7 @@ export function CommandPermissionPrompts({
               <dt>Requested by</dt>
               <dd>{selected.leadSessionId}</dd>
               <dt>Shell</dt>
-              <dd>{selected.shell}</dd>
+              <dd>{COMMAND_SHELL_LABELS[selected.shell]}</dd>
               <dt>Runtime limit</dt>
               <dd>{Math.round(selected.timeoutMs / 1000)} seconds</dd>
               <dt>Approve before</dt>

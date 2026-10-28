@@ -6,6 +6,7 @@ import process from "node:process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   effectiveRestartKind,
+  linuxUpdateUnit,
   parseArguments,
   restartCommand,
   run,
@@ -26,7 +27,11 @@ function directory() {
   return path;
 }
 
-const statusFile = "C:\\Fleet\\apps\\host\\data\\self-update.json";
+// Absolute on the platform running the test, as the Host always sends.
+const statusFile =
+  process.platform === "win32"
+    ? "C:\\Fleet\\apps\\host\\data\\self-update.json"
+    : "/srv/fleet/apps/host/data/self-update.json";
 const valid = [
   "--status",
   statusFile,
@@ -180,14 +185,87 @@ describe("self-update", () => {
     expect(existsSync(`${status}.task.xml`)).toBe(false);
   });
 
-  it("refuses to schedule anywhere but Windows", () => {
+  it("schedules a Linux update as a transient systemd user unit outside the Host's", () => {
+    const exec = vi.fn(() => "");
+    const options = parseArguments(["schedule", ...valid]);
+    const result = schedule(options, {
+      exec,
+      nodePath: "/usr/bin/node",
+      root: "/srv/fleet",
+      platform: "linux",
+      manifestPath: "/custom/state/copilot-fleet/login/host/manifest.json",
+    });
+    expect(result).toEqual({ ok: true, taskName: linuxUpdateUnit(options.updateId) });
+    const [file, args] = exec.mock.calls[0];
+    expect(file).toBe("systemd-run");
+    expect(args).toEqual([
+      "--user",
+      `--unit=copilot-fleet-update-${options.updateId}`,
+      "--collect",
+      "--quiet",
+      "--working-directory=/srv/fleet",
+      "--",
+      "/usr/bin/node",
+      join("/srv/fleet", "scripts", "self-update.mjs"),
+      "run",
+      "--status",
+      statusFile,
+      "--update-id",
+      options.updateId,
+      "--restart",
+      "host+node",
+      "--running-revision",
+      "abc123def456",
+      // The unit lacks the Host's environment, so it is told where the manifest is.
+      "--manifest",
+      "/custom/state/copilot-fleet/login/host/manifest.json",
+    ]);
+    // The unit's own invocation parses back to the same manifest.
+    expect(
+      parseArguments(["run", ...args.slice(args.indexOf("--status"))]),
+    ).toMatchObject({
+      manifestPath: "/custom/state/copilot-fleet/login/host/manifest.json",
+    });
+  });
+
+  it("reads the Host environment from the manifest path it was given", async () => {
+    const status = join(directory(), "self-update.json");
+    const environment = vi.fn(() => ({}));
+    await run(
+      {
+        ...parseArguments(["run", ...valid, "--manifest", statusFile]),
+        statusFile: status,
+      },
+      {
+        root: "C:\\Fleet",
+        loadUpdater: async () => ({
+          applyUpdate: async () => ({ stage: "up_to_date", detail: "" }),
+          runCommand: vi.fn(),
+        }),
+        environment,
+        restart: vi.fn(),
+        removeTask: vi.fn(),
+      },
+    );
+    expect(environment).toHaveBeenCalledWith(
+      expect.objectContaining({ manifestPath: statusFile }),
+    );
+  });
+
+  it("refuses a relative manifest path", () => {
+    expect(() =>
+      parseArguments(["run", ...valid, "--manifest", "manifest.json"]),
+    ).toThrow("--manifest must be an absolute path");
+  });
+
+  it("refuses to schedule where there is no login service", () => {
     expect(() =>
       schedule(parseArguments(["schedule", ...valid]), {
         sid: "S-1-5-21-1-2-3-1001",
         exec: vi.fn(),
-        platform: "linux",
+        platform: "darwin",
       }),
-    ).toThrow("only on Windows");
+    ).toThrow("only on Windows and Linux");
   });
 
   describe("effectiveRestartKind", () => {

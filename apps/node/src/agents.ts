@@ -3,7 +3,12 @@ import { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { packageRoot } from "./paths.js";
-import { spawnManagedProcess, stopProcessTree } from "./process-quiescence.js";
+import {
+  OWN_PROCESS_GROUP,
+  spawnManagedProcess,
+  stopProcessTree,
+  trackProcessGroup,
+} from "./process-quiescence.js";
 import * as acp from "@agentclientprotocol/sdk";
 import type { LogLevel } from "@fleet/protocol/log-buffer";
 import type {
@@ -784,9 +789,11 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
         shell,
+        detached: OWN_PROCESS_GROUP,
         ...(this.environment ? { env: this.environment } : {}),
       },
     );
+    trackProcessGroup(child);
     this.child = child;
     if (child.pid) this.processOwnership?.processStarted?.(child.pid);
     child.stderr.setEncoding("utf8");

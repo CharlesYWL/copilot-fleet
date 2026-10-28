@@ -1,4 +1,5 @@
 // Disposable Node-parent fixture. Never targets a process it did not create.
+import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import process from "node:process";
@@ -11,8 +12,17 @@ const input = JSON.parse(await readFile(process.argv[2], "utf8"));
 if (input.mode === "readiness" || input.mode === "missing") {
   // Change after the TS loader starts: a false SystemRoot can also stop Node's
   // own dependency loader, which would test the wrong failure boundary.
-  if (input.mode === "missing")
+  if (input.mode === "missing") {
+    // OpenSSL seeds its generator from the Windows system directory on first
+    // use (Node 26 and later). Seed it now, while SystemRoot is still real, so
+    // the failure under test is the missing supervisor rather than randomUUID.
+    randomUUID();
+    // Windows names are case-insensitive, and the inherited key may not be
+    // spelled `SystemRoot` (Vitest upper-cases them); replace every spelling.
+    for (const key of Object.keys(process.env))
+      if (key.toUpperCase() === "SYSTEMROOT") delete process.env[key];
     process.env.SystemRoot = join(input.root, "missing-windows");
+  }
   const ready = await commandSupervisorReadiness();
   let prepareFailed = false;
   try {

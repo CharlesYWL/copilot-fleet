@@ -13,12 +13,15 @@ const processSuites = [
   "apps/node/src/command-execution-manager.test.ts",
   "apps/node/src/command-storage.test.ts",
   "apps/node/src/command-supervisor.test.ts",
+  "apps/node/src/command-supervisor-posix.test.ts",
   "apps/node/src/managed-worktrees.test.ts",
   "packages/protocol/src/updater.integration.test.ts",
   "scripts/launcher.integration.test.js",
   "scripts/login-service-install.test.js",
   "scripts/managed-worktrees.integration.test.js",
   "scripts/managed-worktrees.recovery.test.js",
+  // A real Host and Nodes over WebSockets with SQLite journals.
+  "scripts/session-console.integration.test.ts",
   "scripts/windows-login-task.test.js",
 ];
 

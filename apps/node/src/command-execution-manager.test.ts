@@ -296,6 +296,42 @@ describe("approved command execution", () => {
     expect(f.journal.get(descriptor.executionId)?.receipt.reason).toContain("negotiate");
   });
 
+  it("withholds posix-sh from a Host that has not confirmed it, and refuses other shells", async () => {
+    const f = await fixture();
+    const posixHost = { value: false };
+    vi.mocked(f.supervisor.readiness).mockResolvedValue({
+      supported: true,
+      reason: "posix fixture",
+      shellPath: "/bin/sh",
+      shells: ["posix-sh"],
+    });
+    const manager = new CommandExecutionManager({
+      ...f,
+      connection: () => ({
+        sealed: true,
+        negotiated: true,
+        permissions: true,
+        posixShell: posixHost.value,
+        hostId: "host",
+        nodeId: "node",
+      }),
+    });
+    await manager.configure(true);
+    // An older Host would reject the unknown literal and drop the connection.
+    expect(manager.readiness.shells).toEqual([]);
+    posixHost.value = true;
+    expect(manager.readiness.shells).toEqual(["posix-sh"]);
+
+    await manager.handle({ type: "prepare_command_execution", request: f.request });
+    expect(
+      f.messages.filter((entry) => entry.type === "command_execution_prepared").at(-1),
+    ).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("not windows-powershell-5.1"),
+    });
+    expect(f.prepare).not.toHaveBeenCalled();
+  });
+
   it("reports unavailable supervisor readiness, not a missing local opt-in", async () => {
     const f = await fixture();
     vi.mocked(f.supervisor.readiness).mockRejectedValueOnce(

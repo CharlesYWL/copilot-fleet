@@ -61,6 +61,10 @@ vi.mock("node:child_process", async (importOriginal) => ({
   spawn: vi.fn(),
 }));
 vi.mock("./process-quiescence.js", () => ({
+  // Children here are fakes; process-group ownership is covered by
+  // agent-process-group.test.ts against real processes.
+  OWN_PROCESS_GROUP: false,
+  trackProcessGroup: vi.fn(),
   spawnManagedProcess: vi.fn(),
   stopProcessTree: vi.fn(async (child: ChildProcess) => {
     child.kill();
@@ -826,7 +830,7 @@ describe("Hermes ACP startup", () => {
         type: "system",
         payload: {
           message:
-            '"claude-opus-5" is not one of the choices for model, so it was left alone',
+            'Could not set model to "claude-opus-5": "claude-opus-5" is not one of the choices for model; it was left alone',
         },
       }),
     );

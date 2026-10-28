@@ -32,7 +32,9 @@ afterEach(() => {
   vi.unstubAllEnvs();
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
 });
-const windowsIt = it.skipIf(process.platform !== "win32");
+// Real managed ownership exists on every platform: a Job Object on Windows, a
+// verified process group on Linux and macOS.
+const managedIt = it;
 const managed = () => ({
   spawnManagedProcess: vi.fn(spawnManagedProcess),
   stopProcessTree: vi.fn(stopProcessTree),
@@ -213,7 +215,7 @@ it.each(["missing", "changed", "running"])(
   },
 );
 
-windowsIt(
+managedIt(
   "recovers a crash only after orphaned descendants stop, preserving identity, arguments and environment",
   async () => {
     vi.stubEnv("GH_CONFIG_DIR", "saved-login-profile");
@@ -267,7 +269,7 @@ windowsIt(
   30_000,
 );
 
-windowsIt(
+managedIt(
   "caps crash recovery at four retries and retains the final nonzero exit",
   async () => {
     const manifest = fixture("node", 'console.error("crash");process.exitCode=19;');
@@ -285,7 +287,7 @@ windowsIt(
   60_000,
 );
 
-windowsIt.each(["SIGINT", "SIGTERM"])(
+managedIt.each(["SIGINT", "SIGTERM"])(
   "stops an active managed child intentionally on %s without restarting",
   async (signal) => {
     const manifest = fixture(
@@ -362,7 +364,9 @@ it("fails closed on synchronous and emitted spawn errors", async () => {
   }
 });
 
-windowsIt(
+// Windows-only: a POSIX managed child is the leader itself, with no separate
+// supervisor wrapper whose death could leave ownership unproven.
+it.skipIf(process.platform !== "win32")(
   "refuses recovery after wrapper death without ownership proof",
   async () => {
     const manifest = fixture(
@@ -419,7 +423,7 @@ it("fails closed when an intentional stop cannot terminate a still-running child
   }
 });
 
-windowsIt(
+managedIt(
   "keeps large stdout/stderr bounded and intact under log backpressure",
   async () => {
     const manifest = fixture(
@@ -451,7 +455,7 @@ windowsIt(
   30_000,
 );
 
-windowsIt(
+managedIt(
   "propagates a runtime log error and verifies cleanup instead of retrying",
   async () => {
     const manifest = fixture(

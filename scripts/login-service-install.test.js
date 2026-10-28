@@ -51,6 +51,7 @@ function fixture(installedKind) {
     "login-service-cli.mjs",
     "login-service.mjs",
     "login-service-runner.mjs",
+    "linux-login-service.mjs",
   ]) {
     copyFileSync(resolve("scripts", file), join(root, "scripts", file));
   }

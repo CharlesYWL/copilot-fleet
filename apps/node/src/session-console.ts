@@ -93,7 +93,8 @@ export class NodeSessionConsole {
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly hostEpochs = new Map<string, number>();
   private readonly syncSessions = new Set<string>();
-  private readonly unavailableSessions = new Set<string>();
+  /** Sessions whose control is blocked until reconciliation, with the reason shown. */
+  private readonly unavailableSessions = new Map<string, string>();
   private readonly sentOperations = new Map<string, string>();
   private fastFlush = false;
   private liveWake = false;
@@ -242,7 +243,7 @@ export class NodeSessionConsole {
       if (generation !== this.generation) return;
       this.unavailableSessions.clear();
       for (const id of response.unavailableSessionIds) {
-        this.unavailableSessions.add(id);
+        this.unavailableSessions.set(id, UNAVAILABLE_SESSION_DETAIL);
         this.options.onError(`Session console ${id}: ${UNAVAILABLE_SESSION_DETAIL}`);
       }
       for (const grant of response.grants) this.grant(grant);
@@ -329,6 +330,30 @@ export class NodeSessionConsole {
     this.syncSessions.add(grant.session.id);
     this.hostEpochs.set(grant.session.id, grant.controlEpoch);
     this.markOperationsDirty(grant.session.id);
+  }
+
+  /**
+   * Blocks one session after the Host sent a grant this Node cannot accept.
+   *
+   * Retained evidence for that session no longer matches what the Host says it
+   * is, so admitting work on the old grant would act on a binding the Host has
+   * replaced. Other sessions are unaffected. The block lasts until the next
+   * synchronization or an accepted grant, which is when the two agree again.
+   */
+  refuseGrant(sessionId: string, reason: string): void {
+    const detail = `The Host's latest grant for this session was refused (${reason}). Session control is unavailable until the Node and Host reconcile it.`;
+    this.unavailableSessions.set(sessionId, detail);
+    this.options.onError(`Session console ${sessionId}: ${detail}`);
+    if (this.viewers.has(sessionId)) {
+      try {
+        this.emit(sessionId, {
+          type: "session",
+          session: this.localView(sessionId).session,
+        });
+      } catch {
+        // No local record to show; the block itself is what matters.
+      }
+    }
   }
 
   capture(event: SessionEvent): boolean {
@@ -814,7 +839,7 @@ export class NodeSessionConsole {
         !entry.session.cleanupRequested &&
         this.status !== "conflict",
       detail: unavailable
-        ? UNAVAILABLE_SESSION_DETAIL
+        ? (this.unavailableSessions.get(id) ?? UNAVAILABLE_SESSION_DETAIL)
         : this.detail ||
           (!live ? "The session process is not running. Resume through Host." : ""),
     };
@@ -1081,12 +1106,13 @@ export class NodeSessionConsole {
   hostCommand(command: NodeCommand, epoch?: number): Promise<CommandResult> {
     return this.exclusive(command.sessionId, async () => {
       const safety = ["stop", "cancel", "permission_response"].includes(command.type);
-      if (!safety && this.unavailableSessions.has(command.sessionId))
+      const blocked = this.unavailableSessions.get(command.sessionId);
+      if (!safety && blocked)
         return {
           commandId: command.commandId,
           ok: false,
           fatal: false,
-          error: UNAVAILABLE_SESSION_DETAIL,
+          error: blocked,
         };
       const entry = this.journal.get(command.sessionId);
       const blocker = safety ? undefined : this.hostWorkBlocker(entry, epoch);
@@ -1136,8 +1162,8 @@ export class NodeSessionConsole {
   }
 
   private async action(id: string, input: ConsoleAction): Promise<unknown> {
-    if (this.unavailableSessions.has(id))
-      throw new NodeConsoleError(409, UNAVAILABLE_SESSION_DETAIL);
+    const blocked = this.unavailableSessions.get(id);
+    if (blocked) throw new NodeConsoleError(409, blocked);
     if (
       (input.action === "queue_cancel" || input.action === "queue_send_now") &&
       input.messageId.startsWith("node:")
@@ -1270,16 +1296,16 @@ export class NodeSessionConsole {
     messageId: string,
     action: "cancel" | "send-now",
   ): Promise<{ ok: true }> {
-    if (this.unavailableSessions.has(id))
-      throw new NodeConsoleError(409, UNAVAILABLE_SESSION_DETAIL);
+    const blocked = this.unavailableSessions.get(id);
+    if (blocked) throw new NodeConsoleError(409, blocked);
     if (this.status === "syncing" || this.status === "conflict")
       throw new NodeConsoleError(409, "Reconcile the session before changing its queue");
     const entry = this.journal.get(id);
     if (!entry || entry.hostId !== this.options.hostId())
       throw new NodeConsoleError(404, "Local session not found");
     await this.exclusive(id, async () => {
-      if (this.unavailableSessions.has(id))
-        throw new NodeConsoleError(409, UNAVAILABLE_SESSION_DETAIL);
+      const blockedNow = this.unavailableSessions.get(id);
+      if (blockedNow) throw new NodeConsoleError(409, blockedNow);
       if (this.status === "syncing" || this.status === "conflict")
         throw new NodeConsoleError(
           409,

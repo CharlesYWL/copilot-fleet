@@ -130,6 +130,7 @@ for private-IP HTTPS/WSS between reachable Windows Dev Boxes, without Dev Tunnel
 - **[Chats](docs/guide/using-fleet.md#chats)**: start a session with no checkout, for questions and research.
 - **[Local agents](docs/guide/orchestration.md#local-agents-handing-work-to-an-orchestrator-from-this-machine)**: hand work to an orchestrator from an agent on your own machine.
 - **[Windows login startup](docs/guide/nodes.md#windows-login-startup)**: start the Host and Node when you sign in to Windows.
+- **[Linux login startup](docs/guide/nodes.md#linux-login-startup)**: run the Host and Node as `systemd --user` services on Linux.
 - **[Backup, restore and migration](docs/guide/operations.md#moving-a-host-or-a-node-to-another-machine)**: move a Host or Node to another machine.
 
 ## Quick start
