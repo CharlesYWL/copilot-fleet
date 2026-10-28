@@ -184,9 +184,10 @@ collection start before invoking the provider, not at result mapping.
 Evidence older than the normal freshness window is retained only as `lastAttempt`,
 not promoted to a current snapshot/readiness. A fresh complete receipt can make the
 job due for action, but preparing/dispatching a repair still requires a **new current
-bounded visit and remaining allowance**. Under a pause, release or human hold, an
-otherwise exact same-scope receipt can update only `lastAttempt`, not lifecycle,
-current observation, findings or decisions. Owner/binding/authorization/generation or
+bounded visit and remaining allowance**. Pause and pending-design holds may accept
+an otherwise exact same-scope read-only observation refresh without clearing the hold
+or authorizing action. Release blocks promotion beyond `lastAttempt`.
+Owner/binding/authorization/generation or
 manual-control scope changes still refuse admission. Portable restore revokes the
 local accepted-preparation receipt and cannot acquire active receipt authority; raw
 command evidence and already-saved attempts remain readable under existing retention.

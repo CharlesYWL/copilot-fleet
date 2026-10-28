@@ -27,6 +27,7 @@ import {
   MAX_ATTACHMENT_BYTES,
   MUTUAL_AUTH_PROTOCOL,
   CommandExecutionBackupSchema,
+  CommandExecutionSchema,
   PromptSchema,
   type PrMaintenanceIdentity,
   type PrMaintenanceObservation,
@@ -3198,6 +3199,150 @@ describe("PR maintenance with durable commands", () => {
     }
     expect(store.commands.prompts()).toHaveLength(1);
   });
+
+  it.each(["unsettled", "terminal-output-incomplete"] as const)(
+    "keeps %s observation review gates closed behind 10,001 newer global commands",
+    async (state) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const path = receiptPath();
+      const h = await observationCommand(path);
+      const result = await observeFixture(fixtureInput(new Date().toISOString()));
+      if (state === "terminal-output-incomplete")
+        expect(
+          h.f.result(h.execution, {
+            state: "succeeded",
+            exitCode: 0,
+            finalOutputSeq: Math.ceil(Buffer.byteLength(JSON.stringify(result)) / 16_384),
+            settledAt: new Date().toISOString(),
+          }),
+        ).toBe(true);
+      const claim = h.f.store.prMaintenance.beginWake(
+        h.f.lead.id,
+        h.first.delivery.deliveryId,
+      ).observationClaims[0]!;
+      expect(claim).toMatchObject({
+        recordId: h.record.id,
+        generation: h.record.generation,
+        executionId: h.execution.id,
+        attemptId: h.execution.attemptId,
+      });
+      const db = new DatabaseSync(path);
+      try {
+        const insert = db.prepare(
+          "INSERT INTO command_executions(id,lead_id,node_id,task_id,version,data) VALUES(?,?,?,NULL,?,?)",
+        );
+        db.exec("BEGIN");
+        for (let i = 0; i < 10_001; i++) {
+          const execution = CommandExecutionSchema.parse({
+            id: randomUUID(),
+            attemptId: randomUUID(),
+            version: 1,
+            hostId: h.execution.hostId,
+            nodeId: h.f.node.id,
+            nodeName: "target",
+            leadSessionId: i % 2 ? "another-lead" : h.f.lead.id,
+            target: h.execution.target,
+            command: "Write-Output ok",
+            shell: h.execution.shell,
+            reason: "Synthetic unrelated command",
+            requestKey: String(i),
+            requestedPath: "C:\\repo",
+            requestDigest: "a".repeat(64),
+            state: i === 10_000 ? "running" : "succeeded",
+            ownership: i === 10_000 ? "active" : "quiescent",
+            createdAt: new Date(Date.now() + i + 1).toISOString(),
+            updatedAt: new Date(Date.now() + i + 1).toISOString(),
+            expiresAt: h.execution.expiresAt,
+            ...(i === 10_000
+              ? {
+                  maintenanceObservation: {
+                    ...h.execution.maintenanceObservation!,
+                    recordId: randomUUID(),
+                  },
+                }
+              : { settledAt: new Date().toISOString(), finalOutputSeq: 0 }),
+            outputComplete: i !== 10_000,
+          });
+          insert.run(
+            execution.id,
+            execution.leadSessionId,
+            execution.nodeId,
+            execution.version,
+            JSON.stringify(execution),
+          );
+        }
+        db.exec("COMMIT");
+        expect(
+          Number(
+            db
+              .prepare(
+                "SELECT count(*) AS count FROM command_executions WHERE rowid > (SELECT rowid FROM command_executions WHERE id=?)",
+              )
+              .get(h.execution.id)!.count,
+          ),
+        ).toBe(10_001);
+        const lifecycleBytes = Number(
+          db
+            .prepare(
+              `SELECT (SELECT coalesce(sum(length(CAST(data AS BLOB))),0) FROM command_executions)
+              + (SELECT coalesce(sum(metadata_bytes),0) FROM lead_prompt_deliveries)
+              + (SELECT count(*)*512 FROM command_request_tombstones)
+              + (SELECT coalesce(sum(length(receipt)),0) FROM command_attempt_tombstones) AS bytes`,
+            )
+            .get()!.bytes,
+        );
+        expect(lifecycleBytes + 2 * 32_768).toBeLessThan(
+          COMMAND_LIMITS.lifecycleReserveBytes,
+        );
+        const list = vi.spyOn(h.f.store.commands, "list");
+        const prepare = vi.spyOn(DatabaseSync.prototype, "prepare");
+        expect.soft(h.f.store.prMaintenance.pendingReviewWakes()).toEqual([]);
+        const current = h.f.store.prMaintenance.get(h.record.id)!;
+        expect(
+          h.f.store.prMaintenance.markReviewWake(
+            current.id,
+            current.review!.id,
+            "delivered-review",
+          ),
+        ).toBe(true);
+        expect.soft(h.f.store.prMaintenance.staleReviews(() => false)).toEqual([]);
+        expect(list).not.toHaveBeenCalled();
+        const query = prepare.mock.calls.find(([sql]) =>
+          sql.includes("FROM command_executions"),
+        )?.[0];
+        expect(query).toBeDefined();
+        expect(query).not.toMatch(/SELECT data|ORDER BY|10_000|10000/i);
+        const plan = db.prepare(`EXPLAIN QUERY PLAN ${query!}`).all(h.record.id);
+        expect(plan.map((row) => row.detail).join("\n")).toMatch(
+          /SEARCH command_executions USING INDEX command_execution_observation_pending/,
+        );
+        prepare.mockRestore();
+        list.mockRestore();
+        const tick = vi.spyOn(h.f.service.commands, "tick").mockImplementation(() => {});
+        h.finish(result);
+        tick.mockRestore();
+        const recovered = await h.call("fleet_checkpoint_pr_maintenance", {
+          executionId: h.execution.id,
+        });
+        expect(recovered.ok, recovered.text).toBe(true);
+        expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toEqual(
+          result.observation,
+        );
+        expect(h.f.store.prMaintenance.staleReviews(() => false)).toEqual([
+          { recordId: current.id, reviewId: current.review!.id },
+        ]);
+        // The unrelated running execution cannot block this record after its receipt.
+        db.prepare(
+          "UPDATE pr_maintenance SET data=json_remove(data,'$.review.wakeKey','$.review.wakeQueuedAt') WHERE id=?",
+        ).run(current.id);
+        expect(
+          h.f.store.prMaintenance.pendingReviewWakes().map((entry) => entry.id),
+        ).toEqual([current.id]);
+      } finally {
+        db.close();
+      }
+    },
+  );
 
   it("waits for terminal-before-output evidence before both completion and review wakes", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });

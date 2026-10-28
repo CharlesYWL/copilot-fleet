@@ -80,6 +80,10 @@ export class CommandExecutionStore {
         task_id TEXT, version INTEGER NOT NULL, data TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS command_execution_owner ON command_executions(lead_id);
+      CREATE INDEX IF NOT EXISTS command_execution_observation_pending
+        ON command_executions(json_extract(data,'$.maintenanceObservation.recordId'))
+        WHERE json_extract(data,'$.settledAt') IS NULL
+          OR coalesce(json_extract(data,'$.outputComplete'),0)=0;
       CREATE TABLE IF NOT EXISTS command_execution_events (
         execution_id TEXT NOT NULL, sequence INTEGER NOT NULL, bytes INTEGER NOT NULL,
         data TEXT NOT NULL, PRIMARY KEY(execution_id,sequence)

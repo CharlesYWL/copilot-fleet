@@ -3893,13 +3893,15 @@ export class PrMaintenanceStore {
 
   /** A claimed helper command for this record that has not produced its receipt. */
   private observationInFlight(record: PrMaintenanceRegistration): boolean {
-    return this.store.commands
-      .list({ limit: 10_000 })
-      .some(
-        (execution) =>
-          execution.maintenanceObservation?.recordId === record.id &&
-          (!execution.settledAt || !execution.outputComplete),
-      );
+    return !!this.db
+      .prepare(
+        `SELECT 1 FROM command_executions
+         WHERE json_extract(data,'$.maintenanceObservation.recordId')=?
+           AND (json_extract(data,'$.settledAt') IS NULL
+             OR coalesce(json_extract(data,'$.outputComplete'),0)=0)
+         LIMIT 1`,
+      )
+      .get(record.id);
   }
 
   beginWake(
