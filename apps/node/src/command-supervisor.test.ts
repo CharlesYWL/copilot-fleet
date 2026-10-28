@@ -922,7 +922,14 @@ windows("Windows command supervisor: real disposable processes", () => {
         cwd,
         `[IO.File]::WriteAllText(${quote(marker)},'executed')`,
       );
-      const env = { ...process.env };
+      // Windows names are case-insensitive, but a copied environment can hold
+      // the inherited key in another case (Vitest upper-cases them). Both would
+      // reach the child and the inherited Bypass would win, so replace it.
+      const env = Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([key]) => key.toUpperCase() !== "PSEXECUTIONPOLICYPREFERENCE",
+        ),
+      );
       // These tighten only this disposable child's policy. Never bypass or change host policy.
       if (mode === "restricted") env.PSExecutionPolicyPreference = "Restricted";
       const parent = await parentFixture(

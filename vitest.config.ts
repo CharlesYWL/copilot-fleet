@@ -20,6 +20,8 @@ const processSuites = [
   "scripts/login-service-install.test.js",
   "scripts/managed-worktrees.integration.test.js",
   "scripts/managed-worktrees.recovery.test.js",
+  // A real Host and Nodes over WebSockets with SQLite journals.
+  "scripts/session-console.integration.test.ts",
   "scripts/windows-login-task.test.js",
 ];
 

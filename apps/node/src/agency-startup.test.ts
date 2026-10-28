@@ -830,7 +830,7 @@ describe("Hermes ACP startup", () => {
         type: "system",
         payload: {
           message:
-            '"claude-opus-5" is not one of the choices for model, so it was left alone',
+            'Could not set model to "claude-opus-5": "claude-opus-5" is not one of the choices for model; it was left alone',
         },
       }),
     );
