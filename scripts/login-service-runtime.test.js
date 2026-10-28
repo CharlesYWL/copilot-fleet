@@ -450,7 +450,10 @@ managedIt(
     expect(log.match(/\^/g)).toHaveLength(2000000);
     expect(log).toContain("process tree verified terminated");
     expect(log).not.toContain("fleet-process-tree-quiesced:");
-    expect(maximumBuffered).toBeLessThan(256 * 1024);
+    // Bounded, not queued: each of the two pipes may deliver one read after the
+    // log reports backpressure, and pipe read sizes vary by platform (macOS
+    // reached exactly 256 KiB). An unbounded queue would hold most of the 4 MB.
+    expect(maximumBuffered).toBeLessThanOrEqual(512 * 1024);
   },
   30_000,
 );

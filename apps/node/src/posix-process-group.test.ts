@@ -62,6 +62,23 @@ describe("POSIX process-group ownership (unit)", () => {
     await expect(stopProcessGroup(7, { graceMs: 500, kill: polite })).resolves.toBe(true);
     expect(signals).not.toContain("SIGKILL");
   });
+
+  it("treats a zombie-only group's EPERM as nothing to signal only on macOS", async () => {
+    // Real signals answer EPERM for a group of zombies on macOS; the zombies
+    // are then reaped and the probe reports the group gone.
+    let reaped = false;
+    const zombies = (_pid: number, signal: NodeJS.Signals | 0) => {
+      if (signal === 0) {
+        if (reaped) throw error("ESRCH");
+        return true;
+      }
+      reaped = true;
+      throw error("EPERM");
+    };
+    const stopping = stopProcessGroup(7, { graceMs: 200, kill: zombies });
+    if (process.platform === "darwin") await expect(stopping).resolves.toBe(true);
+    else await expect(stopping).rejects.toThrow("EPERM");
+  });
 });
 
 describe.skipIf(process.platform === "win32")("POSIX process-group ownership", () => {
