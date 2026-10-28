@@ -5,6 +5,7 @@ import type {
   ContextTier,
   PromptAttachment,
   SessionUsage,
+  StartupConfig,
 } from "@fleet/protocol";
 import type { AgentLoopState } from "../session-credits.js";
 
@@ -22,6 +23,7 @@ export type AgentLaunchOptions = {
   yolo: boolean;
   agencyMode: boolean;
   contextTier: ContextTier;
+  config?: readonly StartupConfig[];
 };
 
 export type AgentSessionHandle = {

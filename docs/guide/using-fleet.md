@@ -321,6 +321,16 @@ with `--context long_context` and loading the same conversation. ACP still rejec
 `contextTier` as a live config option. Restart/resume reapplies the requested tier;
 Fleet continues to use ACP without a backend migration.
 
+Fleet launches Copilot with the selected model and reasoning effort alongside
+`--context`, before creating or loading the ACP session. Startup reconciliation
+retains session-confirmed selections instead of switching the model again.
+If the session reports a different selection, Fleet still attempts the requested
+profile over ACP and reports any worker-default fallback; such a model switch
+can lose long context. Older CLIs receive only the flags their help advertises
+and retain ACP startup configuration for unsupported launch flags. Invalid launch
+values rejected by the CLI remain explicit startup errors. Live model-picker
+changes still use ACP and can reset the context tier.
+
 A small **context ring beside Send** opens on hover, focus, or click. Its popover
 contains **AI credits**, **context details**, and **Compact**, without adding a
 second composer row. The ring updates from Copilot's ACP `usage_update` even while a

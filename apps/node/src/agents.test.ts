@@ -147,6 +147,26 @@ describe("copilotLaunchArgs", () => {
       "--allow-all",
     ]);
   });
+
+  it("selects only the requested model and effort, not fallback values or other pickers", () => {
+    expect(
+      copilotLaunchArgs(true, "long_context", [
+        { id: "reasoning_effort", value: "high", fallback: "medium" },
+        { id: "model", value: "claude-opus-5.5", fallback: "auto" },
+        { id: "mode", value: "agent" },
+      ]),
+    ).toEqual([
+      "--acp",
+      "--stdio",
+      "--allow-all",
+      "--context",
+      "long_context",
+      "--model",
+      "claude-opus-5.5",
+      "--reasoning-effort",
+      "high",
+    ]);
+  });
 });
 
 describe("copilotSupportsContextTier", () => {
