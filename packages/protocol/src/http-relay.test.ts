@@ -250,11 +250,18 @@ describe("fixed-upstream HTTP and secure WebSocket relay", () => {
     }
   });
 
-  it("allows explicitly different loopback addresses to bind the same port", async () => {
-    const first = await backend();
-    const second = createHttpRelay({ upstream: first.url });
-    closing.push(second.close);
-    await listen(second.server, "127.0.0.2", first.port);
-    expect((await textRequest(`http://127.0.0.2:${first.port}/health`)).status).toBe(200);
-  });
+  // macOS configures only 127.0.0.1 on lo0; other 127/8 addresses need an alias
+  // (`ifconfig lo0 alias 127.0.0.2`), so the second listener has nowhere to bind.
+  it.skipIf(process.platform === "darwin")(
+    "allows explicitly different loopback addresses to bind the same port",
+    async () => {
+      const first = await backend();
+      const second = createHttpRelay({ upstream: first.url });
+      closing.push(second.close);
+      await listen(second.server, "127.0.0.2", first.port);
+      expect((await textRequest(`http://127.0.0.2:${first.port}/health`)).status).toBe(
+        200,
+      );
+    },
+  );
 });

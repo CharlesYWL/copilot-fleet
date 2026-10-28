@@ -43,7 +43,13 @@ function signalGroup(pgid: number, signal: NodeJS.Signals, kill: Signal): void {
   try {
     kill(-pgid, signal);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return;
+    // macOS answers EPERM when every remaining member is a zombie awaiting its
+    // parent's wait(). Polling still decides emptiness, and a member owned by
+    // someone else keeps answering EPERM there, so nothing is assumed gone.
+    if (code === "EPERM" && process.platform === "darwin") return;
+    throw error;
   }
 }
 

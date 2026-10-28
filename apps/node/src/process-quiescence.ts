@@ -46,7 +46,11 @@ export function killPosixProcessGroup(
   try {
     kill(-pid, "SIGKILL");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return;
+    // macOS: EPERM for a group of zombies only; there is nothing left to kill.
+    if (code === "EPERM" && process.platform === "darwin") return;
+    throw error;
   }
 }
 

@@ -113,7 +113,14 @@ function killGroup(pgid: number): void {
   try {
     process.kill(-pgid, "SIGKILL");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return;
+    // macOS answers EPERM for a group whose remaining members are all zombies
+    // (the shell that just exited, not yet reaped). Emptiness is still decided
+    // by polling, so a member that really belongs to someone else keeps the
+    // group alive and leaves ownership unverified.
+    if (code === "EPERM" && process.platform === "darwin") return;
+    throw error;
   }
 }
 
