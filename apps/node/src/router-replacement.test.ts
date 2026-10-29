@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type * as childProcess from "node:child_process";
 import {
   CONTEXT_TIER_CONFIG_ID,
   type AgentParams,
@@ -14,19 +15,20 @@ import {
 } from "./agents.js";
 import { CopilotAgentKind, copilotLaunchArgs } from "./agent-kinds/copilot.js";
 import type { CheckoutLease } from "./checkout-locks.js";
+import type * as copilotLaunch from "./copilot-launch.js";
 import { resolveCopilotLaunch } from "./copilot-launch.js";
 import { spawnManagedProcess, stopProcessTree } from "./process-quiescence.js";
 import { CommandRouter } from "./router.js";
 import type { RepositoryParticipation } from "./repository-participation.js";
 
 vi.mock("./copilot-launch.js", async (original) => ({
-  ...(await original<typeof import("./copilot-launch.js")>()),
+  ...(await original<typeof copilotLaunch>()),
   resolveCopilotLaunch: vi.fn(() => {
     throw new Error("Unexpected launcher discovery");
   }),
 }));
 vi.mock("node:child_process", async (original) => ({
-  ...(await original<typeof import("node:child_process")>()),
+  ...(await original<typeof childProcess>()),
   spawn: vi.fn(() => {
     throw new Error("Unexpected process spawn");
   }),
