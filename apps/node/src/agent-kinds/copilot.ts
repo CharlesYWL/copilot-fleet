@@ -22,11 +22,32 @@ import type {
 
 export const MIN_COPILOT_ACP_AUTH_VERSION = "1.0.69";
 
+function validateLaunchConfig(config: readonly StartupConfig[]): void {
+  for (const { id, value } of config) {
+    if (value === "") continue;
+    // Windows shims use cmd.exe; CRT argument quoting cannot make shell syntax safe.
+    if (id === "model" && (!/^[a-z0-9]/i.test(value) || /[^a-z0-9._:/+-]/i.test(value))) {
+      throw new Error(
+        "Invalid Copilot startup model: expected an identifier starting with a letter or digit and containing only letters, digits, '.', '_', ':', '/', '+', or '-'.",
+      );
+    }
+    if (
+      id === "reasoning_effort" &&
+      !["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value)
+    ) {
+      throw new Error(
+        "Invalid Copilot startup reasoning_effort: expected none, minimal, low, medium, high, xhigh, or max.",
+      );
+    }
+  }
+}
+
 export function copilotLaunchArgs(
   yolo: boolean,
   contextTier?: ContextTier,
   config: readonly StartupConfig[] = [],
 ): string[] {
+  validateLaunchConfig(config);
   const args = ["--acp", "--stdio"];
   if (yolo) args.push("--allow-all");
   if (contextTier) args.push("--context", contextTier);
@@ -168,6 +189,7 @@ export class CopilotAgentKind implements AgentKindAdapter {
   ) {}
 
   async prepare(options: AgentLaunchOptions): Promise<AgentLaunch> {
+    validateLaunchConfig(options.config ?? []);
     const launch = await resolveCopilotLaunch(options.agencyMode, this.command);
     options.signal?.throwIfAborted();
     const key = JSON.stringify([launch.command, launch.args]);

@@ -327,9 +327,15 @@ retains session-confirmed selections instead of switching the model again.
 If the session reports a different selection, Fleet still attempts the requested
 profile over ACP and reports any worker-default fallback; such a model switch
 can lose long context. Older CLIs receive only the flags their help advertises
-and retain ACP startup configuration for unsupported launch flags. Invalid launch
-values rejected by the CLI remain explicit startup errors. Live model-picker
-changes still use ACP and can reset the context tier.
+and retain ACP startup configuration for unsupported launch flags. Before any
+process or CLI metadata probe starts, Fleet rejects invalid startup profile values:
+model IDs must start with a letter or digit and contain only letters, digits,
+`.`, `_`, `:`, `/`, `+`, or `-`; effort must be `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, or `max`. Empty selections still mean no preference. IDs are not
+restricted to the current catalog, and provider prefixes and version punctuation
+are preserved exactly. Invalid values fail startup without launching a fallback;
+valid values rejected by the CLI also remain explicit startup errors. Live
+model-picker changes still use ACP and can reset the context tier.
 
 A small **context ring beside Send** opens on hover, focus, or click. Its popover
 contains **AI credits**, **context details**, and **Compact**, without adding a

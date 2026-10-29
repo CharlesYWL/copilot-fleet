@@ -167,6 +167,85 @@ describe("copilotLaunchArgs", () => {
       "high",
     ]);
   });
+
+  it.each([
+    "auto",
+    "claude-opus-5.5",
+    "gpt-5.3-codex",
+    "Provider/Exact.Model-ID",
+    "provider/model_v2:preview+1",
+    "retired-but-valid-2025-01-01",
+  ])("preserves a structural model ID without a catalog lookup: %s", (value) => {
+    expect(copilotLaunchArgs(false, undefined, [{ id: "model", value }])).toEqual([
+      "--acp",
+      "--stdio",
+      "--model",
+      value,
+    ]);
+  });
+
+  it.each(["none", "minimal", "low", "medium", "high", "xhigh", "max"])(
+    "preserves a supported reasoning level: %s",
+    (value) => {
+      expect(
+        copilotLaunchArgs(false, undefined, [{ id: "reasoning_effort", value }]),
+      ).toEqual(["--acp", "--stdio", "--reasoning-effort", value]);
+    },
+  );
+
+  it("omits empty requested values without launching their fallbacks", () => {
+    expect(
+      copilotLaunchArgs(false, undefined, [
+        { id: "model", value: "", fallback: 'not "launch data"' },
+        { id: "reasoning_effort", value: "", fallback: "arbitrary ACP fallback" },
+        { id: "mode", value: 'not "launch data"' },
+      ]),
+    ).toEqual(["--acp", "--stdio"]);
+  });
+
+  it.each([
+    '"quoted"',
+    "'quoted'",
+    "model&operator",
+    "model|operator",
+    "model>file",
+    "model<file",
+    "model^escape",
+    "%FLEET_ARG_MARKER%",
+    "!FLEET_ARG_MARKER!",
+    "model`command",
+    "model$(command)",
+    "model;command",
+    "model\n",
+    "model\r",
+    "model\u0000",
+    "model\targument",
+    " model",
+    "model ",
+    "--help",
+  ])("rejects inert non-identifier model data without coercion: %j", (value) => {
+    expect(() => copilotLaunchArgs(false, undefined, [{ id: "model", value }])).toThrow(
+      "Invalid Copilot startup model",
+    );
+  });
+
+  it.each(["HIGH", " high", "high ", "high\n", "unsupported", 'high" & inert'])(
+    "rejects non-contract reasoning data without coercion: %j",
+    (value) => {
+      expect(() =>
+        copilotLaunchArgs(false, undefined, [{ id: "reasoning_effort", value }]),
+      ).toThrow("Invalid Copilot startup reasoning_effort");
+    },
+  );
+
+  it("rejects invalid duplicate requests even when the first value is empty", () => {
+    expect(() =>
+      copilotLaunchArgs(false, undefined, [
+        { id: "model", value: "" },
+        { id: "model", value: 'model" & inert' },
+      ]),
+    ).toThrow("Invalid Copilot startup model");
+  });
 });
 
 describe("copilotSupportsContextTier", () => {

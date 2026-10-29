@@ -533,7 +533,9 @@ describe("Copilot launch-selected startup profiles", () => {
         (event) => events.push(event),
         {
           config: config.map((option) =>
-            option.id === id ? { ...option, value: "missing" } : option,
+            option.id === id
+              ? { ...option, value: id === "model" ? "missing" : "max" }
+              : option,
           ),
         },
       );
@@ -605,10 +607,10 @@ describe("Copilot launch-selected startup profiles", () => {
   });
 
   it("reports CLI-rejected launch values as startup failures and cleans up", async () => {
-    launchRejection = "Unsupported reasoning effort: missing";
+    launchRejection = "Unsupported reasoning effort: max";
     await expect(
       new AcpAgentFactory(60_000, "copilot").start("invalid", "C:\\repo", () => {}, {
-        config: [{ id: "reasoning_effort", value: "missing" }],
+        config: [{ id: "reasoning_effort", value: "max" }],
       }),
     ).rejects.toThrow("Unsupported reasoning effort");
     expect(launches()[0]?.child.kill).toHaveBeenCalled();
@@ -635,6 +637,102 @@ describe("Copilot launch-selected startup profiles", () => {
     ]);
     expect(setters()).toEqual([]);
   });
+});
+
+describe("Copilot launch profile validation", () => {
+  const boundaries = [false, true].flatMap((agencyMode) =>
+    [false, true].flatMap((managed) =>
+      ["cmd", "bat", "exe", "com"].map((extension) => ({
+        agencyMode,
+        managed,
+        extension,
+        command: `C:\\Program Files\\Agent\\${agencyMode ? "agency" : "copilot"}.${extension}`,
+      })),
+    ),
+  );
+  const invalid = [
+    { id: "model", value: 'gpt-test" & echo FLEET_ARG_MARKER & rem "' },
+    { id: "reasoning_effort", value: 'high" & echo FLEET_ARG_MARKER & rem "' },
+  ];
+
+  it.each(
+    boundaries.flatMap((boundary) =>
+      [true, false].flatMap((advertised) =>
+        invalid.map((option) => ({ ...boundary, advertised, ...option })),
+      ),
+    ),
+  )(
+    "rejects $id before any spawn (agency=$agencyMode, managed=$managed, $extension, advertised=$advertised)",
+    async ({ agencyMode, managed, command, advertised, id, value }) => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      installation.path = command;
+      profileHelp = advertised ? "--context --model --reasoning-effort" : "--allow-all";
+      await expect(
+        new AcpAgentFactory(60_000, command).start("invalid", "C:\\repo", () => {}, {
+          agencyMode,
+          mcpServers: managed ? fleetMcp : [],
+          config: [{ id, value, fallback: id === "model" ? "auto" : "medium" }],
+        }),
+      ).rejects.toThrow(`Invalid Copilot startup ${id}`);
+      expect(resolveCopilotLaunch).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+      expect(spawnManagedProcess).not.toHaveBeenCalled();
+      expect(stopProcessTree).not.toHaveBeenCalled();
+      expect(processes).toEqual([]);
+      expect(requests).toEqual([]);
+    },
+  );
+
+  it.each(boundaries)(
+    "preserves valid launch wiring (agency=$agencyMode, managed=$managed, $extension)",
+    async ({ agencyMode, managed, command, extension }) => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      installation.path = command;
+      profileHelp = "--context --model --reasoning-effort";
+      profileOptions = true;
+      const agent = await new AcpAgentFactory(60_000, command).start(
+        "valid",
+        "C:\\repo",
+        () => {},
+        {
+          agencyMode,
+          mcpServers: managed ? fleetMcp : [],
+          config: [
+            { id: "model", value: "claude-opus-5.5" },
+            { id: "reasoning_effort", value: "high" },
+          ],
+        },
+      );
+      agents.push(agent);
+      const calls = vi.mocked(managed ? spawnManagedProcess : spawn).mock.calls;
+      const launch = calls.find(([, args]) => args?.includes("--acp"));
+      const shell = extension === "cmd" || extension === "bat";
+      expect(launch?.[0]).toBe(shell ? `"${command}"` : command);
+      expect(launch?.[1]).toEqual([
+        ...(agencyMode ? ["copilot"] : []),
+        "--acp",
+        "--stdio",
+        "--context",
+        "long_context",
+        "--model",
+        "claude-opus-5.5",
+        "--reasoning-effort",
+        "high",
+      ]);
+      expect(launch?.[2]).toMatchObject({ shell });
+      expect(spawnManagedProcess).toHaveBeenCalledTimes(managed ? 1 : 0);
+      expect(
+        vi.mocked(spawn).mock.calls.filter(([, args]) => args?.includes("--acp")),
+      ).toHaveLength(managed ? 0 : 1);
+      expect(
+        requests.some((request) =>
+          ["session/set_model", "session/set_config_option"].includes(request.method),
+        ),
+      ).toBe(false);
+      await agent.stop();
+      expect(stopProcessTree).toHaveBeenCalledWith(launches()[0]?.child, managed);
+    },
+  );
 });
 
 describe("Worker publication permissions over ACP", () => {
