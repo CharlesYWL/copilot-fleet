@@ -206,7 +206,7 @@ else {
           for (const [flag, value] of [
             ["--model", "claude-opus-5.5"],
             ["--reasoning-effort", "high"],
-          ])
+          ] as const)
             expect(launch.args[launch.args.indexOf(flag) + 1]).toBe(value);
         }
         expect(lease.processesQuiesced).toHaveBeenCalledOnce();
