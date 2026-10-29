@@ -36,6 +36,7 @@ import {
 import type { AuthenticatedChannel } from "@fleet/protocol/node-auth";
 import { FleetStore } from "./store.js";
 import { FleetService } from "./fleet-service.js";
+import { CommandConflict } from "./command-execution-store.js";
 import { SealedNodeLink } from "./gateway/node-channel.js";
 import { HostIdentityService } from "./auth/host-identity.js";
 import { OrchestratorEngine } from "./orchestrator/engine.js";
@@ -3343,6 +3344,417 @@ describe("PR maintenance with durable commands", () => {
       }
     },
   );
+
+  function seedNewerGlobalCommands(
+    db: DatabaseSync,
+    h: Awaited<ReturnType<typeof observationCommand>>,
+  ) {
+    const insert = db.prepare(
+      "INSERT INTO command_executions(id,lead_id,node_id,task_id,version,data) VALUES(?,?,?,NULL,?,?)",
+    );
+    db.exec("BEGIN");
+    for (let i = 0; i < 10_001; i++) {
+      const execution = CommandExecutionSchema.parse({
+        id: randomUUID(),
+        attemptId: randomUUID(),
+        version: 1,
+        hostId: h.execution.hostId,
+        nodeId: h.f.node.id,
+        nodeName: "target",
+        leadSessionId: i % 2 ? "another-lead" : h.f.lead.id,
+        target: h.execution.target,
+        command: "Write-Output ok",
+        shell: h.execution.shell,
+        reason: "Synthetic unrelated command",
+        requestKey: String(i),
+        requestedPath: "C:\\repo",
+        requestDigest: "a".repeat(64),
+        state: "succeeded",
+        ownership: "quiescent",
+        createdAt: new Date(Date.now() + i + 1).toISOString(),
+        updatedAt: new Date(Date.now() + i + 1).toISOString(),
+        expiresAt: h.execution.expiresAt,
+        settledAt: new Date().toISOString(),
+        finalOutputSeq: 0,
+        outputComplete: true,
+      });
+      insert.run(
+        execution.id,
+        execution.leadSessionId,
+        execution.nodeId,
+        execution.version,
+        JSON.stringify(execution),
+      );
+    }
+    db.exec("COMMIT");
+    expect(
+      Number(
+        db
+          .prepare(
+            "SELECT count(*) AS count FROM command_executions WHERE rowid > (SELECT rowid FROM command_executions WHERE id=?)",
+          )
+          .get(h.execution.id)!.count,
+      ),
+    ).toBe(10_001);
+    const bytes = Number(
+      db
+        .prepare(
+          `SELECT (SELECT coalesce(sum(length(CAST(data AS BLOB))),0) FROM command_executions)
+          + (SELECT coalesce(sum(metadata_bytes),0) FROM lead_prompt_deliveries)
+          + (SELECT count(*)*512 FROM command_request_tombstones)
+          + (SELECT coalesce(sum(length(receipt)),0) FROM command_attempt_tombstones) AS bytes`,
+        )
+        .get()!.bytes,
+    );
+    expect(bytes + 2 * 32_768).toBeLessThan(COMMAND_LIMITS.lifecycleReserveBytes);
+    process.stdout.write(
+      `automatic receipt lifecycle bytes=${bytes}; cap=${COMMAND_LIMITS.lifecycleReserveBytes}\n`,
+    );
+  }
+
+  function reconnectObservationNode(
+    h: Awaited<ReturnType<typeof observationCommand>>,
+    store: FleetStore,
+    service: FleetService,
+  ) {
+    const raw = {
+      OPEN: 1,
+      readyState: 1,
+      send: (text: string) => h.f.frames.push(JSON.parse(text)),
+      close() {},
+    };
+    service.attachNode(
+      h.f.node.id,
+      new SealedNodeLink(raw, {
+        seal: (text: string) => JSON.parse(text),
+      } as unknown as AuthenticatedChannel),
+    );
+    store.setNodeOnline(h.f.node.id, true, 0);
+    service.commands.nodeReady(h.f.node.id, {
+      capabilities,
+      commandExecution: readiness,
+    });
+  }
+
+  it.each(["tick", "restart"] as const)(
+    "automatically admits and delivers an old settled receipt behind 10,001 newer global commands via %s",
+    async (recovery) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const path = receiptPath();
+      const h = await observationCommand(path);
+      const result = await observeFixture(fixtureInput(new Date().toISOString()));
+      h.finish(result, {}, undefined, true);
+      const db = new DatabaseSync(path);
+      try {
+        seedNewerGlobalCommands(db, h);
+        let store = h.f.store;
+        let service = h.f.service;
+        if (recovery === "restart") {
+          // Reopen a pre-migration database, not just a newly created schema.
+          db.exec(`DROP INDEX command_execution_automatic_pending;
+            DROP INDEX command_execution_observation_unchecked;
+            ALTER TABLE command_executions DROP COLUMN observation_checked`);
+          stores.splice(stores.indexOf(store), 1);
+          store.close();
+          store = open(path);
+          service = new FleetService(store, log, "automatic-receipt-restart");
+          reconnectObservationNode(h, store, service);
+        }
+        const order: string[] = [];
+        const admission = store.prMaintenance.checkpointObservationReceipt.bind(
+          store.prMaintenance,
+        );
+        vi.spyOn(store.prMaintenance, "checkpointObservationReceipt").mockImplementation(
+          (...args) => {
+            const saved = admission(...args);
+            order.push("admission");
+            return saved;
+          },
+        );
+        const queue = service.commands.queueLeadPrompt.bind(service.commands);
+        vi.spyOn(service.commands, "queueLeadPrompt").mockImplementation((...args) => {
+          expect(store.prMaintenance.get(h.record.id)?.observation).toEqual(
+            result.observation,
+          );
+          expect(
+            store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+              .observationClaims[0]?.receiptHash,
+          ).toBeTruthy();
+          order.push(args[1].includes("<fleet-pr-review") ? "review" : "completion");
+          return queue(...args);
+        });
+        expect(store.commands.get(h.execution.id)).toMatchObject({
+          state: "succeeded",
+          outputComplete: true,
+          delivery: "pending",
+        });
+        const prepare = vi.spyOn(DatabaseSync.prototype, "prepare");
+        expect(store.prMaintenance.pendingReviewWakes()).toEqual([]);
+        const list = vi.spyOn(store.commands, "list");
+        expect(store.commands.automaticPending().map((entry) => entry.id)).toEqual([
+          h.execution.id,
+        ]);
+        expect(list).not.toHaveBeenCalled();
+        const automaticQuery = prepare.mock.calls.find(([sql]) =>
+          sql.includes("ORDER BY id LIMIT 128"),
+        )![0];
+        const gateQuery = prepare.mock.calls.find(
+          ([sql]) => sql.includes("SELECT 1") && sql.includes("observation_checked"),
+        )![0];
+        for (const [query, value, index] of [
+          [automaticQuery, "", "command_execution_automatic_pending"],
+          [gateQuery, h.record.id, "command_execution_observation_unchecked"],
+        ]) {
+          const plan = db.prepare(`EXPLAIN QUERY PLAN ${query}`).all(value!);
+          const details = plan.map((row) => row.detail).join("\n");
+          process.stdout.write(`automatic receipt query plan: ${details}\n`);
+          expect(details).toContain(`USING INDEX ${index}`);
+          expect(details).not.toMatch(/SCAN command_executions|TEMP B-TREE/);
+        }
+        prepare.mockRestore();
+        list.mockRestore();
+        // Ordinary engine tick includes the real command tick, then the review gate.
+        new OrchestratorEngine(service).tick();
+        expect(order).toEqual(["admission", "completion", "review"]);
+        expect(store.commands.get(h.execution.id)?.delivery).toBe("reserved");
+        expect(
+          h.f.frames.some(
+            (frame) =>
+              frame.type === "deliver_lead_prompt" &&
+              frame.delivery.prompt.includes(`executionId="${h.execution.id}"`),
+          ),
+        ).toBe(true);
+        const admitted = store.prMaintenance.get(h.record.id)!;
+        service.commands.tick();
+        expect(store.prMaintenance.get(h.record.id)).toEqual(admitted);
+        expect(order).toEqual(["admission", "completion", "review"]);
+      } finally {
+        db.close();
+      }
+    },
+    120_000,
+  );
+
+  it.each(["completion-retry", "output-incomplete", "all-output-incomplete"] as const)(
+    "batches pending automatic %s work fairly without admitting invalid evidence or waking reviews early",
+    async (pendingState) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const path = receiptPath();
+      const h = await observationCommand(path);
+      const result = await observeFixture(fixtureInput(new Date().toISOString()));
+      h.finish(result, {}, undefined, true);
+      const db = new DatabaseSync(path);
+      const invalidReceipts = pendingState === "all-output-incomplete" ? 0 : 1;
+      try {
+        // These low-sorting rows are pending retries, not unrelated history. The
+        // invalid receipt must drain; undeliverable completions must not starve
+        // the real receipt beyond this first bounded page.
+        const insert = db.prepare(
+          "INSERT INTO command_executions(id,lead_id,node_id,task_id,version,data) VALUES(?,?,?,NULL,?,?)",
+        );
+        for (let i = 0; i < 128; i++) {
+          const execution = CommandExecutionSchema.parse({
+            ...h.f.store.commands.get(h.execution.id)!,
+            id: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+            attemptId: randomUUID(),
+            leadSessionId: h.f.lead.id,
+            maintenanceObservation:
+              i < invalidReceipts
+                ? h.execution.maintenanceObservation
+                : pendingState !== "completion-retry"
+                  ? { ...h.execution.maintenanceObservation!, recordId: randomUUID() }
+                  : undefined,
+            descriptor: undefined,
+            delivery: "pending",
+            outputComplete: i < invalidReceipts || pendingState === "completion-retry",
+          });
+          insert.run(
+            execution.id,
+            execution.leadSessionId,
+            execution.nodeId,
+            execution.version,
+            JSON.stringify(execution),
+          );
+        }
+        const queue = h.f.service.commands.queueLeadPrompt.bind(h.f.service.commands);
+        vi.spyOn(h.f.service.commands, "queueLeadPrompt").mockImplementation(
+          (...args) => {
+            if (
+              args[3]?.some(
+                (id) => id.startsWith("00000000") && !id.endsWith("000000000000"),
+              )
+            )
+              throw new CommandConflict("lead_prompt_queue_full");
+            return queue(...args);
+          },
+        );
+        const admission = vi.spyOn(
+          h.f.store.prMaintenance,
+          "checkpointObservationReceipt",
+        );
+        const batch = vi.spyOn(h.f.store.commands, "automaticPending");
+        const engine = new OrchestratorEngine(h.f.service);
+        engine.tick();
+        expect(batch.mock.results[0]!.value).toHaveLength(128);
+        expect(admission).toHaveBeenCalledTimes(invalidReceipts);
+        expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+        expect(
+          h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+            .observationClaims[0]?.receiptHash,
+        ).toBeUndefined();
+        expect(h.f.store.prMaintenance.pendingReviewWakes()).toEqual([]);
+        const current = h.f.store.prMaintenance.get(h.record.id)!;
+        expect(
+          h.f.store.prMaintenance.markReviewWake(
+            current.id,
+            current.review!.id,
+            "queued-review",
+          ),
+        ).toBe(true);
+        expect(h.f.store.prMaintenance.staleReviews(() => false)).toEqual([]);
+        db.prepare(
+          "UPDATE pr_maintenance SET data=json_remove(data,'$.review.wakeKey','$.review.wakeQueuedAt') WHERE id=?",
+        ).run(current.id);
+        expect(
+          db
+            .prepare("SELECT observation_checked FROM command_executions WHERE id=?")
+            .get("00000000-0000-4000-8000-000000000000")!.observation_checked,
+        ).toBe(invalidReceipts);
+        expect(
+          h.f.store.commands
+            .prompts()
+            .some((prompt) => prompt.delivery.prompt.includes("<fleet-pr-review")),
+        ).toBe(false);
+        engine.tick();
+        expect(batch.mock.results[1]!.value).toHaveLength(1);
+        expect(admission).toHaveBeenCalledTimes(invalidReceipts + 1);
+        expect(h.f.store.prMaintenance.get(h.record.id)?.observation).toEqual(
+          result.observation,
+        );
+        const prompts = h.f.store.commands.prompts();
+        expect(
+          prompts.findIndex((prompt) => prompt.key === `command:${h.execution.id}`),
+        ).toBeLessThan(
+          prompts.findIndex((prompt) =>
+            prompt.delivery.prompt.includes("<fleet-pr-review"),
+          ),
+        );
+        expect(
+          prompts.some((prompt) => prompt.delivery.prompt.includes("<fleet-pr-review")),
+        ).toBe(true);
+        engine.tick();
+        expect(batch.mock.results[2]!.value).toHaveLength(0);
+        expect(batch.mock.results[3]!.value).toHaveLength(128 - invalidReceipts);
+        expect(admission).toHaveBeenCalledTimes(invalidReceipts + 1);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it.each(["admission", "acknowledgment", "completion"] as const)(
+    "retries automatic %s storage failure across restart before completion and review wake",
+    async (failure) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const path = receiptPath();
+      const h = await observationCommand(path);
+      const result = await observeFixture(fixtureInput(new Date().toISOString()));
+      h.finish(result, {}, undefined, true);
+      const db = new DatabaseSync(path);
+      try {
+        const [table, operation] =
+          failure === "admission"
+            ? ["pr_maintenance_wakes", "UPDATE"]
+            : failure === "acknowledgment"
+              ? ["command_executions", "UPDATE OF observation_checked"]
+              : ["lead_prompt_deliveries", "INSERT"];
+        db.exec(`CREATE TRIGGER fail_automatic BEFORE ${operation} ON ${table}
+          BEGIN SELECT RAISE(FAIL,'automatic storage interruption'); END`);
+        expect(() => new OrchestratorEngine(h.f.service).tick()).toThrow(
+          "automatic storage interruption",
+        );
+        expect(h.f.store.commands.prompts()).toHaveLength(0);
+        expect(h.f.store.commands.get(h.execution.id)?.delivery).toBe("pending");
+        expect(
+          h.f.store.prMaintenance.get(h.record.id)?.review?.wakeQueuedAt,
+        ).toBeUndefined();
+        const accepted = failure === "completion";
+        expect(!!h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBe(accepted);
+        expect(
+          !!h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+            .observationClaims[0]?.receiptHash,
+        ).toBe(accepted);
+        expect(
+          db
+            .prepare("SELECT observation_checked FROM command_executions WHERE id=?")
+            .get(h.execution.id)!.observation_checked,
+        ).toBe(accepted ? 1 : 0);
+        db.exec("DROP TRIGGER fail_automatic");
+        stores.splice(stores.indexOf(h.f.store), 1);
+        h.f.store.close();
+        const store = open(path);
+        const service = new FleetService(store, log, "automatic-storage-retry");
+        // An offline completion stays pending, but admission is still durable.
+        service.commands.tick();
+        expect(store.prMaintenance.get(h.record.id)?.lastAttempt).toEqual(
+          result.observation,
+        );
+        expect(store.commands.get(h.execution.id)?.delivery).toBe("pending");
+        expect(store.commands.prompts()).toHaveLength(0);
+        expect(
+          store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+            .observationClaims[0]?.receiptHash,
+        ).toBeTruthy();
+        reconnectObservationNode(h, store, service);
+        const order: string[] = [];
+        const queue = service.commands.queueLeadPrompt.bind(service.commands);
+        vi.spyOn(service.commands, "queueLeadPrompt").mockImplementation((...args) => {
+          expect(store.prMaintenance.get(h.record.id)?.observation).toEqual(
+            result.observation,
+          );
+          order.push(args[1].includes("<fleet-pr-review") ? "review" : "completion");
+          return queue(...args);
+        });
+        new OrchestratorEngine(service).tick();
+        expect(order).toEqual(["completion", "review"]);
+        expect(store.commands.get(h.execution.id)?.delivery).toBe("reserved");
+        expect(
+          h.f.frames.some(
+            (frame) =>
+              frame.type === "deliver_lead_prompt" &&
+              frame.delivery.prompt.includes(`executionId="${h.execution.id}"`),
+          ),
+        ).toBe(true);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it("quarantines old pending receipts and completions beyond the global cutoff on archive restore", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const path = receiptPath();
+    const h = await observationCommand(path);
+    const result = await observeFixture(fixtureInput(new Date().toISOString()));
+    h.finish(result, {}, undefined, true);
+    const db = new DatabaseSync(path);
+    try {
+      seedNewerGlobalCommands(db, h);
+      // Exercise the same quarantine invoked after archive merge, without
+      // rebuilding 10,001 unrelated archive fixtures.
+      h.f.store.commands.quarantine(true);
+      expect(h.f.store.commands.get(h.execution.id)?.delivery).toBe("orphaned");
+      expect(h.f.store.commands.preparationClock(h.execution.id)?.acceptedAt).toBeNull();
+      expect(h.f.store.commands.automaticPending()).toEqual([]);
+      const admit = vi.spyOn(h.f.store.prMaintenance, "checkpointObservationReceipt");
+      h.f.service.commands.tick();
+      expect(admit).not.toHaveBeenCalled();
+      expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+      expect(h.f.store.commands.prompts()).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+  }, 120_000);
 
   it("waits for terminal-before-output evidence before both completion and review wakes", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });

@@ -119,8 +119,12 @@ End the turn after dispatch. The Host reconstructs and admits the exact observat
 from persisted, approved command stdout **before** the completion/review wake.
 It requires known quiescence, complete bounded output without gaps, helper exit
 0 or 2, and the original claim, clock, identity, pin and allowance proofs.
+Automatic ticks use indexed pending work in bounded, rotating batches, independent
+of unrelated command history, including after same-database restart. Reviews remain
+blocked while a settled receipt awaits admission. Local checked/retry bookkeeping
+is not acceptance: only the original wake claim's saved receipt hash proves that.
 On the completion wake, read the current maintenance record, not a relayed copy
-of helper output. For restart/interruption recovery call
+of helper output. For explicit restart/interruption recovery, if needed, call
 `fleet_checkpoint_pr_maintenance` with **only** `{executionId}`.
 Do not supply `recordId`, `expectedVersion` or `checkpoint` on this path.
 The Host derives them from the owned execution and original reservation.

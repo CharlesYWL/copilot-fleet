@@ -3893,15 +3893,17 @@ export class PrMaintenanceStore {
 
   /** A claimed helper command for this record that has not produced its receipt. */
   private observationInFlight(record: PrMaintenanceRegistration): boolean {
-    return !!this.db
-      .prepare(
-        `SELECT 1 FROM command_executions
+    return (
+      !!this.db
+        .prepare(
+          `SELECT 1 FROM command_executions
          WHERE json_extract(data,'$.maintenanceObservation.recordId')=?
            AND (json_extract(data,'$.settledAt') IS NULL
              OR coalesce(json_extract(data,'$.outputComplete'),0)=0)
          LIMIT 1`,
-      )
-      .get(record.id);
+        )
+        .get(record.id) || this.store.commands.observationIngestionPending(record.id)
+    );
   }
 
   beginWake(
@@ -4141,8 +4143,10 @@ export class PrMaintenanceStore {
       if (
         originalClaim.receiptHash &&
         this.store.commands.preparationClock(execution.id)?.acceptedAt
-      )
+      ) {
+        this.store.commands.markObservationChecked(execution.id);
         return current;
+      }
       const { record, claim, wake } = this.observationExecution(execution);
       if (claim.executionId !== execution.id || claim.attemptId !== execution.attemptId)
         refuse(
@@ -4348,6 +4352,7 @@ export class PrMaintenanceStore {
       if (claim.receiptHash) {
         if (claim.receiptHash !== hash)
           refuse("receipt_conflict", "This claim already saved a different result.");
+        this.store.commands.markObservationChecked(execution.id);
         return record;
       }
       const admission = this.admission({ action: "discover", recordId, leadSessionId });
@@ -4395,6 +4400,7 @@ export class PrMaintenanceStore {
       const saved = this.save(record);
       claim.receiptHash = hash;
       this.saveWake(wake);
+      this.store.commands.markObservationChecked(execution.id);
       return saved;
     });
   }

@@ -75,6 +75,7 @@ export class CommandExecutionService {
     { sentWall: number; sentMonotonic: number; link: SealedNodeLink }
   >();
   private lastSweep = 0;
+  private automaticCursor = "";
   constructor(private readonly service: FleetService) {}
   private get store() {
     return this.service.store;
@@ -1420,6 +1421,11 @@ export class CommandExecutionService {
     }
     for (const execution of this.records.list({ limit: 10_000 })) {
       if (execution.taskId && "worktreeId" in execution.target) this.observe(execution);
+    }
+    let pending = this.records.automaticPending(this.automaticCursor);
+    if (!pending.length && this.automaticCursor)
+      pending = this.records.automaticPending();
+    for (const execution of pending) {
       if (
         execution.maintenanceObservation &&
         terminalCommandExecutionStates.has(execution.state)
@@ -1444,6 +1450,7 @@ export class CommandExecutionService {
           // failures must escape: a later tick/restart retries before any wake.
           if (!(error instanceof PrMaintenanceError) && !(error instanceof ZodError))
             throw error;
+          this.records.markObservationChecked(execution.id);
         }
       }
       if (execution.delivery === "pending") {
@@ -1454,6 +1461,7 @@ export class CommandExecutionService {
         }
       }
     }
+    this.automaticCursor = pending.at(-1)?.id ?? "";
     for (const leadId of new Set(
       this.records.prompts().map((record) => record.delivery.sessionId),
     ))
