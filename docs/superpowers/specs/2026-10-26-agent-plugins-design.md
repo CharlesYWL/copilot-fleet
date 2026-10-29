@@ -12,9 +12,9 @@ tags:
 **Area**: Node agent launch, Host scheduling and settings, protocol  
 **Engineer**: Not assigned  
 **Driver / Approver**: Charles Yin, repository owner  
-**Status**: Design approved in conversation; revised for review findings (2026-10-28, 2026-10-29); not implemented  
+**Status**: Design approved in conversation; revised for review findings (2026-10-28 and twice on 2026-10-29); not implemented  
 **Date**: 2026-10-26; revised 2026-10-28 and 2026-10-29  
-**Source baseline**: `6ccbdaf` on `main` (drafted at `3456c2a`; rechecked at `daed730`, `bc268b8` and `6ccbdaf`)  
+**Source baseline**: `e19f5ff` on `main` (drafted at `3456c2a`; rechecked at `daed730`, `bc268b8`, `6ccbdaf` and `e19f5ff`)  
 **Work item**: Not supplied
 
 ## Related documents
@@ -33,6 +33,50 @@ tags:
 | Claude Code ACP adapter | [agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) |
 | Inspiration | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) ("everything is a plugin") |
 | Node.js batch-file argument handling | [CVE-2024-27980 security release](https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2) |
+
+## Revision 4 (2026-10-29)
+
+A third review round closed the five Revision 3 findings and found one
+remaining compatibility case. It was checked against `main` at `e19f5ff`, and
+it holds:
+
+| Finding | Where it is resolved |
+| --- | --- |
+| P1. An older Host sends no role, so a newer Node whose plugin chose startup settings by role could drop that Host's `mode: agent` | [Startup settings](#startup-settings) |
+
+Revision 3 put a role on launch commands so that a plugin hook on the Node
+could compute the startup settings, and let the plugin's list replace the
+Host's. The hook was the only reason the Node needed the role, and it left
+commands from an older Host, which carry no role, undefined. This revision
+removes the hook and the role field:
+
+- The Host builds the complete list from the target Node's manifest
+  (`startupSettings`), or from the compatibility manifest for an older Node,
+  and sends it as today.
+- Every Node applies the list it receives and keeps it for process
+  replacements, as Nodes do today. A command from an older Host is therefore
+  handled exactly like one from a newer Host.
+- The rule the review asked for is recorded for any later role field: it must
+  be optional with no default, a missing role means today's behavior, and only
+  an explicitly sent value, including `""`, may enable role-specific behavior.
+- The test the review asked for is added: commands recorded from the pinned
+  older Host drive a new Node through start, resume, process replacement,
+  a context-tier change and a context rollover. Copilot leads and workers keep
+  `mode: agent`, model and effort, and plain sessions and reviewers keep their
+  own mode (AC-22).
+
+Checking the same pairing in the other direction, frames a newer Node sends to
+an older Host, showed that a Host at `e19f5ff` closes the connection on a Node
+message type or session event type it does not know. It ignores unknown fields
+in the inventory and accepts any content in an event's payload.
+[Mixed versions](#mixed-versions) now puts new Node-to-Host data only in those
+places, or in message types sent after the Host advertises them, and a
+compatibility test checks every Node-to-Host message and event type against
+the frozen older Host schema.
+
+Rebaselined on `e19f5ff`. The only change there that touches this design is
+#111's process-ancestry check in native session sync, which is not specific
+to any agent and stays in core; see [Code plugin API](#code-plugin-api).
 
 ## Revision 3 (2026-10-29)
 
@@ -54,10 +98,9 @@ Checking them also showed:
   `model` and `reasoning_effort` startup settings into `--model` and
   `--reasoning-effort` launch flags, and validates them first. The Copilot
   plugin keeps that behavior; see [Startup settings](#startup-settings).
-- A released Node's command schema silently drops fields it does not know.
-  A new launch field such as `runRole` is therefore safe to send to an older
-  Node, but the older Node ignores it, so the Host must keep sending what
-  older Nodes rely on.
+- A released Node's command schema silently drops fields it does not know, so
+  the Host must keep sending everything older Nodes rely on. (Revision 4
+  removes the launch-command role this item originally discussed.)
 - The repository has no release tags, so "the last release" in tests means a
   pinned commit, recorded in the test fixture.
 
@@ -305,7 +348,9 @@ type AgentParams = { kind: string; params?: Record<string, string> };
 
 - Legacy rows `{ kind: "hermes", profile }` parse and are normalized to
   `{ kind: "hermes", params: { profile } }` on read. A missing `agentParams` still
-  means Copilot.
+  means Copilot. The same parsing applies to every frame a Node receives, so a
+  newer Node accepts the legacy shape in commands and console data from an
+  older Host and normalizes it the same way.
 - The Host validates `params` against the target Node's manifest for usability.
   The Node validates again against the plugin's own schema and is authoritative.
 - A plugin never receives an undeclared key. Values become whole argv elements
@@ -339,11 +384,9 @@ with these changes:
 
 - `prepare()` returns a launch description: `command`, `args`, `env` additions,
   optional `notice`, and `failureMessage`. The core spawns.
-- New optional `startupConfig(role, requested)` returns the settings to apply
-  when a session starts or resumes. `role` comes from the launch command (see
-  [Startup settings](#startup-settings)); `requested` is the model and effort
-  the Host chose. Copilot returns `mode: agent` for leads and workers, as the
-  Host does today, plus the requested settings.
+- Role-specific startup settings are declared as data in the manifest
+  (`startupSettings`), not computed by a plugin hook. The Host builds each
+  session's startup list from them; see [Startup settings](#startup-settings).
 - New optional `history`, present only when the manifest declares
   `nativeHistoryCleanup`. It offers `find(nativeSessionId)` and
   `remove(nativeSessionId)`, and nothing else. The deletion sequence and its
@@ -360,7 +403,9 @@ with these changes:
   conversation. Ordering, sequence reservation, import acknowledgments and the
   router hooks stay in core, and the core follows a session only when its
   plugin provides `nativeLog`, so a non-Copilot session is never matched against
-  Copilot's `session-state` folder.
+  Copilot's `session-state` folder. The process-ancestry check added in #111,
+  which decides whether a holder the plugin found is Fleet's own agent process,
+  works on process IDs alone and stays in core as well.
 - `usage`, `configOptions`, `setConfigOption`, `stderrLogLevel`, `rollover` and
   `tracksUnpromptedWork` remain optional hooks.
 
@@ -433,7 +478,8 @@ Rules:
   agent's own records. `nativeHistoryCleanup`, `nativeStateFiles`,
   `nativeLogSync`, `adoptExisting` and `rollover` are false.
 - An invalid file is logged and listed with its exact validation error on the
-  Node config page and in Settings → Agents. It never stops the Node from
+  Node config page and in Settings → Agents. The Node reports it to the Host
+  in the inventory's `agentDefinitionErrors`. It never stops the Node from
   starting.
 
 ## Core-owned sequences
@@ -528,7 +574,9 @@ afterwards. The suite checks that:
   resume and a restore from backup while its Node is still old;
 - a Claude Code session is refused for an old Node with the stated reason, and
   no frame is sent;
-- a new Node's inventory parses under the frozen old Host schema.
+- a new Node's inventory, and every message type and session event type a new
+  Node sends to a Host whose `welcome` advertises nothing new, parse under the
+  frozen old Host schema.
 
 **Connection tests** run the real gateway with both a sealed and a legacy
 Node, with serialization in place, and check that heartbeats and events are
@@ -547,53 +595,98 @@ applies to the new session. Today the Host builds that list in
 - the model and reasoning effort: the orchestrator defaults for a lead, the
   worker's routed selection, or the fleet defaults.
 
-The Node applies the list after `session/new` or `session/load`, and since
-#110 it also turns `model` and `reasoning_effort` into Copilot's `--model` and
-`--reasoning-effort` launch flags. Start and resume commands carry no role, so
-older Nodes depend entirely on the Host's list: without `mode: agent`, Copilot
-keeps whatever mode it would otherwise start in.
+Start and resume commands carry no role. Today's Node (`router.ts` and
+`agents.ts` in `apps/node/src/`):
 
-Under this design:
+- applies the list after `session/new` or `session/load`, and since #110 also
+  turns `model` and `reasoning_effort` into Copilot's `--model` and
+  `--reasoning-effort` launch flags;
+- keeps the list for the session in `slot.config`, updates it with every value
+  the agent reports and every picker change, and starts any replacement
+  process from it (MCP recovery and a context-tier change both end in
+  `replaceAgent`);
+- on a context rollover, applies the list that process was started with
+  again, with the current model and effort (`rolloverStartupConfig`).
 
-1. **The Host keeps building the full list** for every Node, including
-   `mode: agent` for Copilot leads and workers. Older Nodes keep today's
-   behavior exactly.
-2. **Launch commands also carry the role.** `start_session` and
-   `resume_session` gain `runRole` (`""`, `lead`, `worker` or `reviewer`). The
-   existing `coordinator` flag is not enough: it is set only on
-   `start_session`, only for an orchestrator, and only when the Node supports
-   managed worktrees. The Node stores `runRole` in the slot's launch state, so a
-   process replacement after an MCP reconnect or a context-window change still
-   knows the role. An older Node drops the unknown field silently, so it is
-   safe to send to every Node.
-3. **The Host stops branching on agent names here.** For an agent kind whose
-   manifest lists startup settings for a role (the manifest's
-   `startupSettings` field), the Host takes them from the manifest. Copilot's
-   compatibility manifest maps `lead` and `worker` to `mode: agent`. The model
-   and effort part keeps reading the saved defaults and selection, keyed by
-   agent kind.
-4. **On a Node with `agent-plugins-v1`**, the plugin's `startupConfig(role,
-   requested)` produces the final list from the command's `runRole` and the
-   Host's requested model and effort. For Copilot it is the same list the Host
-   sends, and a test compares the two for every role so they cannot drift.
-   Where they do differ, the plugin wins, so a newer Node's Copilot plugin can
-   change its own startup behavior without a Host release.
-5. **Copilot launch flags stay in the Copilot plugin.** The validation and
-   `--model` / `--reasoning-effort` flags from #110 move into the plugin's
-   `prepare()` unchanged.
+Whether a Copilot lead or worker runs in agent mode therefore depends entirely
+on the list the Host sends. Under this design that stays true whichever side is
+newer:
 
-**Tests check the mode actually reached**, using a fake ACP agent that offers a
-`mode` option and records each `session/set_config_option` call:
+1. **The Host builds the complete list** and sends it to every Node: `mode:
+   agent` for Copilot leads and workers, and the model and effort.
+2. **The Host takes role-specific settings from the manifest**, not from agent
+   names. `startupSettings` maps each role to the settings it must start with.
+   The Copilot plugin's manifest, and the compatibility manifest the Host
+   writes for an older Node, map `lead` and `worker` to `mode: agent`. The
+   model and effort part keeps reading the saved defaults and selection, keyed
+   by agent kind. A test compares the list built from the Copilot manifest with
+   the lists recorded from the pinned older Host (see the tests below) for
+   every role, with and without a routed selection, so phase 2 changes nothing
+   on the wire. The recording is the reference because phase 2 removes the
+   code that builds today's list.
+3. **The Node handles the received list exactly as today's Node does.** It
+   never rebuilds the list, from a role or from model and effort alone, and
+   never substitutes a list of its own. A plugin may still apply settings
+   derived from other command fields, as Copilot does today for `yolo` and as
+   a definition file's `startupConfig.unattended` will. The received list is
+   applied after them, so where both name an option, the Host's value stands.
+4. **Replacements and rollovers keep today's sources:** `slot.config` for a
+   replacement, and for a rollover the list that process was started with,
+   updated with the current model and effort. The plugin refactor moves this
+   code without changing it.
+5. **Copilot launch flags stay in the Copilot plugin.** The validation and the
+   `--model` and `--reasoning-effort` flags from #110 move into the plugin's
+   `prepare()` unchanged, still computed from the list the Node holds.
 
-- an older Node (frozen schema, pinned commit) started and resumed by a new
-  Host ends in `mode: agent` for a Copilot lead and a Copilot worker;
-- a new Node does the same through the plugin, including after an MCP-driven
-  process replacement;
-- a plain session (role `""`) and a reviewer are left in the agent's own mode,
-  as today;
-- the role survives a process replacement on the Node, and after a Node
-  restart the Host's next resume command carries it again, because slots are
-  not kept across a Node restart.
+**Launch commands carry no role.** Revision 3 added `runRole` to them so that a
+plugin hook on the Node could compute the list, and the plugin's list replaced
+the Host's. A command from an older Host has no role, and that design had no
+safe reading of it: a required field rejects the command, and a default of
+`""` rebuilds the list without `mode: agent`. With the list decided on the
+Host, every command gets the handling the review asked for when the role is
+missing: the complete received list is applied and kept for process
+replacements. What the hook offered, a Copilot plugin changing its own startup
+settings without a Host release, remains available to Hosts with this change
+through the manifest's `startupSettings`. An older Host reads no manifests, so
+it keeps sending today's list, and the Node applies that list as sent.
+
+Any later role field on launch commands must keep that guarantee:
+
+- it is optional with no schema default. Stored sessions use
+  `RunRoleSchema.default("")`, which on a command would turn a missing role
+  into a plain session;
+- a missing role means today's behavior: the received list is applied
+  unchanged and kept for replacements;
+- only an explicitly sent value, including `""` for a plain session, may enable
+  role-specific behavior;
+- the older-Host test below (AC-22) still passes unchanged.
+
+**Tests check the settings that reach the agent**, using a fake ACP agent that
+offers `mode`, `model` and `reasoning_effort` options and records each
+`session/set_config_option` call and its own launch arguments. Each pairing
+covers a Copilot lead, a Copilot worker with and without a routed selection, a
+reviewer and a plain session, with a model and effort configured:
+
+- **New Host, older Node** (frozen schema, pinned commit): after start and
+  resume, the lead and workers are in `mode: agent` (AC-18).
+- **New Host, new Node:** the same, and again after a process replacement
+  (AC-18).
+- **Older Host, new Node** (AC-22). The commands are the pinned commit's own:
+  a fixture generator, run once at that commit, records the start, resume and
+  context-tier change commands its `FleetService` sends for each case, and the
+  fixture is stored with the frozen schemas. A Host affects startup settings
+  only through these commands, so replaying them tests what running the
+  pinned Host would. The test checks that each command parses under the
+  frozen Host-to-Node schema and carries no role, then
+  replays the commands into a new Node through start, resume, a process
+  replacement and a context rollover. Sessions with MCP servers, such as the
+  lead, are replaced after an MCP reconnect, and every Copilot session after a
+  context-tier change. After each step the lead and workers have
+  `mode: agent` and the Host's model and effort, and every Copilot process was
+  launched with the matching `--model` and `--reasoning-effort` flags.
+- In every pairing, a plain session and a reviewer receive no `mode` setting
+  at start or resume. Where a replacement runs, they come back in the mode
+  they were in before it, including a mode the operator chose.
 
 ### Native history deletion
 
@@ -851,7 +944,7 @@ type StepSelection = {
 | Generic helpers (`findAgentCommand`, `agentOutput`) | `@fleet/plugin-api` (search and probe) |
 | `copilotSpawnTarget` (`shell: true` for Windows command shims), the session-listing connection's `shell: true`, and the managed launcher's `cmd.exe` wrapper and PowerShell string in `windows-process-job.ts` | Replaced by the core launch path in [Launching on Windows](#launching-on-windows) |
 | Host `fleet-service.ts`: workers limited to Copilot, Copilot-only adopt, Agency and context tier, custom agent | Manifest checks: `roles`, `adoptExisting`, `launchOptions` |
-| Host `startupConfigFor`: `mode: agent` for Copilot leads and workers | Manifest `startupSettings`; the Host still sends the full list to every Node, and the launch commands carry `runRole` (see [Startup settings](#startup-settings)) |
+| Host `startupConfigFor`: `mode: agent` for Copilot leads and workers | Manifest `startupSettings`, read by the Host; the Host still sends the complete list to every Node, and every Node applies what it receives (see [Startup settings](#startup-settings)) |
 | Copilot launch flags from startup settings (`validateLaunchConfig` and `copilotLaunchArgs` in `agent-kinds/copilot.ts`, #110) | Copilot plugin's `prepare()`, unchanged |
 | Host `session-retention.ts` Hermes exclusion; `session-files.ts` Copilot-only native state access | `features.nativeHistoryCleanup`; `features.nativeStateFiles` with the plugin's `nativeStateDirectory` hook on the Node |
 | UI `OrchestratorPanel.tsx` Hermes branches; labels in `SessionInfoDialog`, `SessionTile`, `TerminalView`, usage views | Generic picker and parameter form from manifests; `manifest.label` |
@@ -947,6 +1040,24 @@ core and compares the whole `agentParams` value instead of naming Hermes.
   manifests: Copilot always, and Hermes when the Node reported it.
 - An older Host does not know `agentManifests` and ignores it, because the
   inventory schema is a non-strict `z.object`. It keeps reading `agentKinds`.
+- **Commands from an older Host** carry `agentParams` in the legacy shape,
+  which a newer Node accepts and normalizes as storage does, the complete
+  startup list, and no role, exactly as today. A newer Node applies that list
+  and keeps it for process replacements and rollovers, so Copilot leads and
+  workers still run in `mode: agent` with that Host's model and effort; see
+  [Startup settings](#startup-settings) and AC-22.
+- **Frames from a newer Node to an older Host** stay within what that Host
+  accepts. A Host at `e19f5ff` closes the connection on a Node message type or
+  session event type it does not know, and on an event for a session the Node
+  does not own. It ignores unknown inventory fields and accepts any content in
+  an event's payload. So a newer Node:
+  - sends its manifests and definition-file errors only inside the inventory
+    (`agentManifests` and `agentDefinitionErrors`), which an older Host
+    ignores;
+  - reports automatic approvals and replacement refusals as `system` or
+    `error` events on the session they concern, never as new event types;
+  - sends a new Node-to-Host message type only after the Host advertises it in
+    `welcome`, the same rule native session sync uses today.
 - In the other direction, the Host rewrites every frame to an older Node into
   the legacy `agentParams` shape, and refuses actions it cannot express. See
   [Wire compatibility](#wire-compatibility); that section is the contract, and
@@ -986,7 +1097,7 @@ core and compares the whole `agentParams` value instead of naming Hermes.
   (`requestPermission` in `apps/node/src/agents.ts`, which today auto-approves
   for Hermes). Phase 3 adds a transcript entry for each automatic approval,
   naming the tool call and the option chosen, because today those approvals
-  leave no record.
+  leave no record. The entry is a `system` event, which every Host accepts.
 - **Hard limits stay on the Host:** run budgets, `maxSessions`, read-only
   categories, checkout locks and maintenance holds. No agent kind can change
   them.
@@ -1010,11 +1121,13 @@ Each phase is a separate PR, in this order.
    registry; manifests in the inventory and `agent-plugins-v1`; the Host
    compatibility module and `agent_manifests` column; per-Node serialization
    inside `FleetService.send` with the frozen-schema and connection tests;
-   `runRole` on launch commands and manifest `startupSettings`, with the Host
-   still sending the full startup list; Copilot and Hermes moved into plugin
-   folders; the deletion sequence, process-replacement policy and eligibility
-   function moved into core; manifest checks replacing name checks in the Host
-   and UI; the lint rule and the name check test.
+   manifest `startupSettings` read by the Host, which still sends the complete
+   startup list, with the mixed-version startup tests in both directions,
+   including the recorded older-Host commands (AC-22);
+   Copilot and Hermes moved into plugin folders; the deletion sequence,
+   process-replacement policy and eligibility function moved into core;
+   manifest checks replacing name checks in the Host and UI; the lint rule and
+   the name check test.
 3. **Generic ACP plugin and Claude Code as orchestrator.** Definition-file
    loading, fixed parameter validators, feature measurement with the
    launch-digest cache, per-launch capability checks, `claude.json`, the
@@ -1054,10 +1167,11 @@ Each phase is a separate PR, in this order.
 | AC-15 | An agent kind without `resume` is never stopped for internal replacement: MCP recovery keeps the process and reports the condition, and a worker of that kind is not retained after its step settles. |
 | AC-16 | Parameter validation of a 128-character input completes in under 1 ms for every format, and a definition file cannot supply its own pattern. |
 | AC-17 | Changing a definition file's command, arguments or environment, or replacing its program, triggers a fresh feature check before the agent kind is offered again. |
-| AC-18 | A Copilot orchestrator and a Copilot worker end in `mode: agent` when started and resumed on a Node at the pinned older commit by a Host on this change, and on a new Node including after a process replacement. A plain session and a reviewer keep the agent's own mode. |
+| AC-18 | With a Host on this change driving a Node at the pinned older commit, and driving a new Node, a Copilot orchestrator and a Copilot worker end in `mode: agent` after start and resume, and on the new Node also after a process replacement. A plain session and a reviewer receive no `mode` setting. |
 | AC-19 | With serialization in place, a sealed and a legacy Node each have heartbeats and events accepted, a closed socket triggers disconnect cleanup, a superseding connection replaces the old one, and command execution and file downloads remain available on the sealed link. |
 | AC-20 | An event whose opaque payload contains an `agentParams` property reaches old and new Nodes unchanged, and no console frame is refused because of it. |
 | AC-21 | Neither an agent started through the managed launcher nor a child it starts can read the command line, Job name or proof token from its environment. |
+| AC-22 | Start, resume and context-tier change commands recorded from a Host at the pinned older commit, which carry no role, drive a new Node through start, resume, process replacement (after an MCP reconnect for the orchestrator, and after a context-tier change for both) and a context rollover. After each step a Copilot orchestrator and a Copilot worker have `mode: agent` and that Host's model and reasoning effort, and every Copilot process was launched with the matching `--model` and `--reasoning-effort` flags. A plain session and a reviewer receive no `mode` setting and keep their mode across a replacement. |
 
 ## Testing
 
@@ -1068,16 +1182,22 @@ Each phase is a separate PR, in this order.
   rejection; start, resume, stop, cancel and permission handling; YOLO
   approval; and refusal when a launch finds a capability missing.
 - **Wire compatibility.** Frozen copies of the Host-to-Node and Node-to-Host
-  schemas from the pinned commit under `packages/protocol/src/compat/`; every
-  frame type that carries a schema-owned agent field, produced for an old Node
-  and parsed under the frozen schema; the schema-walk test for new frames; the
+  schemas from the pinned commit under `packages/protocol/src/compat/`, with
+  the commands that commit's Host sends for each startup case; every frame
+  type that carries a schema-owned agent field, produced for an old Node and
+  parsed under the frozen schema; every frame a new Node sends to an old Host,
+  parsed under the frozen schema; the schema-walk test for new frames; the
   colliding-property test for opaque payloads (AC-04, AC-20).
 - **Connections.** The real gateway with a sealed and a legacy Node and
   serialization in place: packet acceptance, `instanceof SealedNodeLink`
   features, disconnect cleanup and superseding connections (AC-19).
-- **Startup settings.** A fake ACP agent with a `mode` option that records
-  every setting it receives; mode selection for each role on old and new
-  Nodes, after resume and after a process replacement (AC-18).
+- **Startup settings.** A fake ACP agent with `mode`, `model` and
+  `reasoning_effort` options that records every setting it receives and its
+  launch arguments. Each role on old and new Nodes, after resume and after a
+  process replacement (AC-18). Commands recorded from the pinned older Host
+  replayed into a new Node through start, resume, replacement, context-tier
+  change and rollover (AC-22). The manifest-built list against the recorded
+  older-Host lists for every role.
 - **Launch.** The literal-argument suite on Windows and Linux (AC-07); npm shim
   recognition across local, global, scoped and linked installs; refusal of
   non-inert arguments to other batch files; the managed Job launcher with
@@ -1116,8 +1236,24 @@ Each phase is a separate PR, in this order.
   possible.
 - The Node inventory schema (`nodeInventoryShape` in
   `packages/protocol/src/index.ts`) is a non-strict object, so older Hosts
-  ignore new fields. Host-to-Node frames are the opposite: older Nodes reject
-  what they do not recognize and close the connection.
+  ignore new fields. Host-to-Node frames are stricter: older Nodes close the
+  connection on an unknown message type or an `agentParams` value outside the
+  two legacy shapes, and drop unknown fields inside a known message.
+- A Host at `e19f5ff` decodes every Node frame with `NodeToHostMessageSchema`
+  and closes the connection when it fails, which includes an unknown message
+  type and an unknown session event type. An event's `payload` is
+  `z.record(z.string(), z.unknown())`, so any content there is accepted
+  (checked 2026-10-29 in `apps/host/src/gateway/node-socket.ts` and the
+  protocol package).
+- At `e19f5ff`, `start_session` and `resume_session` carry `config` and no
+  role. The Node stores `config` in `slot.config`, updates it from the values
+  the agent reports and from picker changes, and builds every replacement in
+  `replaceAgent` from it; a context rollover reapplies the list that process
+  was started with, updated with the current model and effort
+  (`rolloverStartupConfig`). The Host's
+  `startupConfigFor` adds `mode: agent` only for Copilot leads and workers
+  (checked 2026-10-29 in `apps/node/src/router.ts`, `apps/node/src/agents.ts`
+  and `apps/host/src/fleet-service.ts`).
 - Node.js refuses to start a `.cmd` or `.bat` file without `shell: true`
   (`EINVAL`), and with `shell: true` it does not escape arguments. Windows
   PowerShell treats `‘`, `’`, `‚` and `‛` as single quotes. All three were
@@ -1136,7 +1272,8 @@ Each phase is a separate PR, in this order.
 - The Node at `6ccbdaf` parses `start_session` with a schema that drops fields
   it does not know, rejects the canonical `{ kind, params }` agent shape, and
   rejects unknown message types (checked 2026-10-29 against the built
-  protocol package).
+  protocol package). The protocol package is unchanged between `6ccbdaf` and
+  `e19f5ff`.
 
 ## Out of scope
 
