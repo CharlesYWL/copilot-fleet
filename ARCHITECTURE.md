@@ -96,12 +96,27 @@ Legacy script text is recovered only from hash-verified local journal evidence.
 The prior opt-in/drain setup and
 stop-all dialog are no longer part of this flow.
 
-The Node journals launch/cancel identities and uses a command-specific Windows
+The Node journals launch/cancel identities and uses a command-specific
 supervisor with suspended process admission, independent deadlines, parent-loss
 termination, and durable quiescence evidence. Windows PowerShell 5.1 receives
 script files rather than an oversized encoded command line. Outcome, process
 ownership, and output completeness are distinct facts; neither lost receipts nor
 forced descendant cleanup are reported as ordinary success.
+
+On Linux and macOS the shell is `/bin/sh` (`posix-sh`), and the supervisor is a
+dependency-free Node script (`command-supervisor-posix-runner.ts`) started
+detached so it outlives a Node crash. It writes the same `ready`/`started`/
+`quiescent`/`terminal` receipts as the Windows supervisor, so the journal and the
+Host treat both platforms alike. Admission is gated, not suspended: the root
+`/bin/sh` first blocks reading one byte from a descriptor only the supervisor can
+write, and the supervisor writes it after `release.json`. Ownership is the root's
+process group, proved empty with `kill(-pgid, 0)`; process identity is PID plus
+start time from `/proc/<pid>/stat` (or `ps` on macOS). A descendant that calls
+`setsid()` escapes the group, which is the POSIX counterpart of Job Object
+breakaway and is not prevented. A Node lists `posix-sh` only when its Host
+advertises `command-shell-posix-v1`, so an older Host never receives a shell it
+cannot parse. Managed ACP agents use the same process-group ownership
+([managed worktree isolation](docs/managed-worktree-isolation.md)).
 
 Per-stream output offsets commit atomically with journal events. Recovery reads
 retained native bytes before deleting their files, without assigning new

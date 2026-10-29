@@ -226,6 +226,12 @@ and progress to `self-update.json`, both beside the Host database. The Host
 recognises that it was started by this service because its output is the
 manifest's `runtime.log`, so a Host started by hand never restarts the tasks.
 
+## Linux login startup
+
+The Linux counterpart, a `systemd --user` unit driven by the same
+`npm run service` commands, is described in
+[Linux login startup](linux-login-startup.md).
+
 ## Historical references
 
 These earlier experiments are retained as history, not the current CLI contract:

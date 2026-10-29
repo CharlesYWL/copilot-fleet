@@ -206,6 +206,47 @@ describe("durable Node session journal", () => {
     expect(open(directory).get("worker")?.session).toEqual(full);
   });
 
+  it("keeps the same evidence across a rotated lease attempt but refuses a different checkout", () => {
+    const { journal } = fixture();
+    const binding = {
+      worktreeId: "worktree-1",
+      generation: 1,
+      sourcePlacementId: "placement",
+      cwd: "/work/.fleet-worktrees/task",
+      checkoutKey: "linux:host:1:2",
+      accessClass: "shell" as const,
+      leaseAttempt: "attempt-1",
+      quarantined: false,
+    };
+    const input = {
+      hostId: "host",
+      grantId: "grant",
+      session: session("worker", { executionBinding: binding }),
+    };
+    journal.enable(input);
+    expect(journal.append(event(1)).sequence).toBe(1);
+    journal.flush();
+    // The Host rotates leaseAttempt on every start/resume of the same checkout.
+    const rotated = session("worker", {
+      executionBinding: { ...binding, leaseAttempt: "attempt-2" },
+    });
+    expect(() => journal.enable({ ...input, session: rotated })).not.toThrow();
+    expect(() => journal.updateSession(rotated)).not.toThrow();
+    expect(journal.highWater("worker")).toBe(1);
+    // A different checkout is a different continuation and stays refused.
+    for (const change of [
+      { cwd: "/elsewhere" },
+      { worktreeId: "worktree-2" },
+      { generation: 2 },
+    ])
+      expect(() =>
+        journal.enable({
+          ...input,
+          session: session("worker", { executionBinding: { ...binding, ...change } }),
+        }),
+      ).toThrow("conflicts with retained evidence");
+  });
+
   it("seeds a new grant from Host's sequence offset without resetting an existing journal", () => {
     const { journal, directory } = fixture();
     const input = {

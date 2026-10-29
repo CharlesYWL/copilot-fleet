@@ -14,6 +14,7 @@ import {
   type CommandExecutionNodeMessage,
   type CommandPreparation,
   type CommandReadiness,
+  type CommandShell,
   type PreparedCommand,
   type CommandOutputEvent,
   type CommandApprovalScope,
@@ -54,7 +55,13 @@ export type PreparedCommandProcess = {
   result: Promise<CommandProcessResult>;
 };
 export type CommandSupervisor = {
-  readiness(): Promise<{ supported: boolean; reason: string; shellPath?: string }>;
+  readiness(): Promise<{
+    supported: boolean;
+    reason: string;
+    shellPath?: string;
+    /** Shells the supervisor proved; older fakes omit it, meaning PowerShell. */
+    shells?: CommandShell[];
+  }>;
   prepare(input: {
     executionId: string;
     attemptId: string;
@@ -77,6 +84,8 @@ export type CommandConnection = {
   sealed: boolean;
   negotiated: boolean;
   permissions?: boolean;
+  /** The Host accepts `posix-sh`; older Hosts only parse PowerShell readiness. */
+  posixShell?: boolean;
   hostId: string;
   nodeId: string;
 };
@@ -103,6 +112,7 @@ export class CommandExecutionManager {
   private enabled = false;
   private reason = "Command supervisor readiness has not been checked.";
   private shellPath = "";
+  private shells: CommandShell[] = [];
   private stopped = false;
   private readonly permissions: CommandPermissions;
 
@@ -153,9 +163,27 @@ export class CommandExecutionManager {
       enabled: this.enabled,
       supported: this.supported && !this.options.admission.reason && !this.stopped,
       reason: this.options.admission.reason || this.reason,
-      shells: this.supported ? ["windows-powershell-5.1"] : [],
+      shells: this.advertisedShells(),
       admissionVersion: COMMAND_ADMISSION_VERSION,
     };
+  }
+
+  /**
+   * The proven shells this Host can be told about.
+   *
+   * An older Host validates readiness against the PowerShell-only schema and
+   * closes the connection on anything else, so `posix-sh` is withheld until the
+   * Host confirms it understands it.
+   */
+  private advertisedShells(): CommandShell[] {
+    if (!this.supported) return [];
+    let posixShell = false;
+    try {
+      posixShell = this.options.connection().posixShell === true;
+    } catch {
+      posixShell = false;
+    }
+    return this.shells.filter((shell) => shell !== "posix-sh" || posixShell);
   }
   get unsettled(): boolean {
     return (
@@ -188,6 +216,7 @@ export class CommandExecutionManager {
     }
     this.supported = ready.supported && !!ready.shellPath;
     this.shellPath = ready.shellPath ?? "";
+    this.shells = ready.shells ?? (this.supported ? ["windows-powershell-5.1"] : []);
     this.reason = ready.reason;
     if (!this.supported)
       throw new Error(ready.reason || "Command supervisor is unavailable.");
@@ -312,6 +341,10 @@ export class CommandExecutionManager {
       const context = this.connection(true);
       if (request.hostId !== context.hostId || request.nodeId !== context.nodeId)
         throw new Error("Prepared command enrollment identity mismatch.");
+      if (!this.shells.includes(request.shell))
+        throw new Error(
+          `This Node runs ${this.shells.join(", ") || "no supported shell"}, not ${request.shell}.`,
+        );
       const prior = this.options.journal.get(request.executionId);
       if (prior) {
         if (prior.namespace !== this.options.journal.namespace)

@@ -97,10 +97,10 @@ describe("login-start CLI", () => {
       [resolve("scripts/login-service-cli.mjs"), "node", "--help"],
       { encoding: "utf8" },
     );
-    expect(output).toContain("not signed-out boot");
+    expect(output).toContain("systemd --user");
     expect(output).toContain("host+node install");
     expect(output).toContain("Run install once before start");
-    expect(output).toContain("start does not install tasks");
+    expect(output).toContain("start does not install the service");
   });
 });
 
@@ -123,13 +123,49 @@ describe("manifest and profile", () => {
       PATH: "C:\\Tools",
     });
   });
+  it("keeps a custom XDG_STATE_HOME, so the Host finds its service manifest", () => {
+    const env = { HOME: "/home/me", XDG_STATE_HOME: "/srv/state" };
+    expect(captureEnvironment(env)).toMatchObject({ XDG_STATE_HOME: "/srv/state" });
+    // The service resolves its directory from the saved environment alone.
+    expect(loginDirectory("host", captureEnvironment(env), "linux")).toBe(
+      loginDirectory("host", env, "linux"),
+    );
+  });
   it("handles Path casing and separates workloads and users", () => {
     expect(captureEnvironment({ Path: "C:\\Tools" })).toEqual({ PATH: "C:\\Tools" });
-    expect(loginDirectory("host", { LOCALAPPDATA: "C:\\Users\\Me\\Local" })).toBe(
-      "C:\\Users\\Me\\Local\\CopilotFleet\\login\\host",
-    );
+    expect(
+      loginDirectory("host", { LOCALAPPDATA: "C:\\Users\\Me\\Local" }, "win32"),
+    ).toBe("C:\\Users\\Me\\Local\\CopilotFleet\\login\\host");
     expect(taskName("node", sid)).not.toBe(taskName("host", sid));
     expect(taskName("node", sid)).not.toBe(taskName("node", `${sid}1`));
+  });
+  it("uses XDG state and systemd unit names for a POSIX account", () => {
+    expect(loginDirectory("node", { HOME: "/home/me" }, "linux")).toBe(
+      "/home/me/.local/state/copilot-fleet/login/node",
+    );
+    expect(
+      loginDirectory("host", { HOME: "/home/me", XDG_STATE_HOME: "/state" }, "linux"),
+    ).toBe("/state/copilot-fleet/login/host");
+    expect(() => loginDirectory("node", {}, "linux")).toThrow("HOME");
+    expect(taskName("node", "uid:1000")).toBe("copilot-fleet-node");
+    expect(taskName("host", "uid:1000")).toBe("copilot-fleet-host");
+  });
+  it("accepts a same-user POSIX manifest and rejects one for another uid", () => {
+    const manifest = {
+      ...fixture(),
+      accountSid: "uid:1000",
+      taskName: "copilot-fleet-node",
+      repositoryPath: "/home/me/fleet",
+      nodePath: "/usr/bin/node",
+      runnerPath: "/home/me/.local/state/copilot-fleet/login/node/runner.mjs",
+      controllerPath: "/home/me/.config/systemd/user/copilot-fleet-node.service",
+      logPath: "/home/me/.local/state/copilot-fleet/login/node/runtime.log",
+    };
+    expect(validateManifest(manifest, "uid:1000")).toEqual(manifest);
+    expect(() => validateManifest(manifest, "uid:1001")).toThrow();
+    expect(() =>
+      validateManifest({ ...manifest, repositoryPath: "C:\\fleet" }, "uid:1000"),
+    ).toThrow();
   });
   it("accepts a same-user manifest", () => {
     expect(validateManifest(fixture(), sid)).toEqual(fixture());
@@ -181,7 +217,7 @@ describe("Copilot status protocol", () => {
   );
 });
 
-describe.skipIf(process.platform !== "win32")("existing Node lock", () => {
+describe("existing Node lock", () => {
   const directories = [];
   afterEach(() => {
     for (const directory of directories.splice(0))

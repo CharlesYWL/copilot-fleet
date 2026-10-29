@@ -14,6 +14,7 @@ export type ConfigAsset = { body: string | Buffer; contentType: string };
  */
 const ASSETS: Record<string, { file: string; contentType: string }> = {
   "/": { file: "index.html", contentType: "text/html; charset=utf-8" },
+  "/favicon.svg": { file: "favicon.svg", contentType: "image/svg+xml" },
   "/config.css": { file: "config.css", contentType: "text/css; charset=utf-8" },
   "/config.js": {
     file: "config.js",

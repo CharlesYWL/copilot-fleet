@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, expect, it, vi } from "vitest";
 import { CONFIG_UI_EVENT_MARKER } from "@fleet/protocol";
-import { logPosition, printNodeConfigUrl } from "./login-service-cli.mjs";
+import { logPosition, npmCli, printNodeConfigUrl } from "./login-service-cli.mjs";
 
 const directories = [];
 const timestamp = "2026-01-01T00:00:00.000Z";
@@ -128,4 +128,33 @@ it("times out explicitly if the task never announces its config listener", async
   await expect(
     printNodeConfigUrl(path, logPosition(path), { log: vi.fn(), timeoutMs: 10 }),
   ).rejects.toThrow("the task remains installed");
+});
+
+it("builds with the npm that is running, such as a distribution's /usr/share layout", () => {
+  const debian = "/usr/share/nodejs/npm/bin/npm-cli.js";
+  const exists = (path) => path === debian;
+  expect(
+    npmCli({ env: { npm_execpath: debian }, execPath: "/usr/bin/node", exists }),
+  ).toBe(debian);
+  // Not an npm CLI script, or not present: fall back to npm beside node.
+  const beside = join(
+    "/opt/node/bin",
+    "..",
+    "lib",
+    "node_modules",
+    "npm",
+    "bin",
+    "npm-cli.js",
+  );
+  const besideOnly = (path) => path === beside;
+  expect(
+    npmCli({
+      env: { npm_execpath: "/usr/bin/yarn" },
+      execPath: "/opt/node/bin/node",
+      exists: besideOnly,
+    }),
+  ).toBe(beside);
+  expect(
+    npmCli({ env: {}, execPath: "/usr/bin/node", exists: () => false }),
+  ).toBeUndefined();
 });

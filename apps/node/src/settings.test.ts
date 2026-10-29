@@ -159,10 +159,9 @@ describe("loadSettings", () => {
     });
     const settings = await loadSettings({});
     expect(settings).not.toHaveProperty("remoteCommandsEnabled");
-    expect(settings.commandPermissionRules.map((rule) => rule.commandKey)).toEqual([
-      "cd",
-      "set-location",
-    ]);
+    expect(settings.commandPermissionRules.map((rule) => rule.commandKey)).toEqual(
+      process.platform === "win32" ? ["cd", "set-location"] : ["cd"],
+    );
   });
 
   it("persists explicit builtin removal rather than restoring defaults on restart", async () => {
@@ -216,11 +215,12 @@ describe("serialized settings mutations", () => {
     await expect(
       update((settings) => ({ ...settings, commandPermissionRules: [] })),
     ).rejects.toThrow("disk full");
-    expect(current.commandPermissionRules).toHaveLength(2);
+    const defaults = settingsFromEnv({}).commandPermissionRules.length;
+    expect(current.commandPermissionRules).toHaveLength(defaults);
     expect(current.commandPermissionRevision).toBe(0);
     await update((settings) => ({ ...settings, nodeName: "after-failure" }));
     expect(current.nodeName).toBe("after-failure");
-    expect(current.commandPermissionRules).toHaveLength(2);
+    expect(current.commandPermissionRules).toHaveLength(defaults);
     expect(current.commandPermissionRevision).toBe(0);
   });
 });

@@ -156,4 +156,13 @@ describe("config assets", () => {
     expect(configAsset("/../package.json")).toBeUndefined();
     expect(configAsset("/index.html")).toBeUndefined();
   });
+
+  it("serves the brand mark as the tab icon the page links", () => {
+    const icon = configAsset("/favicon.svg");
+    expect(icon?.contentType).toBe("image/svg+xml");
+    expect(icon?.body).toContain("<svg");
+    expect(configAsset("/")?.body).toContain(
+      '<link rel="icon" type="image/svg+xml" href="/favicon.svg" />',
+    );
+  });
 });

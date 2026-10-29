@@ -157,7 +157,10 @@ describe.skipIf(process.platform !== "win32")("unmanaged Windows process cleanup
 describe.skipIf(process.platform === "win32")("unmanaged POSIX process cleanup", () => {
   it("cleans up the exit wait when signaling the process group fails", async () => {
     const child = runningChild();
-    const error = Object.assign(new Error("permission denied"), { code: "EPERM" });
+    // On macOS EPERM is also what a group of zombies answers, so it is treated
+    // as nothing left to signal there; use a failure no platform tolerates.
+    const code = process.platform === "darwin" ? "EINVAL" : "EPERM";
+    const error = Object.assign(new Error("signal failed"), { code });
     vi.spyOn(process, "kill").mockImplementation(() => {
       throw error;
     });

@@ -148,11 +148,39 @@ describe("detectHostLaunch", () => {
         }),
       ).mode,
     ).toBe("manual");
+  });
+
+  it("recognises the Linux systemd user service the same way", () => {
     expect(
       detectHostLaunch(
         probe({
           platform: "linux",
-          readServiceManifest: installed,
+          repoRoot: "/home/me/copilot-fleet",
+          readServiceManifest: (kind) =>
+            kind === "host"
+              ? {
+                  repositoryPath: "/home/me/copilot-fleet",
+                  logPath: "/home/me/.local/state/copilot-fleet/login/host/runtime.log",
+                }
+              : undefined,
+          stdoutIs: (path) => path.endsWith("/host/runtime.log"),
+        }),
+      ),
+    ).toEqual({
+      mode: "service",
+      restartCommand: "npm run service -- host restart",
+      restartKind: "host",
+    });
+    // POSIX paths are case-sensitive: another spelling is another checkout.
+    expect(
+      detectHostLaunch(
+        probe({
+          platform: "linux",
+          repoRoot: "/home/me/copilot-fleet",
+          readServiceManifest: () => ({
+            repositoryPath: "/home/me/Copilot-Fleet",
+            logPath: "/log",
+          }),
           stdoutIs: () => true,
         }),
       ).mode,

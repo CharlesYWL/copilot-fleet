@@ -1,0 +1,111 @@
+# Runs the test suite on a GitHub-hosted macOS runner.
+#
+# Manual only: start it from the Actions tab ("macOS tests" > "Run workflow").
+# It never runs on push or pull_request, so it costs nothing until someone asks.
+name: macOS tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "What to run: posix (process, command and service tests) or full (everything)"
+        type: choice
+        options:
+          - posix
+          - full
+        default: posix
+      node-version:
+        description: "Node.js version"
+        type: string
+        default: "22"
+      runner:
+        description: "macOS runner image"
+        type: choice
+        options:
+          - macos-latest
+          - macos-15
+          - macos-14
+        default: macos-latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ inputs.scope }} on ${{ inputs.runner }} (Node ${{ inputs.node-version }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      # Managed-worktree and updater tests make real commits.
+      - name: Configure git identity
+        run: |
+          git config --global user.name "Fleet CI"
+          git config --global user.email "fleet-ci@users.noreply.github.com"
+          git config --global init.defaultBranch main
+
+      - name: Show platform
+        run: |
+          sw_vers
+          uname -a
+          node --version
+          npm --version
+          ls -l /bin/sh
+          /bin/sh --version || true
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # The parts of Fleet that differ between platforms: process groups and
+      # identity, the command supervisor, command permissions, the launcher and
+      # the login-service scripts.
+      - name: Test (POSIX platform suites)
+        if: inputs.scope == 'posix'
+        run: >
+          npx vitest run
+          apps/node/src/command-supervisor-posix.test.ts
+          apps/node/src/posix-process-group.test.ts
+          apps/node/src/posix-shell-environment.test.ts
+          apps/node/src/process-quiescence.test.ts
+          apps/node/src/command-permissions.test.ts
+          apps/node/src/command-permissions-executable.test.ts
+          apps/node/src/command-execution-manager.test.ts
+          apps/node/src/session-console.test.ts
+          scripts/launcher.test.js
+          scripts/launcher.integration.test.js
+          scripts/login-service.test.js
+          scripts/login-service-runtime.test.js
+          scripts/linux-login-service.test.js
+          scripts/self-update.test.js
+          --reporter=default --reporter=junit --outputFile.junit=test-results/junit.xml
+
+      - name: Test (full suite)
+        if: inputs.scope == 'full'
+        run: >
+          npx vitest run
+          --reporter=default --reporter=junit --outputFile.junit=test-results/junit.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-test-results-${{ inputs.runner }}-node${{ inputs.node-version }}
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 14

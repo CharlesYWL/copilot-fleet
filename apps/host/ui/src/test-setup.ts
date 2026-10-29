@@ -1,5 +1,5 @@
 import { afterEach, vi } from "vitest";
-import { cleanup } from "@testing-library/react";
+import { cleanup, configure } from "@testing-library/react";
 import {
   createElement,
   forwardRef,
@@ -14,6 +14,36 @@ import type * as VirtuosoModule from "react-virtuoso";
 // Testing Library only registers this for itself when the test globals are on,
 // and they are not; without it each render stacks onto the previous document.
 afterEach(cleanup);
+
+/*
+ * findBy* and waitFor give up after 1s by default. A full run executes test
+ * files in parallel with the process suites, and file reads, Fluent's dialogs
+ * and mocked fetches then take longer to settle; a test that passes alone in
+ * well under a second failed that way on both Windows and Linux. This is how
+ * long to wait for something that is coming, not a delay: a passing query
+ * returns as soon as it matches.
+ */
+configure({ asyncUtilTimeout: 5_000 });
+
+/*
+ * Node 25 and later define their own `localStorage` global, which is undefined
+ * unless Node runs with --localstorage-file, and their own `Storage` class. Both
+ * shadow the jsdom window's, so tests would see no storage, and spies on
+ * `Storage.prototype` would patch a class no page object uses. Use the jsdom
+ * document's, as a browser page has.
+ */
+const jsdomWindow = (globalThis as { jsdom?: { window?: Window & typeof globalThis } })
+  .jsdom?.window;
+if (jsdomWindow && globalThis.localStorage === undefined) {
+  for (const name of ["Storage", "localStorage", "sessionStorage"] as const) {
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      enumerable: name !== "Storage",
+      writable: true,
+      value: jsdomWindow[name],
+    });
+  }
+}
 
 /*
  * jsdom does no layout: every `offsetParent` is null and <body> measures 0x0.

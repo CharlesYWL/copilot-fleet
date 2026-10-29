@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, fstatSync, readFileSync, statSync } from "node:fs";
 import { connect } from "node:net";
-import { join, win32 } from "node:path";
+import { join, posix, win32 } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 import {
   MUTUAL_AUTH_PROTOCOL,
@@ -112,7 +112,7 @@ export function detectHostLaunch(probe: LaunchProbe): HostLaunch {
       token,
     };
   }
-  if (platform === "win32") {
+  if (platform === "win32" || platform === "linux") {
     const host = probe.readServiceManifest("host");
     if (
       host &&
@@ -132,18 +132,41 @@ export function detectHostLaunch(probe: LaunchProbe): HostLaunch {
   return { mode: "manual", reason: MANUAL_LAUNCH_REASON };
 }
 
+/**
+ * Where the login service keeps a workload's manifest, matching
+ * `scripts/login-service.mjs`: `%LOCALAPPDATA%` on Windows, XDG state on Linux.
+ */
+function serviceManifestPath(
+  env: NodeJS.ProcessEnv,
+  kind: "host" | "node",
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  if (platform === "win32")
+    return env.LOCALAPPDATA
+      ? win32.join(env.LOCALAPPDATA, "CopilotFleet", "login", kind, "manifest.json")
+      : undefined;
+  const base = env.XDG_STATE_HOME?.startsWith("/")
+    ? env.XDG_STATE_HOME
+    : env.HOME?.startsWith("/")
+      ? posix.join(env.HOME, ".local", "state")
+      : undefined;
+  return base
+    ? posix.join(base, "copilot-fleet", "login", kind, "manifest.json")
+    : undefined;
+}
+
 function readServiceManifest(
   env: NodeJS.ProcessEnv,
   kind: "host" | "node",
 ): ServiceManifest | undefined {
-  if (!env.LOCALAPPDATA) return undefined;
+  const path = serviceManifestPath(env, kind);
+  if (!path) return undefined;
   try {
-    const manifest = JSON.parse(
-      readFileSync(
-        win32.join(env.LOCALAPPDATA, "CopilotFleet", "login", kind, "manifest.json"),
-        "utf8",
-      ).replace(/^\uFEFF/, ""),
-    ) as { kind?: unknown; repositoryPath?: unknown; logPath?: unknown };
+    const manifest = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, "")) as {
+      kind?: unknown;
+      repositoryPath?: unknown;
+      logPath?: unknown;
+    };
     if (
       manifest.kind !== kind ||
       typeof manifest.repositoryPath !== "string" ||

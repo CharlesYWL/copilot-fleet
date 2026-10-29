@@ -379,7 +379,10 @@ describe("GeneralPanel", () => {
     );
     const view = render(panel);
     expect(await screen.findByText("Defaults unavailable")).toBeTruthy();
-    expect(notify).toHaveBeenCalledExactlyOnceWith("Defaults unavailable", "error");
+    // The toast is raised from an effect, which can land after the inline text.
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledExactlyOnceWith("Defaults unavailable", "error"),
+    );
     view.rerender(panel);
     expect(notify).toHaveBeenCalledTimes(1);
     expect(screen.getByText("Defaults unavailable")).toBeTruthy();

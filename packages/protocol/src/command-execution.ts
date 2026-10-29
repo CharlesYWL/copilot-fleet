@@ -41,8 +41,28 @@ const path = z
   .min(1)
   .max(32_768)
   .refine((value) => !value.includes("\0"));
-export const CommandShellSchema = z.literal("windows-powershell-5.1");
+/**
+ * The shells a command may name.
+ *
+ * Windows Nodes run Windows PowerShell 5.1; Linux and macOS Nodes run the
+ * system POSIX shell, `/bin/sh`. A Node reports which one it supports in its
+ * readiness, and the orchestrator writes the script for that shell.
+ */
+export const COMMAND_SHELLS = ["windows-powershell-5.1", "posix-sh"] as const;
+export const CommandShellSchema = z.enum(COMMAND_SHELLS);
 export type CommandShell = z.infer<typeof CommandShellSchema>;
+/**
+ * Advertised by a Host that understands `posix-sh` in readiness and requests.
+ *
+ * An older Host validates readiness against the PowerShell-only literal and
+ * would close the connection on anything else, so a Node lists `posix-sh` only
+ * once the Host has confirmed it in `welcome`.
+ */
+export const POSIX_COMMAND_SHELL_CAPABILITY = "command-shell-posix-v1";
+export const COMMAND_SHELL_LABELS: Record<CommandShell, string> = {
+  "windows-powershell-5.1": "Windows PowerShell 5.1",
+  "posix-sh": "POSIX sh",
+};
 export const CommandTextSchema = z
   .string()
   .min(1)
@@ -415,7 +435,7 @@ export const CommandReadinessSchema = z.object({
   enabled: z.boolean(),
   supported: z.boolean(),
   reason: detail,
-  shells: z.array(CommandShellSchema).max(1),
+  shells: z.array(CommandShellSchema).max(COMMAND_SHELLS.length),
   admissionVersion: z.number().int().nonnegative(),
 });
 export type CommandReadiness = z.infer<typeof CommandReadinessSchema>;

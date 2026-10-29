@@ -47,8 +47,9 @@ Different Node installations therefore cannot bypass admission by choosing
 different application data directories.
 
 Leases include an incarnation, owner, attempt, exclusive token and recorded process
-state. No elapsed-time unlock exists. Managed ACP is launched suspended into a
-Windows Job Object before any agent code runs. Breakaway is disabled; an orphaned
+state. No elapsed-time unlock exists. On Windows, managed ACP is launched
+suspended into a Job Object before any agent code runs; on Linux and macOS it
+leads its own process group from the moment it is spawned. Breakaway is disabled; an orphaned
 grandchild remains owned. Both Stop and unsolicited root exit terminate the job's
 remaining processes and require an empty-job proof before releasing the checkout.
 The supervisor starts its proof on a separate stderr line. Before ACP diagnostic
@@ -544,9 +545,27 @@ cross-Node migration, clone lifecycle, user-worktree adoption, signing automatio
 network-volume identity and advanced repository configurations. Large Git output
 or an unprovable physical/process identity fails closed rather than weakening
 admission or treating incomplete observations as clean.
-Managed ACP process supervision currently requires Windows Job Objects; on other
-platforms managed ACP launch fails closed instead of relying on an escapable
-process group. Unmanaged ACP launch is unchanged.
+Managed ACP process supervision uses a Windows Job Object on Windows and a
+verified process group on Linux and macOS (see below). Unmanaged ACP launch is
+unchanged.
+
+### Process ownership on Linux and macOS
+
+POSIX has no Job Object, and Fleet does not require cgroups. A managed agent is
+spawned detached, so it leads a new process group, and every descendant joins
+that group by default. Stop sends SIGTERM to the whole group, waits briefly, then
+sends SIGKILL, and polls `kill(-pgid, 0)` until the kernel reports that no member
+is left (bounded to about 15 seconds). The checkout is released only after that
+proof. When the agent exits on its own, a surviving grandchild still holds the
+group, and so the lease, exactly as it holds the Job Object on Windows. If the
+group cannot be proved empty, the worktree enters `needs_reconciliation` instead
+of being released. No stderr proof line is involved on POSIX.
+
+**Limitation:** a descendant that calls `setsid()` or `setpgid()` leaves the
+group and is no longer tracked. Ordinary tools (shells, Git, npm, language
+servers) do not do this; daemonising tools can. A Node running under the Linux
+login service is still contained by the unit's control group, which systemd ends
+when the unit stops, but that does not participate in lease release.
 
 ## Verification
 

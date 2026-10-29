@@ -125,4 +125,39 @@ describe("Node session console Host work admission", () => {
     });
     expect(route).toHaveBeenCalledWith(stop);
   });
+
+  it("blocks a session whose replacement grant was refused, leaving others and stop working", async () => {
+    const { sessionConsole, journal, route } = createConsole();
+    const stored = journal.get(sessionId)!;
+    // A grant for a changed binding conflicts with the evidence the Node retains.
+    const replacement = {
+      hostId: "host",
+      grantId: "grant-2",
+      controlEpoch: 0,
+      session: { ...stored.session, workspaceId: "another-checkout" },
+    };
+    let refusal = "";
+    try {
+      sessionConsole.grant(replacement as Parameters<typeof sessionConsole.grant>[0]);
+    } catch (error) {
+      refusal = (error as Error).message;
+    }
+    expect(refusal).not.toBe("");
+    sessionConsole.refuseGrant(sessionId, refusal);
+
+    const resume: NodeCommand = { ...prompt, commandId: "after-refusal" };
+    const result = await sessionConsole.hostCommand(resume, 0);
+    expect(result).toMatchObject({ ok: false, fatal: false });
+    expect(result.error).toContain("grant for this session was refused");
+    expect(route).not.toHaveBeenCalledWith(resume);
+    // Safety commands still reach a blocked session.
+    await expect(sessionConsole.hostCommand(stop, 0)).resolves.toMatchObject({
+      ok: true,
+    });
+    // Another session is not affected by this one's refusal.
+    const other: NodeCommand = { ...prompt, sessionId: "other", commandId: "other" };
+    await expect(sessionConsole.hostCommand(other, 0)).resolves.toMatchObject({
+      ok: true,
+    });
+  });
 });

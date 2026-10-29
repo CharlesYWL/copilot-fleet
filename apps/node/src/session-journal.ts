@@ -110,12 +110,26 @@ function eligible(session: FleetSession): FleetSession {
   return JSON.parse(json(parsed.data)) as FleetSession;
 }
 
+/**
+ * The checkout a session's evidence belongs to.
+ *
+ * `leaseAttempt` is left out: it is the Host's per-dispatch fencing token, which
+ * an authenticated start or resume rotates on the same conversation and checkout
+ * (see ExecutionBindingSchema). The Host's own grant identity ignores it too, so
+ * comparing it here turned every rotation into a "conflict".
+ */
+function continuationBinding(session: FleetSession): unknown {
+  if (!session.executionBinding) return null;
+  const { leaseAttempt: _leaseAttempt, ...binding } = session.executionBinding;
+  return binding;
+}
+
 function sameBinding(before: FleetSession, after: FleetSession): boolean {
   return (
     before.nodeId === after.nodeId &&
     before.workspaceId === after.workspaceId &&
     before.placementId === after.placementId &&
-    digest(before.executionBinding ?? null) === digest(after.executionBinding ?? null) &&
+    digest(continuationBinding(before)) === digest(continuationBinding(after)) &&
     digest(before.agentParams ?? null) === digest(after.agentParams ?? null)
   );
 }

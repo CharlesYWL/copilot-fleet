@@ -131,19 +131,14 @@ it.each(["after_turn", "ongoing"] as const)(
           evidence: "Synthetic complete observation.",
         },
       });
-      store.prMaintenance.holdForDecision(
-        lead.id,
-        record.id,
-        record.version,
-        {
-          id: "fixture-decision",
-          version: 1,
-          proposal: "Retain the public API?",
-          scope: "Existing null invariant",
-          headSha,
-        },
-        () => store.updateRun(task.id, { state: "awaiting_human" }),
-      );
+      store.prMaintenance.holdForDecision(lead.id, record.id, record.version, {
+        id: "fixture-decision",
+        version: 1,
+        proposal: "Retain the public API?",
+        scope: "Existing null invariant",
+        headSha,
+      });
+      store.updateRun(task.id, { state: "awaiting_human" });
       prepared.ids.push(lead.id, worker.id);
       prepared.nextSequence.set(lead.id, 1);
       prepared.nextSequence.set(worker.id, 1);

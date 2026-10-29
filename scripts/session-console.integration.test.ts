@@ -1,7 +1,7 @@
 import Fastify from "fastify";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -37,7 +37,9 @@ afterEach(async () => {
 });
 
 async function fixture(enable = true, journalBatchMs = 2) {
-  const directory = mkdtempSync(join(tmpdir(), "fleet-console-"));
+  // realpath: on macOS tmpdir() is under /var, a link to /private/var, and the
+  // journal refuses linked storage paths.
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "fleet-console-")));
   const work = join(directory, "work");
   mkdirSync(work);
   const app = Fastify();
@@ -161,8 +163,11 @@ async function fixture(enable = true, journalBatchMs = 2) {
       ...(lead ? { runRole: "lead" as const } : {}),
     });
     if (!result.ok) throw new Error(result.error);
-    await vi.waitFor(() =>
-      expect(store.getSession(result.session.id)?.state).toBe("idle"),
+    // A fresh agent starting takes longer than vi.waitFor's 1s while the rest
+    // of the suite runs in parallel.
+    await vi.waitFor(
+      () => expect(store.getSession(result.session.id)?.state).toBe("idle"),
+      { timeout: 10_000 },
     );
     return result.session.id;
   };

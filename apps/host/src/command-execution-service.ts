@@ -5,6 +5,7 @@ import {
   COMMAND_EXECUTION_CAPABILITY,
   COMMAND_PERMISSIONS_CAPABILITY,
   COMMAND_LIMITS,
+  POSIX_COMMAND_SHELL_CAPABILITY,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
   CommandDecisionSchema,
   CommandExecutionNodeMessageSchema,
@@ -110,6 +111,7 @@ export class CommandExecutionService {
     commandExecutions: boolean;
     commandPermissions: boolean;
     durableLeadDelivery: boolean;
+    posixCommandShell?: boolean;
   } {
     const link = this.service.nodeSocket(nodeId);
     if (!(link instanceof SealedNodeLink)) {
@@ -131,6 +133,10 @@ export class CommandExecutionService {
       commandExecutions: this.commandProtocol(nodeId),
       commandPermissions: this.capable(nodeId, COMMAND_PERMISSIONS_CAPABILITY),
       durableLeadDelivery: this.capable(nodeId, DURABLE_LEAD_DELIVERY_CAPABILITY),
+      // Only a Node that knows the field is told; older Nodes reject unknown keys.
+      ...(this.capable(nodeId, POSIX_COMMAND_SHELL_CAPABILITY)
+        ? { posixCommandShell: true }
+        : {}),
     };
   }
 
@@ -1651,33 +1657,46 @@ export class CommandExecutionService {
     return true;
   }
 
+  /** The shell a Node runs commands in, as its readiness reports it. */
+  private targetShell(nodeId: string): RunCommand["shell"] {
+    return this.peers.get(nodeId)?.readiness?.shells[0] ?? "windows-powershell-5.1";
+  }
+
+  private discoveryEntry(
+    leadId: string,
+    nodeId: string,
+    target: RunCommand["target"],
+  ): { eligible: boolean; reason: string; shell: RunCommand["shell"] } {
+    const shell = this.targetShell(nodeId);
+    let reason = this.capable(nodeId, COMMAND_PERMISSIONS_CAPABILITY)
+      ? ""
+      : "Once only; upgrade this Node for Host permission prompts and reusable scopes.";
+    try {
+      this.assertReadiness(nodeId, shell);
+      this.target(leadId, {
+        target,
+        command: "discovery",
+        shell,
+        reason: "discovery",
+        requestKey: "discovery",
+        timeoutMs: 1_000,
+      });
+    } catch (error) {
+      reason = error instanceof Error ? error.message : "unavailable";
+      return { eligible: false, reason, shell };
+    }
+    return { eligible: this.durableLead(leadId), reason, shell };
+  }
+
   discovery(leadId: string): string {
     const targets: unknown[] = [];
     for (const placement of this.store.listPlacements()) {
-      let eligible = true;
-      let reason = this.capable(placement.nodeId, COMMAND_PERMISSIONS_CAPABILITY)
-        ? ""
-        : "Once only; upgrade this Node for Host permission prompts and reusable scopes.";
-      try {
-        this.assertReadiness(placement.nodeId, "windows-powershell-5.1");
-        this.target(leadId, {
-          target: { placementId: placement.id },
-          command: "discovery",
-          shell: "windows-powershell-5.1",
-          reason: "discovery",
-          requestKey: "discovery",
-          timeoutMs: 1_000,
-        });
-      } catch (error) {
-        eligible = false;
-        reason = error instanceof Error ? error.message : "unavailable";
-      }
+      const target = { placementId: placement.id };
       targets.push({
-        target: { placementId: placement.id },
+        target,
         nodeId: placement.nodeId,
         cwd: placement.localPath,
-        eligible: eligible && this.durableLead(leadId),
-        reason,
+        ...this.discoveryEntry(leadId, placement.nodeId, target),
         readiness: this.peers.get(placement.nodeId)?.readiness,
       });
     }
@@ -1686,31 +1705,13 @@ export class CommandExecutionService {
       ...this.store.listDerivedWorkspaces(),
     ]) {
       if (this.store.getRun(tree.runId)?.leadSessionId !== leadId) continue;
-      let eligible = true;
-      let reason = this.capable(tree.nodeId, COMMAND_PERMISSIONS_CAPABILITY)
-        ? ""
-        : "Once only; upgrade this Node for Host permission prompts and reusable scopes.";
-      try {
-        this.assertReadiness(tree.nodeId, "windows-powershell-5.1");
-        this.target(leadId, {
-          target: { worktreeId: tree.id, generation: tree.generation },
-          command: "discovery",
-          shell: "windows-powershell-5.1",
-          reason: "discovery",
-          requestKey: "discovery",
-          timeoutMs: 1_000,
-        });
-      } catch (error) {
-        eligible = false;
-        reason = error instanceof Error ? error.message : "unavailable";
-      }
+      const target = { worktreeId: tree.id, generation: tree.generation };
       targets.push({
-        target: { worktreeId: tree.id, generation: tree.generation },
+        target,
         taskId: tree.runId,
         nodeId: tree.nodeId,
         cwd: tree.path,
-        eligible: eligible && this.durableLead(leadId),
-        reason,
+        ...this.discoveryEntry(leadId, tree.nodeId, target),
       });
     }
     return JSON.stringify({

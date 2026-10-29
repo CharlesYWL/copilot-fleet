@@ -17,6 +17,7 @@ import {
 } from "@fluentui/react-components";
 import {
   COMMAND_LIMITS,
+  COMMAND_SHELL_LABELS,
   CommandExecutionPageSchema,
   CommandExecutionSchema,
   commandApprovalExpiresAt,
@@ -548,7 +549,7 @@ export function CommandExecutionsDialog({
                         )}
                       </dd>
                       <dt>Shell</dt>
-                      <dd>{selected.shell}</dd>
+                      <dd>{COMMAND_SHELL_LABELS[selected.shell]}</dd>
                       {selected.descriptor && (
                         <>
                           <dt>Shell executable</dt>
