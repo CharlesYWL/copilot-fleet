@@ -91,6 +91,9 @@ async function fixture(agencyMode: boolean, agentParams?: AgentParams) {
     resolvePermission: vi.fn(),
     denyPendingPermissions: vi.fn(),
     resync: vi.fn(),
+    advanceSequence: vi.fn((atLeast: number) => {
+      sequence = Math.max(sequence, atLeast);
+    }),
     busy: false,
   };
   const next = { ...old, stop: vi.fn(async () => {}) };
@@ -302,8 +305,10 @@ describe("replacement launch preflight", () => {
         ),
       ).toBe(false);
       expect(JSON.stringify(f.events)).not.toContain("MCP tools restored");
+      const lastSequence = Math.max(...f.events.map((event) => event.sequence));
       f.send("state", { state: "idle", activity: "Original agent is still attached" });
       expect(f.events.at(-1)?.payload.activity).toBe("Original agent is still attached");
+      expect(f.events.at(-1)!.sequence).toBeGreaterThan(lastSequence);
       expect(
         await f.router.route({
           type: "prompt",
@@ -316,6 +321,34 @@ describe("replacement launch preflight", () => {
       expect(f.old.prompt).toHaveBeenCalledOnce();
     },
   );
+
+  it("does not claim to retain a session after an earlier replacement already stopped it", async () => {
+    const f = await fixture(false);
+    f.start.mockImplementationOnce(async (_id, _cwd, sink) => {
+      sink({
+        eventId: "replacement-normalized",
+        sessionId: "s1",
+        sequence: f.slot.generation + 10,
+        type: "config",
+        payload: { options: [{ id: "model", name: "Model", currentValue: "bad model" }] },
+        createdAt: new Date().toISOString(),
+      });
+      throw new Error("Backend failed after reporting its profile");
+    });
+    const operation = f.trigger("mcp");
+    await vi.runAllTimersAsync();
+    await operation;
+    expect(f.old.stop).toHaveBeenCalledExactlyOnceWith(false);
+    expect(f.router.activeSessionIds).toEqual([]);
+    expect(JSON.stringify(f.events)).not.toContain("Existing session retained");
+    expect(f.events.at(-1)).toMatchObject({
+      type: "state",
+      payload: {
+        state: "failed",
+        activity: expect.stringContaining("MCP recovery exhausted"),
+      },
+    });
+  });
 
   it.each(
     routes.flatMap((route) =>

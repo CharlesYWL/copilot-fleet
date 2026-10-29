@@ -1590,6 +1590,7 @@ export class CommandRouter {
               slot.agent?.busy ? "running" : "idle",
               error.message,
             );
+            slot.agent?.advanceSequence?.(slot.sequenceOffset);
             return;
           }
           ++slot.generation;
@@ -1645,9 +1646,11 @@ export class CommandRouter {
       if ((launch.agentParams?.kind ?? "copilot") === "copilot")
         validateLaunchConfig(config);
     } catch (error) {
+      if (!slot.agent) throw error;
       const message = `Cannot replace Copilot: ${
         error instanceof Error ? error.message : String(error)
       } Existing session retained.`;
+      slot.agent.advanceSequence?.(slot.sequenceOffset + 1);
       this.emit({
         eventId: `replacement-config-${sessionId}-${++slot.sequenceOffset}`,
         sessionId,
