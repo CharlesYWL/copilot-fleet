@@ -66,6 +66,9 @@ type Waiter = {
 export const LIVE_EVENT_WINDOW_BATCHES = 128;
 export const LIVE_EVENT_WINDOW_BYTES = 8 * 1024 * 1024;
 const LIVE_EVENT_BATCH_BYTES = 512 * 1024;
+/** Unsent bytes one live viewer may hold before it is dropped as stalled. */
+const VIEWER_BACKLOG_LIMIT_BYTES = 1024 * 1024;
+const VIEWER_HEARTBEAT_MS = 15_000;
 const UNAVAILABLE_SESSION_DETAIL =
   "The Host no longer has this session. Local history is retained for inspection and was not replayed; session control is unavailable.";
 type LiveControl = { operation: ConsoleOperation; signature: string };
@@ -980,8 +983,12 @@ export class NodeSessionConsole {
       "cache-control": "no-store",
       connection: "keep-alive",
     });
-    response.write(": connected\n\n");
-    const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
+    // A socket error is this viewer's problem alone; unheard, it would end the Node.
+    response.on("error", () => response.destroy());
+    this.writeToViewer(response, ": connected\n\n");
+    const heartbeat = setInterval(() => {
+      if (!this.writeToViewer(response, ": heartbeat\n\n")) clearInterval(heartbeat);
+    }, VIEWER_HEARTBEAT_MS);
     heartbeat.unref();
     response.on("close", () => {
       clearInterval(heartbeat);
@@ -1016,13 +1023,31 @@ export class NodeSessionConsole {
   }
 
   private emit(id: string, message: unknown): void {
-    for (const response of this.viewers.get(id) ?? []) {
-      if (response.writableLength > 1024 * 1024) {
-        response.end();
-        continue;
-      }
-      response.write(`data: ${JSON.stringify(message)}\n\n`);
+    const frame = `data: ${JSON.stringify(message)}\n\n`;
+    for (const response of this.viewers.get(id) ?? [])
+      this.writeToViewer(response, frame);
+  }
+
+  /**
+   * The only way anything is written to a live viewer; false once it is gone.
+   *
+   * A viewer that stops reading — a background tab, a sleeping laptop — keeps
+   * whatever is sent to it queued here, and a busy turn sends a whole session
+   * per event. Past the limit the connection is destroyed rather than ended:
+   * `end()` waits to flush what that viewer is not reading, so `close` never
+   * came, and the heartbeat's next write after `end()` raised an error nobody
+   * listened for and took the whole Node down. Destroying fires `close` now,
+   * which stops the heartbeat and unsubscribes, and the page's EventSource
+   * reconnects and reloads the session.
+   */
+  private writeToViewer(response: ServerResponse, frame: string): boolean {
+    if (response.destroyed || response.writableEnded) return false;
+    if (response.writableLength > VIEWER_BACKLOG_LIMIT_BYTES) {
+      response.destroy();
+      return false;
     }
+    response.write(frame);
+    return true;
   }
   private connection(): void {
     for (const id of this.viewers.keys()) {

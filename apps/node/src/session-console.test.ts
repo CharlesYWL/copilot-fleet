@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
+import { IncomingMessage, ServerResponse } from "node:http";
+import { Socket } from "node:net";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SessionSchema, type NodeCommand } from "@fleet/protocol";
+import { SessionSchema, type BrowserMessage, type NodeCommand } from "@fleet/protocol";
 import { NodeSessionConsole } from "./session-console.js";
 import { SessionJournal } from "./session-journal.js";
 import type { CommandRouter } from "./router.js";
@@ -159,5 +161,70 @@ describe("Node session console Host work admission", () => {
     await expect(sessionConsole.hostCommand(other, 0)).resolves.toMatchObject({
       ok: true,
     });
+  });
+});
+
+describe("Node session console live viewers", () => {
+  /**
+   * A response with no connected socket keeps everything written to it
+   * buffered, the same as a browser tab that stopped reading. Without a socket
+   * `end()` cannot finish either, so `close` never fires on its own.
+   */
+  const stalledViewer = () => new ServerResponse(new IncomingMessage(new Socket()));
+  const errorsOf = (response: ServerResponse) => {
+    const errors: Error[] = [];
+    response.on("error", (error) => errors.push(error));
+    return errors;
+  };
+  /** A console with one stalled viewer on the session, fed the way the Host feeds it. */
+  const watchedConsole = async () => {
+    const { sessionConsole, internals, journal } = createConsole();
+    const viewer = stalledViewer();
+    const errors = errorsOf(viewer);
+    // Opened from local history: the Host round trip in stream() is not what
+    // these tests are about, and nothing here would answer it.
+    internals.status = "offline";
+    await sessionConsole.stream(sessionId, viewer);
+    // Host updates are forwarded to viewers only while online.
+    internals.status = "online";
+    const session = journal.get(sessionId)!.session;
+    // A busy turn republishes the whole session with every event it streams.
+    const update: BrowserMessage = {
+      type: "session",
+      session: { ...session, lastText: "x".repeat(64 * 1024) },
+    };
+    return { sessionConsole, viewer, errors, update };
+  };
+  const hasViewers = (sessionConsole: NodeSessionConsole) =>
+    (sessionConsole as unknown as { viewers: Map<string, unknown> }).viewers.has(
+      sessionId,
+    );
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("drops a viewer that stopped reading, and its heartbeat never writes to it again", async () => {
+    vi.useFakeTimers();
+    const { sessionConsole, viewer, errors, update } = await watchedConsole();
+    while (viewer.writableLength <= 1024 * 1024) sessionConsole.update(update);
+    expect(viewer.destroyed).toBe(false);
+    sessionConsole.update(update);
+    expect(viewer.destroyed).toBe(true);
+
+    // The heartbeat used to write after end() here and take the whole Node down.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(errors.map((error) => error.message)).toEqual([]);
+    expect(hasViewers(sessionConsole)).toBe(false);
+  });
+
+  it("does not write to a viewer whose response has already finished", async () => {
+    vi.useFakeTimers();
+    const { sessionConsole, viewer, errors, update } = await watchedConsole();
+    // Something else ended the response while the viewer was still registered.
+    viewer.end();
+    sessionConsole.update(update);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(errors.map((error) => error.message)).toEqual([]);
   });
 });
