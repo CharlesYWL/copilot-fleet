@@ -59,6 +59,12 @@ const ACK_TIMEOUT_MS = 5_000;
 const CATCH_UP_LIMIT_MS = 30_000;
 /** Matches the Node's ACP startup budget; a failed start stops claiming. */
 const CLAIM_WINDOW_MS = 120_000;
+/**
+ * After the process table could not be read, how long before asking again.
+ * Each read starts a process (PowerShell on Windows), so a pass every few
+ * seconds must not start one every time while the answer stays unavailable.
+ */
+const ANCESTRY_RETRY_MS = 60_000;
 
 export type NativeEvent = {
   id: string;
@@ -463,7 +469,101 @@ export async function processStartTimes(
   return times;
 }
 
+/** Parent of each process, and when it started in epoch ms where known. */
+type ProcessTableEntry = { parent: number; startedAt?: number };
+
+/** One snapshot of every process this account can see. Empty if it cannot be read. */
+async function processTable(): Promise<Map<number, ProcessTableEntry>> {
+  const table = new Map<number, ProcessTableEntry>();
+  const record = (pid: number, parent: number, startedAt: number) =>
+    table.set(pid, Number.isFinite(startedAt) ? { parent, startedAt } : { parent });
+  try {
+    if (process.platform === "win32") {
+      const { stdout } = await execFileAsync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId) $(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') })" }`,
+        ],
+        { timeout: 15_000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+      );
+      for (const line of stdout.split(/\r?\n/)) {
+        const [pid, parent, at] = line.trim().split(" ");
+        if (pid && parent) record(Number(pid), Number(parent), Date.parse(at ?? ""));
+      }
+    } else {
+      const { stdout } = await execFileAsync("ps", ["-A", "-o", "pid=,ppid=,lstart="], {
+        timeout: 15_000,
+        maxBuffer: 16 * 1024 * 1024,
+        // `lstart` follows the locale; C keeps it in a form Date.parse reads.
+        env: { ...process.env, LC_ALL: "C" },
+      });
+      for (const line of stdout.split("\n")) {
+        const match = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+        if (match) record(Number(match[1]), Number(match[2]), Date.parse(match[3]!));
+      }
+    }
+  } catch {
+    // Unknown ancestry: the caller treats every holder as someone else's.
+  }
+  return table;
+}
+
+/**
+ * Whether `pid` was started by `root`, directly or through any number of
+ * intermediate processes. A link whose parent started after it is a reused
+ * pid, not a parent, so it ends the walk.
+ */
+function descendsFrom(
+  table: ReadonlyMap<number, ProcessTableEntry>,
+  pid: number,
+  root: number,
+): boolean {
+  const visited = new Set<number>();
+  let current = pid;
+  let entry = table.get(current);
+  while (entry && !visited.has(current)) {
+    visited.add(current);
+    const parent = table.get(entry.parent);
+    if (
+      entry.startedAt !== undefined &&
+      parent?.startedAt !== undefined &&
+      parent.startedAt > entry.startedAt
+    )
+      return false;
+    if (entry.parent === root) return true;
+    current = entry.parent;
+    entry = parent;
+  }
+  return false;
+}
+
+/**
+ * Which of `pids` this Node process started, directly or through a shell;
+ * `undefined` when the process table could not be read at all. A pid that is
+ * not running is nobody's descendant.
+ *
+ * That is what makes a Copilot process Fleet's own. When its lock appears is
+ * not: a resumed Copilot takes its lock only at its first prompt, long after
+ * Fleet stopped expecting one, while a terminal's lock can appear at any time.
+ * A terminal descends from its own shell, never from this Node.
+ */
+export async function processDescendants(
+  pids: readonly number[],
+  root: number = process.pid,
+): Promise<Set<number> | undefined> {
+  if (pids.length === 0) return new Set();
+  const table = await processTable();
+  if (table.size === 0) return undefined;
+  return new Set(pids.filter((pid) => descendsFrom(table, pid, root)));
+}
+
 type LockFile = { pid: number; writtenAt: number };
+
+/** One lock as written: a reused pid writes a new lock, so it is judged afresh. */
+const lockKey = (lock: LockFile) => `${lock.pid}:${lock.writtenAt}`;
 
 async function sessionLocks(directory: string): Promise<LockFile[]> {
   const names = await readdir(directory).catch(() => [] as string[]);
@@ -589,6 +689,8 @@ export type NativeSessionFollowerOptions = {
   send: (message: ImportMessage) => boolean;
   alive?: (pid: number) => boolean;
   startTimes?: (pids: readonly number[]) => Promise<Map<number, number>>;
+  /** Which of these pids this Node started; see {@link processDescendants}. */
+  descendants?: (pids: readonly number[]) => Promise<Set<number> | undefined>;
   maxBytesPerPass?: number;
   ackTimeoutMs?: number;
   now?: () => number;
@@ -641,6 +743,10 @@ export class NativeSessionFollower {
   private readonly followed = new Map<string, FollowState>();
   private readonly copilotHome: string;
   private readonly verdicts = new Map<string, boolean>();
+  /** Whether this Node started a lock's holder, by lock; the answer cannot change. */
+  private readonly ancestry = new Map<string, boolean>();
+  /** No ancestry lookups before this time; set when the process table was unreadable. */
+  private ancestryRetryAt = 0;
   private readonly waiters = new Map<string, Waiter[]>();
   private readonly hostSequences = new Map<string, number>();
   private running: Promise<FollowerPassStats> | undefined;
@@ -682,7 +788,8 @@ export class NativeSessionFollower {
    * Everything already in the log is Fleet's or predates it, so a new record
    * starts at the end. Lock holders present now are this Fleet process — the
    * Host refuses to open a session another process holds — so they are
-   * remembered as Fleet's own.
+   * remembered as Fleet's own. A resumed process may not hold its lock yet;
+   * `externalHolders` recognises it by ancestry once it does.
    */
   async track(fleetSessionId: string, nativeSessionId: string): Promise<void> {
     if (!isSafeNativeSessionId(nativeSessionId)) return;
@@ -848,7 +955,7 @@ export class NativeSessionFollower {
     // or a previous process still exiting; either way the resume must wait.
     state.claimingUntil = 0;
     state.fleetPids.clear();
-    return answer(await this.externalHolders(state));
+    return answer(await this.externalHolders(state, { ancestry: false }));
   }
 
   private freshState(nativeSessionId: string, cursor: NativeCursor): FollowState {
@@ -1021,15 +1128,27 @@ export class NativeSessionFollower {
     stats.imported += events.length;
   }
 
-  /** Live lock holders that are not Fleet's process and did write their lock. */
-  private async externalHolders(state: FollowState): Promise<number[]> {
+  /**
+   * Live lock holders that are not Fleet's process and did write their lock.
+   *
+   * A holder is Fleet's if it was here when `track` ran, appeared during a
+   * launch, or descends from this Node process. A resumed Copilot locks the
+   * session only at its first prompt, after the first two have passed, so
+   * only ancestry recognises it. A resume asks with `ancestry` off: it starts
+   * a new process, and any holder still alive — even an old one of Fleet's
+   * that is still exiting — would be a second writer to the conversation.
+   */
+  private async externalHolders(
+    state: FollowState,
+    { ancestry = true }: { ancestry?: boolean } = {},
+  ): Promise<number[]> {
     const alive = this.options.alive ?? processAlive;
     // A Fleet process that has exited no longer vouches for its pid.
     for (const pid of state.fleetPids) if (!alive(pid)) state.fleetPids.delete(pid);
     const directory = nativeSessionDirectory(this.copilotHome, state.nativeSessionId);
     const known = new Set(state.attachment?.pids ?? []);
     const claiming = state.claimingUntil > (this.options.now ?? Date.now)();
-    const candidates = (await sessionLocks(directory)).filter((lock) => {
+    let candidates = (await sessionLocks(directory)).filter((lock) => {
       if (state.fleetPids.has(lock.pid) || !alive(lock.pid)) return false;
       if (claiming && !known.has(lock.pid)) {
         state.fleetPids.add(lock.pid);
@@ -1037,9 +1156,25 @@ export class NativeSessionFollower {
       }
       return true;
     });
-    const unknown = candidates.filter(
-      (lock) => !this.verdicts.has(`${lock.pid}:${lock.writtenAt}`),
-    );
+    if (ancestry && candidates.length > 0) {
+      const unjudged = candidates.filter((lock) => !this.ancestry.has(lockKey(lock)));
+      const now = (this.options.now ?? Date.now)();
+      if (unjudged.length > 0 && now >= this.ancestryRetryAt) {
+        const owned = await (this.options.descendants ?? processDescendants)(
+          unjudged.map((lock) => lock.pid),
+        );
+        if (owned)
+          for (const lock of unjudged)
+            this.ancestry.set(lockKey(lock), owned.has(lock.pid));
+        else this.ancestryRetryAt = now + ANCESTRY_RETRY_MS;
+      }
+      candidates = candidates.filter((lock) => {
+        if (!this.ancestry.get(lockKey(lock))) return true;
+        state.fleetPids.add(lock.pid);
+        return false;
+      });
+    }
+    const unknown = candidates.filter((lock) => !this.verdicts.has(lockKey(lock)));
     if (unknown.length > 0) {
       const started = await (this.options.startTimes ?? processStartTimes)(
         unknown.map((lock) => lock.pid),
@@ -1048,13 +1183,13 @@ export class NativeSessionFollower {
         const at = started.get(lock.pid);
         // Two seconds of slack for clock granularity between the two sources.
         this.verdicts.set(
-          `${lock.pid}:${lock.writtenAt}`,
+          lockKey(lock),
           at !== undefined && at <= lock.writtenAt + 2_000,
         );
       }
     }
     return candidates
-      .filter((lock) => this.verdicts.get(`${lock.pid}:${lock.writtenAt}`))
+      .filter((lock) => this.verdicts.get(lockKey(lock)))
       .map((lock) => lock.pid)
       .sort((a, b) => a - b);
   }

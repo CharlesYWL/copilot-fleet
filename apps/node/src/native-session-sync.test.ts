@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { appendFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -7,6 +8,7 @@ import {
   MemoryFollowerStore,
   NativeSessionFollower,
   lineType,
+  processDescendants,
   readNativeEvents,
   translateNativeEvents,
   type ImportMessage,
@@ -149,6 +151,68 @@ describe("native session log reading", () => {
   });
 });
 
+describe("process ancestry", () => {
+  // Each lookup reads the real process table, which starts PowerShell on Windows.
+  const lookupBudget = 60_000;
+
+  it(
+    "knows a process this one started, through a shell, from one it did not",
+    async () => {
+      // The real process table, the way a Copilot launch looks on each platform:
+      // a shell between this process and the one that holds the lock.
+      const shell = spawn(
+        process.execPath,
+        [
+          "-e",
+          `const { spawn } = require("node:child_process");
+           const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+           console.log(child.pid);
+           setTimeout(() => {}, 60000);`,
+        ],
+        { stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
+      );
+      let grandchild: number | undefined;
+      try {
+        grandchild = await new Promise<number>((resolve, reject) => {
+          shell.stdout.once("data", (chunk: Buffer) =>
+            resolve(Number(String(chunk).trim())),
+          );
+          shell.once("error", reject);
+        });
+        const owned = await processDescendants([grandchild, shell.pid!, process.pid]);
+        expect(owned?.has(grandchild)).toBe(true);
+        expect(owned?.has(shell.pid!)).toBe(true);
+        // Nothing is its own descendant; the walk only goes upwards from a holder.
+        expect(owned?.has(process.pid)).toBe(false);
+        // Seen from another root, neither belongs to it.
+        const elsewhere = await processDescendants([grandchild], shell.pid! + 1_000_000);
+        expect(elsewhere?.has(grandchild)).toBe(false);
+      } finally {
+        // Killing the shell does not end its child on Windows.
+        if (grandchild) {
+          try {
+            process.kill(grandchild);
+          } catch {
+            // Already gone.
+          }
+        }
+        shell.kill();
+      }
+    },
+    lookupBudget,
+  );
+
+  it(
+    "counts a process that is not running as nobody's descendant",
+    async () => {
+      const owned = await processDescendants([2_147_483_000]);
+      expect(owned).toBeInstanceOf(Set);
+      expect(owned!.size).toBe(0);
+    },
+    lookupBudget,
+  );
+});
+
 describe("NativeSessionFollower", () => {
   let home: string;
   let directory: string;
@@ -159,6 +223,8 @@ describe("NativeSessionFollower", () => {
   const terminalPid = 424242;
   const fleetPid = 313131;
   let live: Set<number>;
+  /** Holders whose process tree leads back to this Node. None, unless a test says so. */
+  let nodeDescendants: Set<number>;
 
   const lock = (pid: number) =>
     writeFile(join(directory, `inuse.${pid}.lock`), String(pid));
@@ -187,6 +253,7 @@ describe("NativeSessionFollower", () => {
     sent = [];
     fleetTurn = false;
     live = new Set([fleetPid, terminalPid]);
+    nodeDescendants = new Set();
     follower = new NativeSessionFollower({
       copilotHome: home,
       store: new MemoryFollowerStore(),
@@ -199,6 +266,8 @@ describe("NativeSessionFollower", () => {
       alive: (pid) => live.has(pid),
       // Every holder started long before its lock was written.
       startTimes: async (pids) => new Map(pids.map((pid) => [pid, 0])),
+      descendants: async (pids) =>
+        new Set(pids.filter((pid) => nodeDescendants.has(pid))),
     });
   });
 
@@ -289,6 +358,7 @@ describe("NativeSessionFollower", () => {
       },
       alive: () => true,
       startTimes: async (pids) => new Map(pids.map((pid) => [pid, Date.now() + 60_000])),
+      descendants: async () => new Set(),
     });
     await follower.track(fleetId, nativeId);
     await lock(terminalPid);
@@ -313,6 +383,89 @@ describe("NativeSessionFollower", () => {
     await appendFile(path, line("hook.start", {}));
     await follower.poll();
     expect(sent.every((message) => !message.attachment)).toBe(true);
+  });
+
+  it("recognises Fleet's resumed process whose lock appears only at its first prompt", async () => {
+    // A resumed Copilot takes no lock until its first prompt, by which time
+    // `track` has run and the startup claim has closed. Its lock was read as a
+    // terminal's, and that mark then kept the session from being re-attached
+    // when the Node restarted.
+    const resumedFleetPid = 515151;
+    live.add(resumedFleetPid);
+    nodeDescendants.add(resumedFleetPid);
+    await follower.track(fleetId, nativeId);
+    await connect();
+    fleetTurn = true;
+    await lock(resumedFleetPid);
+    await appendFile(path, userTurn("prompt from fleet"));
+    await follower.poll();
+    fleetTurn = false;
+    await follower.poll();
+    expect(sent.every((message) => !message.attachment)).toBe(true);
+    expect(follower.attachment(fleetId)).toBeNull();
+  });
+
+  it("still reports a terminal that attaches after Fleet's process", async () => {
+    await follower.track(fleetId, nativeId);
+    await connect();
+    await lock(terminalPid);
+    await appendFile(path, userTurn("from terminal"));
+    await follower.poll();
+    expect(sent.at(-1)?.attachment).toMatchObject({ pids: [terminalPid] });
+  });
+
+  it("falls back to reporting the holder, and asks less often, when ancestry is unreadable", async () => {
+    let lookups = 0;
+    follower = new NativeSessionFollower({
+      copilotHome: home,
+      store: new MemoryFollowerStore(),
+      fleetTurnActive: () => false,
+      reserveSequences: () => undefined,
+      send: (message) => {
+        sent.push(message);
+        return true;
+      },
+      alive: (pid) => live.has(pid),
+      startTimes: async (pids) => new Map(pids.map((pid) => [pid, 0])),
+      descendants: async () => {
+        lookups += 1;
+        return undefined;
+      },
+    });
+    await follower.track(fleetId, nativeId);
+    await connect();
+    await lock(terminalPid);
+    await appendFile(path, userTurn("x"));
+    await follower.poll();
+    expect(sent.at(-1)?.attachment).toMatchObject({ pids: [terminalPid] });
+    ackAll();
+    for (let pass = 0; pass < 5; pass += 1) {
+      await appendFile(path, line("hook.start", {}));
+      await follower.poll();
+      ackAll();
+    }
+    expect(lookups).toBe(1);
+  });
+
+  it("does not let a remembered descendant vouch for a resume", async () => {
+    // A process this Node started may still be exiting when the next resume
+    // asks; two Copilot processes must not write one conversation either way.
+    nodeDescendants.add(fleetPid);
+    await follower.track(fleetId, nativeId);
+    await connect();
+    await lock(fleetPid);
+    // Outside the Fleet turn, so this pass judges the holder.
+    await appendFile(path, line("hook.start", {}));
+    await follower.poll();
+    expect(sent.every((message) => !message.attachment)).toBe(true);
+    const acknowledging = setInterval(ackAll, 1);
+    try {
+      await expect(follower.catchUp(fleetId)).resolves.toMatchObject({
+        externalPids: [fleetPid],
+      });
+    } finally {
+      clearInterval(acknowledging);
+    }
   });
 
   it("catches up and reports the Host's sequence before a resume", async () => {
