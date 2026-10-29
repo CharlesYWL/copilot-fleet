@@ -10,6 +10,12 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
+# Kept in step with RELAUNCH_EXIT_CODE in login-service-runner.mjs.
+$FleetRelaunchExitCode = 75
+# STATUS_CONTROL_C_EXIT: Ctrl+C or Ctrl+Break ended the runner before it could handle it.
+$FleetControlCExitCode = -1073741510
+$FleetRelaunchLimitPerHour = 5
+
 function Get-FleetFullPath([string]$Path) {
   if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match '[\x00\r\n"]' -or
       $Path -notmatch '^(?:[a-zA-Z]:[\\/]|\\\\[^\\/?]+\\[^\\/]+(?:\\|$))') {
@@ -288,6 +294,95 @@ function Write-FleetStartupError([string]$Message, [string]$LogPath) {
   }
 }
 
+function Test-FleetInstallerBusy {
+  # Windows Installer holds this mutex while an installation runs.
+  $mutex = $null
+  try { return [Threading.Mutex]::TryOpenExisting('Global\_MSIExecute', [ref]$mutex) }
+  catch [UnauthorizedAccessException] { return $true } # It exists; this account cannot open it.
+  finally { if ($mutex) { $mutex.Dispose() } }
+}
+
+function Wait-FleetInstaller($Config) {
+  # Restart Manager stops node.exe before an installer replaces it. Starting
+  # node.exe again before the installer finishes would lock it once more.
+  Start-Sleep -Milliseconds 30000
+  while ((Test-FleetInstallerBusy) -or ![IO.File]::Exists($Config.nodePath)) {
+    Start-Sleep -Milliseconds 5000
+  }
+}
+
+function Initialize-FleetLaunchJob {
+  if ('FleetLaunchJob' -as [type]) { return }
+  Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public static class FleetLaunchJob {
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool QueryInformationJobObject(IntPtr job, int kind, IntPtr info, int length, IntPtr returned);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool TerminateProcess(IntPtr process, uint code);
+  [DllImport("kernel32.dll")]
+  static extern bool CloseHandle(IntPtr handle);
+
+  // Every process in this action's job, including those in nested jobs.
+  static List<int> Members() {
+    for (int capacity = 64; ; capacity *= 2) {
+      int size = 8 + IntPtr.Size * capacity;
+      IntPtr buffer = Marshal.AllocHGlobal(size);
+      try {
+        if (QueryInformationJobObject(IntPtr.Zero, 3, buffer, size, IntPtr.Zero)) {
+          int listed = Marshal.ReadInt32(buffer, 4);
+          var ids = new List<int>(listed);
+          for (int i = 0; i < listed; i++)
+            ids.Add((int)Marshal.ReadIntPtr(buffer, 8 + i * IntPtr.Size).ToInt64());
+          return ids;
+        }
+        int error = Marshal.GetLastWin32Error();
+        if (error != 234) throw new Win32Exception(error); // ERROR_MORE_DATA
+      } finally {
+        Marshal.FreeHGlobal(buffer);
+      }
+    }
+  }
+
+  // Ends what earlier launches left in this action's job, as closing the job
+  // would, and reports whether only this process remains.
+  public static bool EndOthers(int self, int milliseconds) {
+    var deadline = DateTime.UtcNow.AddMilliseconds(milliseconds);
+    while (true) {
+      var others = Members();
+      others.Remove(self);
+      if (others.Count == 0) return true;
+      if (DateTime.UtcNow >= deadline) return false;
+      var opened = new List<KeyValuePair<int, IntPtr>>();
+      foreach (int id in others) {
+        IntPtr process = OpenProcess(0x0001, false, id); // PROCESS_TERMINATE
+        if (process != IntPtr.Zero) opened.Add(new KeyValuePair<int, IntPtr>(id, process));
+      }
+      // An open handle keeps its PID from being reused, so a PID still listed
+      // after opening it names the same job member.
+      var current = Members();
+      foreach (var entry in opened) {
+        if (current.Contains(entry.Key)) TerminateProcess(entry.Value, 1);
+        CloseHandle(entry.Value);
+      }
+      Thread.Sleep(100);
+    }
+  }
+}
+'@
+}
+
+function Clear-FleetLaunchJob {
+  return [FleetLaunchJob]::EndOthers($PID, 10000)
+}
+
 function Invoke-FleetRun($Config, [string]$ManifestPath, [string]$ResultPath) {
   $helper = Join-Path ([IO.Path]::GetDirectoryName($Config.controllerPath)) 'windows-login-job.ps1'
   if (![IO.File]::Exists($helper)) { throw 'The login-start job guard is missing; reinstall login startup.' }
@@ -325,17 +420,41 @@ function Invoke-FleetRun($Config, [string]$ManifestPath, [string]$ResultPath) {
   $diagnostic = [IO.FileStream]::new($Config.logPath + '.startup.log', [IO.FileMode]::Append,
     [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1, [IO.FileOptions]::WriteThrough)
   try {
-    if ($guard.HasExited) { throw 'The login-start job guard exited before Node could start.' }
-    $child = [Diagnostics.Process]::Start($info)
-    try {
-      $stderr = $child.StandardError.BaseStream.CopyToAsync($diagnostic)
-      $child.WaitForExit()
-      $null = $stderr.Wait(2000)
-      if ($child.ExitCode -ne 0) {
-        Write-FleetStartupError "Node runner exited with code $($child.ExitCode); startup stderr: $($Config.logPath).startup.log." $Config.logPath
+    if (!$ResultPath) { Initialize-FleetLaunchJob }
+    $relaunches = [Collections.Generic.List[DateTime]]::new()
+    while ($true) {
+      if ($guard.HasExited) { throw 'The login-start job guard exited before Node could start.' }
+      $child = [Diagnostics.Process]::Start($info)
+      try {
+        $stderr = $child.StandardError.BaseStream.CopyToAsync($diagnostic)
+        $child.WaitForExit()
+        $null = $stderr.Wait(2000)
+        $code = $child.ExitCode
+      } finally { $child.Dispose() }
+      if ($ResultPath -or $code -notin @($FleetRelaunchExitCode, $FleetControlCExitCode)) { break }
+      # Another program, such as an installer replacing node.exe, stopped the
+      # runner. Task Scheduler restarts only a task that fails to launch, so
+      # this action relaunches it, a bounded number of times, once nothing
+      # from the stopped launch remains.
+      $kind = $Config.kind
+      $now = Get-FleetNow
+      $recent = @($relaunches | Where-Object { $_ -gt $now.AddHours(-1) })
+      if ($recent.Count -ge $FleetRelaunchLimitPerHour) {
+        Write-FleetStartupError "[login-start] Other programs stopped $kind $($recent.Count + 1) times within an hour; not relaunching it. Start it with: npm run service -- $kind start" $Config.logPath
+        return $code
       }
-      return $child.ExitCode
-    } finally { $child.Dispose() }
+      if (!(Clear-FleetLaunchJob)) {
+        Write-FleetStartupError "[login-start] Processes from the stopped $kind did not end; not relaunching it." $Config.logPath
+        return $code
+      }
+      $relaunches.Add($now)
+      Write-FleetStartupError "[login-start] Another program stopped $kind (exit $code); relaunching it once installers finish." $Config.logPath
+      Wait-FleetInstaller $Config
+    }
+    if ($code -ne 0) {
+      Write-FleetStartupError "Node runner exited with code $code; startup stderr: $($Config.logPath).startup.log." $Config.logPath
+    }
+    return $code
   } finally {
     $diagnostic.Dispose()
     # Do not stop the guard here: closing the action process kills its entire job.
