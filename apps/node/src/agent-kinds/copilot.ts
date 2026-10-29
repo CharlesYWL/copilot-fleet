@@ -22,7 +22,7 @@ import type {
 
 export const MIN_COPILOT_ACP_AUTH_VERSION = "1.0.69";
 
-function validateLaunchConfig(config: readonly StartupConfig[]): void {
+export function validateLaunchConfig(config: readonly StartupConfig[]): void {
   for (const { id, value } of config) {
     if (value === "") continue;
     // Windows shims use cmd.exe; CRT argument quoting cannot make shell syntax safe.

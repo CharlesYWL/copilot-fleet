@@ -333,8 +333,11 @@ model IDs must start with a letter or digit and contain only letters, digits,
 `.`, `_`, `:`, `/`, `+`, or `-`; effort must be `none`, `minimal`, `low`, `medium`,
 `high`, `xhigh`, or `max`. Empty selections still mean no preference. IDs are not
 restricted to the current catalog, and provider prefixes and version punctuation
-are preserved exactly. Invalid values fail startup without launching a fallback;
-valid values rejected by the CLI also remain explicit startup errors. Live
+are preserved exactly. Invalid values fail startup without launching a fallback.
+Context-window restarts and MCP recovery validate the saved replacement profile
+before stopping the existing agent. If it is invalid, Fleet reports the refusal
+and retains the live session; no replacement process or metadata probe starts.
+Valid values rejected by the CLI still remain explicit startup errors. Live
 model-picker changes still use ACP and can reset the context tier.
 
 A small **context ring beside Send** opens on hover, focus, or click. Its popover
