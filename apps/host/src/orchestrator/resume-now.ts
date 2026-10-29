@@ -412,9 +412,13 @@ export class WorkerResumeService {
     if (
       this.store.prMaintenance
         .list({ taskId: run.id, retainedOnly: true })
-        .records.some((record) => record.manualControl && !record.manualControl.endedAt)
+        .records.some(
+          (record) =>
+            record.workerSessionId === session.id &&
+            this.store.prMaintenance.hasPendingManualExecution(session.id),
+        )
     )
-      return "A person has manual control of this task's PR-maintenance worker.";
+      return "A person's direct turn on this worker is still settling.";
     const checkoutKey =
       step.executionBinding?.checkoutKey ?? executionKey(run, placementId);
     const reference = this.store.prMaintenance.referenceForStep(step.id, step.attempts);
@@ -430,7 +434,7 @@ export class WorkerResumeService {
         ...(reference ?? {}),
       });
       if (!maintenance.allowed)
-        return `PR maintenance holds this worker: ${maintenance.reason}.`;
+        return `Waiting on PR maintenance: ${maintenance.reason}.`;
     }
     const sessions = this.store.listSessions();
     const localPath = step.executionBinding?.cwd ?? placement.localPath;

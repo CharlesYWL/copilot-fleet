@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Button,
+  Checkbox,
   Dialog,
   DialogActions,
   DialogBody,
@@ -371,8 +372,6 @@ export function PrMaintenancePanel({
       ).size
     : 0;
   void nowMs;
-  const changed = (record: PrMaintenanceRegistration) =>
-    !records.some((entry) => entry.id === record.id && entry.version === record.version);
   let invalidUrl = false;
   if (prUrl.trim()) {
     try {
@@ -384,7 +383,6 @@ export function PrMaintenancePanel({
 
   const controls = (record: PrMaintenanceRegistration) => {
     if (record.ownershipReleasedAt) return null;
-    const outstanding = hasOutstandingWork(record);
     const recordStatus = maintenanceStatusOf(record, view);
     const active = record.lifecycle === "active";
     const canAct = !busy && Boolean(view?.canAuthorize);
@@ -429,11 +427,13 @@ export function PrMaintenancePanel({
           <Button
             disabled={!canAct}
             onClick={() =>
-              void execute(() =>
-                actOnTaskMaintenance(run.id, record, {
-                  action: "pause",
-                  reason: "Paused by the operator",
-                }),
+              void execute(
+                () =>
+                  actOnTaskMaintenance(run.id, record, {
+                    action: "pause",
+                    reason: "Paused by the operator",
+                  }),
+                "Automatic maintenance paused. Queued maintenance work was cancelled without effects; direct work on the worker is unaffected.",
               )
             }
           >
@@ -442,7 +442,7 @@ export function PrMaintenancePanel({
         ) : null}
         <Button
           {...restoreFocusTarget}
-          disabled={!canAct || outstanding}
+          disabled={!canAct}
           onClick={() => {
             setError("");
             setRelease(record);
@@ -452,6 +452,40 @@ export function PrMaintenancePanel({
           Release maintenance
         </Button>
       </div>
+    );
+  };
+
+  /** The grant's optional permissions, editable in place. */
+  const permissions = (record: PrMaintenanceRegistration) => {
+    const scope = record.authorization.scope;
+    if (!scope.publicationAuthorized || record.lifecycle !== "active") return null;
+    const canEdit = !busy && Boolean(view?.canAuthorize);
+    const toggle = (key: "replies" | "resolveThreads" | "retryChecks", label: string) => (
+      <Checkbox
+        label={label}
+        checked={scope[key]}
+        disabled={!canEdit}
+        onChange={(_, data) =>
+          void execute(
+            () =>
+              actOnTaskMaintenance(run.id, record, {
+                action: "scope",
+                scope: { [key]: Boolean(data.checked) },
+              }),
+            "Permissions updated. They apply to the next maintenance batch.",
+          )
+        }
+      />
+    );
+    return (
+      <fieldset aria-label="Maintenance permissions" className={styles.actions}>
+        <legend className={styles.muted}>
+          Maintain this PR: code repairs and normal pushes, plus
+        </legend>
+        {toggle("replies", "Reply to review threads")}
+        {toggle("resolveThreads", "Resolve addressed threads")}
+        {toggle("retryChecks", "Retry failed CI checks once")}
+      </fieldset>
     );
   };
 
@@ -590,7 +624,8 @@ export function PrMaintenancePanel({
         ) : null}
         <p className={styles.muted}>
           Routine fixes on the retained worker. Ready is not merged; maintenance never
-          merges or force-pushes.
+          merges. It force-pushes only to finish a conflict rebase, leased on the exact PR
+          head.
         </p>
         {view?.unsupportedReason ? <p role="status">{view.unsupportedReason}</p> : null}
         {view && !view.canAuthorize ? (
@@ -611,6 +646,7 @@ export function PrMaintenancePanel({
               </p>
             ) : null}
             {controls(current)}
+            {permissions(current)}
             {current.authorization.scope.publicationAuthorized &&
             current.lifecycle === "active" &&
             !current.hold ? (
@@ -685,15 +721,15 @@ export function PrMaintenancePanel({
             </dl>
             {current.manualControl && !current.manualControl.endedAt ? (
               <p role="status">
-                Manual control: a person is driving the retained worker. Choose one-turn
-                handback in the prompt composer to resume automatically after that turn,
-                or Resume maintenance when done.
+                A direct turn is running on the retained worker. Maintenance never
+                interrupts it; queued maintenance work yielded to it, and maintenance
+                continues on its own schedule afterwards.
               </p>
             ) : null}
             {hasOutstandingWork(current) ? (
               <p>
-                Work or effects are still settling. Release waits until they are
-                reconciled; nothing is replayed.
+                Work or effects are still settling; nothing is replayed. Release still
+                works at any time and keeps the history.
               </p>
             ) : null}
             {details(current)}
@@ -879,22 +915,19 @@ export function PrMaintenancePanel({
                   {error} Close this dialog and refresh before authorizing again.
                 </p>
               ) : null}
-              {release && changed(release) ? (
-                <p role="alert">
-                  This job changed. Close and review its current state before releasing.
-                </p>
-              ) : null}
               {release ? (
                 <p>
                   <PrLink record={release} />
                 </p>
               ) : null}
               <p>
-                Only settled work can be released. Later cleanup can remove continuity;
-                resuming requires a new authorized proposal. This does not approve a
-                design change or mark a defect fixed.
+                Release always works and keeps the full history. Fleet stops maintaining
+                this PR, cancels queued maintenance work without effects, withdraws any
+                pending decision and asks a running maintenance turn to stop. Maintaining
+                it again needs a new authorization. This does not approve a design change
+                or mark a defect fixed.
               </p>
-              <Field label="Release reason and decision disposition">
+              <Field label="Release reason">
                 <Textarea
                   value={releaseReason}
                   rows={3}
@@ -909,11 +942,7 @@ export function PrMaintenancePanel({
               </Button>
               <Button
                 disabled={
-                  busy ||
-                  !view?.canAuthorize ||
-                  !releaseReason.trim() ||
-                  !release ||
-                  changed(release)
+                  busy || !view?.canAuthorize || !releaseReason.trim() || !release
                 }
                 onClick={() =>
                   release &&
@@ -921,12 +950,6 @@ export function PrMaintenancePanel({
                     actOnTaskMaintenance(run.id, release, {
                       action: "release",
                       reason: releaseReason.trim(),
-                      ...(release.decision
-                        ? {
-                            decisionId: release.decision.id,
-                            decisionVersion: release.decision.version,
-                          }
-                        : {}),
                     }),
                   )
                 }

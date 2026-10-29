@@ -156,15 +156,20 @@ describe("PR maintenance state machine scenarios", () => {
       recordId,
       expectedVersion: get(recordId).version,
       checkpoint: {
-        kind: "prepare_batch",
-        batch: {
-          id: batchId,
-          kind: "repair",
-          sources: [source],
-          headSha,
-          prompt: `Add the missing null check (${batchId}); verify and push normally.`,
-          scope: "Routine reviewer fix",
+        kind: "prepare_work_order",
+        plan: {
+          batchId,
+          summary: `Routine reviewer fix (${batchId})`,
+          conflictResolution: false,
           reservedMutations: 2,
+          findings: [
+            {
+              sourceId: source.id,
+              revision: source.revision,
+              task: "repair",
+              instructions: "Add the missing null check; verify and push normally.",
+            },
+          ],
         },
       },
     });
@@ -178,26 +183,62 @@ describe("PR maintenance state machine scenarios", () => {
     return get(recordId);
   };
 
-  /** The retained worker finishes its turn and the step settles. */
+  /** The worker's final message: one tagged prm.work-report/1. */
+  const workReport = (batchId: string, progress: boolean) => {
+    const published = "c".repeat(40);
+    return `Done.\n<prm-work-report>\n${JSON.stringify({
+      schema: "prm.work-report/1",
+      batchId,
+      summary: progress ? "Fixed and pushed." : "Still failing.",
+      mutationAttempts: progress ? 1 : 0,
+      findings: [
+        {
+          sourceId: source.id,
+          revision: source.revision,
+          outcome: progress ? "addressed" : "failed",
+          stage: progress ? "published" : "inspected",
+          ...(progress ? { verifiedHeadSha: published, publishedCommit: published } : {}),
+          evidence: progress ? ["tests passed"] : ["still failing"],
+          ...(progress ? {} : { nextAction: "Try again" }),
+        },
+      ],
+      effects: progress ? [{ kind: "push", state: "known", commit: published }] : [],
+    })}\n</prm-work-report>`;
+  };
+
+  /**
+   * The retained worker finishes its turn with a work report and the step
+   * settles. The Host settles the batch from that report itself; the lead
+   * relays nothing.
+   */
   const finishWorker = (
     t: { run: { id: string }; worker: { id: string }; step: { id: string } },
     recordId: string,
     progress = true,
   ) => {
     world.store.updateRunStep(t.step.id, { state: "running" });
+    const batch = get(recordId).batches.at(-1)!;
     const sequence = world.store.maxEventSequence(t.worker.id) + 1;
     world.store.appendEvent({
-      eventId: `done-${sequence}`,
+      eventId: `text-${sequence}`,
       sessionId: t.worker.id,
       sequence,
+      type: "agent_text",
+      payload: { text: workReport(batch.id, progress) },
+      createdAt: new Date().toISOString(),
+    });
+    world.store.appendEvent({
+      eventId: `done-${sequence + 1}`,
+      sessionId: t.worker.id,
+      sequence: sequence + 1,
       type: "turn_complete",
       payload: {},
       createdAt: new Date().toISOString(),
     });
     world.store.appendEvent({
-      eventId: `idle-${sequence + 1}`,
+      eventId: `idle-${sequence + 2}`,
       sessionId: t.worker.id,
-      sequence: sequence + 1,
+      sequence: sequence + 2,
       type: "state",
       payload: { state: "idle" },
       createdAt: new Date().toISOString(),
@@ -208,36 +249,9 @@ describe("PR maintenance state machine scenarios", () => {
       state: "succeeded",
       output: "Worker finished.",
     });
-    const batch = get(recordId).batches.at(-1)!;
-    const settled = tools.checkpointPrMaintenance({
-      recordId,
-      expectedVersion: get(recordId).version,
-      checkpoint: {
-        kind: "batch",
-        batchId: batch.id,
-        generation: batch.generation,
-        state: progress ? "succeeded" : "failed",
-        executionSettled: true,
-        published: progress,
-        usedMutations: progress ? 2 : 0,
-        effects: [],
-        findings: [
-          {
-            source,
-            outcome: progress ? "addressed" : "failed",
-            stage: progress ? "replied" : "inspected",
-            evidence: progress ? ["tests passed", "reply posted"] : ["still failing"],
-            responseRequired: progress,
-            responseIds: progress ? ["reply-1"] : [],
-            ...(progress ? { publishedCommit: "c".repeat(40) } : {}),
-            nextAction: progress ? undefined : "Try again",
-            progress,
-          },
-        ],
-        evidence: "Correlated terminal step and provider receipts.",
-      },
-    });
-    expect(settled.ok, settled.text).toBe(true);
+    const settled = get(recordId).batches.find((entry) => entry.id === batch.id)!;
+    expect(settled.settlementError, settled.settlementError).toBeUndefined();
+    expect(settled.state).toBe(progress ? "succeeded" : "failed");
     return get(recordId);
   };
 
@@ -762,5 +776,558 @@ describe("PR maintenance state machine scenarios", () => {
       continuation: { id: "3dfd8803-a92c-4233-aa86-83c981878e9b" },
     });
     expect(legacy.workRequests[0]?.state).toBe("cancelled");
+  });
+  /*
+   * Charles's simplified PR maintenance decisions, one regression per criterion.
+   */
+  describe("simplified maintenance decisions", () => {
+    const published = "c".repeat(40);
+    const reportText = (body: Record<string, unknown>) =>
+      `Done.\n<prm-work-report>\n${JSON.stringify({
+        schema: "prm.work-report/1",
+        mutationAttempts: 1,
+        summary: "Worker summary.",
+        effects: [],
+        ...body,
+      })}\n</prm-work-report>`;
+    const addressed = {
+      sourceId: source.id,
+      revision: source.revision,
+      outcome: "addressed",
+      stage: "published",
+      verifiedHeadSha: published,
+      publishedCommit: published,
+      evidence: ["verification passed"],
+    };
+    /** The worker ends its turn with `text`; the Host settles from it itself. */
+    const finishWith = (
+      t: { run: { id: string }; worker: { id: string }; step: { id: string } },
+      text: string,
+    ) => {
+      world.store.updateRunStep(t.step.id, {
+        state: "running",
+        dispatchedAt: new Date().toISOString(),
+      });
+      const sequence = world.store.maxEventSequence(t.worker.id) + 1;
+      for (const [offset, type, payload] of [
+        [0, "agent_text", { text }],
+        [1, "turn_complete", {}],
+        [2, "state", { state: "idle" }],
+      ] as const)
+        world.store.appendEvent({
+          eventId: `${type}-${sequence + offset}`,
+          sessionId: t.worker.id,
+          sequence: sequence + offset,
+          type,
+          payload,
+          createdAt: new Date().toISOString(),
+        });
+      world.service.settleOrchestrationStep({
+        runId: t.run.id,
+        stepId: t.step.id,
+        state: "succeeded",
+        output: "Worker finished.",
+      });
+    };
+    const plan = (batchId: string, conflictResolution = false) => ({
+      kind: "prepare_work_order" as const,
+      plan: {
+        batchId,
+        summary: conflictResolution ? "Rebase onto the current base." : "Routine fix.",
+        conflictResolution,
+        reservedMutations: 2,
+        findings: [
+          {
+            sourceId: source.id,
+            revision: source.revision,
+            task: "repair" as const,
+            instructions: "Fix it within the accepted design and verify.",
+          },
+        ],
+      },
+    });
+    const checkpoint = (recordId: string, input: unknown) =>
+      tools.checkpointPrMaintenance({
+        recordId,
+        expectedVersion: get(recordId).version,
+        checkpoint: input as never,
+      });
+    const follow = (recordId: string, workerId: string, batchId: string) =>
+      tools.followUp({
+        sessionId: workerId,
+        maintenance: { recordId, generation: get(recordId).generation, batchId },
+      });
+
+    it.each(["active", "paused", "released"] as const)(
+      "never reserves the task, checkout or worker against a direct turn (%s)",
+      (state) => {
+        const t = enable();
+        review(t.record.id);
+        if (state === "paused")
+          pm().operatorAction(
+            t.record.id,
+            get(t.record.id).version,
+            { action: "pause", reason: "Hold automatic work" },
+            "operator",
+          );
+        if (state === "released")
+          pm().operatorAction(
+            t.record.id,
+            get(t.record.id).version,
+            { action: "release", reason: "Done with it" },
+            "operator",
+          );
+        const before = get(t.record.id);
+        for (const action of ["dispatch", "execute", "prompt", "resume"] as const)
+          expect(
+            pm().admission({
+              action,
+              taskId: t.run.id,
+              sessionId: t.worker.id,
+              placementId: t.worker.placementId,
+            }),
+          ).toEqual({ allowed: true });
+        const direct = tools.followUp({
+          sessionId: t.worker.id,
+          prompt: "A direct question from the person.",
+        });
+        expect(direct.ok, direct.text).toBe(true);
+        expect(world.store.getRunStep(t.step.id)?.prompt).toBe(
+          "A direct question from the person.",
+        );
+        const after = get(t.record.id);
+        expect(after.hold).toEqual(before.hold);
+        expect(after.ownershipReleasedAt).toEqual(before.ownershipReleasedAt);
+      },
+    );
+
+    it("lets direct work take precedence over queued maintenance without duplicate writes", () => {
+      vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
+      const t = enable();
+      review(t.record.id);
+      expect(checkpoint(t.record.id, plan("queued-1")).ok).toBe(true);
+      expect(follow(t.record.id, t.worker.id, "queued-1").ok).toBe(true);
+      const queuedPrompt = get(t.record.id).batches[0]!.prompt;
+      expect(get(t.record.id).batches[0]!.state).toBe("accepted");
+      const direct = tools.followUp({
+        sessionId: t.worker.id,
+        prompt: "Direct fix first.",
+      });
+      expect(direct.ok, direct.text).toBe(true);
+      // The queued batch yielded: settled at once, no effects, never replayed.
+      expect(get(t.record.id).batches[0]).toMatchObject({
+        state: "cancelled",
+        reason: "direct_work",
+        executionSettled: true,
+        executionNotDispatched: true,
+        effects: [],
+      });
+      const step = world.store.getRunStep(t.step.id)!;
+      expect(step).toMatchObject({ prompt: "Direct fix first.", state: "pending" });
+      expect(pm().referenceForStep(step.id, step.attempts)).toBeUndefined();
+      // One writer: new maintenance waits while the direct turn is outstanding.
+      expect(checkpoint(t.record.id, plan("after-direct")).ok).toBe(true);
+      const record = get(t.record.id);
+      expect(
+        pm().admission({
+          action: "dispatch",
+          taskId: t.run.id,
+          sessionId: t.worker.id,
+          recordId: record.id,
+          generation: record.generation,
+          batchId: "after-direct",
+        }).reason,
+      ).toBe("direct_work_active");
+      expect(follow(t.record.id, t.worker.id, "after-direct").ok).toBe(false);
+      expect(world.store.getRunStep(t.step.id)?.prompt).not.toBe(queuedPrompt);
+    });
+
+    it("waits for a running maintenance turn instead of writing beside it", () => {
+      vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
+      const t = enable();
+      review(t.record.id);
+      expect(checkpoint(t.record.id, plan("running-1")).ok).toBe(true);
+      expect(follow(t.record.id, t.worker.id, "running-1").ok).toBe(true);
+      world.store.updateRunStep(t.step.id, {
+        state: "running",
+        dispatchedAt: new Date().toISOString(),
+      });
+      const refused = tools.followUp({ sessionId: t.worker.id, prompt: "Direct now." });
+      expect(refused.ok).toBe(false);
+      expect(refused.text).toMatch(/maintenance_in_flight|maintenance turn/i);
+      expect(() =>
+        world.service.dispatch(t.worker.nodeId, {
+          type: "prompt",
+          sessionId: t.worker.id,
+          prompt: "Direct now.",
+          attachments: [],
+        }),
+      ).toThrow(/maintenance_in_flight/);
+      const started = world.service.createAndStartSession({
+        placement: world.store.getPlacement(t.worker.placementId)!,
+        prompt: "A second writer on the same checkout.",
+        yolo: false,
+        runId: t.run.id,
+        runRole: "worker",
+      });
+      expect(started).toMatchObject({ ok: false, status: 409 });
+      expect(!started.ok && started.error).toMatch(/maintenance_in_flight/);
+      finishWith(t, reportText({ batchId: "running-1", findings: [addressed] }));
+      expect(get(t.record.id).batches[0]!.state).toBe("succeeded");
+      expect(
+        tools.followUp({ sessionId: t.worker.id, prompt: "Direct after it." }).ok,
+      ).toBe(true);
+    });
+
+    it("pause keeps operator work and stops automatic work only; release always succeeds and keeps history", () => {
+      vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
+      const t = enable();
+      review(t.record.id);
+      const requestId = randomUUID();
+      let record = pm().operatorAction(
+        t.record.id,
+        get(t.record.id).version,
+        { action: "work", requestId, direction: "Also update the changelog." },
+        "operator",
+      );
+      record = pm().operatorAction(
+        record.id,
+        record.version,
+        { action: "pause", reason: "Hold automatic work" },
+        "operator",
+      );
+      expect(record.hold?.kind).toBe("paused");
+      expect(record.workRequests[0]).toMatchObject({ id: requestId, state: "pending" });
+      record = pm().operatorAction(
+        record.id,
+        record.version,
+        { action: "resume" },
+        "operator",
+      );
+      expect(record.workRequests[0]?.state).toBe("pending");
+      expect(record.review).toMatchObject({ source: "resume" });
+      // A running batch and a pending decision never block Release.
+      review(record.id);
+      expect(checkpoint(record.id, plan("running-2")).ok).toBe(true);
+      expect(follow(record.id, t.worker.id, "running-2").ok).toBe(true);
+      world.store.updateRunStep(t.step.id, {
+        state: "running",
+        dispatchedAt: new Date().toISOString(),
+      });
+      record = pm().holdForDecision(world.leadId, record.id, get(record.id).version, {
+        id: "decision-1",
+        version: 1,
+        proposal: "Change the public contract?",
+        headSha,
+        scope: "public contract",
+      });
+      const stale = record.version - 1;
+      const released = pm().operatorAction(
+        record.id,
+        stale,
+        { action: "release", reason: "Stop maintaining this PR." },
+        "operator",
+      );
+      expect(released.ownershipReleasedAt).toBeDefined();
+      expect(released.decision).toMatchObject({ state: "withdrawn" });
+      expect(released.workRequests[0]?.state).toBe("cancelled");
+      expect(released.batches[0]).toMatchObject({
+        id: "running-2",
+        state: "accepted",
+        cancellationRequestedAt: expect.any(String),
+      });
+      expect(released.reviewHistory.length).toBeGreaterThan(0);
+      // Idempotent.
+      expect(
+        pm().operatorAction(
+          record.id,
+          1,
+          { action: "release", reason: "Again" },
+          "operator",
+        ),
+      ).toEqual(released);
+    });
+
+    it("settles a queued batch with zero effects when released", () => {
+      vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
+      const t = enable();
+      review(t.record.id);
+      expect(checkpoint(t.record.id, plan("queued-2")).ok).toBe(true);
+      expect(follow(t.record.id, t.worker.id, "queued-2").ok).toBe(true);
+      const released = pm().operatorAction(
+        t.record.id,
+        get(t.record.id).version,
+        { action: "release", reason: "No longer needed." },
+        "operator",
+      );
+      expect(released.batches[0]).toMatchObject({
+        state: "cancelled",
+        executionNotDispatched: true,
+        effects: [],
+      });
+      expect(world.store.getRunStep(t.step.id)?.state).toBe("cancelled");
+    });
+
+    it("grants replies and thread resolution by default and edits the grant in place", () => {
+      const t = task();
+      const record = pm().enableFromOperator(
+        {
+          taskId: t.run.id,
+          workerSessionId: t.worker.id,
+          identity,
+          headSha,
+          scope: {
+            baseline: "Keep the approved API.",
+            verification: "Run the focused suite.",
+            publicationAuthorized: true,
+          },
+          eligibilityEvidence: "Operator verified the PR, branch HEAD and worker.",
+        },
+        "operator",
+      );
+      expect(record.authorization.scope).toMatchObject({
+        replies: true,
+        resolveThreads: true,
+        retryChecks: false,
+      });
+      review(record.id);
+      const edited = pm().operatorAction(
+        record.id,
+        get(record.id).version,
+        { action: "scope", scope: { resolveThreads: false } },
+        "operator",
+      );
+      expect(edited.authorization.id).toBe(record.authorization.id);
+      expect(edited.authorization.scope).toMatchObject({
+        replies: true,
+        resolveThreads: false,
+      });
+      expect(edited.scopeHistory).toHaveLength(1);
+      expect(edited.hold).toBeUndefined();
+      expect(checkpoint(record.id, plan("scoped-1")).ok).toBe(true);
+      expect(get(record.id).batches[0]!.workOrder).toMatchObject({
+        permissions: { push: true, reply: true, resolveThreads: false },
+      });
+    });
+
+    it("settles from the worker report itself and keeps work_report as the one recovery path", () => {
+      vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
+      const t = enable();
+      review(t.record.id);
+      // No lead relay of large observations or alternate evidence.
+      const relayed = checkpoint(t.record.id, {
+        kind: "observation",
+        observation: observation({ helperState: { pad: "x".repeat(40_000) } }),
+      });
+      expect(relayed.ok).toBe(false);
+      expect(relayed.text).toContain("observation_relay_refused");
+      expect(checkpoint(t.record.id, plan("report-1")).ok).toBe(true);
+      expect(follow(t.record.id, t.worker.id, "report-1").ok).toBe(true);
+      finishWith(t, "Done, but I forgot the report.");
+      let batch = get(t.record.id).batches[0]!;
+      expect(batch).toMatchObject({ state: "reconciling", executionSettled: true });
+      expect(batch.settlementError).toMatch(/report_missing/);
+      // No hand-built per-finding settlement for a work order.
+      const handBuilt = checkpoint(t.record.id, {
+        kind: "batch",
+        batchId: "report-1",
+        generation: batch.generation,
+        state: "succeeded",
+        executionSettled: true,
+        usedMutations: 1,
+        published: true,
+        effects: [],
+        findings: [],
+        evidence: "Lead says it worked.",
+      });
+      expect(handBuilt.ok).toBe(false);
+      expect(handBuilt.text).toContain("host_settlement");
+      const recovered = checkpoint(t.record.id, {
+        kind: "work_report",
+        batchId: "report-1",
+        generation: batch.generation,
+        report: JSON.parse(
+          reportText({ batchId: "report-1", findings: [addressed] })
+            .split("<prm-work-report>")[1]!
+            .split("</prm-work-report>")[0]!,
+        ),
+      });
+      expect(recovered.ok, recovered.text).toBe(true);
+      batch = get(t.record.id).batches[0]!;
+      expect(batch.state).toBe("succeeded");
+      expect(batch.settlementError).toBeUndefined();
+      expect(get(t.record.id).review).toMatchObject({ source: "worker_result" });
+    });
+
+    it("maintains a PR while its task awaits a human, without touching the task", () => {
+      const t = enable("awaiting_human");
+      review(t.record.id);
+      dispatchRoutine(t.record.id, t.worker.id);
+      expect(phase(get(t.record.id))).toBe("working");
+      finishWorker(t, t.record.id);
+      expect(world.store.getRun(t.run.id)?.state).toBe("awaiting_human");
+      expect(phase(get(t.record.id))).toBe("reviewing");
+    });
+
+    describe("merge conflicts", () => {
+      const conflictReport = (batchId: string, effect: Record<string, unknown>) =>
+        reportText({
+          batchId,
+          findings: [addressed],
+          effects: [{ kind: "push", state: "known", commit: published, ...effect }],
+        });
+      const conflicted = () => {
+        vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
+        const t = enable();
+        review(t.record.id, { mergeability: "conflicting" });
+        return t;
+      };
+
+      it("rebases and force-pushes with a lease on the exact PR head", () => {
+        const t = conflicted();
+        const plain = checkpoint(t.record.id, plan("plain"));
+        expect(plain.ok).toBe(false);
+        expect(plain.text).toContain("observation_blocked");
+        expect(checkpoint(t.record.id, plan("rebase-1", true)).ok).toBe(true);
+        const batch = get(t.record.id).batches[0]!;
+        expect(batch).toMatchObject({ conflictResolution: true, baseSha });
+        expect(batch.prompt).toContain("rebase");
+        expect(batch.prompt).toContain(`--force-with-lease=<headRef>:<pr.headSha>`);
+        expect(batch.prompt).toContain("Preserve user work");
+        expect(follow(t.record.id, t.worker.id, "rebase-1").ok).toBe(true);
+        finishWith(
+          t,
+          conflictReport("rebase-1", { force: true, expectedRemoteSha: headSha }),
+        );
+        const settled = get(t.record.id).batches[0]!;
+        expect(settled.settlementError).toBeUndefined();
+        expect(settled).toMatchObject({ state: "succeeded", published: true });
+        expect(settled.effects[0]).toMatchObject({
+          kind: "push",
+          force: true,
+          expectedRemoteSha: headSha,
+        });
+      });
+
+      it("never settles a forced push leased on another remote head", () => {
+        const t = conflicted();
+        expect(checkpoint(t.record.id, plan("rebase-2", true)).ok).toBe(true);
+        expect(follow(t.record.id, t.worker.id, "rebase-2").ok).toBe(true);
+        finishWith(
+          t,
+          conflictReport("rebase-2", { force: true, expectedRemoteSha: "d".repeat(40) }),
+        );
+        const batch = get(t.record.id).batches[0]!;
+        expect(batch.state).toBe("reconciling");
+        expect(batch.published).toBe(false);
+        expect(batch.settlementError).toMatch(/lease the exact remote head/);
+      });
+
+      it("stops on unknown remote changes, user work or an ambiguous conflict", () => {
+        const t = conflicted();
+        expect(checkpoint(t.record.id, plan("rebase-3", true)).ok).toBe(true);
+        expect(follow(t.record.id, t.worker.id, "rebase-3").ok).toBe(true);
+        finishWith(
+          t,
+          reportText({
+            batchId: "rebase-3",
+            mutationAttempts: 0,
+            findings: [
+              {
+                sourceId: source.id,
+                revision: source.revision,
+                outcome: "needs_human",
+                stage: "inspected",
+                evidence: ["The remote head moved past pr.headSha; nothing was pushed."],
+                nextAction: "Ask whether to keep the other writer's commits.",
+              },
+            ],
+          }),
+        );
+        const record = get(t.record.id);
+        expect(record.batches[0]).toMatchObject({ effects: [], published: false });
+        expect(record.decision).toMatchObject({ state: "pending" });
+        expect(phase(record)).toBe("waiting_for_decision");
+      });
+
+      it("refuses a forced push outside a conflict-resolution batch", () => {
+        vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
+        const t = enable();
+        review(t.record.id);
+        expect(checkpoint(t.record.id, plan("routine-force")).ok).toBe(true);
+        expect(follow(t.record.id, t.worker.id, "routine-force").ok).toBe(true);
+        finishWith(
+          t,
+          conflictReport("routine-force", { force: true, expectedRemoteSha: headSha }),
+        );
+        let record = get(t.record.id);
+        expect(record.batches[0]!.settlementError).toMatch(/conflict-resolution/);
+        // The registry guard holds even for a hand-built receipt.
+        expect(() =>
+          pm().checkpoint(world.leadId, record.id, record.version, {
+            kind: "batch",
+            batchId: "routine-force",
+            generation: record.generation,
+            state: "reconciling",
+            executionSettled: true,
+            findings: [],
+            effects: [
+              {
+                key: "forced",
+                kind: "push",
+                state: "known",
+                headSha: published,
+                actor: "worker",
+                actionIdentity: "forced",
+                providerId: published,
+                evidence: "read back",
+                attempts: 1,
+                force: true,
+                expectedRemoteSha: headSha,
+              },
+            ],
+            evidence: "forced",
+          }),
+        ).toThrow(/forced push/i);
+        record = get(t.record.id);
+        expect(record.batches[0]!.published).toBe(false);
+      });
+    });
+
+    it("keeps the hard safeguards: no merge, preserved user work, holds refuse automatic writes only", () => {
+      vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
+      const t = enable();
+      review(t.record.id);
+      expect(checkpoint(t.record.id, plan("rules-1")).ok).toBe(true);
+      const batch = get(t.record.id).batches[0]!;
+      expect(batch.prompt).toContain("merge the PR, enable auto-merge/auto-complete");
+      expect(batch.prompt).toContain("Never force-push, rebase or reset the PR branch");
+      expect(batch.prompt).toContain("Preserve user work");
+      // An operator pause refuses the maintenance dispatch, not direct work.
+      const paused = pm().operatorAction(
+        t.record.id,
+        get(t.record.id).version,
+        { action: "pause", reason: "Hold" },
+        "operator",
+      );
+      expect(paused.batches[0]!.state).toBe("cancelled");
+      expect(
+        pm().admission({
+          action: "dispatch",
+          taskId: t.run.id,
+          sessionId: t.worker.id,
+          recordId: paused.id,
+          generation: paused.generation,
+          batchId: "rules-1",
+        }).allowed,
+      ).toBe(false);
+      expect(pm().admission({ action: "prompt", sessionId: t.worker.id }).allowed).toBe(
+        true,
+      );
+      const resent = follow(t.record.id, t.worker.id, "rules-1");
+      expect(resent.text).toContain("no prompt was sent");
+      expect(world.store.getRunStep(t.step.id)?.prompt).not.toBe(batch.prompt);
+      expect(get(t.record.id).batches[0]!.state).toBe("cancelled");
+    });
   });
 });

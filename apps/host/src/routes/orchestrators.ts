@@ -363,6 +363,17 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
                 source: "operator",
               },
             );
+          if (operation.action === "scope")
+            store.appendRunNote(
+              id,
+              run.phaseIndex,
+              `PR maintenance permissions edited by ${actor}: ${JSON.stringify(operation.scope)}`,
+              {
+                summary: "PR maintenance permissions edited",
+                kind: "decision",
+                source: "operator",
+              },
+            );
           if (operation.action === "release")
             store.appendRunNote(
               id,

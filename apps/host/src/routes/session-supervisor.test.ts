@@ -15,6 +15,7 @@ import { fleet } from "../orchestrator/fleet-harness.js";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
 import { archiveRun } from "../orchestrator/lifecycle.js";
 import { FleetService } from "../fleet-service.js";
+import { prMaintenanceUnsettled } from "../pr-maintenance-store.js";
 import { FleetAuth, AUTH_MODE_SETTING, NO_AUTH_PRINCIPAL } from "../auth/service.js";
 import { OPERATOR_COOKIE } from "../auth.js";
 import { registerRequestGuard } from "../request-guard.js";
@@ -84,7 +85,13 @@ async function setup(
   );
   if (!publicationAuthorized) {
     const backup = store.prMaintenance.exportBackup();
-    backup.registrations[0]!.authorization.scope.publicationAuthorized = false;
+    const scope = backup.registrations[0]!.authorization.scope;
+    // A retired observation-only grant never carried response permissions.
+    Object.assign(scope, {
+      publicationAuthorized: false,
+      replies: false,
+      resolveThreads: false,
+    });
     store.writeAtomically(() => store.prMaintenance.importBackup(backup));
     record = store.prMaintenance.get(record.id)!;
   }
@@ -213,16 +220,20 @@ async function setup(
       },
     });
     return store.writeAtomically(() => {
-      const retry = store.retryRunStepInSession(
-        task.id,
-        {
-          stepKey: "work",
-          title: "Work",
-          prompt: "automatic repair",
-          placementId: placement.id,
-        },
-        worker.id,
-        0,
+      const retry = store.prMaintenance.asMaintenanceDispatch(
+        { recordId: record.id, batchId: "queued" },
+        () =>
+          store.retryRunStepInSession(
+            task.id,
+            {
+              stepKey: "work",
+              title: "Work",
+              prompt: "automatic repair",
+              placementId: placement.id,
+            },
+            worker.id,
+            0,
+          ),
       );
       return store.prMaintenance.acceptBatch(
         leadId,
@@ -333,11 +344,9 @@ describe("trusted supervisor session handoff", () => {
           (status) => status.taskId === f.task.id,
         )?.status;
       };
-      const held = async () => {
-        expect(projected()).toMatchObject({
-          hold: expect.stringMatching(/permission|manual_control/),
-        });
-        expect((await f.command("prompt")).statusCode).toBe(409);
+      const held = () => {
+        // A pending permission holds automatic maintenance only.
+        expect(projected()).toMatchObject({ hold: "permission" });
         expect(f.store.prMaintenance.get(f.record.id)).toEqual(record);
         expect(f.store.getRunStep(f.step.id)).toEqual(step);
         expect(f.sent).toEqual(sent);
@@ -345,7 +354,7 @@ describe("trusted supervisor session handoff", () => {
 
       const first = permissionEvent(sessionId, "first");
       deliver(first);
-      await held();
+      held();
       if (path.startsWith("terminal worker")) {
         expect(broadcast.mock.calls.map(([message]) => message.type)).toEqual([
           "snapshot",
@@ -364,13 +373,13 @@ describe("trusted supervisor session handoff", () => {
       expect(f.sent).toEqual(sent);
 
       deliver(permissionEvent(sessionId, "second"));
-      await held();
+      held();
       deliver(permissionEvent(sessionId, "wrong-request", true));
-      await held();
+      held();
       deliver(permissionEvent(otherSessionId, "first", true));
-      await held();
+      held();
       deliver(permissionEvent(sessionId, "first", true));
-      await held();
+      held();
       const last = permissionEvent(sessionId, "second", true);
       deliver(last);
       // With the permission answered, only the record's own hold (if any) remains.
@@ -393,11 +402,12 @@ describe("trusted supervisor session handoff", () => {
       expect(broadcast.mock.calls.some(([message]) => message.type === "snapshot")).toBe(
         false,
       );
+      // A direct turn never leaves a maintenance hold behind.
       expect(
         f.service
           .snapshot()
           .prMaintenanceTasks?.find((status) => status.taskId === f.task.id)?.status.hold,
-      ).toBe(path === "manual worker" ? "manual_control" : undefined);
+      ).toBeUndefined();
       if (path.startsWith("terminal worker")) {
         deliver(
           SessionEventSchema.parse({
@@ -468,34 +478,17 @@ describe("trusted supervisor session handoff", () => {
         stoppedByOrchestrator: true,
       });
       f.event("state", { state: "stopped" });
-      let record = f.store.prMaintenance.get(f.record.id)!;
-      record = f.store.prMaintenance.checkpoint(f.leadId, record.id, record.version, {
-        kind: "batch",
-        batchId: "queued",
-        generation: record.generation,
+      // The Stop settled the never-sent queued attempt itself: cancelled, no effects.
+      const record = f.store.prMaintenance.get(f.record.id)!;
+      expect(record.batches[0]).toMatchObject({
+        id: "queued",
         state: "cancelled",
         executionSettled: true,
-        usedMutations: 0,
-        findings: [
-          {
-            source,
-            outcome: "incomplete",
-            stage: "not_attempted",
-            evidence: [],
-            responseRequired: false,
-            responseIds: [],
-            nextAction: "Wait for explicit direction.",
-            progress: false,
-          },
-        ],
+        executionNotDispatched: true,
         effects: [],
-        evidence: "Queued attempt stopped; no execution or remote effects.",
       });
       const stopped = f.store.getRunStep(f.step.id)!;
-      expect(stopped).toMatchObject({
-        state: "cancelled",
-        stoppedByOrchestrator: true,
-      });
+      expect(stopped).toMatchObject({ state: "cancelled" });
       expect((await f.command("resume", { operationId: randomUUID() })).statusCode).toBe(
         202,
       );
@@ -623,11 +616,7 @@ describe("trusted supervisor session handoff", () => {
           prompt: "Automatic work",
           attachments: [],
         }),
-      ).toThrow(
-        boundary === "released"
-          ? /manual_execution_unsettled/
-          : /paused|manual_control|maintenance_batch_required/,
-      );
+      ).toThrow(/manual_execution_unsettled/);
       if (boundary === "released")
         expect(() =>
           f.store.prMaintenance.enableFromOperator(
@@ -843,8 +832,8 @@ describe("trusted supervisor session handoff", () => {
     expect(f.sent).toHaveLength(5);
   });
 
-  it("refuses changed checkout identity before manual takeover without clearing the binding", async () => {
-    const f = await setup();
+  it("lets a direct turn run on a changed checkout while maintenance refuses it without clearing the binding", async () => {
+    const f = await setup("password", true);
     const binding = {
       worktreeId: "",
       generation: 1,
@@ -857,11 +846,13 @@ describe("trusted supervisor session handoff", () => {
     };
     f.store.setSessionExecutionBinding(f.worker.id, binding);
     const reply = await f.command("prompt");
-    expect(reply.statusCode, reply.body).toBe(409);
-    expect(reply.body).toMatch(/binding_changed/);
+    expect(reply.statusCode, reply.body).toBe(202);
     expect(f.store.getSession(f.worker.id)?.executionBinding).toEqual(binding);
-    expect(f.store.prMaintenance.get(f.record.id)?.manualControl).toBeUndefined();
-    expect(f.sent).toHaveLength(0);
+    const record = f.store.prMaintenance.get(f.record.id)!;
+    expect(record.hold).toBeUndefined();
+    // Maintenance never replaces or follows the worker to another checkout.
+    expect(f.store.prMaintenance.status(record).hold).toBe("binding");
+    expect(f.sent).toHaveLength(1);
   });
 
   it("does not accept a revoked operator session as supervisor provenance", async () => {
@@ -873,7 +864,7 @@ describe("trusted supervisor session handoff", () => {
   });
 
   it.each(["prompt", "resume"] as const)(
-    "rejects missing, Node, MCP and forged credentials for %s",
+    "rejects missing, Node, MCP and forged credentials for %s and never grants human provenance",
     async (kind) => {
       const f = await setup();
       if (kind === "resume") f.resumable();
@@ -904,22 +895,23 @@ describe("trusted supervisor session handoff", () => {
         },
       ]) {
         const reply = await f.command(kind, forged, headers);
-        expect(reply.statusCode).toBeGreaterThanOrEqual(400);
+        // Signed in (or no-sign-in) with a bearer riding along: authenticated,
+        // not a human actor. Maintenance does not refuse it as a direct turn.
+        const authenticated = "x-csrf-token" in headers && !(NODE_ID_HEADER in headers);
+        if (authenticated) expect(reply.statusCode, reply.body).toBe(202);
+        else
+          expect(
+            reply.statusCode,
+            JSON.stringify(Object.keys(headers)),
+          ).toBeGreaterThanOrEqual(400);
       }
-      expect(f.sent).toHaveLength(0);
+      // The forged fields never become supervisor provenance.
+      expect(f.sent.length).toBeLessThanOrEqual(1);
+      expect(f.store.getSessionDispatchAttempt(f.worker.id)?.attempt ?? "").not.toMatch(
+        /^manual:/,
+      );
       expect(f.store.prMaintenance.get(f.record.id)?.manualControl).toBeUndefined();
-      if (kind === "prompt")
-        expect(() =>
-          f.service.promptSession(f.worker.id, {
-            prompt: "I am the supervisor",
-            attachments: [],
-          }),
-        ).toThrow();
-      else
-        expect(f.service.resumeSession(f.worker.id)).toMatchObject({
-          ok: false,
-          status: 409,
-        });
+      expect(f.store.prMaintenance.hasManualHistory(f.worker.id)).toBe(false);
     },
   );
 
@@ -930,11 +922,23 @@ describe("trusted supervisor session handoff", () => {
       { ...f.headers, authorization: "Bearer lead" },
       { ...f.headers, [NODE_ID_HEADER]: f.worker.nodeId },
     ]) {
-      expect(
-        (await f.command("prompt", { supervisor: true }, headers)).statusCode,
-      ).toBeGreaterThanOrEqual(400);
+      const reply = await f.command(
+        "prompt",
+        { supervisor: true, operationId: randomUUID() },
+        headers,
+      );
+      // No sign-in admits every CSRF-bearing local caller; without a human actor
+      // it is an ordinary direct turn, never supervisor provenance.
+      if ("x-csrf-token" in headers) expect(reply.statusCode, reply.body).toBe(202);
+      else
+        expect(
+          reply.statusCode,
+          JSON.stringify(Object.keys(headers)),
+        ).toBeGreaterThanOrEqual(400);
     }
-    expect(f.sent).toHaveLength(0);
+    expect(f.sent.length).toBeLessThanOrEqual(2);
+    expect(f.store.prMaintenance.get(f.record.id)?.manualControl).toBeUndefined();
+    expect(f.store.prMaintenance.hasManualHistory(f.worker.id)).toBe(false);
   });
 
   it("atomically fences accepted-but-never-sent queued maintenance and cannot revive it after the manual turn", async () => {
@@ -965,6 +969,7 @@ describe("trusted supervisor session handoff", () => {
     expect(
       f.store.prMaintenance.takeDue(f.leadId, "stale-automatic-wake"),
     ).toBeUndefined();
+    // One writer: automatic work waits while the person's direct turn runs.
     expect(() =>
       f.service.dispatch(f.worker.nodeId, {
         type: "prompt",
@@ -972,11 +977,16 @@ describe("trusted supervisor session handoff", () => {
         prompt: "automatic repair",
         attachments: [],
       }),
-    ).toThrow(/manual_control|paused/);
+    ).toThrow(/manual_execution_unsettled/);
     f.settle();
     new OrchestratorEngine(f.service).tick();
     expect(f.sent.filter((entry) => entry.sessionId === f.worker.id)).toHaveLength(1);
-    expect(f.store.prMaintenance.get(f.record.id)?.hold?.kind).toBe("manual_control");
+    // The direct turn left no hold, and the yielded batch is never revived.
+    const after = f.store.prMaintenance.get(f.record.id)!;
+    expect(after.hold).toBeUndefined();
+    expect(after.manualControl?.endedAt).toBeDefined();
+    expect(after.batches[0]!.state).toBe("cancelled");
+    expect(f.store.getRunStep(f.step.id)?.state).toBe("cancelled");
   });
 
   it("resumes a stopped worker with correlated quiescence while its maintenance batch awaits final bookkeeping", async () => {
@@ -1013,8 +1023,8 @@ describe("trusted supervisor session handoff", () => {
     expect(f.sent.map((command) => command.type)).toEqual(["prompt", "resume_session"]);
     f.event("state", { state: "idle" });
     const manual = f.store.prMaintenance.get(f.record.id)!;
+    expect(manual.hold).toBeUndefined();
     expect(manual).toMatchObject({
-      hold: { kind: "manual_control" },
       batches: before.batches,
       authorization: before.authorization,
       manualControl: { commands: [{ kind: "resume_session", state: "settled" }] },
@@ -1033,7 +1043,7 @@ describe("trusted supervisor session handoff", () => {
     "uncertain effect",
     "uncertain batch",
   ] as const)(
-    "refuses %s maintenance without deleting receipts, pausing or cancelling its worker",
+    "waits on in-flight %s maintenance and never deletes its receipts or pauses its worker",
     async (state) => {
       const f = await setup("password", true);
       let record = f.queue();
@@ -1081,16 +1091,43 @@ describe("trusted supervisor session handoff", () => {
       const before = f.store.prMaintenance.get(record.id);
       const sent = f.sent.length;
       const reply = await f.command("prompt");
-      expect(reply.statusCode, reply.body).toBe(409);
-      expect(reply.body).toMatch(/receipts/);
-      expect(f.sent).toHaveLength(sent);
-      expect(f.store.prMaintenance.get(record.id)).toEqual(before);
-      f.resumable();
-      const resume = await f.command("resume", { operationId: randomUUID() });
-      expect(resume.statusCode, resume.body).toBe(409);
-      expect(resume.body).toMatch(/receipts/);
-      expect(f.sent).toHaveLength(sent);
-      expect(f.store.prMaintenance.get(record.id)).toEqual(before);
+      if (state === "sent" || state === "unknown execution") {
+        // One writer at a time: the direct turn waits for the maintenance turn.
+        expect(reply.statusCode, reply.body).toBe(409);
+        expect(reply.body).toMatch(/maintenance_in_flight/);
+        expect(f.sent).toHaveLength(sent);
+        expect(f.store.prMaintenance.get(record.id)).toEqual(before);
+        f.resumable();
+        const resume = await f.command("resume", { operationId: randomUUID() });
+        expect(resume.statusCode, resume.body).toBe(409);
+        expect(resume.body).toMatch(/maintenance_in_flight/);
+        expect(f.sent).toHaveLength(sent);
+        expect(f.store.prMaintenance.get(record.id)).toEqual(before);
+        return;
+      }
+      // Execution ended; only a remote effect's outcome is unknown. The direct
+      // turn runs, the unknown evidence is kept, and maintenance itself still
+      // refuses new automatic work until that effect is reconciled.
+      expect(reply.statusCode, reply.body).toBe(202);
+      expect(f.sent).toHaveLength(sent + 1);
+      const after = f.store.prMaintenance.get(record.id)!;
+      expect(after.batches).toEqual(before!.batches);
+      expect(after.hold).toBeUndefined();
+      expect(prMaintenanceUnsettled(after)).toBe(true);
+      expect(() =>
+        f.store.prMaintenance.checkpoint(f.leadId, after.id, after.version, {
+          kind: "prepare_batch",
+          batch: {
+            id: "next",
+            kind: "repair",
+            sources: [source],
+            headSha,
+            prompt: "next automatic repair",
+            scope: "Preserve design",
+            reservedMutations: 1,
+          },
+        }),
+      ).toThrow(/Reconcile|outstanding/);
     },
   );
 

@@ -195,7 +195,7 @@ describe("command approval UI", () => {
     ).toBeTruthy();
     expect(screen.getByText("Bounded repairs")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Authorize maintenance" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Maintain this PR" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Review maintenance scope" }));
     expect(review).toHaveBeenCalledWith(approval);
     expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === "POST")).toBe(

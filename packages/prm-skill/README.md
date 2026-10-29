@@ -67,8 +67,9 @@ guards; the wrapper only translates:
   Fleet's existing finding/effect settlement shape.
 
 The Host exposes this through `fleet_checkpoint_pr_maintenance` kinds `prepare_work_order` and
-`work_report`, and `fleet_follow_up` with only a maintenance reference. Legacy hand-written
-`prepare_batch` / `batch` checkpoints remain accepted for existing records.
+`work_report`, and `fleet_follow_up` with only a maintenance reference. The Host settles a work-order batch from the
+worker's report automatically; `work_report` is the single recovery path. The lead tool refuses hand-written
+`prepare_batch`, per-finding `batch` settlement of work orders, alternate evidence and large observation relays.
 
 The `PRM_PROVIDER_FIXTURE` environment variable replaces the live provider read with a JSON
 file. It exists only for rehearsals and tests.

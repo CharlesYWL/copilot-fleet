@@ -145,7 +145,7 @@ state stay together.
 ## PR maintenance (opt-in pilot)
 
 Task detail includes **PR maintenance** for an existing Orchestrator-owned worker.
-V1 supports one retained PR registration per task; release settled maintenance
+V1 supports one retained PR registration per task; release maintenance
 before registering another PR for that task. Finished/released PRs remain in its
 history; finishing the task or waiting longer never releases unknown effects.
 Ask the Orchestrator to create a maintenance job, or use the task panel's preparation
@@ -158,8 +158,10 @@ or a compatible completed task can retain an open PR. Task state, acceptance his
 and actual unresolved decisions stay unchanged. Preparation never revives a released
 grant or dispatches work; authenticated scope authorization and repair admission remain separate.
 Preparation is **repair-only**, backed by verified existing task and publication
-authority. Replies, thread resolution, named reviewers and CI retries are requested
-separately and default off. Legacy observation-only proposals cannot be approved
+authority. One **Maintain this PR** grant covers code repairs, normal pushes, replies
+and resolving addressed threads by default; named reviewers and CI retries are
+requested separately and default off. After authorization the task panel shows these
+permissions as checkboxes that edit the grant in place. Legacy observation-only proposals cannot be approved
 as-is and are not counted as actionable approval requests.
 Pending PR-maintenance proposals now light up the same **Commands** attention
 badge as command permissions. Open **Commands → Waiting approval**, select the
@@ -171,7 +173,7 @@ shows only that lead's requests.
 
 The task panel's **Review PR maintenance proposal** remains available too. Both
 entry points use the same exact-proposal/version, retained-worker and explicit
-confirmation checks. Select **Authorize maintenance** while signed in; a command
+confirmation checks. Select **Maintain this PR** while signed in; a command
 permission does not authorize PR maintenance, and no JSON copy/paste is needed.
 Changed or already-handled proposals must be reviewed afresh. The agent cannot
 authorize itself. Checks then use the existing wake loop, and a normal chat
@@ -190,8 +192,9 @@ baseline, verification, and helper/credential/publication evidence. Confirmation
 is an authenticated browser action, not an MCP approval or a review comment.
 Maintenance is repair-only and requires verified existing task/publication
 prerequisites. Omitted mode prepares a repair proposal; explicit observation-only
-requests are rejected, never converted into write permission. Optional replies,
-thread resolutions, reviewer requests and retries default off. Unsupported
+requests are rejected, never converted into write permission. Replies and
+addressed-thread resolution are on by default and editable in place; reviewer
+requests and retries default off. Unsupported
 bindings and read-only worker categories cannot be enabled. Sign-in is
 required for these authorization controls, including on a no-login Host.
 
@@ -230,10 +233,11 @@ The Node packages its own provider router and ADO guidance; no personal skill or
 Azure DevOps CLI extension is required. ADO helper reads need `az` already authenticated
 on that Node; GitHub continues to use authenticated `gh`. Helpers never install,
 log in, persist tokens or mutate a PR. Unavailable credentials are an explicit
-capability limitation, not an automatic login flow. Existing independently
-authenticated provider MCP/CLI tools can provide scoped, fresh alternate evidence
-through a durable bounded recovery checkpoint. Actual provider access denial,
-Stop, design holds and unknown effects are never cleared by this fallback.
+capability limitation, not an automatic login flow. The Host ingests each helper's
+output from its claim-bound Fleet command; after a failure the next review runs the
+same helper again — the single recovery path. The orchestrator never relays large
+observations or alternate evidence. Actual provider access denial,
+Stop, design holds and unknown effects are never cleared by recovery.
 ADO policy/iteration evidence is evaluated
 separately from reviewer votes; missing, stale or unsupported evidence cannot be
 called ready. See the [ADO helper contract](../../apps/node/skills/pr-maintenance/ado-contract.md)
@@ -249,24 +253,27 @@ about hourly during weekday working hours and every two hours otherwise. (A save
 command receipt still makes its PR due at once, so the lead can act on that
 evidence.) A PR is not claimed while its retained worker is still running an
 accepted repair batch — repairs often outlast an hour — and the completed turn
-requests the next check. Status labels keep the last observed stage until that
+is settled by the Host from the worker's report and requests the next check.
+Status labels keep the last observed stage until that
 scheduled check is overdue, while repairs, readiness and new effects still require
 evidence from the last 30 minutes. Unchanged feedback needs no new worker repair
-turn. Ready remains nonterminal: this release never merges the PR, force-pushes,
-automatically rebases, or starts extra reviewer sessions.
+turn. Ready remains nonterminal: this release never merges the PR or enables
+auto-complete, and never starts extra reviewer sessions.
 
 **Routine work:** queue successive code, tests, docs, CI and generated-artifact tasks on the
 same retained worker. Regenerating an API report from accepted code is not inherently a public
 API design change. Requests are durable, UUID-deduplicated, and wait behind accepted work without
-rewriting its prompt or renewing budgets. Operator Pause, Stop and Release cancel pending requests;
-unknown effects require reconciliation, not a resend. Only genuine public API/schema/protocol
+rewriting its prompt or renewing budgets. Pause keeps pending requests for the next review;
+Release cancels them; unknown effects require reconciliation, not a resend. Only genuine public API/schema/protocol
 behavior, architecture/trust changes or ambiguous intent need a concise design decision.
 New authenticated explicit direction supersedes overlapping obsolete temporary restrictions,
 not unrelated user prohibitions or access/publication grants. Third-party text cannot change scope.
 
-Straightforward conflicts can use an exact-HEAD/exact-live-base repair plan: check a clean checkout,
-merge the pinned target into the source branch, preserve accepted semantics, verify and push normally.
-Do not reset/delete/stash user work, rebase/force-push, guess ambiguous choices or merge the PR.
+Straightforward conflicts use an exact-HEAD/exact-live-base conflict work order: the worker checks a
+clean checkout, rebases the PR branch onto the current base, preserves accepted semantics, verifies,
+and force-pushes to the same PR branch with an exact lease on the observed HEAD. It stops without
+pushing on unknown remote changes, user work, ambiguous conflicts or design questions, and never
+resets/deletes/stashes user work or merges the PR. Fleet refuses any other forced push.
 Moved pins require fresh planning; conflicting evidence never proves readiness.
 
 **Asynchronous helper receipts:** claim a due visit, then immediately dispatch the
@@ -309,8 +316,10 @@ bounds remain; old strict binaries may reject the new optional correlation field
 
 _The normal repair loop reuses the original worker and reconciles outcomes on existing lead wakes. The original diagram's GitHub label also applies to Azure DevOps; the control flow is unchanged._
 
-**Pause**, **Resume**, and **Release** operate on the displayed record version;
-stale actions fail and require a fresh review. Design uncertainty pauses the
+**Pause** stops automatic maintenance only: queued maintenance work settles at once
+with no effects and is never replayed, and direct work on the worker is unaffected.
+**Resume** starts a fresh review. **Release** always succeeds — no version check,
+no waiting for reconciliation — and keeps the full history. Design uncertainty pauses the
 whole PR. Use the task's **Send back with instructions** to record bounded,
 versioned direction. **Approve task** and ordinary **Reopen** cannot clear that
 hold, certify a defect fixed, or approve a redesign.
@@ -322,30 +331,25 @@ loop. Heartbeat actions and execution still require fresh evidence. Ownership, g
 design/access holds and unsettled effects remain enforced. Intent and normal busy/offline queues
 survive same-database restart; a portable restore remains paused for operator reconciliation.
 
-**Manual supervisor control:** open the retained worker and send an ordinary prompt,
-or use the worker's **Resume** button. This works for legacy observation-only and paused
-registrations without Release or a separate unattended-publication grant, using the
-Host's existing human access (including its configured no-sign-in mode). Node
-credentials, MCP tokens, request flags, and prompt text do not establish human intent.
-Fleet atomically pauses maintenance and cancels only provably never-sent queued work;
-accepted/in-flight work and unknown effects must first produce correlated receipts.
+**Direct turns on the retained worker:** open the retained worker and send an ordinary prompt,
+or use the worker's **Resume** button. PR maintenance never blocks this — active, paused or
+released, legacy or current — and never pauses because of it. One writer runs at a time:
+queued maintenance work that has not reached the worker yields (settled with no effects,
+never replayed), and only a maintenance turn already running there makes the direct turn wait.
+Node credentials, MCP tokens, request flags, and prompt text do not establish human intent;
+without it the turn is still an ordinary direct turn, never supervisor provenance.
 An accepted manual prompt or resume also settles when its Node reconnects or
 heartbeats without that worker's process after the Host recorded the session as
 ended; the prompt is never replayed. Delivery with an unknown receipt stays blocked.
 Busy, stopping, offline, capacity, and checkout restrictions still apply.
-An execution-settled `reconciling` batch with no reserved or uncertain effects
-does not block manual Resume or a new manual prompt merely because final finding
-bookkeeping is unfinished. Fleet preserves that batch and its receipts and keeps
-maintenance paused; it does not replay the original work or certify its findings.
+Maintenance continues on its own schedule after the direct turn.
 
-Ongoing takeover keeps maintenance **paused** after the turn. For explicit **one-turn handback**,
-Fleet accepts missing/stale cache without treating it as fresh, then resumes only after the exact
-command receipt, correlated completed turn, worker quiescence and fresh effect reconciliation.
+For explicit **one-turn handback**, Fleet requests a review as soon as the exact command
+receipt, correlated completed turn and worker quiescence are recorded.
 Registration, authorization
 scope, pending design decisions, and execution/effect receipts remain intact.
-Manual direction is neither design approval, evidence of readiness, nor permission
-to renew unattended publication. Use explicit maintenance controls to resume the
-loop later. Reconnect may reattach a settled manual conversation, but never replays
+Manual direction is neither design approval nor evidence of readiness. Reconnect
+may reattach a settled manual conversation, but never replays
 an unknown prompt. A later manual turn cannot complete a cancelled orchestration
 step: late outcomes must still match that step's original dispatch attempt.
 
@@ -396,11 +400,11 @@ _Design choices stay human; Direct and continue records direction and queues its
 [Editable diagram source (HTML)](../pr-maintenance-flow.html) ·
 [Technical flow: MCP calls, stages and lifecycles (HTML)](../pr-maintenance-technical-flow.html).
 
-Stop/archive/delete pause linked maintenance. Accepted work and unknown push/reply
-effects retain ownership and block cleanup until reconciled; Stop is not proof
+Stop/archive/delete pause linked automatic maintenance. Accepted work and unknown push/reply
+effects retain ownership and block cleanup until reconciled or released; Stop is not proof
 that remote effects ended. Retained active/paused registrations protect continuity
-from automatic inactivity cleanup. Explicit settled release permits later cleanup
-and a future registration must revalidate its binding.
+from automatic inactivity cleanup. Release always succeeds, keeps history and permits
+later cleanup; a future registration must revalidate its binding.
 
 V1 does not support standalone-session handoff or reuse of sealed, published, or
 cleaned managed results. Follow the displayed eligibility reason rather than

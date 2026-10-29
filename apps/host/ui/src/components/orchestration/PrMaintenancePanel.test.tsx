@@ -499,8 +499,8 @@ describe("PR maintenance task controls", () => {
     ).toMatchObject({ title: "PR maintenance status unavailable", attention: true });
   });
 
-  it("keeps manual control and unknown delivery from enabling release", async () => {
-    const record = held("manual_control");
+  it("shows a running direct turn without holding maintenance, and keeps Release available", async () => {
+    const record = registration();
     record.manualControl = {
       operatorId: "supervisor",
       takenAt: at,
@@ -519,17 +519,17 @@ describe("PR maintenance task controls", () => {
     serve(record);
     show();
     expect(
-      await screen.findByText(/a person is driving the retained worker/),
+      await screen.findByText(/A direct turn is running on the retained worker/),
     ).toBeTruthy();
-    expect(screen.getByText("Idle · Manual control")).toBeTruthy();
+    expect(screen.queryByText(/Manual control/)).toBeNull();
     expect(
       (screen.getByRole("button", { name: "Release maintenance" }) as HTMLButtonElement)
         .disabled,
-    ).toBe(true);
-    expect(screen.getByRole("button", { name: "Resume maintenance" })).toBeTruthy();
+    ).toBe(false);
+    expect(screen.queryByRole("button", { name: "Resume maintenance" })).toBeNull();
   });
 
-  it("reports unknown effects as reconciling and holds release until they settle", async () => {
+  it("reports unknown effects as reconciling and still lets Release keep the history", async () => {
     const record = registration();
     record.batches = [
       {
@@ -554,7 +554,40 @@ describe("PR maintenance task controls", () => {
     expect(
       (screen.getByRole("button", { name: "Release maintenance" }) as HTMLButtonElement)
         .disabled,
-    ).toBe(true);
+    ).toBe(false);
+  });
+
+  it("edits the default Maintain this PR permissions in place", async () => {
+    const record = registration();
+    serve(record);
+    show();
+    const replies = (await screen.findByRole("checkbox", {
+      name: "Reply to review threads",
+    })) as HTMLInputElement;
+    const resolve = screen.getByRole("checkbox", {
+      name: "Resolve addressed threads",
+    }) as HTMLInputElement;
+    expect(replies.checked).toBe(record.authorization.scope.replies);
+    expect(resolve.checked).toBe(record.authorization.scope.resolveThreads);
+    expect(
+      (
+        screen.getByRole("checkbox", {
+          name: "Retry failed CI checks once",
+        }) as HTMLInputElement
+      ).checked,
+    ).toBe(false);
+    vi.mocked(actOnTaskMaintenance).mockResolvedValue(record);
+    fireEvent.click(resolve);
+    await waitFor(() =>
+      expect(actOnTaskMaintenance).toHaveBeenCalledWith(
+        task.id,
+        expect.objectContaining({ id: record.id }),
+        {
+          action: "scope",
+          scope: { resolveThreads: !record.authorization.scope.resolveThreads },
+        },
+      ),
+    );
   });
 
   it("counts only unique settled executed batches, not reservations or undispatched cancellations", async () => {
@@ -741,7 +774,7 @@ describe("PR maintenance task controls", () => {
           />
         </FluentProvider>,
       );
-      const button = await screen.findByRole("button", { name: "Authorize maintenance" });
+      const button = await screen.findByRole("button", { name: "Maintain this PR" });
       expect(button).toHaveProperty("disabled", true);
       expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
       if (!repairs) {
@@ -796,7 +829,7 @@ describe("PR maintenance task controls", () => {
         <PrMaintenanceApprovalReview {...props} />
       </FluentProvider>,
     );
-    await screen.findByRole("button", { name: "Authorize maintenance" });
+    await screen.findByRole("button", { name: "Maintain this PR" });
     fireEvent.click(screen.getByRole("checkbox"));
     view.rerender(
       <FluentProvider theme={fleetDarkTheme}>
@@ -811,7 +844,7 @@ describe("PR maintenance task controls", () => {
       "textContent",
       expect.stringContaining("changed or was already handled"),
     );
-    expect(screen.queryByRole("button", { name: "Authorize maintenance" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Maintain this PR" })).toBeNull();
     expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
   });
 
@@ -848,7 +881,7 @@ describe("PR maintenance task controls", () => {
       </FluentProvider>,
     );
     expect(
-      await screen.findByRole("button", { name: "Authorize maintenance" }),
+      await screen.findByRole("button", { name: "Maintain this PR" }),
     ).toHaveProperty("disabled", true);
     expect(screen.getByRole("checkbox")).toHaveProperty("disabled", true);
     expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
@@ -882,7 +915,7 @@ describe("PR maintenance task controls", () => {
         <PrMaintenanceApprovalReview {...props} />
       </FluentProvider>,
     );
-    await screen.findByRole("button", { name: "Authorize maintenance" });
+    await screen.findByRole("button", { name: "Maintain this PR" });
     fireEvent.click(screen.getByRole("checkbox"));
     view.rerender(
       <FluentProvider theme={fleetDarkTheme}>
@@ -893,7 +926,7 @@ describe("PR maintenance task controls", () => {
       "textContent",
       "Maintenance status unavailable",
     );
-    expect(screen.queryByRole("button", { name: "Authorize maintenance" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Maintain this PR" })).toBeNull();
     expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
   });
 
@@ -949,7 +982,7 @@ describe("PR maintenance task controls", () => {
         name: "Ask Orchestrator to prepare",
       });
       expect(screen.queryByRole("textbox", { name: "Registration proposal" })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Authorize maintenance" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Maintain this PR" })).toBeNull();
       if (url)
         fireEvent.change(screen.getByRole("textbox", { name: "PR URL (optional)" }), {
           target: { value: ` ${url} ` },
@@ -1032,9 +1065,7 @@ describe("PR maintenance task controls", () => {
       "https://dev.azure.com/sample-org/Sample%20Project/_git/Repo%20Name/pullrequest/7";
     expect(within(dialog).getByRole("link").getAttribute("href")).toBe(url);
     fireEvent.click(within(dialog).getByRole("checkbox"));
-    fireEvent.click(
-      within(dialog).getByRole("button", { name: "Authorize maintenance" }),
-    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Maintain this PR" }));
     await waitFor(() =>
       expect(authorizeTaskMaintenanceProposal).toHaveBeenCalledWith(task.id, {
         id: pending.id,
@@ -1074,11 +1105,11 @@ describe("PR maintenance task controls", () => {
     ).toBeNull();
     expect(within(dialog).getByText(/Original coder/)).toBeTruthy();
     const authorize = within(dialog).getByRole("button", {
-      name: "Authorize maintenance",
+      name: "Maintain this PR",
     });
     expect(
       within(dialog).getByRole("checkbox", {
-        name: "I authorize these bounded repairs and responses only. No merge, force-push or unapproved design changes.",
+        name: "I authorize maintaining this PR: code repairs, normal pushes, and the responses above. No merge, no unapproved design changes, and a force-push only to finish a conflict rebase leased on the exact PR head.",
       }),
     ).toBeTruthy();
     expect((authorize as HTMLButtonElement).disabled).toBe(true);
@@ -1135,7 +1166,7 @@ describe("PR maintenance task controls", () => {
     rendered.rerender(panel(2));
     expect(await within(dialog).findByRole("alert")).toBeTruthy();
     const authorize = within(dialog).getByRole("button", {
-      name: "Authorize maintenance",
+      name: "Maintain this PR",
     });
     expect((authorize as HTMLButtonElement).disabled).toBe(true);
     expect(within(dialog).getByText(/Run regression tests/)).toBeTruthy();

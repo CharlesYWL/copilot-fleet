@@ -62,8 +62,10 @@ permissions).
 
 ### Holds (exceptional, orthogonal to phase)
 
-A hold stops worker dispatch and new effects. It does not stop read-only
-refresh unless noted.
+A hold stops **automatic** maintenance: worker dispatch and new effects. It never
+refuses a person's or the orchestrator's direct turn on the worker, and it does
+not stop read-only refresh unless noted. Queued maintenance work it cancels
+settles at once with no effects and is never replayed.
 
 | Hold | Set by | Cleared by |
 | --- | --- | --- |
@@ -71,7 +73,7 @@ refresh unless noted.
 | `paused` | Explicit Pause (operator or owning lead) | Resume; newer operator direction |
 | `access` | Provider authentication or permission denial | Resume (operator) |
 | `identity` | Provider identity or pinned ref changed | Resume (operator) |
-| `manual_control` | Supervisor takes manual control of the worker | Handback or Resume |
+| `manual_control` (legacy) | Only on records held before direct turns stopped pausing maintenance | Resume, or automatically when that direct turn settles |
 | `reconciling` (derived) | Uncertain execution or external effect | Reconciliation evidence |
 
 Stopping, cancelling, or losing the **orchestrator** session no longer changes
@@ -101,16 +103,18 @@ batches. Manual requests never write `nextCheckAt`.
 | `idle` | Heartbeat | `nextCheckAt ≤ now`, no hold | `reviewing` | review(`heartbeat`) claimed by `takeDue` |
 | any non-terminal | Manual **Review now** (UI or orchestrator) | no stored hold | `reviewing` | review(`manual`); bypasses `nextCheckAt` without changing it |
 | `reviewing` | Complete observation, merged/closed | — | `merged`/`closed` | pending decision withdrawn as moot |
-| `reviewing` | Lead prepares batch and worker accepts it | no hold, no pending decision, fresh evidence for that head | `working` | review concluded `working` |
+| `reviewing` | Lead prepares a work order and worker accepts it | no hold, no pending decision, fresh evidence for that head, no direct work running | `working` | review concluded `working` |
 | `reviewing` | Lead escalates a genuine design decision | — | `waiting_for_decision` | notification; review concluded `decision`; task state untouched |
 | `reviewing` | Lead records `review_done` | — | `idle` | review concluded `idle` |
 | `reviewing` | Observation fails (non-access) | — | `idle` | review concluded `failed`; heartbeat retries; capability recovery wake if applicable |
 | `reviewing` | Lead turn ends without outcome | no helper command in flight | `idle` | review concluded `abandoned` |
-| `working` | Worker step settles | — | `reviewing` | review(`worker_result`) woken immediately |
+| `working` | Worker step settles | — | `reviewing` | Host settles the batch from the worker's `prm.work-report/1`; review(`worker_result`) woken immediately. An unreadable report leaves the batch `reconciling` with `settlementError` (recovered only by `work_report`) |
 | `working` | Same finding group: 3 attempts without progress, or flips back to an earlier state | — | `waiting_for_decision` | Host-raised decision (no cap on total batches) |
 | `waiting_for_decision` | Direction recorded (PRM panel or orchestrator chat in a user turn) | matches pending decision | `reviewing` | review(`direction`); clears a `paused` hold; no second Resume |
-| any | Explicit Pause | — | hold `paused` | undispatched batch cancelled; in-flight attempt cancelled |
+| any | Explicit Pause | — | hold `paused` | undispatched batch settled `cancelled` with no effects (never replayed); in-flight attempt asked to stop; queued operator work kept |
 | any | Explicit worker/task Stop | — | hold `stopped` | as above |
+| any | Direct turn on the worker or checkout | no maintenance turn running there | unchanged | undispatched batch yields: settled `cancelled` (`direct_work`), never replayed; no hold |
+| any | Release (operator) | always | `released` | history kept; pending decision withdrawn; queued work cancelled; in-flight attempt asked to stop |
 | any | Provider auth/permission denial | — | hold `access` | — |
 | any | Provider identity change | — | hold `identity` | — |
 | hold | Resume (operator; lead only for its own pause) | binding intact, task not cancelled | hold cleared → `reviewing` | review(`resume`) |
@@ -120,13 +124,13 @@ batches. Manual requests never write `nextCheckAt`.
 
 | Action | Refused only when |
 | --- | --- |
-| `discover` (read-only refresh) | released, `stopped`, or `manual_control` |
-| Prepare/accept a batch | any hold, pending decision, unsettled work, broken binding, stale or mismatched evidence for the batch head, draft, unplanned conflict |
-| Execute an accepted batch | any hold, pending decision, broken binding, uncertain execution |
-| Ordinary dispatch to the retained worker/checkout | always (`maintenance_batch_required`) |
+| `discover` (read-only refresh) | released, terminal or `stopped` |
+| Prepare/accept a batch | any hold, pending decision, unsettled work, broken binding, stale or mismatched evidence for the batch head, draft, unplanned conflict, direct work running on the worker (`direct_work_active`) |
+| Execute an accepted batch | any hold, pending decision, broken binding, uncertain execution, direct work running |
+| Direct write to the worker/checkout (prompt, follow-up, new step, resume, command) | only while a dispatched maintenance turn is still executing there (`maintenance_in_flight`); never for a hold, pause, release, decision or awaiting-human task |
 | Approve/advance/submit/aggregate the task | in-flight maintenance work |
 | Reopen the task | never |
-| Cleanup of retained resources | always (`maintenance_retention`) |
+| Cleanup of retained resources | always (`maintenance_retention`) until released |
 
 The underlying task's `awaiting_human` or `completed` state no longer affects
 admission. Maintenance batches dispatch even while the task waits for an
@@ -134,7 +138,12 @@ unrelated review, and never change the task state.
 
 ## 4. Safeguards that remain
 
-- Never merge or enable auto-complete; never force-push or rewrite history.
+- Never merge or enable auto-complete. History is rewritten only to resolve a
+  straightforward merge conflict in a `conflictResolution` batch: the worker
+  rebases onto the current base and force-pushes to the same PR branch with
+  `--force-with-lease` on the exact HEAD the batch was prepared from; the Host
+  refuses any other forced push. Unknown remote changes, user work, ambiguous
+  conflicts and design questions stop the worker without pushing.
 - Exact provider/repository/PR/source-ref identity and retained worker binding.
 - Explicit Stop, authentication and identity holds.
 - Uncertain effects are reconciled before new effects or retries.
@@ -152,7 +161,24 @@ lead-session pause, the coupling between task review and PRM decisions, and the
 observation-failure/scan-stall pauses (failed reviews return to `idle` and the
 next heartbeat retries).
 
-## 5. Migration (registry schema 3 → 4, record v1 → v2)
+## 5. Simplifications (2026-10)
+
+- **Direct work is never blocked.** PRM reserves nothing against an explicit direct turn, whether the record is
+  active, paused or released. One writer runs at a time: direct work goes first and queued maintenance yields to it;
+  only a maintenance turn already executing makes a direct write wait. Direct turns set no hold.
+- **Pause and Release are simple.** Pause stops automatic actions only; undispatched batches settle as cancelled
+  with zero effects and never replay; operator work survives. Release always succeeds (idempotent, no version or
+  decision reference needed) and keeps history, including unsettled evidence.
+- **One editable grant.** *Maintain this PR* covers code repairs, normal pushes, replies and resolving addressed
+  threads by default. The operator edits permissions in place (`scope` action, recorded in `scopeHistory`).
+- **Host-owned ingestion and settlement.** The Host ingests claim-bound helper output and settles work-order
+  batches from the worker's report. The lead tool refuses large observation relays, alternate evidence, hand-built
+  `prepare_batch` and per-finding `batch` settlement of work orders. `work_report` is the single settlement recovery
+  path; re-running the helper on the next review is the single observation recovery path.
+- **Conflicts.** A `conflictResolution` work order rebases onto the current base and force-pushes with an exact
+  lease; see Safeguards.
+
+## 6. Migration (registry schema 3 → 4, record v1 → v2)
 
 Each stored v1 registration is converted once on Host start, and v1 records in
 portable backups are converted on import:

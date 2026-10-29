@@ -1611,7 +1611,7 @@ V1 每个任务只保留一个 PR 维护注册；为同一任务注册另一个 
 `fleet_prepare_pr_maintenance` 自动填入任务基线和原有 coder，核实最新平台
 元数据后保存待授权提案。在任务面板点击
 **Review PR maintenance proposal**，审阅已填好的范围后，以登录身份点击
-**Authorize maintenance**。无需复制 JSON，agent 也不能自行授权。
+**Maintain this PR**。无需复制 JSON，agent 也不能自行授权。
 之后沿用现有唤醒流程；也可发送普通聊天消息要求立即检查。
 准备操作默认仅观察，所有远程修改权限关闭。修复/发布必须有已核实的原有发布授权，
 回复、解决讨论、指定审查者和 CI 重试需分别显式请求。审批展示准确权限，不会将

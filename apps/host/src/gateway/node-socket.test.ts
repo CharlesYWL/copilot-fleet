@@ -1668,7 +1668,12 @@ describe("node reconnect socket ordering", () => {
         "original-operator",
       );
       const backup = store.prMaintenance.exportBackup();
-      backup.registrations[0]!.authorization.scope.publicationAuthorized = false;
+      // A retired observation-only grant never carried response permissions.
+      Object.assign(backup.registrations[0]!.authorization.scope, {
+        publicationAuthorized: false,
+        replies: false,
+        resolveThreads: false,
+      });
       store.writeAtomically(() => store.prMaintenance.importBackup(backup));
       record = store.prMaintenance.get(record.id)!;
       const client = await connect({ activeSessionIds: [worker.id], busySessionIds: [] });

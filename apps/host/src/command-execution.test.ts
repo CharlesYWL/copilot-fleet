@@ -2635,15 +2635,14 @@ describe("PR maintenance with durable commands", () => {
     );
   }
 
-  it("reserves the task and legacy placement, including held work, but permits a separate helper target", () => {
+  it("never reserves the maintained task or placement against commands, even with a pending decision", () => {
     const f = setup();
     const pending = f.prepare(f.request());
     const record = enableMaintenance(f);
-    expect(() => f.approve(pending)).toThrow("maintenance_batch_required");
-    expect(() => f.request({ taskId: record.taskId })).toThrow(
-      "maintenance_batch_required",
+    expect(f.approve(pending).state).not.toBe("failed");
+    expect(f.prepare(f.request({ taskId: record.taskId })).state).toBe(
+      "awaiting_approval",
     );
-    expect(() => f.request()).toThrow("maintenance_batch_required");
     f.store.prMaintenance.holdForDecision(f.lead.id, record.id, record.version, {
       id: "design-decision",
       version: 1,
@@ -2651,9 +2650,11 @@ describe("PR maintenance with durable commands", () => {
       headSha: record.authorization.headSha,
       scope: record.authorization.scope.baseline,
     });
-    // The decision does not free the retained checkout for ordinary commands.
-    expect(() => f.request({ taskId: record.taskId })).toThrow("decision_pending");
-    expect(() => f.request()).toThrow("decision_pending");
+    // A pending PR decision holds automatic maintenance only, never direct commands.
+    expect(f.prepare(f.request({ taskId: record.taskId })).state).toBe(
+      "awaiting_approval",
+    );
+    expect(f.prepare(f.request()).state).toBe("awaiting_approval");
     const helper = f.store.createPlacement(
       f.store.createWorkspace("Helper context", "").id,
       f.node.id,
@@ -2661,10 +2662,10 @@ describe("PR maintenance with durable commands", () => {
     );
     const execution = f.prepare(f.request({ target: { placementId: helper.id } }));
     expect(execution.state).toBe("awaiting_approval");
-    expect(f.approve(execution).state).toBe("starting");
+    expect(["starting", "queued"]).toContain(f.approve(execution).state);
   });
 
-  it("rechecks queued remote commands when maintenance reserves their target", () => {
+  it("starts queued remote commands after maintenance is enabled on their target", () => {
     const f = setup();
     const blocker = f.start();
     const queued = f.approve(f.prepare(f.request()));
@@ -2672,21 +2673,16 @@ describe("PR maintenance with durable commands", () => {
     enableMaintenance(f);
     f.result(blocker);
     f.service.commands.tick();
-    expect(f.service.commands.get(queued.id)).toMatchObject({
-      state: "failed",
-      reasonCode: "maintenance_target_reserved",
-    });
-    expect(f.store.commands.attempt(queued.id)).toMatchObject({
-      start_version: null,
-      cancelled: 1,
-    });
+    expect(f.service.commands.get(queued.id)?.reasonCode).not.toBe(
+      "maintenance_target_reserved",
+    );
     expect(
       f.frames.some(
         (frame) =>
           frame.type === "start_command_execution" &&
           frame.descriptor.executionId === queued.id,
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("changes the maintenance wake allowance only on accepted durable delivery, not reservations or replays", () => {
@@ -4430,22 +4426,19 @@ describe("PR maintenance with durable commands", () => {
       recordId: record.id,
       expectedVersion: record.version,
       checkpoint: {
-        kind: "prepare_batch",
-        batch: {
-          id: "receipt-is-not-action-authority",
-          kind: "repair",
-          sources: [
+        kind: "prepare_work_order",
+        plan: {
+          batchId: "receipt-is-not-action-authority",
+          summary: "No action on an old allowance.",
+          reservedMutations: 1,
+          findings: [
             {
-              id: "synthetic",
+              sourceId: "synthetic",
               revision: "1",
-              groupKey: "synthetic",
-              evidence: "No authority to repair.",
+              task: "repair",
+              instructions: "No authority to repair.",
             },
           ],
-          headSha: record.authorization.headSha,
-          prompt: "No action on an old allowance.",
-          scope: record.authorization.scope.baseline,
-          reservedMutations: 1,
         },
       },
     });
@@ -5097,25 +5090,31 @@ describe("PR maintenance with durable commands", () => {
     const saved = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
     expect(saved.ok, saved.text).toBe(true);
     const record = h.f.store.prMaintenance.get(h.record.id)!;
-    const batch = {
-      id: "async-repair",
-      kind: "repair",
-      sources: result.observation.sources,
-      headSha: record.authorization.headSha,
-      prompt: "Repair within approved scope.",
-      scope: record.authorization.scope.baseline,
-      reservedMutations: 1,
-    };
+    const batch = { id: "async-repair" };
     const args = {
       recordId: record.id,
       expectedVersion: record.version,
-      checkpoint: { kind: "prepare_batch", batch },
+      checkpoint: {
+        kind: "prepare_work_order",
+        plan: {
+          batchId: batch.id,
+          summary: "Repair within approved scope.",
+          reservedMutations: 1,
+          findings: result.observation.sources
+            .slice(0, 50)
+            .map((source: { id: string; revision: string }) => ({
+              sourceId: source.id,
+              revision: source.revision,
+              task: "repair",
+              instructions: "Repair within approved scope.",
+            })),
+        },
+      },
     };
     const prepared = await h.call("fleet_checkpoint_pr_maintenance", args);
     expect(prepared.ok, prepared.text).toBe(true);
     const followUp = {
       sessionId: record.workerSessionId,
-      prompt: batch.prompt,
       maintenance: {
         recordId: record.id,
         generation: record.generation,

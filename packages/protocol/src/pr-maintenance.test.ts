@@ -3,6 +3,7 @@ import {
   PR_MAINTENANCE_WAKE_LIMITS,
   PR_MAINTENANCE_RECOVERY_LIMITS,
   PrMaintenanceCheckpointSchema,
+  PrMaintenanceEffectSchema,
   PrMaintenanceIdentitySchema,
   PrMaintenanceOperatorActionSchema,
   PrMaintenanceScopeSchema,
@@ -616,12 +617,12 @@ describe("PR maintenance wire schemas", () => {
       ).toBe(false);
   });
 
-  it("requires explicit repair scope and leaves optional provider actions off", () => {
+  it("one Maintain this PR grant covers replies and addressed-thread resolution by default", () => {
     const scope = { baseline: "Observe only.", verification: "Read existing evidence." };
     const repair = {
       publicationAuthorized: true,
-      replies: false,
-      resolveThreads: false,
+      replies: true,
+      resolveThreads: true,
       reviewers: [],
       retryChecks: false,
     };
@@ -633,6 +634,61 @@ describe("PR maintenance wire schemas", () => {
     expect(
       PrMaintenanceScopeSchema.parse({ ...scope, publicationAuthorized: true }),
     ).toMatchObject(repair);
+    // The person can still narrow it explicitly.
+    expect(
+      PrMaintenanceScopeSchema.parse({
+        ...scope,
+        publicationAuthorized: true,
+        replies: false,
+        resolveThreads: false,
+      }),
+    ).toMatchObject({ replies: false, resolveThreads: false });
+  });
+
+  it("edits the grant's permissions in place and accepts only leased forced pushes", () => {
+    expect(
+      PrMaintenanceOperatorActionSchema.parse({
+        action: "scope",
+        scope: { replies: false },
+      }),
+    ).toEqual({ action: "scope", scope: { replies: false } });
+    expect(
+      PrMaintenanceOperatorActionSchema.safeParse({ action: "scope", scope: {} }).success,
+    ).toBe(false);
+    expect(
+      PrMaintenanceOperatorActionSchema.safeParse({
+        action: "scope",
+        scope: { publicationAuthorized: false },
+      }).success,
+    ).toBe(false);
+    const push = {
+      key: "push-1",
+      kind: "push",
+      state: "known",
+      headSha: "c".repeat(40),
+      actor: "worker",
+      actionIdentity: "push-1",
+      providerId: "c".repeat(40),
+      evidence: "Read back.",
+    };
+    expect(PrMaintenanceEffectSchema.safeParse({ ...push, force: true }).success).toBe(
+      false,
+    );
+    expect(
+      PrMaintenanceEffectSchema.safeParse({
+        ...push,
+        force: true,
+        expectedRemoteSha: "a".repeat(40),
+      }).success,
+    ).toBe(true);
+    expect(
+      PrMaintenanceEffectSchema.safeParse({
+        ...push,
+        kind: "reply",
+        force: true,
+        expectedRemoteSha: "a".repeat(40),
+      }).success,
+    ).toBe(false);
   });
 
   it.each([

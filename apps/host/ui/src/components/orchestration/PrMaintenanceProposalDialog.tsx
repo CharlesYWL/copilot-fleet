@@ -87,7 +87,7 @@ export function PrMaintenanceProposalDialog({
     <Dialog open onOpenChange={(_, data) => !busy && !data.open && onClose()}>
       <DialogSurface>
         <DialogBody>
-          <DialogTitle>Authorize bounded PR maintenance</DialogTitle>
+          <DialogTitle>Maintain this PR</DialogTitle>
           <DialogContent>
             {changed && !busy ? (
               <p role="alert">
@@ -155,9 +155,11 @@ export function PrMaintenanceProposalDialog({
                   "Read-only findings only; no provider mutations."
                 ) : (
                   <>
-                    Replies: {candidate.scope.replies ? "yes" : "no"} · resolve evidenced
-                    threads: {candidate.scope.resolveThreads ? "yes" : "no"} · CI retry:{" "}
-                    {candidate.scope.retryChecks ? "yes" : "no"}
+                    Code repairs and normal pushes · replies:{" "}
+                    {candidate.scope.replies ? "yes" : "no"} · resolve addressed threads:{" "}
+                    {candidate.scope.resolveThreads ? "yes" : "no"} · CI retry:{" "}
+                    {candidate.scope.retryChecks ? "yes" : "no"}. You can change these
+                    later without re-authorizing.
                   </>
                 )}
               </dd>
@@ -205,7 +207,7 @@ export function PrMaintenanceProposalDialog({
               checked={confirmed}
               disabled={disabled}
               onChange={(_, data) => onConfirmedChange(data.checked === true)}
-              label="I authorize these bounded repairs and responses only. No merge, force-push or unapproved design changes."
+              label="I authorize maintaining this PR: code repairs, normal pushes, and the responses above. No merge, no unapproved design changes, and a force-push only to finish a conflict rebase leased on the exact PR head."
             />
           </DialogContent>
           <DialogActions>
@@ -217,7 +219,7 @@ export function PrMaintenanceProposalDialog({
               disabled={disabled || !confirmed}
               onClick={onAuthorize}
             >
-              Authorize maintenance
+              Maintain this PR
             </Button>
           </DialogActions>
         </DialogBody>

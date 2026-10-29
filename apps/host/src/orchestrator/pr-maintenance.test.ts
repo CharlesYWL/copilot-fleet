@@ -11,6 +11,7 @@ import { OrchestratorEngine } from "./engine.js";
 import { FleetTools, GetPrMaintenanceSchema, SetPrMaintenanceSchema } from "./tools.js";
 import { transferRun } from "./lifecycle.js";
 import { SessionCleanupPendingError } from "../store.js";
+import { prMaintenanceUnsettled } from "../pr-maintenance-store.js";
 
 describe("PR maintenance orchestration", () => {
   let world: ReturnType<typeof fleet>;
@@ -438,7 +439,6 @@ describe("PR maintenance orchestration", () => {
       const prepared = prepare(record.id);
       const prompt = prepared.batches[0]!.prompt;
       const broadcast = vi.spyOn(world.service, "broadcast");
-      expect(tools.followUp({ sessionId: worker.id, prompt }).ok).toBe(false);
       const result = tools.followUp({
         sessionId: worker.id,
         prompt,
@@ -522,7 +522,7 @@ describe("PR maintenance orchestration", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("prevents a paused queued batch from starting and retains reconciliation", () => {
+  it("settles a paused queued batch at once with no effects and never replays it", () => {
     const { record, worker, step } = setup();
     const prepared = prepare(record.id);
     vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
@@ -534,7 +534,6 @@ describe("PR maintenance orchestration", () => {
       }).ok,
     ).toBe(true);
     const accepted = world.store.prMaintenance.get(record.id)!;
-    const publishSnapshot = vi.spyOn(world.service, "publishSnapshot");
     expect(
       tools.setPrMaintenance({
         recordId: record.id,
@@ -543,16 +542,32 @@ describe("PR maintenance orchestration", () => {
         reason: "Operator pause",
       }).ok,
     ).toBe(true);
-    expect(publishSnapshot).toHaveBeenCalledTimes(2);
-    publishSnapshot.mockClear();
-    new OrchestratorEngine(world.service).tickRun(step.runId);
+    // Pause settles the queued attempt in the same transaction: nothing to reconcile.
     expect(world.store.getRunStep(step.id)!.state).toBe("cancelled");
     expect(world.store.prMaintenance.get(record.id)!.batches[0]).toMatchObject({
-      state: "reconciling",
+      state: "cancelled",
       executionSettled: true,
+      executionNotDispatched: true,
+      effects: [],
+      findings: [expect.objectContaining({ outcome: "incomplete" })],
     });
-    expect(world.store.prMaintenance.hasSessionRetentionBlockers(worker.id)).toBe(true);
-    expect(publishSnapshot).not.toHaveBeenCalled();
+    expect(prMaintenanceUnsettled(world.store.prMaintenance.get(record.id)!)).toBe(false);
+    const dispatch = vi.spyOn(world.service, "dispatch");
+    new OrchestratorEngine(world.service).tickRun(step.runId);
+    const paused = world.store.prMaintenance.get(record.id)!;
+    const resumed = tools.setPrMaintenance({
+      recordId: record.id,
+      expectedVersion: paused.version,
+      action: "resume",
+    });
+    expect(resumed.ok, resumed.text).toBe(true);
+    new OrchestratorEngine(world.service).tickRun(step.runId);
+    expect(world.store.getRunStep(step.id)!.state).toBe("cancelled");
+    expect(world.store.prMaintenance.get(record.id)!.batches[0]!.state).toBe("cancelled");
+    expect(dispatch).not.toHaveBeenCalledWith(
+      worker.nodeId,
+      expect.objectContaining({ sessionId: worker.id }),
+    );
   });
 
   it.each(["github", "azure-devops"] as const)(
@@ -598,9 +613,11 @@ describe("PR maintenance orchestration", () => {
       });
       expect(stages).toEqual(["working", "reconciling"]);
       expect(() => prepare(record.id)).not.toThrow();
-      expect(tools.followUp({ sessionId: worker.id, prompt: "New repair" }).ok).toBe(
-        false,
-      );
+      // Direct work on the worker is admitted once the maintenance turn ended.
+      expect(
+        world.store.prMaintenance.admission({ action: "prompt", sessionId: worker.id })
+          .allowed,
+      ).toBe(true);
       const checkpoint = (
         update: Parameters<FleetTools["checkpointPrMaintenance"]>[0]["checkpoint"],
       ) =>
@@ -1022,8 +1039,9 @@ describe("PR maintenance orchestration", () => {
           permissions: {
             modifyCode: true,
             push: true,
-            reply: false,
-            resolveThreads: false,
+            // One "Maintain this PR" grant covers replies and resolving addressed threads.
+            reply: true,
+            resolveThreads: true,
           },
           baseline: record.authorization.scope.baseline,
           verification: [record.authorization.scope.verification],
@@ -1067,6 +1085,25 @@ describe("PR maintenance orchestration", () => {
       );
       expect(invented.ok).toBe(false);
       expect(invented.text).toContain("source_mismatch");
+      // The person narrows the grant in place; the next plan follows it.
+      const current = world.store.prMaintenance.get(record.id)!;
+      const narrowed = world.store.prMaintenance.operatorAction(
+        record.id,
+        current.version,
+        { action: "scope", scope: { replies: false } },
+        "operator",
+      );
+      expect(narrowed.authorization).toMatchObject({
+        id: current.authorization.id,
+        scope: { replies: false, resolveThreads: true },
+      });
+      expect(narrowed.scopeHistory).toEqual([
+        expect.objectContaining({
+          actorId: "operator",
+          authorizationId: current.authorization.id,
+          previous: expect.objectContaining({ replies: true }),
+        }),
+      ]);
       const answer = checkpoint(
         record.id,
         plan({

@@ -278,16 +278,6 @@ export class OrchestratorEngine {
           "Node history and local control are synchronizing; scheduling waits for reconciliation.",
       });
     }
-    const manual = this.store.prMaintenance
-      .list({ taskId: runId, retainedOnly: true })
-      .records.find((record) => record.manualControl && !record.manualControl.endedAt);
-    if (manual) {
-      this.holdEveryPending(run.id, {
-        code: "maintenance_hold",
-        detail: `${manual.manualControl?.actor?.kind === "node_console" ? "The local Node console" : "A person"} has taken manual control of this task's PR-maintenance worker; scheduling waits until that control ends.`,
-      });
-      return;
-    }
     const commandFence = this.store.commands.fence(runId);
     if (
       commandFence &&
@@ -356,15 +346,10 @@ export class OrchestratorEngine {
         completedTurns.add(session.id);
       }
     }
-    const maintenance = this.store.prMaintenance.admission({
-      action: "discover",
-      taskId: run.id,
-    });
-    const mayContinue = maintenance.allowed;
+    // PR maintenance never holds the task's own scheduling; a maintenance turn
+    // still executing on a step's worker or checkout is checked per step.
     const workspaceReady =
-      !syncing &&
-      mayContinue &&
-      (steps.length ? this.service.worktrees.ensureReady(run) : true);
+      !syncing && (steps.length ? this.service.worktrees.ensureReady(run) : true);
     if (workspaceReady && run.workspaceBinding?.effectiveMode === "managed") {
       for (const step of steps)
         if (step.state === "pending") this.service.worktrees.ensureStepReady(run, step);
@@ -398,15 +383,6 @@ export class OrchestratorEngine {
       holds,
       exceptions: this.resume.exceptionsFor(run, nowMs),
     });
-    if (!mayContinue) {
-      // The planner only sees an unready workspace; the reason is maintenance.
-      for (const [stepId, hold] of holds)
-        if (hold.code === "workspace_not_ready")
-          holds.set(stepId, {
-            code: "maintenance_hold",
-            detail: `PR maintenance holds this task (${maintenance.reason}); nothing new is dispatched until it is resolved.`,
-          });
-    }
 
     let touched = false;
     for (const action of actions) {
@@ -921,9 +897,9 @@ export class OrchestratorEngine {
           lead.id,
           [
             `PR maintenance observation recovery: record ${pending.recordId}, incident ${pending.incidentId}.`,
-            "Read fleet_get_pr_maintenance for the exact retained error and receipts. Claim a bounded visit before read-only recovery.",
-            "Use alternate_attempt to reserve an alternate evidence method BEFORE calling it, then alternate_observation with pinned identity, fresh structured evidence and the same resolutionId. At most 3 attempts per incident; the existing 5 visits / 100 requests / 5 minutes per wake still apply. Each helper invocation remains capped at 120 seconds.",
-            "Do not repeat a reserved attempt after uncertain delivery. Incomplete evidence stays incomplete. Provider auth/permission denial, identity drift, Stop, human holds and unknown effects are not capability recovery. Do not resume, authorize, release, reset budgets or replay worker dispatch.",
+            "Read fleet_get_pr_maintenance for the exact retained error. There is one recovery path: claim a review with takeDue and run the same packaged helper again as a claim-bound Fleet command; the Host ingests its output. A lost receipt is recovered with only its executionId.",
+            "The existing 5 visits / 100 requests / 5 minutes per wake still apply; each helper invocation remains capped at 120 seconds.",
+            "Incomplete evidence stays incomplete. Provider auth/permission denial, identity drift, Stop, human holds and unknown effects are not capability recovery. Do not resume, authorize, release, reset budgets or replay worker dispatch.",
           ].join("\n"),
           `pr-maintenance-recovery:${pending.incidentId}`,
         );
@@ -1078,7 +1054,7 @@ export class OrchestratorEngine {
         ),
         ...(recoveries.length
           ? [
-              `Observation recovery incidents: ${recoveries.map((pending) => `${pending.recordId} (${pending.incidentId})`).join(", ")}. Reserve alternate_attempt before read-only alternate evidence, then checkpoint alternate_observation. Never repeat a reserved attempt or replay dispatch.`,
+              `Observation recovery incidents: ${recoveries.map((pending) => `${pending.recordId} (${pending.incidentId})`).join(", ")}. Recover by reading fleet_get_pr_maintenance and running the same helper again as a claim-bound Fleet command on the next review. Never replay dispatch.`,
             ]
           : []),
       ].join("\n\n");
