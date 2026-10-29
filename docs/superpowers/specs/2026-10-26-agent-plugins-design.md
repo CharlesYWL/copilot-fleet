@@ -12,9 +12,9 @@ tags:
 **Area**: Node agent launch, Host scheduling and settings, protocol  
 **Engineer**: Not assigned  
 **Driver / Approver**: Charles Yin, repository owner  
-**Status**: Design approved in conversation; revised for review findings (2026-10-28); not implemented  
-**Date**: 2026-10-26; revised 2026-10-28  
-**Source baseline**: `bc268b8` on `main` (drafted at `3456c2a`; rechecked at `daed730` and `bc268b8`)  
+**Status**: Design approved in conversation; revised for review findings (2026-10-28, 2026-10-29); not implemented  
+**Date**: 2026-10-26; revised 2026-10-28 and 2026-10-29  
+**Source baseline**: `6ccbdaf` on `main` (drafted at `3456c2a`; rechecked at `daed730`, `bc268b8` and `6ccbdaf`)  
 **Work item**: Not supplied
 
 ## Related documents
@@ -33,6 +33,33 @@ tags:
 | Claude Code ACP adapter | [agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) |
 | Inspiration | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) ("everything is a plugin") |
 | Node.js batch-file argument handling | [CVE-2024-27980 security release](https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2) |
+
+## Revision 3 (2026-10-29)
+
+A second review round found five places where a new mechanism did not yet
+preserve existing behavior. Each was checked against `main` at `6ccbdaf`, and
+each holds:
+
+| Finding | Where it is resolved |
+| --- | --- |
+| P1. Start and resume commands carry no role, and older Nodes rely on the Host's startup settings to put Copilot in agent mode | [Startup settings](#startup-settings) |
+| P1. A delegating wrapper around the Node link would break code that compares links or checks `instanceof SealedNodeLink` | [Wire compatibility](#wire-compatibility) |
+| P2. Rewriting every key named `agentParams` would change unrelated data inside event payloads | [Wire compatibility](#wire-compatibility) |
+| P2. Local npm shims point outside their own directory, so the containment rule rejected normal installs | [Launching on Windows](#launching-on-windows) |
+| P2. The managed launcher's child inherits the helper's environment, so the "helper-only" variables reached the agent | [Launching on Windows](#launching-on-windows) |
+
+Checking them also showed:
+
+- `main` gained Copilot startup profiles (#110): the Node now turns the
+  `model` and `reasoning_effort` startup settings into `--model` and
+  `--reasoning-effort` launch flags, and validates them first. The Copilot
+  plugin keeps that behavior; see [Startup settings](#startup-settings).
+- A released Node's command schema silently drops fields it does not know.
+  A new launch field such as `runRole` is therefore safe to send to an older
+  Node, but the older Node ignores it, so the Host must keep sending what
+  older Nodes rely on.
+- The repository has no release tags, so "the last release" in tests means a
+  pinned commit, recorded in the test fixture.
 
 ## Revision 2 (2026-10-28)
 
@@ -62,8 +89,8 @@ Checking the findings turned up three more problems, fixed in the same places:
   PowerShell also treats as single quotes. A probe built the same way ended the
   string early and ran an injected command.
 - Older Nodes also parse the full session records sent for the local session
-  console (`session_console_grant`, and `session_console_update` messages that
-  carry a session), and those records contain `agentParams`.
+  console, and those records contain `agentParams`. (Revision 3 lists every
+  such frame, including console responses.)
 - Copilot CLI 1.0.105 does not advertise `sessionCapabilities.delete` in its ACP
   `initialize` response, and Fleet's retention deletion requires it. A
   hard-coded "Copilot supports cleanup" feature would therefore have been
@@ -236,6 +263,8 @@ type AgentManifest = {
     verified: boolean;           // resume, httpMcp and images were measured from ACP initialize
   };
   launchOptions: string[];       // Host-supplied options this kind accepts, e.g. "agency", "contextTier", "customAgent"
+  startupSettings?: Partial<Record<"" | "lead" | "worker" | "reviewer",
+    Array<{ id: string; value: string }>>>;  // settings each role must start with; see Startup settings
   setupHint?: string;            // max 300 chars
 };
 
@@ -310,9 +339,11 @@ with these changes:
 
 - `prepare()` returns a launch description: `command`, `args`, `env` additions,
   optional `notice`, and `failureMessage`. The core spawns.
-- New optional `startupConfig(role)` returns initial session settings. Copilot
-  returns today's `mode: agent` for leads and workers, which removes the
-  Copilot-only branch from the Host's `startupConfigFor`.
+- New optional `startupConfig(role, requested)` returns the settings to apply
+  when a session starts or resumes. `role` comes from the launch command (see
+  [Startup settings](#startup-settings)); `requested` is the model and effort
+  the Host chose. Copilot returns `mode: agent` for leads and workers, as the
+  Host does today, plus the requested settings.
 - New optional `history`, present only when the manifest declares
   `nativeHistoryCleanup`. It offers `find(nativeSessionId)` and
   `remove(nativeSessionId)`, and nothing else. The deletion sequence and its
@@ -416,63 +447,153 @@ Nodes released before this change validate `agentParams` strictly. Their
 schema accepts `{ kind: "copilot" }` and `{ kind: "hermes", profile }` only. A
 frame that fails Node validation makes the Node close its whole connection,
 which interrupts every session on that Node. A message type an older Node does
-not know is refused the same way.
+not know is refused the same way. Fields an older Node does not know inside a
+known message are dropped silently.
 
 The Host therefore serializes per Node:
 
 - **Storage, backups and the Host's own logic** use the canonical shape.
-- **Every frame to a Node** passes through one function,
-  `toNodeWire(message, node)`. Today frames leave the Host through
-  `FleetService.send` and, for file reads, directly through the `NodeLink` in
-  `apps/host/src/session-files.ts`. Every Node connection, sealed or legacy,
-  is attached as a `NodeLink`, so the Host wraps each link when the Node is
-  attached and the wrapper calls `toNodeWire` before every send. For a Node
-  without `agent-plugins-v1` it rewrites every `agentParams` in the frame to the
-  legacy shape: Copilot unchanged, Hermes as `{ kind: "hermes", profile }`.
+- **Every frame to a Node passes through one function**,
+  `toNodeWire(message, nodeId)`, before it is turned into text. Today frames
+  leave the Host in two places: `FleetService.send`, and the file-read path in
+  `apps/host/src/session-files.ts`, which writes to the link directly. The
+  file-read path moves to `FleetService.send`, keeping its existing checks
+  (sealed link only, Node online); `session_file_read` is not on the list of
+  frames that history synchronization holds back, so moving it changes no
+  behavior. `toNodeWire` runs inside `FleetService.send`. A test fails if any
+  Host source other than `FleetService.send` calls `send` on a `NodeLink`. The
+  only other write to a Node socket is the handshake challenge in
+  `apps/host/src/gateway/node-socket.ts`, sent before the Node is attached; it
+  carries no agent fields and is listed as the test's single exception.
+- **Links are never wrapped or replaced.** Existing code depends on the link
+  object itself: the gateway ignores packets when the stored link is not the
+  one it captured, command execution and file downloads check
+  `instanceof SealedNodeLink`, and disconnect cleanup matches the closed socket
+  against the stored link. Because the rewrite happens inside
+  `FleetService.send`, the object stored by `attachNode` is the same
+  `SealedNodeLink` or socket as today, and all of those checks are unchanged.
 - **Frames that cannot be expressed** in the legacy shape are never sent. A
   session whose agent kind is neither Copilot nor Hermes cannot be started,
   resumed, deleted or granted on an older Node. The Host refuses the action
-  with a reason that names the Node's version, and drops the record from
-  console updates to that Node. Placement already excludes such Nodes, because
-  their compatibility manifests list only Copilot and Hermes.
+  with a reason that names the Node's version, and leaves that session out of
+  console updates and console responses to that Node. Placement already
+  excludes such Nodes, because their compatibility manifests list only Copilot
+  and Hermes.
 - **A rewrite that fails is never sent.** If an unexpected value appears where
   the legacy shape has no room for it, the Host refuses that one action and
   logs it. It never sends the frame, because that would close the Node's whole
   connection.
 
-The frames that carry `agentParams` today, each covered by the rewrite and by a
-test:
+**Only schema-owned agent fields are rewritten.** `toNodeWire` does not search
+for any key named `agentParams`. Session events and some console data carry
+opaque JSON: event `payload` fields are free-form, and the Node keeps ACP
+updates it does not recognize inside `system` events. An agent or extension may
+legitimately put an unrelated `agentParams` property there, and an older Node
+accepts it unchanged. The function therefore rewrites only the fields listed
+below, located by the frame's type, and copies everything else unchanged:
 
-| Frame | Field |
+| Frame | Field rewritten |
 | --- | --- |
 | `command` → `start_session` | `command.agentParams` |
 | `command` → `resume_session` | `command.agentParams` |
 | `command` → `delete_session` | `command.agentParams` |
 | `session_console_grant` | `grant.session.agentParams` |
-| `session_console_update` carrying a session | `message.session.agentParams` |
+| `session_console_update` with message type `session` | `message.session.agentParams` |
+| `session_console_response` answering `initialize` | `response.data.grants[].session.agentParams` |
+| `session_console_response` answering `session` or `subscribe` | `response.data.session.agentParams` |
+| `session_console_response` answering `catalog` | `response.data.sessions[].agentParams` |
 
-The rewrite works by walking the frame for any `agentParams` key, so a frame
-added later is covered without being listed. A test fails if any
-Host-to-Node schema embeds `AgentParamsSchema` in a path the rewrite does not
-reach. Later fields that older Nodes reject, such as new launch options, are
-added to the same function and gated by the capability that introduced them.
+The console response rows are needed because the Node parses those answers
+with the same session schema. A test walks every Host-to-Node schema and fails
+when a schema field typed as `SessionSchema` or `AgentParamsSchema` has no row
+here, so a frame added later cannot be missed. Later fields that older Nodes
+reject are added to the same function and gated by the capability that
+introduced them.
 
 The Node's local session journal stores sessions it was granted, and compares
 `agentParams` when a grant is renewed. A Node upgraded to `agent-plugins-v1`
 normalizes stored records before comparing, so its first canonical grant does
 not read as a conflicting binding.
 
-**Compatibility tests** use frozen copies of the released Host-to-Node and
-Node-to-Host schemas, saved under `packages/protocol/src/compat/` and never
-edited afterwards. The suite checks that:
+**Compatibility tests** use frozen copies of the Host-to-Node and Node-to-Host
+schemas from the last commit before this change, saved under
+`packages/protocol/src/compat/` with that commit recorded, and never edited
+afterwards. The suite checks that:
 
-- start, resume, delete and console frames produced for an old Node parse under
-  the frozen old schema, for Copilot and for Hermes;
+- every frame in the table above, produced for an old Node, parses under the
+  frozen old schema, for Copilot and for Hermes;
+- an event whose opaque payload contains an `agentParams` property reaches
+  the Node byte-for-byte unchanged, for old and new Nodes;
 - a Hermes session survives a Host upgrade, a Node reconnect, an automatic
   resume and a restore from backup while its Node is still old;
 - a Claude Code session is refused for an old Node with the stated reason, and
   no frame is sent;
 - a new Node's inventory parses under the frozen old Host schema.
+
+**Connection tests** run the real gateway with both a sealed and a legacy
+Node, with serialization in place, and check that heartbeats and events are
+accepted, that command execution and file downloads are available on the
+sealed link, that a closed socket triggers disconnect cleanup, and that a
+superseding connection replaces the old one.
+
+### Startup settings
+
+Each start or resume command carries `config`, a list of settings the Node
+applies to the new session. Today the Host builds that list in
+`startupConfigFor` (`apps/host/src/fleet-service.ts`):
+
+- for Copilot orchestrators and workers, `mode: agent`. Fleet sessions take
+  one turn and stop, so Copilot's plan and autopilot modes are never wanted;
+- the model and reasoning effort: the orchestrator defaults for a lead, the
+  worker's routed selection, or the fleet defaults.
+
+The Node applies the list after `session/new` or `session/load`, and since
+#110 it also turns `model` and `reasoning_effort` into Copilot's `--model` and
+`--reasoning-effort` launch flags. Start and resume commands carry no role, so
+older Nodes depend entirely on the Host's list: without `mode: agent`, Copilot
+keeps whatever mode it would otherwise start in.
+
+Under this design:
+
+1. **The Host keeps building the full list** for every Node, including
+   `mode: agent` for Copilot leads and workers. Older Nodes keep today's
+   behavior exactly.
+2. **Launch commands also carry the role.** `start_session` and
+   `resume_session` gain `runRole` (`""`, `lead`, `worker` or `reviewer`). The
+   existing `coordinator` flag is not enough: it is set only on
+   `start_session`, only for an orchestrator, and only when the Node supports
+   managed worktrees. The Node stores `runRole` in the slot's launch state, so a
+   process replacement after an MCP reconnect or a context-window change still
+   knows the role. An older Node drops the unknown field silently, so it is
+   safe to send to every Node.
+3. **The Host stops branching on agent names here.** For an agent kind whose
+   manifest lists startup settings for a role (the manifest's
+   `startupSettings` field), the Host takes them from the manifest. Copilot's
+   compatibility manifest maps `lead` and `worker` to `mode: agent`. The model
+   and effort part keeps reading the saved defaults and selection, keyed by
+   agent kind.
+4. **On a Node with `agent-plugins-v1`**, the plugin's `startupConfig(role,
+   requested)` produces the final list from the command's `runRole` and the
+   Host's requested model and effort. For Copilot it is the same list the Host
+   sends, and a test compares the two for every role so they cannot drift.
+   Where they do differ, the plugin wins, so a newer Node's Copilot plugin can
+   change its own startup behavior without a Host release.
+5. **Copilot launch flags stay in the Copilot plugin.** The validation and
+   `--model` / `--reasoning-effort` flags from #110 move into the plugin's
+   `prepare()` unchanged.
+
+**Tests check the mode actually reached**, using a fake ACP agent that offers a
+`mode` option and records each `session/set_config_option` call:
+
+- an older Node (frozen schema, pinned commit) started and resumed by a new
+  Host ends in `mode: agent` for a Copilot lead and a Copilot worker;
+- a new Node does the same through the plugin, including after an MCP-driven
+  process replacement;
+- a plain session (role `""`) and a reviewer are left in the agent's own mode,
+  as today;
+- the role survives a process replacement on the Node, and after a Node
+  restart the Host's next resume command carries it again, because slots are
+  not kept across a Node restart.
 
 ### Native history deletion
 
@@ -558,11 +679,25 @@ session-listing connection:
    with `shell: false`. Arguments are quoted under the standard C runtime
    rules, which programs using the standard command-line parser read back
    unchanged.
-2. **npm shims run their script directly.** A `.cmd` file whose content
-   matches the template npm generates for a package's `bin` entry is not run.
-   The core reads the target script path from it, checks that the script lies
-   inside the shim's own directory tree, and launches the same `node.exe` the
-   shim would use, with the script and the arguments, and `shell: false`.
+2. **npm shims run their target directly.** A `.cmd` file whose content
+   matches one of the templates npm generates for a package's `bin` entry is
+   not run. The core reads the target path from it (written relative to the
+   shim as `%dp0%\...`), resolves it, and checks that it lies inside a
+   `node_modules` directory belonging to the same installation as the shim:
+   - a local install, where the shim is `<root>\node_modules\.bin\x.cmd` and
+     the target is under `<root>\node_modules\` (for example
+     `..\tsx\dist\cli.mjs`, or `..\@scope\pkg\bin\cli.js`);
+   - a global install, where the shim is `<prefix>\x.cmd` and the target is
+     under `<prefix>\node_modules\`, scoped or not.
+
+   The check uses the resolved real path, so a package linked into
+   `node_modules` from elsewhere (as npm workspaces do) is accepted when the
+   link itself lives in that `node_modules`. A target that resolves anywhere
+   else is refused. If the target is a native `.exe` (npm writes this form for
+   packages that ship an executable, such as Claude Code's `claude.cmd`), it
+   is launched directly as in rule 1. Otherwise the core launches the same
+   `node.exe` the shim would use, with the target script and the arguments,
+   and `shell: false`; this includes targets without a file extension.
 3. **Other batch files accept only inert arguments.** Some agents install their
    own batch launcher; Hermes installs `hermes.cmd`. The core runs such a file
    through `cmd.exe` only when the batch path contains no `"`, `%`, `!` or
@@ -573,14 +708,22 @@ session-listing connection:
    Hermes's arguments (`-p`, a validated profile name, `acp`, `--check`) fit.
 4. **No values inside PowerShell source.** The managed launcher passes the
    command line, Job name and proof token to its PowerShell helper as Base64
-   values in environment variables that only the helper reads, so no value is
-   ever parsed as PowerShell. The Job Object, process-tree termination and
-   quiescence proof are unchanged.
+   values in environment variables, so no value is ever parsed as PowerShell.
+   A child process inherits its parent's environment by default, and the
+   helper's `CreateProcess` call passes no environment of its own, so those
+   variables would otherwise reach the agent and everything it starts. The
+   helper therefore reads them into local variables and removes them from its
+   own environment before it creates the child. This matters most for the
+   proof token: the child writes to the same error stream as the helper, so
+   only the token's secrecy separates a real proof from a forged line. An
+   agent that read the token could print it; Stop would then skip ending the
+   Job and wait for a natural exit until it timed out. The Job Object,
+   process-tree termination and quiescence proof are otherwise unchanged.
 5. **Fail closed.** If a command cannot be launched under these rules, the
    launch fails with a clear error. There is no fallback to a shell.
 
 Copilot keeps working: it is normally `copilot.exe`, and an npm installation is
-launched through its shim's script. Agency (`agency.exe`) runs directly.
+launched through its shim's target. Agency (`agency.exe`) runs directly.
 
 The same single-quote helper is copied in five other places
 (`apps/node/src/command-supervisor.ts`, `scripts/self-update.mjs`,
@@ -595,6 +738,18 @@ Linux. It passes values containing `&`, `|`, `<`, `>`, `^`, `%VAR%`, `!`, `"`,
 `'`, `‘`, `’`, `‚`, `‛`, spaces, parentheses and a trailing backslash. Each
 value either reaches the agent unchanged or, for the other-batch-file form, is
 refused before launch; in every case nothing else runs.
+
+The shim test covers real layouts: a local install (`node_modules\.bin\x.cmd`
+targeting `..\pkg\...`), a scoped local package (`..\@scope\pkg\...`), a global
+install and a scoped global install (`<prefix>\node_modules\...`), a package
+linked into `node_modules`, a shim whose target is a native `.exe`, a target
+without an extension, and a shim whose target resolves outside its
+installation, which is refused.
+
+The environment test starts an agent through the managed launcher, has it and
+a child it starts each list their environment, and checks that neither sees the
+command line, Job name or proof token. It also checks that a process printing a
+guessed proof line does not end the session early.
 
 ### Process replacement
 
@@ -695,7 +850,9 @@ type StepSelection = {
 | `createAgentKind` switch, `detectAgentKinds` in `agent-kinds/index.ts` | `apps/node/src/plugins/registry.ts` |
 | Generic helpers (`findAgentCommand`, `agentOutput`) | `@fleet/plugin-api` (search and probe) |
 | `copilotSpawnTarget` (`shell: true` for Windows command shims), the session-listing connection's `shell: true`, and the managed launcher's `cmd.exe` wrapper and PowerShell string in `windows-process-job.ts` | Replaced by the core launch path in [Launching on Windows](#launching-on-windows) |
-| Host `fleet-service.ts`: workers limited to Copilot, Copilot-only adopt, Agency and context tier, custom agent, startup config | Manifest checks: `roles`, `adoptExisting`, `launchOptions`, plugin `startupConfig` |
+| Host `fleet-service.ts`: workers limited to Copilot, Copilot-only adopt, Agency and context tier, custom agent | Manifest checks: `roles`, `adoptExisting`, `launchOptions` |
+| Host `startupConfigFor`: `mode: agent` for Copilot leads and workers | Manifest `startupSettings`; the Host still sends the full list to every Node, and the launch commands carry `runRole` (see [Startup settings](#startup-settings)) |
+| Copilot launch flags from startup settings (`validateLaunchConfig` and `copilotLaunchArgs` in `agent-kinds/copilot.ts`, #110) | Copilot plugin's `prepare()`, unchanged |
 | Host `session-retention.ts` Hermes exclusion; `session-files.ts` Copilot-only native state access | `features.nativeHistoryCleanup`; `features.nativeStateFiles` with the plugin's `nativeStateDirectory` hook on the Node |
 | UI `OrchestratorPanel.tsx` Hermes branches; labels in `SessionInfoDialog`, `SessionTile`, `TerminalView`, usage views | Generic picker and parameter form from manifests; `manifest.label` |
 | `AgentKindSchema = z.enum(["copilot","hermes"])`, `agentKindLabels` | Open string ID plus manifests; labels from manifests |
@@ -844,17 +1001,20 @@ Each phase is a separate PR, in this order.
 1. **Launch safety, with no new agents.** The core launch path from
    [Launching on Windows](#launching-on-windows) for Copilot, Agency, Hermes,
    the bounded probes and the Copilot session-listing connection, replacing
-   `shell: true`, the `cmd.exe` wrapper and the PowerShell string embedding.
+   `shell: true`, the `cmd.exe` wrapper and the PowerShell string embedding,
+   and clearing the helper's transport variables before the child starts.
    Also the shared PowerShell quoting helper for the five other copies. This
    fixes the existing launcher for everyone and must ship before any generic
    parameter is accepted.
 2. **Foundation, with no visible change.** `packages/plugin-api`; plugin
    registry; manifests in the inventory and `agent-plugins-v1`; the Host
-   compatibility module and `agent_manifests` column; per-Node wire
-   serialization with the frozen-schema tests; Copilot and Hermes moved into
-   plugin folders; the deletion sequence, process-replacement policy and
-   eligibility function moved into core; manifest checks replacing name checks
-   in the Host and UI; the lint rule and the name check test.
+   compatibility module and `agent_manifests` column; per-Node serialization
+   inside `FleetService.send` with the frozen-schema and connection tests;
+   `runRole` on launch commands and manifest `startupSettings`, with the Host
+   still sending the full startup list; Copilot and Hermes moved into plugin
+   folders; the deletion sequence, process-replacement policy and eligibility
+   function moved into core; manifest checks replacing name checks in the Host
+   and UI; the lint rule and the name check test.
 3. **Generic ACP plugin and Claude Code as orchestrator.** Definition-file
    loading, fixed parameter validators, feature measurement with the
    launch-digest cache, per-launch capability checks, `claude.json`, the
@@ -880,10 +1040,10 @@ Each phase is a separate PR, in this order.
 | AC-01 | After phases 1 and 2, every existing Copilot and Hermes test passes unchanged, and the manual Hermes smoke exercise from the backend plan passes against the moved plugin. |
 | AC-02 | After phase 2, no Host or UI source file outside the name check test's allow list contains `"copilot"` or `"hermes"` as an agent-kind literal, and no allowed use decides admission, scheduling, resume or retention. |
 | AC-03 | Every built-in plugin and the generic ACP plugin pass the shared plugin test suite. |
-| AC-04 | With a Node still on the previous release and a Host on this change, Copilot and Hermes sessions start, resume, reconnect, auto-resume, restore from backup and are cleaned up by retention; every frame sent to that Node parses under the frozen old schema. A new Node connected to an old Host keeps starting and resuming Copilot and Hermes sessions. |
+| AC-04 | With a Node at the last commit before this change (recorded in the compatibility fixture) and a Host on this change, Copilot and Hermes sessions start, resume, reconnect, auto-resume, restore from backup and are cleaned up by retention; every frame sent to that Node parses under the frozen old schema. A new Node connected to an old Host keeps starting and resuming Copilot and Hermes sessions. |
 | AC-05 | On a Node with `claude-agent-acp` installed and signed in, and with no Host code naming Claude: a Claude Code orchestrator starts, lists Fleet MCP tools, plans a task, dispatches a Copilot worker, is woken when the worker settles, stops, resumes from its saved conversation and accepts a follow-up. |
 | AC-06 | An invalid operator definition file is listed with its error on the Node config page and in Settings → Agents, and the Node still starts and runs other agent kinds. |
-| AC-07 | Arguments containing `&`, `\|`, `<`, `>`, `^`, `%VAR%`, `!`, `"`, `'`, `‘`, `’`, `‚`, `‛`, spaces, parentheses and a trailing backslash reach the agent unchanged through a native executable, an npm `.cmd` shim and the managed Job launcher on Windows, and on Linux. A batch file that is not an npm shim refuses each such value before launch. In no case does another command run. |
+| AC-07 | Arguments containing `&`, `\|`, `<`, `>`, `^`, `%VAR%`, `!`, `"`, `'`, `‘`, `’`, `‚`, `‛`, spaces, parentheses and a trailing backslash reach the agent unchanged through a native executable, an npm `.cmd` shim and the managed Job launcher on Windows, and on Linux. A batch file that is not an npm shim refuses each such value before launch. In no case does another command run. Local, global and scoped npm installs are recognized, and a shim whose target resolves outside its installation is refused. |
 | AC-08 | After phase 4, an orchestrator dispatches a review with a `claude-review` profile; the reviewer runs on Claude Code on a Node that offers it, finishes, and its result settles the step. With routing Off the explicit profile still applies. |
 | AC-09 | A dispatch naming a profile whose agent kind no online Node offers is refused with a reason naming the agent kind; no Copilot worker is started instead. |
 | AC-10 | A Host backup made before this change restores with Hermes orchestrators and preferences intact. |
@@ -894,6 +1054,10 @@ Each phase is a separate PR, in this order.
 | AC-15 | An agent kind without `resume` is never stopped for internal replacement: MCP recovery keeps the process and reports the condition, and a worker of that kind is not retained after its step settles. |
 | AC-16 | Parameter validation of a 128-character input completes in under 1 ms for every format, and a definition file cannot supply its own pattern. |
 | AC-17 | Changing a definition file's command, arguments or environment, or replacing its program, triggers a fresh feature check before the agent kind is offered again. |
+| AC-18 | A Copilot orchestrator and a Copilot worker end in `mode: agent` when started and resumed on a Node at the pinned older commit by a Host on this change, and on a new Node including after a process replacement. A plain session and a reviewer keep the agent's own mode. |
+| AC-19 | With serialization in place, a sealed and a legacy Node each have heartbeats and events accepted, a closed socket triggers disconnect cleanup, a superseding connection replaces the old one, and command execution and file downloads remain available on the sealed link. |
+| AC-20 | An event whose opaque payload contains an `agentParams` property reaches old and new Nodes unchanged, and no console frame is refused because of it. |
+| AC-21 | Neither an agent started through the managed launcher nor a child it starts can read the command line, Job name or proof token from its environment. |
 
 ## Testing
 
@@ -903,14 +1067,22 @@ Each phase is a separate PR, in this order.
   manifest validity; `detect()` when the program is missing; parameter
   rejection; start, resume, stop, cancel and permission handling; YOLO
   approval; and refusal when a launch finds a capability missing.
-- **Wire compatibility.** Frozen copies of the released Host-to-Node and
-  Node-to-Host schemas under `packages/protocol/src/compat/`; every frame type
-  that carries `agentParams` produced for an old Node and parsed under the
-  frozen schema; the schema-walk test for new frames (AC-04).
+- **Wire compatibility.** Frozen copies of the Host-to-Node and Node-to-Host
+  schemas from the pinned commit under `packages/protocol/src/compat/`; every
+  frame type that carries a schema-owned agent field, produced for an old Node
+  and parsed under the frozen schema; the schema-walk test for new frames; the
+  colliding-property test for opaque payloads (AC-04, AC-20).
+- **Connections.** The real gateway with a sealed and a legacy Node and
+  serialization in place: packet acceptance, `instanceof SealedNodeLink`
+  features, disconnect cleanup and superseding connections (AC-19).
+- **Startup settings.** A fake ACP agent with a `mode` option that records
+  every setting it receives; mode selection for each role on old and new
+  Nodes, after resume and after a process replacement (AC-18).
 - **Launch.** The literal-argument suite on Windows and Linux (AC-07); npm shim
-  recognition and script containment; refusal of non-inert arguments to other
-  batch files; the managed Job launcher with values passed outside PowerShell
-  source, and its process-tree termination and quiescence proof, unchanged;
+  recognition across local, global, scoped and linked installs; refusal of
+  non-inert arguments to other batch files; the managed Job launcher with
+  values passed outside PowerShell source and cleared before the child starts
+  (AC-21), and its process-tree termination and quiescence proof, unchanged;
   Hermes's `hermes.cmd` launch and `--check` probe.
 - **Deletion.** The cases in AC-11, using a fake history whose `updatedAt` and
   existence change between the two checks.
@@ -952,6 +1124,19 @@ Each phase is a separate PR, in this order.
   reproduced on Node.js 26.12.1 and Windows PowerShell 5.1.
 - Hermes on Windows is installed as a batch launcher, `hermes.cmd`, that is not
   an npm shim (checked 2026-10-28).
+- npm's Windows shims name their target relative to the shim. A local shim in
+  `node_modules\.bin` points into a sibling package (`..\tsx\dist\cli.mjs`,
+  `..\@scope\pkg\...`); a global shim points into `<prefix>\node_modules\`; and
+  a package that ships an executable gets a shim that runs the `.exe` directly
+  (checked 2026-10-29 on this repository and a global npm prefix).
+- A process started by Windows `CreateProcess` without an explicit environment
+  inherits its parent's environment, including variables the parent set at run
+  time; removing a variable in the parent first keeps it from the child
+  (checked 2026-10-29).
+- The Node at `6ccbdaf` parses `start_session` with a schema that drops fields
+  it does not know, rejects the canonical `{ kind, params }` agent shape, and
+  rejects unknown message types (checked 2026-10-29 against the built
+  protocol package).
 
 ## Out of scope
 
