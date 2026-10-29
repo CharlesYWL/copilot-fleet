@@ -111,6 +111,49 @@ describe("resolving what the Host asked for", () => {
   }
 
   describe("profile startup and ordinary-default fallback", () => {
+    it("preserves a session-confirmed launch profile without any ACP setters", async () => {
+      const { handle } = configurationHarness();
+      expect(
+        await applyStartupConfig(handle, [
+          { id: "model", value: "native", fallback: "default" },
+          { id: "reasoning_effort", value: "low", fallback: "medium" },
+        ]),
+      ).toBe(false);
+      expect(handle.setConfigOption).not.toHaveBeenCalled();
+      expect(handle.notice).not.toHaveBeenCalled();
+    });
+
+    it("reports fallback when the session and recovery supply no profile confirmation", async () => {
+      const { handle } = configurationHarness();
+      handle.options = () => [];
+      expect(
+        await applyStartupConfig(handle, [
+          { id: "model", value: "routed", fallback: "default" },
+          { id: "reasoning_effort", value: "high", fallback: "medium" },
+        ]),
+      ).toBe(true);
+      expect(handle.setConfigOption).not.toHaveBeenCalled();
+      expect(handle.notice).toHaveBeenCalledWith(
+        expect.stringContaining('This agent has no "model" setting'),
+      );
+    });
+
+    it("does not claim a routed profile when ACP fails to confirm its setter", async () => {
+      const { handle, order } = configurationHarness();
+      handle.setConfigOption.mockResolvedValue(undefined);
+      expect(
+        await applyStartupConfig(handle, [
+          { id: "model", value: "routed", fallback: "default" },
+          { id: "reasoning_effort", value: "high", fallback: "medium" },
+        ]),
+      ).toBe(true);
+      expect(order).toEqual([]);
+      expect(handle.notice).toHaveBeenCalledWith(
+        expect.stringContaining('did not confirm model as "routed"'),
+      );
+      expect(handle.setConfigOption).not.toHaveBeenCalledWith("reasoning_effort", "high");
+    });
+
     it("sets model before effort using the refreshed model-specific catalog", async () => {
       const { handle, order } = configurationHarness();
       expect(

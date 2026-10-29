@@ -22,6 +22,7 @@ import {
   type SessionAgent,
 } from "./agents.js";
 import { installRequestedAgent, type CatalogEntry } from "./agent-catalog.js";
+import { validateLaunchConfig } from "./agent-kinds/copilot.js";
 type SessionKind = "writing" | "read-only";
 import { resolveMcpServers } from "./mcp-endpoint.js";
 import type { ManagedWorktrees } from "./managed-worktrees.js";
@@ -54,6 +55,8 @@ export type CommandResult = {
  * now" instead of tearing down a session that is working perfectly well.
  */
 export class CommandRefused extends Error {}
+
+class ReplacementConfigRefused extends CommandRefused {}
 
 /**
  * Whether replacing this agent's process would cut work short: a turn in
@@ -1578,6 +1581,18 @@ export class CommandRouter {
           );
           return;
         } catch (error) {
+          if (error instanceof ReplacementConfigRefused) {
+            if (signal.aborted || this.slots.get(sessionId) !== slot) return;
+            this.warn(`session ${sessionId.slice(0, 8)}: ${error.message}`);
+            this.publishRecoveryState(
+              sessionId,
+              slot,
+              slot.agent?.busy ? "running" : "idle",
+              error.message,
+            );
+            slot.agent?.advanceSequence?.(slot.sequenceOffset);
+            return;
+          }
           ++slot.generation;
           if (signal.aborted) return;
           if (this.slots.get(sessionId) !== slot) return;
@@ -1626,6 +1641,26 @@ export class CommandRouter {
     signal?: AbortSignal,
   ): Promise<void> {
     const launch = slot.launch!;
+    const config = [...slot.config].map(([id, value]): StartupConfig => ({ id, value }));
+    try {
+      if ((launch.agentParams?.kind ?? "copilot") === "copilot")
+        validateLaunchConfig(config);
+    } catch (error) {
+      if (!slot.agent) throw error;
+      const message = `Cannot replace Copilot: ${
+        error instanceof Error ? error.message : String(error)
+      } Existing session retained.`;
+      slot.agent.advanceSequence?.(slot.sequenceOffset + 1);
+      this.emit({
+        eventId: `replacement-config-${sessionId}-${++slot.sequenceOffset}`,
+        sessionId,
+        sequence: slot.sequenceOffset,
+        type: "error",
+        payload: { message },
+        createdAt: new Date().toISOString(),
+      });
+      throw new ReplacementConfigRefused(message);
+    }
     slot.silentReplacement = true;
     const generation = ++slot.generation;
     const nextContextTier = contextTier ?? launch.contextTier;
@@ -1686,7 +1721,7 @@ export class CommandRouter {
           ...(nextContextTier ? { contextTier: nextContextTier } : {}),
           mcpServers: resolveMcpServers(launch.mcpServers, this.hostUrl()),
           agent: slot.selectedAgent ?? "",
-          config: [...slot.config].map(([id, value]): StartupConfig => ({ id, value })),
+          config,
           announceLifecycle: false,
           ...(signal ? { signal, allowResumeRollover: false } : {}),
           ...this.processOwnership(slot),

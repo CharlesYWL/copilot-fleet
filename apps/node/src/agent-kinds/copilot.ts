@@ -4,6 +4,7 @@ import {
   errorMessage,
   type ContextTier,
   type PromptAttachment,
+  type StartupConfig,
 } from "@fleet/protocol";
 import {
   agentOutput,
@@ -21,10 +22,42 @@ import type {
 
 export const MIN_COPILOT_ACP_AUTH_VERSION = "1.0.69";
 
-export function copilotLaunchArgs(yolo: boolean, contextTier?: ContextTier): string[] {
+export function validateLaunchConfig(config: readonly StartupConfig[]): void {
+  for (const { id, value } of config) {
+    if (value === "") continue;
+    // Windows shims use cmd.exe; CRT argument quoting cannot make shell syntax safe.
+    if (id === "model" && (!/^[a-z0-9]/i.test(value) || /[^a-z0-9._:/+-]/i.test(value))) {
+      throw new Error(
+        "Invalid Copilot startup model: expected an identifier starting with a letter or digit and containing only letters, digits, '.', '_', ':', '/', '+', or '-'.",
+      );
+    }
+    if (
+      id === "reasoning_effort" &&
+      !["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value)
+    ) {
+      throw new Error(
+        "Invalid Copilot startup reasoning_effort: expected none, minimal, low, medium, high, xhigh, or max.",
+      );
+    }
+  }
+}
+
+export function copilotLaunchArgs(
+  yolo: boolean,
+  contextTier?: ContextTier,
+  config: readonly StartupConfig[] = [],
+): string[] {
+  validateLaunchConfig(config);
   const args = ["--acp", "--stdio"];
   if (yolo) args.push("--allow-all");
   if (contextTier) args.push("--context", contextTier);
+  for (const [id, flag] of [
+    ["model", "--model"],
+    ["reasoning_effort", "--reasoning-effort"],
+  ] as const) {
+    const value = config.find((option) => option.id === id)?.value;
+    if (value) args.push(flag, value);
+  }
   return args;
 }
 
@@ -148,7 +181,7 @@ export class CopilotAgentKind implements AgentKindAdapter {
       "Copilot\u2019s saved conversation exceeded the request-size limit. Fleet started a fresh conversation in the same workspace and continued with a bounded task handoff.",
   };
   private readonly validation = new Map<string, Promise<void>>();
-  private readonly contextSupport = new Map<string, Promise<boolean>>();
+  private readonly launchHelp = new Map<string, Promise<string>>();
 
   constructor(
     private readonly command: string,
@@ -156,6 +189,7 @@ export class CopilotAgentKind implements AgentKindAdapter {
   ) {}
 
   async prepare(options: AgentLaunchOptions): Promise<AgentLaunch> {
+    validateLaunchConfig(options.config ?? []);
     const launch = await resolveCopilotLaunch(options.agencyMode, this.command);
     options.signal?.throwIfAborted();
     const key = JSON.stringify([launch.command, launch.args]);
@@ -174,18 +208,21 @@ export class CopilotAgentKind implements AgentKindAdapter {
     }
     await validation;
     options.signal?.throwIfAborted();
-    let support = this.contextSupport.get(key);
-    if (!support) {
-      support = copilotSupportsContextTier(launch.command, () =>
-        this.metadata(launch, "--help"),
-      );
-      this.contextSupport.set(key, support);
+    let help = this.launchHelp.get(key);
+    if (!help) {
+      help = this.metadata(launch, "--help").catch(() => "");
+      this.launchHelp.set(key, help);
     }
-    const contextTier = (await support) ? options.contextTier : undefined;
+    const supported = await help;
+    const contextTier = supported.includes("--context") ? options.contextTier : undefined;
+    const config = (options.config ?? []).filter((option) =>
+      supported.includes(option.id === "model" ? "--model" : "--reasoning-effort"),
+    );
     options.signal?.throwIfAborted();
     return {
       command: launch.command,
-      args: [...launch.args, ...copilotLaunchArgs(options.yolo, contextTier)],
+      // ACP model switches reset long context; select the profile before session/new/load.
+      args: [...launch.args, ...copilotLaunchArgs(options.yolo, contextTier, config)],
       contextTier,
       notice:
         [

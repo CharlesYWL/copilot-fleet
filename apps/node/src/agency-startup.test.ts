@@ -90,6 +90,12 @@ let advertiseContext = false;
 let contextResponse = "";
 let contextFailure = false;
 let currentModel = "model-a";
+let profileHelp: string | undefined;
+let profileOptions = false;
+let confirmLaunchProfile = true;
+let omitSessionConfig = false;
+let currentEffort = "low";
+let launchRejection: string | undefined;
 let hermesModels: { modelId: string; name: string }[] = [];
 let interleavedText = false;
 let splitContextResponse = false;
@@ -127,6 +133,12 @@ beforeEach(() => {
     "Context Usage\n\n○ ● ·   model-a · 31k/400k tokens (8%)\n◎ ◎   Buffer 141.6k (35%)";
   contextFailure = false;
   currentModel = "model-a";
+  profileHelp = undefined;
+  profileOptions = false;
+  confirmLaunchProfile = true;
+  omitSessionConfig = false;
+  currentEffort = "low";
+  launchRejection = undefined;
   hermesModels = [
     { modelId: "model-a", name: "A" },
     { modelId: "model-b", name: "B" },
@@ -178,9 +190,7 @@ beforeEach(() => {
         child.stdout.write(
           argv.includes("--version")
             ? `GitHub Copilot CLI ${agency ? agencyVersion : "1.0.84"}`
-            : agency
-              ? "--context <tier>"
-              : "--allow-all",
+            : (profileHelp ?? (agency ? "--context <tier>" : "--allow-all")),
         );
         close(0);
       };
@@ -192,6 +202,19 @@ beforeEach(() => {
       return child;
     }
 
+    if (launchRejection && !hermes) {
+      queueMicrotask(() => {
+        child.stderr.write(launchRejection);
+        close(1);
+      });
+      return child;
+    }
+    if (profileOptions && confirmLaunchProfile && !hermes) {
+      const modelIndex = argv.indexOf("--model");
+      const effortIndex = argv.indexOf("--reasoning-effort");
+      if (modelIndex !== -1) currentModel = argv[modelIndex + 1]!;
+      if (effortIndex !== -1) currentEffort = argv[effortIndex + 1]!;
+    }
     let buffered = "";
     child.stdin.on("data", (chunk: Buffer) => {
       buffered += chunk.toString("utf8");
@@ -210,6 +233,12 @@ beforeEach(() => {
         if (request.method === "session/set_model") {
           currentModel = String(request.params.modelId);
         }
+        if (
+          request.method === "session/set_config_option" &&
+          request.params.configId === "reasoning_effort"
+        ) {
+          currentEffort = String(request.params.value);
+        }
         const configOptions = [
           {
             id: "allow_all",
@@ -221,7 +250,7 @@ beforeEach(() => {
               { value: "off", name: "Off" },
             ],
           },
-          ...(advertiseContext
+          ...(advertiseContext || profileOptions
             ? [
                 {
                   id: "model",
@@ -232,6 +261,20 @@ beforeEach(() => {
                     { value: "model-a", name: "A" },
                     { value: "model-b", name: "B" },
                   ],
+                },
+              ]
+            : []),
+          ...(profileOptions
+            ? [
+                {
+                  id: "reasoning_effort",
+                  name: "Reasoning",
+                  type: "select",
+                  currentValue: currentEffort,
+                  options: ["low", "medium", "high"].map((value) => ({
+                    value,
+                    name: value,
+                  })),
                 },
               ]
             : []),
@@ -251,7 +294,13 @@ beforeEach(() => {
                 availableModes: [{ id: "default", name: "Default" }],
               },
             }
-          : { configOptions };
+          : {
+              configOptions:
+                omitSessionConfig &&
+                ["session/new", "session/load"].includes(request.method)
+                  ? []
+                  : configOptions,
+            };
         const result =
           hermes && request.method === "session/load" && missingHermesLoad
             ? null
@@ -394,6 +443,301 @@ afterEach(async () => {
 
 const fleetMcp = [{ name: "fleet", url: "http://127.0.0.1:8787/mcp", headers: [] }];
 const launches = () => processes.filter((entry) => entry.args.includes("--acp"));
+
+describe("Copilot launch-selected startup profiles", () => {
+  const config = [
+    { id: "model", value: "model-b", fallback: "model-a" },
+    { id: "reasoning_effort", value: "high", fallback: "medium" },
+  ];
+  const setters = () =>
+    requests.filter((request) => request.method === "session/set_config_option");
+
+  beforeEach(() => {
+    profileHelp = "--model <model> --reasoning-effort <level> --context <tier>";
+    profileOptions = true;
+  });
+
+  it.each([
+    { agencyMode: false, resumeAgentSessionId: undefined },
+    { agencyMode: false, resumeAgentSessionId: "saved-id" },
+    { agencyMode: true, resumeAgentSessionId: undefined },
+    { agencyMode: true, resumeAgentSessionId: "saved-id" },
+  ])(
+    "launches the complete profile without resetting confirmation (agency=$agencyMode, resume=$resumeAgentSessionId)",
+    async ({ agencyMode, resumeAgentSessionId }) => {
+      const agent = await new AcpAgentFactory(60_000, "copilot").start(
+        "routed",
+        "C:\\repo",
+        () => {},
+        { config, agencyMode, ...(resumeAgentSessionId ? { resumeAgentSessionId } : {}) },
+      );
+      agents.push(agent);
+      expect(launches()[0]?.args).toEqual([
+        ...(agencyMode ? ["copilot"] : []),
+        "--acp",
+        "--stdio",
+        "--context",
+        "long_context",
+        "--model",
+        "model-b",
+        "--reasoning-effort",
+        "high",
+      ]);
+      expect(requests.slice(0, 2).map((request) => request.method)).toEqual([
+        "initialize",
+        resumeAgentSessionId ? "session/load" : "session/new",
+      ]);
+      expect(setters()).toEqual([]);
+      await agent.prompt("Work");
+      expect(setters()).toEqual([]);
+      await agent.stop();
+      expect(launches()[0]?.child.kill).toHaveBeenCalled();
+    },
+  );
+
+  it("recovers omitted session options without switching the launch-confirmed model", async () => {
+    omitSessionConfig = true;
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "routed",
+      "C:\\repo",
+      () => {},
+      { config, resumeAgentSessionId: "saved-id" },
+    );
+    agents.push(agent);
+    expect(setters().map((request) => request.params)).toEqual([
+      { sessionId: "saved-id", configId: "allow_all", value: "off" },
+    ]);
+  });
+
+  it("reconciles an unconfirmed launch selection through the existing ACP path", async () => {
+    confirmLaunchProfile = false;
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "routed",
+      "C:\\repo",
+      () => {},
+      { config },
+    );
+    agents.push(agent);
+    expect(
+      setters().map((request) => [request.params.configId, request.params.value]),
+    ).toEqual([
+      ["model", "model-b"],
+      ["reasoning_effort", "high"],
+    ]);
+  });
+
+  it.each(["model", "reasoning_effort"])(
+    "retains explicit worker-default fallback for an unsupported %s",
+    async (id) => {
+      confirmLaunchProfile = false;
+      const events: SessionEvent[] = [];
+      const agent = await new AcpAgentFactory(60_000, "copilot").start(
+        "routed",
+        "C:\\repo",
+        (event) => events.push(event),
+        {
+          config: config.map((option) =>
+            option.id === id
+              ? { ...option, value: id === "model" ? "missing" : "max" }
+              : option,
+          ),
+        },
+      );
+      agents.push(agent);
+      expect(
+        events.some((event) => event.payload.workerModelRoutingFallback === true),
+      ).toBe(true);
+      expect(currentModel).toBe("model-a");
+      expect(currentEffort).toBe("medium");
+    },
+  );
+
+  it.each([
+    {
+      help: "--model <model>",
+      flags: ["--model", "model-b"],
+      setters: ["reasoning_effort"],
+    },
+    {
+      help: "--context <tier>",
+      flags: ["--context", "long_context"],
+      setters: ["model", "reasoning_effort"],
+    },
+    { help: "--allow-all", flags: [], setters: ["model", "reasoning_effort"] },
+  ])("keeps old-CLI capability paths: $help", async ({ help, flags, setters: ids }) => {
+    profileHelp = help;
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "routed",
+      "C:\\repo",
+      (event) => events.push(event),
+      { config },
+    );
+    agents.push(agent);
+    expect(launches()[0]?.args).toEqual(["--acp", "--stdio", ...flags]);
+    expect(setters().map((request) => request.params.configId)).toEqual(ids);
+    if (!help.includes("--context")) {
+      expect(
+        events.some((event) =>
+          String(event.payload.message).includes("does not support --context"),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it("passes explicit default context and skips empty profile values", async () => {
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "default",
+      "C:\\repo",
+      () => {},
+      {
+        contextTier: "default",
+        config: [
+          { id: "model", value: "model-b" },
+          { id: "reasoning_effort", value: "", fallback: "medium" },
+        ],
+      },
+    );
+    agents.push(agent);
+    expect(launches()[0]?.args).toEqual([
+      "--acp",
+      "--stdio",
+      "--context",
+      "default",
+      "--model",
+      "model-b",
+    ]);
+    expect(setters().some((request) => request.params.configId === "model")).toBe(false);
+  });
+
+  it("reports CLI-rejected launch values as startup failures and cleans up", async () => {
+    launchRejection = "Unsupported reasoning effort: max";
+    await expect(
+      new AcpAgentFactory(60_000, "copilot").start("invalid", "C:\\repo", () => {}, {
+        config: [{ id: "reasoning_effort", value: "max" }],
+      }),
+    ).rejects.toThrow("Unsupported reasoning effort");
+    expect(launches()[0]?.child.kill).toHaveBeenCalled();
+  });
+
+  it("keeps the launched profile on oversized-load recovery without a model switch", async () => {
+    oversizedLoad = true;
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "routed",
+      "C:\\repo",
+      () => {},
+      {
+        config,
+        resumeAgentSessionId: "saved-id",
+        contextOverflowRecoveryPrompt: "Continue task",
+      },
+    );
+    agents.push(agent);
+    expect(requests.slice(0, 4).map((request) => request.method)).toEqual([
+      "initialize",
+      "session/load",
+      "session/new",
+      "session/prompt",
+    ]);
+    expect(setters()).toEqual([]);
+  });
+});
+
+describe("Copilot launch profile validation", () => {
+  const boundaries = [false, true].flatMap((agencyMode) =>
+    [false, true].flatMap((managed) =>
+      ["cmd", "bat", "exe", "com"].map((extension) => ({
+        agencyMode,
+        managed,
+        extension,
+        command: `C:\\Program Files\\Agent\\${agencyMode ? "agency" : "copilot"}.${extension}`,
+      })),
+    ),
+  );
+  const invalid = [
+    { id: "model", value: 'gpt-test" & echo FLEET_ARG_MARKER & rem "' },
+    { id: "reasoning_effort", value: 'high" & echo FLEET_ARG_MARKER & rem "' },
+  ];
+
+  it.each(
+    boundaries.flatMap((boundary) =>
+      [true, false].flatMap((advertised) =>
+        invalid.map((option) => ({ ...boundary, advertised, ...option })),
+      ),
+    ),
+  )(
+    "rejects $id before any spawn (agency=$agencyMode, managed=$managed, $extension, advertised=$advertised)",
+    async ({ agencyMode, managed, command, advertised, id, value }) => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      installation.path = command;
+      profileHelp = advertised ? "--context --model --reasoning-effort" : "--allow-all";
+      await expect(
+        new AcpAgentFactory(60_000, command).start("invalid", "C:\\repo", () => {}, {
+          agencyMode,
+          mcpServers: managed ? fleetMcp : [],
+          config: [{ id, value, fallback: id === "model" ? "auto" : "medium" }],
+        }),
+      ).rejects.toThrow(`Invalid Copilot startup ${id}`);
+      expect(resolveCopilotLaunch).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+      expect(spawnManagedProcess).not.toHaveBeenCalled();
+      expect(stopProcessTree).not.toHaveBeenCalled();
+      expect(processes).toEqual([]);
+      expect(requests).toEqual([]);
+    },
+  );
+
+  it.each(boundaries)(
+    "preserves valid launch wiring (agency=$agencyMode, managed=$managed, $extension)",
+    async ({ agencyMode, managed, command, extension }) => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      installation.path = command;
+      profileHelp = "--context --model --reasoning-effort";
+      profileOptions = true;
+      const agent = await new AcpAgentFactory(60_000, command).start(
+        "valid",
+        "C:\\repo",
+        () => {},
+        {
+          agencyMode,
+          mcpServers: managed ? fleetMcp : [],
+          config: [
+            { id: "model", value: "claude-opus-5.5" },
+            { id: "reasoning_effort", value: "high" },
+          ],
+        },
+      );
+      agents.push(agent);
+      const calls = vi.mocked(managed ? spawnManagedProcess : spawn).mock.calls;
+      const launch = calls.find(([, args]) => args?.includes("--acp"));
+      const shell = extension === "cmd" || extension === "bat";
+      expect(launch?.[0]).toBe(shell ? `"${command}"` : command);
+      expect(launch?.[1]).toEqual([
+        ...(agencyMode ? ["copilot"] : []),
+        "--acp",
+        "--stdio",
+        "--context",
+        "long_context",
+        "--model",
+        "claude-opus-5.5",
+        "--reasoning-effort",
+        "high",
+      ]);
+      expect(launch?.[2]).toMatchObject({ shell });
+      expect(spawnManagedProcess).toHaveBeenCalledTimes(managed ? 1 : 0);
+      expect(
+        vi.mocked(spawn).mock.calls.filter(([, args]) => args?.includes("--acp")),
+      ).toHaveLength(managed ? 0 : 1);
+      expect(
+        requests.some((request) =>
+          ["session/set_model", "session/set_config_option"].includes(request.method),
+        ),
+      ).toBe(false);
+      await agent.stop();
+      expect(stopProcessTree).toHaveBeenCalledWith(launches()[0]?.child, managed);
+    },
+  );
+});
 
 describe("Worker publication permissions over ACP", () => {
   it.each([

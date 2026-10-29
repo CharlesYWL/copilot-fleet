@@ -1579,6 +1579,7 @@ export class AcpAgentFactory implements AgentFactory {
           yolo: options.yolo ?? false,
           agencyMode: options.agencyMode ?? false,
           contextTier: options.contextTier ?? this.contextTier,
+          ...(options.config ? { config: options.config } : {}),
           ...(signal ? { signal } : {}),
         }),
       );
