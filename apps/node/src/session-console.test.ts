@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { rmSync } from "node:fs";
-import { IncomingMessage, ServerResponse } from "node:http";
-import { Socket } from "node:net";
+import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { connect, Socket, type AddressInfo } from "node:net";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionSchema, type BrowserMessage, type NodeCommand } from "@fleet/protocol";
@@ -166,25 +167,53 @@ describe("Node session console Host work admission", () => {
 
 describe("Node session console live viewers", () => {
   /**
-   * A response with no connected socket keeps everything written to it
-   * buffered, the same as a browser tab that stopped reading. Without a socket
-   * `end()` cannot finish either, so `close` never fires on its own.
+   * A response with no socket keeps everything written to it buffered, and
+   * `end()` cannot finish, so nothing ever closes it on its own.
    */
-  const stalledViewer = () => new ServerResponse(new IncomingMessage(new Socket()));
+  const unfinishableViewer = () => new ServerResponse(new IncomingMessage(new Socket()));
+  /**
+   * A real connection whose client stopped reading, the way a background tab
+   * stops reading its EventSource: once the kernel's buffers are full, what is
+   * sent stays queued on the response.
+   */
+  const stalledViewer = async (sessionConsole: NodeSessionConsole) => {
+    let accepted!: (response: ServerResponse) => void;
+    const response = new Promise<ServerResponse>((resolve) => (accepted = resolve));
+    const server = createServer((_request, reply) => {
+      void sessionConsole.stream(sessionId, reply).then(() => accepted(reply));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const client = connect((server.address() as AddressInfo).port, "127.0.0.1");
+    client.on("error", () => undefined);
+    await once(client, "connect");
+    client.write(
+      `GET /api/fleet-sessions/${sessionId}/stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`,
+    );
+    client.pause();
+    return {
+      viewer: await response,
+      close: () => {
+        client.destroy();
+        server.close();
+      },
+    };
+  };
   const errorsOf = (response: ServerResponse) => {
     const errors: Error[] = [];
     response.on("error", (error) => errors.push(error));
     return errors;
   };
-  /** A console with one stalled viewer on the session, fed the way the Host feeds it. */
-  const watchedConsole = async () => {
+  /** A console with one viewer on the session, fed the way the Host feeds it. */
+  const watchedConsole = async (
+    open: (sessionConsole: NodeSessionConsole) => Promise<ServerResponse>,
+  ) => {
     const { sessionConsole, internals, journal } = createConsole();
-    const viewer = stalledViewer();
-    const errors = errorsOf(viewer);
     // Opened from local history: the Host round trip in stream() is not what
     // these tests are about, and nothing here would answer it.
     internals.status = "offline";
-    await sessionConsole.stream(sessionId, viewer);
+    const viewer = await open(sessionConsole);
+    const errors = errorsOf(viewer);
     // Host updates are forwarded to viewers only while online.
     internals.status = "online";
     const session = journal.get(sessionId)!.session;
@@ -205,22 +234,44 @@ describe("Node session console live viewers", () => {
   });
 
   it("drops a viewer that stopped reading, and its heartbeat never writes to it again", async () => {
-    vi.useFakeTimers();
-    const { sessionConsole, viewer, errors, update } = await watchedConsole();
-    while (viewer.writableLength <= 1024 * 1024) sessionConsole.update(update);
-    expect(viewer.destroyed).toBe(false);
-    sessionConsole.update(update);
-    expect(viewer.destroyed).toBe(true);
+    // Only the heartbeat's clock is fake; the connection is real.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let connection: { close: () => void } | undefined;
+    try {
+      const { sessionConsole, viewer, errors, update } = await watchedConsole(
+        async (console) => {
+          const stalled = await stalledViewer(console);
+          connection = stalled;
+          return stalled.viewer;
+        },
+      );
+      for (let sent = 0; sent < 1_000 && viewer.writableLength <= 1024 * 1024; sent += 1)
+        sessionConsole.update(update);
+      expect(viewer.writableLength).toBeGreaterThan(1024 * 1024);
+      expect(viewer.destroyed).toBe(false);
+      const closed = once(viewer, "close");
+      sessionConsole.update(update);
+      expect(viewer.destroyed).toBe(true);
+      await closed;
+      expect(hasViewers(sessionConsole)).toBe(false);
 
-    // The heartbeat used to write after end() here and take the whole Node down.
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(errors.map((error) => error.message)).toEqual([]);
-    expect(hasViewers(sessionConsole)).toBe(false);
+      // The heartbeat used to write after end() here and take the whole Node down.
+      vi.advanceTimersByTime(60_000);
+      expect(errors.map((error) => error.message)).toEqual([]);
+    } finally {
+      connection?.close();
+    }
   });
 
   it("does not write to a viewer whose response has already finished", async () => {
     vi.useFakeTimers();
-    const { sessionConsole, viewer, errors, update } = await watchedConsole();
+    const { sessionConsole, viewer, errors, update } = await watchedConsole(
+      async (console) => {
+        const viewer = unfinishableViewer();
+        await console.stream(sessionId, viewer);
+        return viewer;
+      },
+    );
     // Something else ended the response while the viewer was still registered.
     viewer.end();
     sessionConsole.update(update);
