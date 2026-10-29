@@ -120,7 +120,7 @@ export function prMaintenanceReviewPrompt(record: PrMaintenanceRegistration): st
   return [
     `<fleet-pr-review recordId=${JSON.stringify(record.id)} reviewId=${JSON.stringify(record.review?.id ?? "")} source=${JSON.stringify(record.review?.source ?? "manual")} taskId=${JSON.stringify(record.taskId)} pr=${JSON.stringify(prMaintenanceUrl(record.identity))}>`,
     "Review this PR now. Timing and stale cache are not reasons to wait: this turn exists to refresh.",
-    "1. Claim it: fleet_get_pr_maintenance with takeDue: true. Run the packaged helper once with the returned observationClaim/allowance and checkpoint the observation (or fallback).",
+    "1. Claim it: fleet_get_pr_maintenance with takeDue: true. Run the packaged helper once with the returned observationClaim/allowance. A claim-bound Fleet command is ingested by the Host before its completion/review wake; read the updated record, or recover with fleet_checkpoint_pr_maintenance using only {executionId}. Without a Fleet execution, checkpoint the exact observation (or fallback) with recordId, expectedVersion and checkpoint.",
     "2. If a batch is settled but not reported, checkpoint work_report first.",
     "3. Classify every current source (provider feedback and operatorWorkSources):",
     "   - Routine: code, tests, docs, CI, generated artifacts, lint/format, bot feedback, reviewer nits, a straightforward exact-base conflict. Checkpoint prepare_work_order and dispatch it with fleet_follow_up (maintenance reference only). Then end your turn: the worker's result wakes you for the next review.",

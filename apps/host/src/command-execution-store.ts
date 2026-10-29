@@ -28,6 +28,19 @@ import {
 export const LEAD_PROMPT_SERIALIZED_BYTES = 16 * 1024 * 1024;
 export const LEAD_PROMPT_PAYLOAD_BYTES = 128 * 1024 * 1024;
 const PROMPT_RECEIPT_RESERVE_BYTES = 64 * 1024;
+const observationUnchecked = `
+  observation_checked=0
+  AND json_extract(data,'$.maintenanceObservation.recordId') IS NOT NULL
+  AND json_extract(data,'$.delivery')!='orphaned'
+  AND json_extract(data,'$.settledAt') IS NOT NULL
+  AND json_extract(data,'$.state') IN (${[...terminalCommandExecutionStates]
+    .map((state) => `'${state}'`)
+    .join(",")})`;
+const automaticPending = `
+  json_extract(data,'$.delivery')='pending'
+  OR (${observationUnchecked}
+    AND (json_extract(data,'$.outputComplete')=1
+      OR json_array_length(json_extract(data,'$.gaps'))>0))`;
 
 export class CommandConflict extends Error {
   readonly statusCode = 409;
@@ -80,6 +93,10 @@ export class CommandExecutionStore {
         task_id TEXT, version INTEGER NOT NULL, data TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS command_execution_owner ON command_executions(lead_id);
+      CREATE INDEX IF NOT EXISTS command_execution_observation_pending
+        ON command_executions(json_extract(data,'$.maintenanceObservation.recordId'))
+        WHERE json_extract(data,'$.settledAt') IS NULL
+          OR coalesce(json_extract(data,'$.outputComplete'),0)=0;
       CREATE TABLE IF NOT EXISTS command_execution_events (
         execution_id TEXT NOT NULL, sequence INTEGER NOT NULL, bytes INTEGER NOT NULL,
         data TEXT NOT NULL, PRIMARY KEY(execution_id,sequence)
@@ -154,6 +171,22 @@ export class CommandExecutionStore {
         payload_bytes=length(CAST(json_extract(data,'$.delivery') AS BLOB)),
         metadata_bytes=length(CAST(data AS BLOB))-length(CAST(json_extract(data,'$.delivery') AS BLOB))`);
     }
+    if (
+      !this.db
+        .prepare("PRAGMA table_info(command_executions)")
+        .all()
+        .some((column) => column.name === "observation_checked")
+    )
+      this.db.exec(
+        "ALTER TABLE command_executions ADD COLUMN observation_checked INTEGER NOT NULL DEFAULT 0",
+      );
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS command_execution_automatic_pending
+        ON command_executions(id) WHERE ${automaticPending};
+      CREATE INDEX IF NOT EXISTS command_execution_observation_unchecked
+        ON command_executions(json_extract(data,'$.maintenanceObservation.recordId'))
+        WHERE ${observationUnchecked};
+    `);
   }
 
   get(id: string): CommandExecution | undefined {
@@ -290,6 +323,33 @@ export class CommandExecutionStore {
       )
       .all()
       .map((row) => CommandExecutionSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  automaticPending(afterId = ""): CommandExecution[] {
+    return this.db
+      .prepare(
+        `SELECT data FROM command_executions
+         WHERE (${automaticPending}) AND id>? ORDER BY id LIMIT 128`,
+      )
+      .all(afterId)
+      .map((row) => CommandExecutionSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  observationIngestionPending(recordId: string): boolean {
+    return !!this.db
+      .prepare(
+        `SELECT 1 FROM command_executions
+         WHERE ${observationUnchecked}
+           AND json_extract(data,'$.maintenanceObservation.recordId')=? LIMIT 1`,
+      )
+      .get(recordId);
+  }
+
+  /** Local retry bookkeeping only; the wake claim's receiptHash proves acceptance. */
+  markObservationChecked(id: string): void {
+    this.db
+      .prepare("UPDATE command_executions SET observation_checked=1 WHERE id=?")
+      .run(id);
   }
 
   request(
@@ -1397,10 +1457,13 @@ export class CommandExecutionStore {
             "UPDATE command_preparation_clocks SET accepted_at=NULL,elapsed_ms=NULL",
           )
           .run();
-        for (const execution of this.list({ limit: 10_000 })) {
-          if (execution.delivery !== "orphaned")
-            this.update(execution.id, execution.version, { delivery: "orphaned" });
-        }
+        this.db
+          .prepare(
+            `UPDATE command_executions SET version=version+1,
+             data=json_set(data,'$.delivery','orphaned','$.version',version+1,'$.updatedAt',?)
+             WHERE json_extract(data,'$.delivery')!='orphaned'`,
+          )
+          .run(new Date().toISOString());
       }
       for (const record of this.prompts()) {
         if (restored || ["reserved", "accepted"].includes(record.state))

@@ -3827,6 +3827,7 @@ export class PrMaintenanceStore {
         record.review !== undefined &&
         !record.review.concludedAt &&
         !record.review.wakeQueuedAt &&
+        !this.observationInFlight(record) &&
         !prMaintenanceActiveBatch(record),
     );
   }
@@ -3892,9 +3893,17 @@ export class PrMaintenanceStore {
 
   /** A claimed helper command for this record that has not produced its receipt. */
   private observationInFlight(record: PrMaintenanceRegistration): boolean {
-    return this.store.commands
-      .unsettled()
-      .some((execution) => execution.maintenanceObservation?.recordId === record.id);
+    return (
+      !!this.db
+        .prepare(
+          `SELECT 1 FROM command_executions
+         WHERE json_extract(data,'$.maintenanceObservation.recordId')=?
+           AND (json_extract(data,'$.settledAt') IS NULL
+             OR coalesce(json_extract(data,'$.outputComplete'),0)=0)
+         LIMIT 1`,
+        )
+        .get(record.id) || this.store.commands.observationIngestionPending(record.id)
+    );
   }
 
   beginWake(
@@ -4100,22 +4109,44 @@ export class PrMaintenanceStore {
 
   checkpointObservationReceipt(
     leadSessionId: string,
-    recordId: string,
-    expectedVersion: number,
     executionId: string,
-    input: PrMaintenanceObservation,
   ): PrMaintenanceRegistration {
     return this.store.writeAtomically(() => {
       const execution = this.store.commands.get(executionId);
       if (
         !execution ||
         execution.leadSessionId !== leadSessionId ||
-        execution.maintenanceObservation?.recordId !== recordId
+        !execution.maintenanceObservation
       )
         refuse(
           "receipt_owner",
           "Use the owned execution bound to this exact observation reservation.",
         );
+      const ref = execution.maintenanceObservation;
+      const recordId = ref.recordId;
+      const current = this.required(recordId, leadSessionId);
+      const originalWake = this.wake(leadSessionId, ref.wakeId);
+      const originalClaim = originalWake.observationClaims.find(
+        (entry) =>
+          entry.recordId === recordId &&
+          entry.generation === ref.generation &&
+          entry.executionId === execution.id &&
+          entry.attemptId === execution.attemptId,
+      );
+      if (!originalClaim)
+        refuse(
+          "receipt_claim_conflict",
+          "Execution/attempt does not match the persisted observation claim.",
+        );
+      // An admitted identity stays a no-op even after the record changes. Restored
+      // archives deliberately revoke preparation clocks and cannot regain admission.
+      if (
+        originalClaim.receiptHash &&
+        this.store.commands.preparationClock(execution.id)?.acceptedAt
+      ) {
+        this.store.commands.markObservationChecked(execution.id);
+        return current;
+      }
       const { record, claim, wake } = this.observationExecution(execution);
       if (claim.executionId !== execution.id || claim.attemptId !== execution.attemptId)
         refuse(
@@ -4223,7 +4254,7 @@ export class PrMaintenanceStore {
           "Helper stdout does not match the version-1 result contract.",
         );
       const result = parsed.data;
-      const observation = PrMaintenanceObservationSchema.parse(input);
+      const observation = PrMaintenanceObservationSchema.parse(result.observation);
       if (
         !isDeepStrictEqual(result.observation, observation) ||
         result.complete !== observation.complete ||
@@ -4250,7 +4281,7 @@ export class PrMaintenanceStore {
       )
         refuse(
           "receipt_mismatch",
-          "Checkpoint must equal the exact helper observation in this execution's stdout.",
+          "The helper observation must match its result envelope, snapshot and reservation.",
         );
       const proof = this.store.commands.preparationClock(execution.id)!;
       const descriptor = execution.descriptor;
@@ -4321,9 +4352,9 @@ export class PrMaintenanceStore {
       if (claim.receiptHash) {
         if (claim.receiptHash !== hash)
           refuse("receipt_conflict", "This claim already saved a different result.");
+        this.store.commands.markObservationChecked(execution.id);
         return record;
       }
-      this.required(recordId, leadSessionId, expectedVersion);
       const admission = this.admission({ action: "discover", recordId, leadSessionId });
       const hostAttemptedAt = new Date(earliest).toISOString();
       const hostLatestAt = new Date(latest).toISOString();
@@ -4369,6 +4400,7 @@ export class PrMaintenanceStore {
       const saved = this.save(record);
       claim.receiptHash = hash;
       this.saveWake(wake);
+      this.store.commands.markObservationChecked(execution.id);
       return saved;
     });
   }

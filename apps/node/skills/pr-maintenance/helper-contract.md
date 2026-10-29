@@ -115,17 +115,25 @@ same basis. These bounded derived fields are not permission for collection.
 Paired updated Host/Node/helper code is required; missing old preparation budget
 or revoked/restored clock proof cannot be retroactively manufactured.
 
-End the turn after dispatch. On Fleet's automatic completion wake, read the
-current record and **all** `fleet_get_execution` pages for that execution.
-Use `format:"raw"` and concatenate decoded base64 stdout bytes in sequence before
-UTF-8/JSON decoding (an event can split a character). Require known quiescence,
-complete output, no gaps and helper exit 0 or 2. Persist with
-`{recordId,expectedVersion,executionId,checkpoint:{kind:"observation",observation}}`.
-The Host checks the exact observation against persisted, approved execution stdout,
-not caller claims or a file path. This correlation survives a different Host
-lead turn and same-database restart; repeating the same saved receipt is idempotent.
+End the turn after dispatch. The Host reconstructs and admits the exact observation
+from persisted, approved command stdout **before** the completion/review wake.
+It requires known quiescence, complete bounded output without gaps, helper exit
+0 or 2, and the original claim, clock, identity, pin and allowance proofs.
+Automatic ticks use indexed pending work in bounded, rotating batches, independent
+of unrelated command history, including after same-database restart. Reviews remain
+blocked while a settled receipt awaits admission. Local checked/retry bookkeeping
+is not acceptance: only the original wake claim's saved receipt hash proves that.
+On the completion wake, read the current maintenance record, not a relayed copy
+of helper output. For explicit restart/interruption recovery, if needed, call
+`fleet_checkpoint_pr_maintenance` with **only** `{executionId}`.
+Do not supply `recordId`, `expectedVersion` or `checkpoint` on this path.
+The Host derives them from the owned execution and original reservation.
+Record version churn does not block ingestion; record/generation/execution/attempt
+identifies an admission, and repeats are no-ops even after later record changes.
+Recovery grants no new I/O, deadline, budget, hold bypass or repair authority.
 
-Pass the **whole `result.observation` object** from parsed helper stdout as
+For observations collected **without** a claim-bound Fleet execution, pass the
+**whole `result.observation` object** from parsed helper stdout as
 `checkpoint: {kind: "observation", observation: result.observation}` to
 `fleet_checkpoint_pr_maintenance` with the claimed record ID and current version.
 Exit 2 still has an observation: preserve its actual timestamp, usage, sanitized
@@ -180,9 +188,10 @@ collection start before invoking the provider, not at result mapping.
 Evidence older than the normal freshness window is retained only as `lastAttempt`,
 not promoted to a current snapshot/readiness. A fresh complete receipt can make the
 job due for action, but preparing/dispatching a repair still requires a **new current
-bounded visit and remaining allowance**. Under a pause, release or human hold, an
-otherwise exact same-scope receipt can update only `lastAttempt`, not lifecycle,
-current observation, findings or decisions. Owner/binding/authorization/generation or
+bounded visit and remaining allowance**. Pause and pending-design holds may accept
+an otherwise exact same-scope read-only observation refresh without clearing the hold
+or authorizing action. Release blocks promotion beyond `lastAttempt`.
+Owner/binding/authorization/generation or
 manual-control scope changes still refuse admission. Portable restore revokes the
 local accepted-preparation receipt and cannot acquire active receipt authority; raw
 command evidence and already-saved attempts remain readable under existing retention.

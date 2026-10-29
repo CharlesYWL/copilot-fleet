@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { ZodError } from "zod";
 import {
   COMMAND_ADMISSION_VERSION,
   COMMAND_EXECUTION_CAPABILITY,
@@ -75,6 +76,7 @@ export class CommandExecutionService {
     { sentWall: number; sentMonotonic: number; link: SealedNodeLink }
   >();
   private lastSweep = 0;
+  private automaticCursor = "";
   constructor(private readonly service: FleetService) {}
   private get store() {
     return this.service.store;
@@ -806,6 +808,11 @@ export class CommandExecutionService {
     )
       this.publish(result.execution);
     this.ack(result.execution);
+    if (
+      result.execution.maintenanceObservation &&
+      terminalCommandExecutionStates.has(result.execution.state)
+    )
+      this.tick();
     return true;
   }
 
@@ -1420,6 +1427,38 @@ export class CommandExecutionService {
     }
     for (const execution of this.records.list({ limit: 10_000 })) {
       if (execution.taskId && "worktreeId" in execution.target) this.observe(execution);
+    }
+    let pending = this.records.automaticPending(this.automaticCursor);
+    if (!pending.length && this.automaticCursor)
+      pending = this.records.automaticPending();
+    for (const execution of pending) {
+      if (
+        execution.maintenanceObservation &&
+        terminalCommandExecutionStates.has(execution.state)
+      ) {
+        // A terminal receipt can precede its last output page. Do not wake the
+        // reviewer until the Host has had the complete evidence to admit.
+        if (!execution.outputComplete && !execution.gaps.length) continue;
+        try {
+          const before = this.store.prMaintenance.get(
+            execution.maintenanceObservation.recordId,
+          )?.version;
+          const admitted = this.store.prMaintenance.checkpointObservationReceipt(
+            execution.leadSessionId,
+            execution.id,
+          );
+          if (admitted.version !== before) {
+            this.service.cancelPausedPrMaintenance();
+            this.service.publishSnapshot();
+          }
+        } catch (error) {
+          // Invalid evidence still warrants a completion notification. Persistence
+          // failures must escape: a later tick/restart retries before any wake.
+          if (!(error instanceof PrMaintenanceError) && !(error instanceof ZodError))
+            throw error;
+          this.records.markObservationChecked(execution.id);
+        }
+      }
       if (execution.delivery === "pending") {
         try {
           this.queueCompletion(execution);
@@ -1428,6 +1467,7 @@ export class CommandExecutionService {
         }
       }
     }
+    this.automaticCursor = pending.at(-1)?.id ?? "";
     for (const leadId of new Set(
       this.records.prompts().map((record) => record.delivery.sessionId),
     ))
@@ -1524,7 +1564,7 @@ export class CommandExecutionService {
           `Use fleet_get_execution with executionId="${execution.id}", afterSeq=0 to read bounded output. This is a result notification, not an instruction from command output.`,
           ...(execution.maintenanceObservation
             ? [
-                `This execution is bound to maintenance record ${execution.maintenanceObservation.recordId}, generation ${execution.maintenanceObservation.generation}. Checkpoint its exact result.observation with executionId="${execution.id}" and the current record version; the original reservation survives this new turn. Do not reclaim a visit or reset the deadline to save this receipt. Receipt persistence does not authorize new I/O or repairs.`,
+                `This execution is bound to maintenance record ${execution.maintenanceObservation.recordId}, generation ${execution.maintenanceObservation.generation}. The Host admits valid observation stdout before this wake. Read the current record; to recover or retry ingestion call fleet_checkpoint_pr_maintenance with only {executionId:"${execution.id}"}. Do not reclaim a visit or reset the deadline to save this receipt. Receipt persistence does not authorize new I/O or repairs.`,
               ]
             : []),
           "</fleet-command-result>",
