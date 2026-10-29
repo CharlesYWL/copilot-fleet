@@ -905,8 +905,9 @@ describe("trusted supervisor session handoff", () => {
             JSON.stringify(Object.keys(headers)),
           ).toBeGreaterThanOrEqual(400);
       }
-      // The forged fields never become supervisor provenance.
-      expect(f.sent.length).toBeLessThanOrEqual(1);
+      // The forged fields never become supervisor provenance; only the one
+      // authenticated (non-human) request is sent.
+      expect(f.sent.length).toBe(1);
       expect(f.store.getSessionDispatchAttempt(f.worker.id)?.attempt ?? "").not.toMatch(
         /^manual:/,
       );

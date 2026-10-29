@@ -118,7 +118,7 @@ export function workReportCheckpoints(input: {
     if (!batch.stepId || !input.output)
       throw new PrMaintenanceError(
         "execution_unsettled",
-        "The batch has no accepted attempt to read a report from.",
+        "The batch's attempt has not settled yet, so there is no bounded report to read.",
       );
     const extracted = extractWorkReport(input.output());
     if ("error" in extracted)

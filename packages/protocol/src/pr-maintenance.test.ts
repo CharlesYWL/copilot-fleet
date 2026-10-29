@@ -293,8 +293,9 @@ describe("PR maintenance wire schemas", () => {
       expect(
         v1({ lifecycle: "paused", pauseReason: "remote_identity_changed" }).hold?.kind,
       ).toBe("identity");
+      // A legacy manual-control hold becomes an explicit pause.
       expect(v1({ lifecycle: "paused", pauseReason: "manual_control" }).hold?.kind).toBe(
-        "manual_control",
+        "paused",
       );
       const continued = v1({
         continuation: {

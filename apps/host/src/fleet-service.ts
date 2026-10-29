@@ -854,6 +854,18 @@ export class FleetService {
     return this.workerResume ? this.workerResume.decorate(runId, steps) : [...steps];
   }
 
+  /**
+   * The Node refused a maintenance prompt because its checkout was dirty or off
+   * the batch's head. The batch settles unsent and a person decides.
+   */
+  refusePrMaintenanceCheckout(sessionId: string, reason: string): void {
+    const step = this.store.getRunStepBySession(sessionId);
+    if (!step) return;
+    if (!this.store.prMaintenance.refuseCheckout(step.id, step.attempts, reason)) return;
+    this.publishRunSteps(step.runId, this.store.listRunSteps(step.runId));
+    this.publishSnapshot();
+  }
+
   reconcilePrMaintenanceExecution(sessionId: string): void {
     const step = this.store.getRunStepBySession(sessionId);
     if (!step || !terminalRunStepStates.has(step.state)) return;
@@ -964,9 +976,9 @@ export class FleetService {
       batch.executionNotDispatched
     )
       return false;
-    const step = this.store.getRunStep(batch.stepId);
-    // The report lives in the batch's own attempt; later direct work starts a new one.
-    if (!step || step.attempts !== batch.attempt) return false;
+    // Exactly the batch's own attempt, even if direct work has since reused the worker.
+    const events = this.store.prMaintenance.batchEvents(record.id, batch.id);
+    if (!events) return false;
     try {
       this.store.writeAtomically(() => {
         let version = record.version;
@@ -975,10 +987,7 @@ export class FleetService {
           generation: record.generation,
           workerSessionId: record.workerSessionId,
           output: () =>
-            this.store
-              .listEventsAfter(record.workerSessionId, step.eventSeqFrom)
-              .map((event) => eventPayload(event, "agent_text")?.text ?? "")
-              .join(""),
+            events.map((event) => eventPayload(event, "agent_text")?.text ?? "").join(""),
         }))
           version = this.store.prMaintenance.checkpoint(
             record.leadSessionId,
@@ -1020,7 +1029,7 @@ export class FleetService {
           // A person is needed: a design decision, or a hold only they can clear.
           if (record.decision?.state === "pending")
             this.notifications.createPrMaintenanceAttention(record, "decision");
-          else if (record.hold && record.hold.kind !== "manual_control")
+          else if (record.hold)
             this.notifications.createPrMaintenanceAttention(record, "paused");
           if (record.readyFingerprint)
             this.notifications.createPrMaintenanceAttention(record, "ready");

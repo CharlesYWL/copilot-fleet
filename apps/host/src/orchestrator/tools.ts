@@ -1565,7 +1565,8 @@ export class FleetTools {
     const batch = record?.batches.find((entry) => entry.id === checkpoint.batchId);
     if (!record || !batch)
       throw new PrMaintenanceError("batch_not_found", "No such maintenance batch.");
-    const step = batch.stepId ? this.store.getRunStep(batch.stepId) : undefined;
+    // Read only the batch attempt's own event range, never later direct work.
+    const events = registry.batchEvents(recordId, batch.id);
     const wakeId = this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId;
     let current = record;
     let version = expectedVersion;
@@ -1574,14 +1575,7 @@ export class FleetTools {
       generation: checkpoint.generation,
       workerSessionId: record.workerSessionId,
       ...(checkpoint.report !== undefined ? { report: checkpoint.report } : {}),
-      ...(step && step.attempts === batch.attempt
-        ? {
-            output: () =>
-              workerOutput(
-                this.store.listEventsAfter(record.workerSessionId, step.eventSeqFrom),
-              ),
-          }
-        : {}),
+      ...(events ? { output: () => workerOutput(events) } : {}),
     })) {
       current = registry.checkpoint(
         this.leadSessionId,

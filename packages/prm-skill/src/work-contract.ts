@@ -81,17 +81,16 @@ export const workReportProblems = (order: WorkOrder, report: WorkReport): string
       );
   }
   for (const [index, effect] of report.effects.entries()) {
-    if (!effect.force && effect.expectedRemoteSha === undefined) continue;
     const label = `effects[${index}]`;
-    if (effect.kind !== "push" || !effect.force)
-      problems.push(`${label}: only a forced push carries expectedRemoteSha.`);
-    else if (!order.conflictResolution)
+    if (effect.kind !== "push") {
+      if (effect.force || effect.expectedRemoteSha !== undefined)
+        problems.push(`${label}: only a push carries force or expectedRemoteSha.`);
+      continue;
+    }
+    // Fleet records any forced push as a fact; whether it was authorized is its call.
+    if (effect.state !== "not_performed" && !effect.expectedRemoteSha)
       problems.push(
-        `${label}: a forced push is allowed only for a conflict-resolution work order.`,
-      );
-    else if (effect.expectedRemoteSha !== order.pr.headSha)
-      problems.push(
-        `${label}: a forced push must lease the exact remote head pr.headSha (${order.pr.headSha}).`,
+        `${label}: a push must report expectedRemoteSha, the remote head it replaced (fetched immediately before pushing).`,
       );
   }
   return problems;
@@ -137,7 +136,7 @@ export const renderWorkerPrompt = (
     "",
     `Report shape (${WORK_REPORT_SCHEMA}): {"schema":"${WORK_REPORT_SCHEMA}","batchId":"${order.batchId}","summary":"...","mutationAttempts":N,`,
     '"findings":[{"sourceId","revision","outcome","stage","verifiedHeadSha?","repairCommit?","publishedCommit?","responseIds":[],"evidence":[],"nextAction?"}],',
-    '"effects":[{"kind":"push|thread_comment|discussion|review|thread_resolution","state":"known|uncertain|not_performed","providerId?","actor?","body?","commit?","force?","expectedRemoteSha?"}]}',
+    '"effects":[{"kind":"push|thread_comment|discussion|review|thread_resolution","state":"known|uncertain|not_performed","providerId?","actor?","body?","commit?","expectedRemoteSha (every attempted push: the remote head it replaced)","force? (only the leased conflict-resolution push)"}]}',
     `Outcomes: ${OutcomeSchema.options.join(", ")}. Stages, in order: ${STAGE_ORDER.join(", ")}.`,
   ].join("\n");
 

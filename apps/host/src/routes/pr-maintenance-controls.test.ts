@@ -471,7 +471,14 @@ describe("authenticated PR maintenance controls", () => {
         publishedCommit: published,
         evidence: ["Focused verification passed at the pushed commit."],
       })),
-      effects: [{ kind: "push", state: "known", commit: published }],
+      effects: [
+        {
+          kind: "push",
+          state: "known",
+          commit: published,
+          expectedRemoteSha: registration.headSha,
+        },
+      ],
     };
     let sequence = store.maxEventSequence(worker.id);
     for (const [type, payload] of [

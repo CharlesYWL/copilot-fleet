@@ -73,7 +73,7 @@ settles at once with no effects and is never replayed.
 | `paused` | Explicit Pause (operator or owning lead) | Resume; newer operator direction |
 | `access` | Provider authentication or permission denial | Resume (operator) |
 | `identity` | Provider identity or pinned ref changed | Resume (operator) |
-| `manual_control` (legacy) | Only on records held before direct turns stopped pausing maintenance | Resume, or automatically when that direct turn settles |
+| `manual_control` (legacy) | Never set any more; a stored manual-control hold (v1 or v2) is read as `paused` | Resume (operator) |
 | `reconciling` (derived) | Uncertain execution or external effect | Reconciliation evidence |
 
 Stopping, cancelling, or losing the **orchestrator** session no longer changes
@@ -114,7 +114,7 @@ batches. Manual requests never write `nextCheckAt`.
 | any | Explicit Pause | — | hold `paused` | undispatched batch settled `cancelled` with no effects (never replayed); in-flight attempt asked to stop; queued operator work kept |
 | any | Explicit worker/task Stop | — | hold `stopped` | as above |
 | any | Direct turn on the worker or checkout | no maintenance turn running there | unchanged | undispatched batch yields: settled `cancelled` (`direct_work`), never replayed; no hold |
-| any | Release (operator) | always | `released` | history kept; pending decision withdrawn; queued work cancelled; in-flight attempt asked to stop |
+| any | Release (operator) | always | `released` | history kept; pending decision withdrawn; queued work cancelled; nothing new starts; a running attempt is asked to stop but is still admitted, settled (automatically or `work_report`) and blocks direct writes and cleanup until it settles |
 | any | Provider auth/permission denial | — | hold `access` | — |
 | any | Provider identity change | — | hold `identity` | — |
 | hold | Resume (operator; lead only for its own pause) | binding intact, task not cancelled | hold cleared → `reviewing` | review(`resume`) |
@@ -141,9 +141,18 @@ unrelated review, and never change the task state.
 - Never merge or enable auto-complete. History is rewritten only to resolve a
   straightforward merge conflict in a `conflictResolution` batch: the worker
   rebases onto the current base and force-pushes to the same PR branch with
-  `--force-with-lease` on the exact HEAD the batch was prepared from; the Host
-  refuses any other forced push. Unknown remote changes, user work, ambiguous
-  conflicts and design questions stop the worker without pushing.
+  `--force-with-lease` on the exact HEAD the batch was prepared from. Every
+  reported push names the head it replaced (`expectedRemoteSha`). Any other
+  forced push, or a push that replaced an unexpected head, is recorded as a
+  fact, the batch settles, and a system `paused` hold asks a person to look.
+  The next observation records whether the new head is a fast-forward of the
+  batch head (`batch.lineage`: `fast_forward`, `leased_rewrite`,
+  `rewritten` → hold, or `unverified` without provider ancestry evidence).
+  Unknown remote changes, user work, ambiguous conflicts and design questions
+  stop the worker without pushing.
+- Maintenance dispatch only: the Node refuses the batch prompt unless the
+  checkout is clean and HEAD is the batch's head; the batch settles unsent and
+  a design decision asks a person what to do with the local work.
 - Exact provider/repository/PR/source-ref identity and retained worker binding.
 - Explicit Stop, authentication and identity holds.
 - Uncertain effects are reconciled before new effects or retries.
@@ -170,11 +179,13 @@ next heartbeat retries).
   with zero effects and never replay; operator work survives. Release always succeeds (idempotent, no version or
   decision reference needed) and keeps history, including unsettled evidence.
 - **One editable grant.** *Maintain this PR* covers code repairs, normal pushes, replies and resolving addressed
-  threads by default. The operator edits permissions in place (`scope` action, recorded in `scopeHistory`).
+  threads by default. The operator edits permissions in place (`scope` action, recorded in `scopeHistory`);
+  narrowing cancels queued, unsent batches so they are re-prepared, and a no-op edit changes nothing.
 - **Host-owned ingestion and settlement.** The Host ingests claim-bound helper output and settles work-order
   batches from the worker's report. The lead tool refuses large observation relays, alternate evidence, hand-built
   `prepare_batch` and per-finding `batch` settlement of work orders. `work_report` is the single settlement recovery
-  path; re-running the helper on the next review is the single observation recovery path.
+  path; re-running the helper on the next review is the single observation recovery path. The report is read
+  only from the attempt's own event range (`eventSeqFrom`..`eventSeqTo`, fixed when execution settles).
 - **Conflicts.** A `conflictResolution` work order rebases onto the current base and force-pushes with an exact
   lease; see Safeguards.
 
@@ -185,8 +196,9 @@ portable backups are converted on import:
 
 - `lifecycle: paused` becomes `active` plus a stored hold. `stopped` → `stopped`;
   `authorization_failed` → `access`; `remote_identity_changed` and
-  `continuation_identity_changed` → `identity`; `manual_control` →
-  `manual_control`; anything else → `paused` with the original reason.
+  `continuation_identity_changed` → `identity`; anything else, including
+  `manual_control`, → `paused` with the original reason. A stored v2
+  `manual_control` hold is also read as `paused`.
   A pending decision becomes `waiting_for_decision` without an extra hold.
 - Paused records stay held until the operator presses **Resume** once.
 - `continuation`, `continuationHistory`, `resumeHistory` and `pauseOrigin` move to

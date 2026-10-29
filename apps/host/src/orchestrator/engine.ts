@@ -683,11 +683,17 @@ export class OrchestratorEngine {
      * as this prompt's completion before the Node has even acknowledged it.
      */
     this.turnComplete.delete(session.id);
+    // Only the prompt dispatching a maintenance batch checks the checkout first.
+    const precondition = this.store.prMaintenance.checkoutPrecondition(
+      step.id,
+      step.attempts,
+    );
     const sent = this.service.dispatch(session.nodeId, {
       type: "prompt",
       sessionId: session.id,
       prompt: action.prompt,
       attachments: [],
+      ...(precondition ? { checkoutPrecondition: precondition } : {}),
     });
     if (!sent.sent) {
       this.store.updateRunStep(step.id, { state: "pending", dispatchedAt: "" });

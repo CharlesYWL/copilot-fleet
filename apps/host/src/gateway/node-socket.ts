@@ -711,6 +711,11 @@ export function registerNodeGateway(
                 message.recovery,
               );
               service.settleRefusedLaunch(message.sessionId, message.commandId, reason);
+              if (
+                message.refusal === "checkout_precondition" &&
+                service.store.getSession(message.sessionId)?.nodeId === nodeId
+              )
+                service.refusePrMaintenanceCheckout(message.sessionId, reason);
             }
           }
           if (

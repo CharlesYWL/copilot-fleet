@@ -35,7 +35,8 @@ while you work belongs to a later batch.
 3. Push normally to the exact head repository and ref, for example
    `git push <remote-for-headRepository> HEAD:<headRef>`. Never `--force`, never push to the
    base branch, never change upstream settings to get around a mismatch.
-4. Read back the pushed commit (`git ls-remote` or the provider) before reporting it.
+4. Read back the pushed commit (`git ls-remote` or the provider) before reporting it, and report
+   the push with `expectedRemoteSha`: the remote head you fetched in step 2, which your push replaced.
 
 ## Replying (`permissions.reply`)
 

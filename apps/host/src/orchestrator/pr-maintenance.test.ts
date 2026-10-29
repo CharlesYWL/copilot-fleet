@@ -1248,7 +1248,7 @@ describe("PR maintenance orchestration", () => {
               nextAction: "Confirm whether the push reached the PR head.",
             },
           ],
-          effects: [{ kind: "push", state: "uncertain" }],
+          effects: [{ kind: "push", state: "uncertain", expectedRemoteSha: headSha }],
         }),
       });
       expect(uncertain.ok, uncertain.text).toBe(true);

@@ -88,7 +88,7 @@ describe("Fleet conflict rebase contract", () => {
     );
   });
 
-  it("accepts only a forced push leased on pr.headSha in a conflict order", () => {
+  it("passes every push's replaced head through and leaves the authorization call to Fleet", () => {
     const leased = report({ force: true, expectedRemoteSha: headSha });
     expect(workReportProblems(order(true).workOrder, leased)).toEqual([]);
     const settlement = fleetSettlement({
@@ -103,20 +103,29 @@ describe("Fleet conflict rebase contract", () => {
       force: true,
       expectedRemoteSha: headSha,
     });
+    // A wrong lease or a forced push outside a conflict order is a fact Fleet
+    // records and holds on; the report itself is still settled.
+    for (const [conflict, effect] of [
+      [true, { force: true, expectedRemoteSha: "d".repeat(40) }],
+      [false, { force: true, expectedRemoteSha: headSha }],
+    ] as const)
+      expect(workReportProblems(order(conflict).workOrder, report(effect))).toEqual([]);
+    const normal = fleetSettlement({
+      batch: order(false).batch,
+      workOrder: order(false).workOrder,
+      report: report({ expectedRemoteSha: headSha }),
+      workerActor: "worker",
+    });
+    expect(normal.effects[0]).toMatchObject({ kind: "push", expectedRemoteSha: headSha });
+    expect(normal.effects[0]).not.toHaveProperty("force");
+  });
+
+  it("requires the replaced remote head on every attempted push", () => {
+    expect(workReportProblems(order(false).workOrder, report({}))).toEqual([
+      expect.stringContaining("must report expectedRemoteSha"),
+    ]);
     expect(
-      workReportProblems(
-        order(true).workOrder,
-        report({ force: true, expectedRemoteSha: "d".repeat(40) }),
-      ),
-    ).toEqual([expect.stringContaining("lease the exact remote head")]);
-    expect(
-      workReportProblems(
-        order(false).workOrder,
-        report({ force: true, expectedRemoteSha: headSha }),
-      ),
-    ).toEqual([expect.stringContaining("conflict-resolution work order")]);
-    expect(
-      workReportProblems(order(true).workOrder, report({ expectedRemoteSha: headSha })),
-    ).toEqual([expect.stringContaining("only a forced push")]);
+      workReportProblems(order(false).workOrder, report({ state: "not_performed" })),
+    ).toEqual([]);
   });
 });

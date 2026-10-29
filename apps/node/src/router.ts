@@ -1,5 +1,7 @@
 import { isAbsolute, resolve } from "node:path";
 import { realpath, stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   agentKindLabels,
   CONTEXT_TIER_CONFIG_ID,
@@ -45,6 +47,8 @@ export type CommandResult = {
   fatal?: boolean;
   /** A fix the operator can start from the refusal, when there is one. */
   recovery?: ConsoleRecovery;
+  /** Why a non-fatal refusal happened, when the Host acts on the reason. */
+  refusal?: "checkout_precondition";
   executionBinding?: ExecutionBinding;
 };
 
@@ -55,6 +59,11 @@ export type CommandResult = {
  * now" instead of tearing down a session that is working perfectly well.
  */
 export class CommandRefused extends Error {}
+
+/** A maintenance prompt refused because the checkout is dirty or off the PR head. */
+export class CheckoutPreconditionRefused extends CommandRefused {}
+
+const execFileAsync = promisify(execFile);
 
 class ReplacementConfigRefused extends CommandRefused {}
 
@@ -257,6 +266,9 @@ export class CommandRouter {
         commandId: command.commandId,
         ok: false,
         error: error instanceof Error ? error.message : "Command failed",
+        ...(error instanceof CheckoutPreconditionRefused
+          ? { refusal: "checkout_precondition" as const }
+          : {}),
         // A refusal leaves the session healthy, so the Host must not bury it.
         fatal:
           command.type !== "delete_session" &&
@@ -423,6 +435,8 @@ export class CommandRouter {
       // physical checkout/lease validation is waiting on the filesystem.
       await this.withActivity(slot, async () => {
         await this.revalidate(slot, command.executionBinding);
+        if (command.checkoutPrecondition)
+          await this.assertCheckout(slot, command.checkoutPrecondition.headSha);
         slot.ticket?.revalidate();
         this.assertNotDeleting(command.sessionId, slot.agentSessionId);
         if (this.slots.get(command.sessionId) !== slot || slot.agent !== agent) {
@@ -1144,6 +1158,44 @@ export class CommandRouter {
         for (const lease of leases) lease.processesQuiesced();
       },
     };
+  }
+
+  /**
+   * A PR maintenance prompt runs only on a clean checkout at exactly the PR
+   * head its batch was prepared from; anything else may be a person's work.
+   */
+  private async assertCheckout(slot: SessionSlot, headSha: string): Promise<void> {
+    const cwd = slot.binding?.cwd ?? slot.cwd;
+    if (!cwd)
+      throw new CheckoutPreconditionRefused(
+        "PR maintenance was not sent: this worker has no checkout to verify.",
+      );
+    const git = async (args: string[]) =>
+      (
+        await execFileAsync("git", ["-C", cwd, ...args], {
+          windowsHide: true,
+          timeout: 30_000,
+          maxBuffer: 1024 * 1024,
+        })
+      ).stdout.trim();
+    let head: string;
+    let status: string;
+    try {
+      head = await git(["rev-parse", "HEAD"]);
+      status = await git(["status", "--porcelain=v1", "--untracked-files=normal"]);
+    } catch (error) {
+      throw new CheckoutPreconditionRefused(
+        `PR maintenance was not sent: the checkout could not be inspected (${error instanceof Error ? error.message : String(error)}).`,
+      );
+    }
+    if (status)
+      throw new CheckoutPreconditionRefused(
+        "PR maintenance was not sent: the checkout has uncommitted changes that may be a person's work.",
+      );
+    if (head.toLowerCase() !== headSha.toLowerCase())
+      throw new CheckoutPreconditionRefused(
+        `PR maintenance was not sent: the checkout is at ${head}, not the PR head ${headSha} it was prepared from.`,
+      );
   }
 
   private async revalidate(

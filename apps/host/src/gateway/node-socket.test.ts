@@ -1782,6 +1782,37 @@ describe("node reconnect socket ordering", () => {
     expect(store.listNotifications().notifications).toEqual([]);
   });
 
+  it("routes a maintenance checkout refusal to PR maintenance, and only from the session's Node", async () => {
+    const client = await connect({ activeSessionIds: [sessionId], busySessionIds: [] });
+    await waitFor(() => store.getSession(sessionId)?.state === "idle");
+    const refuse = vi.spyOn(service, "refusePrMaintenanceCheckout");
+    const reason =
+      "PR maintenance was not sent: the checkout has uncommitted changes that may be a person's work.";
+    send(client, {
+      type: "command_result",
+      commandId: "maintenance-prompt",
+      sessionId,
+      ok: false,
+      fatal: false,
+      error: reason,
+      refusal: "checkout_precondition",
+    });
+    await waitFor(() => refuse.mock.calls.length > 0);
+    expect(refuse).toHaveBeenCalledWith(sessionId, reason);
+    // An ordinary refusal does not touch maintenance.
+    send(client, {
+      type: "command_result",
+      commandId: "busy-prompt",
+      sessionId,
+      ok: false,
+      fatal: false,
+      error: "still working",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(refuse).toHaveBeenCalledTimes(1);
+    expect(client.readyState).toBe(WebSocket.OPEN);
+  });
+
   it("settles a resume the Node refused instead of leaving it starting forever", async () => {
     store.setAutoResume(false);
     store.appendEvent({

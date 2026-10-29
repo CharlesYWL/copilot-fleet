@@ -36,8 +36,10 @@ Reviewing → Merged/Closed (provider terminal state; PRM records it and stops)
   or effect) is derived and clears from evidence. A hold stops **automatic**
   maintenance only: it never refuses the person's or your direct turns on the
   worker, and queued maintenance work it cancels settles with no effects and is
-  never replayed. (`manual_control` survives only on records held before direct
-  turns stopped pausing maintenance.)
+  never replayed. (A legacy `manual_control` hold is read as `paused` and needs
+  the same Resume.) Release always succeeds; a maintenance turn already running
+  still settles from its report (or your `work_report` recovery) and keeps the
+  worker until it does, but nothing new starts.
 
 Nothing else pauses maintenance. Stale or missing cached evidence starts a
 refresh; it never rejects a review. The heartbeat interval never delays a manual

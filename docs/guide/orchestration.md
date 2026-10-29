@@ -273,7 +273,12 @@ Straightforward conflicts use an exact-HEAD/exact-live-base conflict work order:
 clean checkout, rebases the PR branch onto the current base, preserves accepted semantics, verifies,
 and force-pushes to the same PR branch with an exact lease on the observed HEAD. It stops without
 pushing on unknown remote changes, user work, ambiguous conflicts or design questions, and never
-resets/deletes/stashes user work or merges the PR. Fleet refuses any other forced push.
+resets/deletes/stashes user work or merges the PR. Every reported push names the remote head it
+replaced (`expectedRemoteSha`). Any other forced push, or a push that replaced an unexpected head,
+is recorded as the fact it is, the batch still settles, and maintenance holds for a person. The next
+observation checks the new head is a fast-forward (provider ancestry evidence when available,
+otherwise recorded as unverified). Before dispatching a batch the Node checks that the checkout is
+clean and at the batch's head; otherwise nothing is sent and a person decides.
 Moved pins require fresh planning; conflicting evidence never proves readiness.
 
 **Asynchronous helper receipts:** claim a due visit, then immediately dispatch the
@@ -319,7 +324,8 @@ _The normal repair loop reuses the original worker and reconciles outcomes on ex
 **Pause** stops automatic maintenance only: queued maintenance work settles at once
 with no effects and is never replayed, and direct work on the worker is unaffected.
 **Resume** starts a fresh review. **Release** always succeeds — no version check,
-no waiting for reconciliation — and keeps the full history. Design uncertainty pauses the
+no waiting for reconciliation — and keeps the full history; a turn already running still settles.
+Narrowing permissions in place cancels queued, unsent work so it is re-prepared under the new grant. Design uncertainty pauses the
 whole PR. Use the task's **Send back with instructions** to record bounded,
 versioned direction. **Approve task** and ordinary **Reopen** cannot clear that
 hold, certify a defect fixed, or approve a redesign.
@@ -401,10 +407,13 @@ _Design choices stay human; Direct and continue records direction and queues its
 [Technical flow: MCP calls, stages and lifecycles (HTML)](../pr-maintenance-technical-flow.html).
 
 Stop/archive/delete pause linked automatic maintenance. Accepted work and unknown push/reply
-effects retain ownership and block cleanup until reconciled or released; Stop is not proof
+effects retain ownership and block cleanup until reconciled; Stop is not proof
 that remote effects ended. Retained active/paused registrations protect continuity
-from automatic inactivity cleanup. Release always succeeds, keeps history and permits
-later cleanup; a future registration must revalidate its binding.
+from automatic inactivity cleanup. Release always succeeds immediately and keeps history.
+Nothing new starts after it, but a maintenance turn already running is still settled
+(automatically or through `work_report`) and keeps blocking direct writes and cleanup of
+its worker and checkout until it settles; cleanup is permitted after that. A future
+registration must revalidate its binding.
 
 V1 does not support standalone-session handoff or reuse of sealed, published, or
 cleaned managed results. Follow the displayed eligibility reason rather than

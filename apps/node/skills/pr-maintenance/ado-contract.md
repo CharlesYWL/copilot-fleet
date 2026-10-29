@@ -298,7 +298,9 @@ Complete current conflicts produce a `merge-conflict` source with revision
 worker and an exact-base `conflictResolution:true` work order: the worker rebases the PR source
 branch onto the live base, verifies, and force-pushes to the same source ref with a lease on the
 exact observed head (`git push --force-with-lease=<ref>:<headSha>`), stopping on unknown remote
-changes, user work or ambiguous hunks. Never PR completion.
+changes, user work or ambiguous hunks. Every reported push carries `expectedRemoteSha`; Fleet
+records any other forced push or unexpected replaced head as a fact and holds for a person.
+Never PR completion.
 An old iteration target is not the integration pin: use the live `baseSha`. Changed base
 requires fresh metadata/planning; ambiguous semantic choices still need a concise design decision.
 Generated API-report regeneration from accepted code needs no new design approval. Only actual

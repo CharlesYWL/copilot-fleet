@@ -380,7 +380,9 @@ export const WorkReportSchema = z
               ),
             expectedRemoteSha: sha
               .optional()
-              .describe("The exact remote head the forced push leased: pr.headSha."),
+              .describe(
+                "Required for every attempted push: the remote head it replaced, fetched immediately before pushing (pr.headSha or your own earlier push). A forced push leases exactly this.",
+              ),
           })
           .strict(),
       )

@@ -509,10 +509,12 @@ export const PrMaintenanceEffectSchema = z
     attempts: z.number().int().min(1).max(1_000).default(1),
     usedAttempts: z.number().int().min(0).max(1_000).optional(),
     /**
-     * A history-rewriting push. Allowed only for a conflict-resolution repair,
-     * and only as a lease on the exact remote HEAD the batch was prepared from.
+     * A history-rewriting push. Authorized only for a conflict-resolution
+     * repair leased on the exact remote HEAD the batch was prepared from; any
+     * other forced push is recorded as a fact and holds maintenance for a person.
      */
     force: z.boolean().optional(),
+    /** The remote head a push replaced, fetched immediately before pushing. */
     expectedRemoteSha: sha.optional(),
   })
   .strict()
@@ -556,6 +558,15 @@ export const PrMaintenanceObservationSchema = z
     draft: z.boolean().optional(),
     fingerprint: id.optional(),
     mergeability: z.enum(["mergeable", "conflicting", "unknown"]).default("unknown"),
+    /**
+     * Provider compare/ancestry evidence for `headSha` against an earlier head,
+     * when the helper can supply it. Without it a changed head after a
+     * maintenance push is recorded as unverified.
+     */
+    headLineage: z
+      .object({ fromSha: sha, fastForward: z.boolean(), evidence: text })
+      .strict()
+      .optional(),
     checks: z
       .array(
         z
@@ -716,6 +727,25 @@ export const PrMaintenanceBatchSchema = PrMaintenancePreparedBatchSchema.extend(
   attempt: z.number().int().positive().optional(),
   executionSettled: z.boolean().default(false),
   executionNotDispatched: z.boolean().optional(),
+  /** The worker's event range of this attempt, fixed when its execution settled. */
+  eventSeqFrom: z.number().int().nonnegative().optional(),
+  eventSeqTo: z.number().int().nonnegative().optional(),
+  /**
+   * How the PR head moved after this batch published, from the next
+   * observation: a fast-forward, the leased conflict rewrite this batch
+   * recorded, a rewrite (held for a person), or unverified when the provider
+   * offered no ancestry evidence.
+   */
+  lineage: z
+    .object({
+      state: z.enum(["fast_forward", "leased_rewrite", "rewritten", "unverified"]),
+      fromSha: sha,
+      toSha: sha,
+      at: time,
+      evidence: text,
+    })
+    .strict()
+    .optional(),
   evidence: text.optional(),
   /** Why the Host could not settle this batch from its worker report automatically. */
   settlementError: text.optional(),
@@ -1007,7 +1037,8 @@ const workRequestSchema = z
  * maintenance: stale evidence, timing, task review, direct work on the worker
  * and orchestrator restarts are handled by refreshing or waiting, not by
  * holding. A hold never refuses a person's or orchestrator's direct worker turn.
- * `manual_control` survives only on records held before that rule.
+ * `manual_control` is history only: a legacy manual-control hold is read as
+ * `paused`, which needs an explicit Resume.
  */
 export const PrMaintenanceHoldKindSchema = z.enum([
   "stopped",
@@ -1028,6 +1059,19 @@ const holdSchema = z
   })
   .strict();
 export type PrMaintenanceHold = z.infer<typeof holdSchema>;
+
+/** A legacy manual-control hold becomes an explicit pause that one Resume clears. */
+const legacyManualPause = (hold: PrMaintenanceHold): PrMaintenanceHold =>
+  hold.kind === "manual_control"
+    ? {
+        ...hold,
+        kind: "paused",
+        reason: `Paused when a person took manual control: ${hold.reason}`.slice(
+          0,
+          8_192,
+        ),
+      }
+    : hold;
 
 export const PrMaintenanceReviewSourceSchema = z.enum([
   "enable",
@@ -1087,7 +1131,7 @@ const PrMaintenanceRegistrationV2Schema = z
     eligibilityEvidence: text,
     /** Provider terminal state; `active` covers every working phase. */
     lifecycle: z.enum(["active", "merged", "closed"]),
-    hold: holdSchema.optional(),
+    hold: holdSchema.transform(legacyManualPause).optional(),
     holdHistory: z.array(holdSchema).max(100).default([]),
     review: reviewSchema.optional(),
     reviewHistory: z.array(reviewSchema).max(50).default([]),
@@ -1178,7 +1222,7 @@ const legacyRegistrationSchema = z
   .passthrough()
   .transform((value) => upgradeLegacyRegistration(value as Record<string, unknown>));
 
-/** Holds the v1 `pauseReason` strings map onto. Unknown reasons become `paused`. */
+/** Holds the v1 `pauseReason` strings map onto. Unknown reasons, and manual control, become `paused`. */
 const legacyHoldKind = (reason: string): PrMaintenanceHoldKind =>
   reason === "stopped"
     ? "stopped"
@@ -1186,9 +1230,7 @@ const legacyHoldKind = (reason: string): PrMaintenanceHoldKind =>
       ? "access"
       : ["remote_identity_changed", "continuation_identity_changed"].includes(reason)
         ? "identity"
-        : reason === "manual_control"
-          ? "manual_control"
-          : "paused";
+        : "paused";
 
 /**
  * Converts a v1 registration. Explicit pauses stay held until one Resume;
