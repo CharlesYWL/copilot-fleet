@@ -6472,6 +6472,30 @@ export class FleetStore {
   }
 
   /**
+   * Forgets every outside-process mark on a Node's sessions, answering the
+   * sessions that had one.
+   *
+   * Only the Node can see who holds a conversation, and it restates that
+   * after every reconnect, so a mark kept while it is gone describes nothing
+   * anyone can check. Kept, it also stops the reconnect from re-attaching the
+   * session, since auto-resume skips a marked one.
+   */
+  clearNodeExternalAttachments(nodeId: string): FleetSession[] {
+    const ids = this.sessionIdsWhere(
+      "WHERE node_id=? AND external_attachment<>''",
+      nodeId,
+    );
+    if (ids.length === 0) return [];
+    this.statement(
+      "UPDATE sessions SET external_attachment='' WHERE node_id=? AND external_attachment<>''",
+    ).run(nodeId);
+    return ids.flatMap((id) => {
+      const session = this.getSession(id);
+      return session ? [session] : [];
+    });
+  }
+
+  /**
    * Appends turns imported from a Copilot native log, numbering them after
    * everything already recorded for the session.
    *

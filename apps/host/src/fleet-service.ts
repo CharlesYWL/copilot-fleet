@@ -2587,6 +2587,9 @@ export class FleetService {
     this.nodeSockets.delete(nodeId);
     const node = this.store.setNodeOnline(nodeId, false, 0);
     if (node) this.publishNode(node);
+    // Who else holds a conversation is the Node's to say, and it says again on
+    // reconnect; a stale mark would keep auto-resume away from the session.
+    const released = this.store.clearNodeExternalAttachments(nodeId);
     // Soft-fail: the Node may still be running agents and will resurrect
     // them on the next hello that lists those session ids.
     const before = new Map(
@@ -2612,6 +2615,10 @@ export class FleetService {
       });
     }
     this.publishSessions(offline);
+    // Marks cleared on sessions that did not go offline above (already
+    // settled ones) still change what a browser draws.
+    const republished = new Set(offline.map((session) => session.id));
+    this.publishSessions(released.filter((session) => !republished.has(session.id)));
   }
 
   /** True while the Host is tearing down, so close handlers stay quiet. */

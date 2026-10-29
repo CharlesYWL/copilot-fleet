@@ -74,7 +74,16 @@ function setup(maxSessions = 4) {
       )
       .at(-1)!.command!.commandId;
 
-  return { store, service, node, placement, orphan, resumeCommands, resumeCommandId };
+  return {
+    store,
+    service,
+    node,
+    placement,
+    orphan,
+    resumeCommands,
+    resumeCommandId,
+    reconnect: () => service.attachNode(node.id, wire.socket),
+  };
 }
 
 describe("auto resume", () => {
@@ -102,6 +111,59 @@ describe("auto resume", () => {
 
     expect(resumeCommands()).toEqual([]);
     expect(store.getSession(session.id)?.state).toBe("idle");
+  });
+
+  it("re-attaches a session whose outside-process mark the lost connection left behind", () => {
+    // Fleet's own Copilot was taken for a terminal, then the Node process died,
+    // and the mark outlived both. Auto-resume skips a marked session, so it
+    // waited for someone to press Resume.
+    const { service, store, node, orphan, resumeCommands, reconnect } = setup();
+    const session = orphan("Marked");
+    store.setExternalAttachment(session.id, {
+      pids: [13100],
+      active: false,
+      since: new Date().toISOString(),
+    });
+    // A settled session's mark is cleared too: nothing re-attaches it, but a
+    // browser should not keep drawing "Open in terminal" on it.
+    const settled = orphan("Settled and marked");
+    store.transitionSession(settled.id, "stopped");
+    store.setExternalAttachment(settled.id, {
+      pids: [13101],
+      active: false,
+      since: new Date().toISOString(),
+    });
+
+    service.disconnectNode(
+      node.id,
+      "Execution stopped when the Node connection was lost",
+    );
+    expect(store.getSession(session.id)?.externalAttachment).toBeNull();
+    expect(store.getSession(settled.id)?.externalAttachment).toBeNull();
+    reconnect();
+    service.reconcile(node.id, []);
+
+    expect(resumeCommands()).toEqual([session.id]);
+  });
+
+  it("still skips a session the reconnected node reports as open elsewhere", () => {
+    // Only the mark from before the disconnect is dropped. One that is current
+    // when the Node is reconciled still keeps auto-resume away.
+    const { service, store, node, orphan, resumeCommands, reconnect } = setup();
+    const session = orphan("In a terminal");
+    service.disconnectNode(
+      node.id,
+      "Execution stopped when the Node connection was lost",
+    );
+    reconnect();
+    store.setExternalAttachment(session.id, {
+      pids: [4242],
+      active: true,
+      since: new Date().toISOString(),
+    });
+    service.reconcile(node.id, []);
+
+    expect(resumeCommands()).toEqual([]);
   });
 
   it("does not resume a session that never reached its agent", () => {

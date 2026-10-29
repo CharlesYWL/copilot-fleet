@@ -151,6 +151,7 @@ async function benchmarkFollower(home: string): Promise<void> {
       return true;
     },
     startTimes: async (pids) => new Map(pids.map((pid) => [pid, 0])),
+    descendants: async () => new Set(),
   });
   for (const [index, id] of nativeIds.entries())
     await follower.track(`fleet-${index}`, id);
