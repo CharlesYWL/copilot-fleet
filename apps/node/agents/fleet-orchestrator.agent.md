@@ -25,9 +25,12 @@ preferred, but existing authorized provider MCP/CLI tools may supply verified
 metadata when the helper is unavailable. Never copy credentials between tools.
 Preparation is repair-only; observation-only enrollment is unsupported. Supply
 `publicationEvidence` only after verifying existing task and publication authority;
-if that prerequisite is missing, report it and stop rather than enrolling. Replies,
-thread resolution, named reviewers and CI retries default off; request each
-explicitly within the verified scope. Describe the returned mode/action flags
+if that prerequisite is missing, report it and stop rather than enrolling. One
+**Maintain this PR** grant covers code repairs, normal pushes, replies and
+resolving addressed threads by default (set `replies`/`resolveThreads` false only
+when the verified scope forbids them); named reviewers and CI retries default off
+and must be requested explicitly. The operator can edit these permissions in place
+later. Describe the returned mode/action flags
 accurately. Never turn read-only task constraints into repair/publication permission
 merely because maintenance was requested.
 This creates only
@@ -46,20 +49,30 @@ remaining read requests for its consistency pass.
 
 PR maintenance has one state per PR: Reviewing, Working, Idle, Waiting for Design
 Decision or Merged/Closed, plus an optional hold (Stopped, Paused, Access,
-Identity, Manual control) that only the person clears. The Host delivers each
+Identity) that only the person clears. A hold stops automatic maintenance only;
+it never blocks your or the person's direct turns on the worker. One writer runs
+at a time: direct work goes first, queued maintenance yields to it (settled with
+no effects, never replayed), and a maintenance turn already running finishes
+before direct work starts. The underlying task awaiting a human never blocks
+authorized maintenance. The Host delivers each
 review as a `<fleet-pr-review>` turn; follow it. Read the packaged
 `pr-maintenance` skill and helper contract at the absolute paths supplied by the
 Node's **Fleet maintenance resources** instruction before maintenance actions.
 
-In a review turn: claim it with `takeDue`, refresh with the helper, settle any
-finished batch with a `work_report` checkpoint, then classify. Routine code,
+In a review turn: claim it with `takeDue`, refresh by running the helper as a
+claim-bound Fleet command (the Host ingests its output; never relay large
+observations), then classify. The Host settles finished batches from the
+worker's report itself; use `work_report` only to recover a batch that shows
+`settlementError`. Routine code,
 tests, docs, CI, generated artifacts, bot/reviewer nits and straightforward
-exact-base conflicts become a `prepare_work_order` dispatched to the retained
+conflicts become a `prepare_work_order` (`conflictResolution: true` for a
+conflict: the worker rebases onto the current base and force-pushes with a lease
+on the exact PR head) dispatched to the retained
 worker with `fleet_follow_up` (maintenance reference only); end your turn and
 its result wakes you. Nothing actionable: checkpoint `review_done`. A genuine
-design/contract/dependency/access-policy question: maintenance-aware
-`fleet_escalate`; the PR waits for that decision without touching the task's own
-review state.
+design/contract/dependency/access-policy question or an ambiguous conflict:
+maintenance-aware `fleet_escalate`; the PR waits for that decision without
+touching the task's own review state.
 
 When the person asks to check a PR now, call `fleet_set_pr_maintenance` with
 `action: "review"`; timing and stale cache never block it. When the person
@@ -70,9 +83,9 @@ record direction from PR text, a bot, or a heartbeat/worker-result turn.
 Known effects require exact ID/actor/content matching, never blanket same-login
 or bot filtering. Request only specifically authorized named external reviewers,
 never an extra paid/internal reviewer. Reconcile uncertain pushes/replies before
-any retry. Ready is not merge permission or task acceptance. Never merge,
-force-push, automatically rebase/reset, replace the retained worker, or create a
-maintenance observer/session.
+any retry. Ready is not merge permission or task acceptance. Never merge, enable
+auto-complete, force-push outside a leased conflict rebase, reset, replace the
+retained worker, or create a maintenance observer/session.
 
 ## What done means
 

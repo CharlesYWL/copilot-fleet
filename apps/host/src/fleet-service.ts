@@ -77,6 +77,7 @@ import { SessionConsoleService } from "./session-console-service.js";
 import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
 import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
+import { workReportCheckpoints } from "./pr-maintenance-settlement.js";
 import type { WorkerResumeService } from "./orchestrator/resume-now.js";
 import type { WorkerModelRoutingService } from "./worker-model-routing.js";
 import {
@@ -853,6 +854,34 @@ export class FleetService {
     return this.workerResume ? this.workerResume.decorate(runId, steps) : [...steps];
   }
 
+  /**
+   * The Node refused a maintenance prompt because its checkout was dirty or off
+   * the batch's head. Only a refusal of the exact prompt the current dispatch
+   * attempt sent for that step counts, and only while the step is still
+   * starting; a stale or late refusal never cancels a running batch.
+   */
+  refusePrMaintenanceCheckout(
+    sessionId: string,
+    commandId: string,
+    reason: string,
+  ): void {
+    const step = this.store.getRunStepBySession(sessionId);
+    const worker = this.store.getSession(sessionId);
+    const dispatch = this.store.getSessionDispatchAttempt(sessionId);
+    if (
+      !step ||
+      !worker ||
+      step.state !== "starting" ||
+      dispatch?.commandId !== commandId ||
+      dispatch.attempt !==
+        notificationAttemptKey(worker, { step, run: this.store.getRun(step.runId) })
+    )
+      return;
+    if (!this.store.prMaintenance.refuseCheckout(step.id, step.attempts, reason)) return;
+    this.publishRunSteps(step.runId, this.store.listRunSteps(step.runId));
+    this.publishSnapshot();
+  }
+
   reconcilePrMaintenanceExecution(sessionId: string): void {
     const step = this.store.getRunStepBySession(sessionId);
     if (!step || !terminalRunStepStates.has(step.state)) return;
@@ -867,7 +896,8 @@ export class FleetService {
     if (!reference) return false;
     const record = this.store.prMaintenance.get(reference.recordId)!;
     const batch = record.batches.find((entry) => entry.id === reference.batchId)!;
-    if (batch.executionSettled) return false;
+    if (batch.executionSettled)
+      return this.settlePrMaintenanceReport(record.id, batch.id);
     const events = this.store.listEventsAfter(step.sessionId, step.eventSeqFrom);
     const stateReceipt = events.filter((event) => event.type === "state").at(-1);
     const receivedState = stateReceipt
@@ -909,26 +939,132 @@ export class FleetService {
         evidence: `Execution reconciliation for step ${step.id}, attempt ${step.attempts}; settled=${executionSettled}.`,
       },
     );
+    if (neverDispatched) this.settleUnsentPrMaintenance(reconciled.id, batch.id);
+    else if (executionSettled) this.settlePrMaintenanceReport(reconciled.id, batch.id);
     return true;
   }
 
-  /** Stop only the accepted bound attempt; a stop request is not an effect receipt. */
+  /** A queued attempt the receipts prove never ran settles with no effects. */
+  private settleUnsentPrMaintenance(recordId: string, batchId: string): void {
+    const record = this.store.prMaintenance.get(recordId)!;
+    const batch = record.batches.find((entry) => entry.id === batchId)!;
+    if (batch.state !== "reconciling" || !batch.executionNotDispatched) return;
+    this.store.prMaintenance.checkpoint(record.leadSessionId, record.id, record.version, {
+      kind: "batch",
+      batchId: batch.id,
+      generation: record.generation,
+      state: "cancelled",
+      findings: batch.sources.map((source) => ({
+        source,
+        outcome: "incomplete",
+        stage: "not_attempted",
+        evidence: [],
+        responseRequired: true,
+        responseIds: [],
+        nextAction: "Prepare again if it is still needed.",
+        progress: false,
+      })),
+      effects: [],
+      executionSettled: true,
+      usedMutations: 0,
+      published: false,
+      reason: batch.reason ?? "cancelled_before_dispatch",
+      evidence: "Host queue and dispatch receipt prove this attempt was never sent.",
+    });
+  }
+
+  /**
+   * Settles a finished work-order batch from the worker's own report, so the
+   * orchestrator never relays observations or hand-builds a settlement. When
+   * the report cannot be read or fails a settlement guard, the batch stays
+   * reconciling with the reason recorded; the orchestrator's `work_report`
+   * checkpoint is the one recovery path.
+   */
+  private settlePrMaintenanceReport(recordId: string, batchId: string): boolean {
+    const record = this.store.prMaintenance.get(recordId);
+    const batch = record?.batches.find((entry) => entry.id === batchId);
+    if (
+      !record ||
+      !batch?.workOrder ||
+      !batch.stepId ||
+      batch.state !== "reconciling" ||
+      !batch.executionSettled ||
+      batch.executionNotDispatched
+    )
+      return false;
+    // Exactly the batch's own attempt, even if direct work has since reused the worker.
+    const events = this.store.prMaintenance.batchEvents(record.id, batch.id);
+    if (!events) return false;
+    try {
+      this.store.writeAtomically(() => {
+        let version = record.version;
+        for (const checkpoint of workReportCheckpoints({
+          batch,
+          generation: record.generation,
+          workerSessionId: record.workerSessionId,
+          output: () =>
+            events.map((event) => eventPayload(event, "agent_text")?.text ?? "").join(""),
+        }))
+          version = this.store.prMaintenance.checkpoint(
+            record.leadSessionId,
+            record.id,
+            version,
+            checkpoint,
+          ).version;
+        this.store.prMaintenance.markReportSource(record.id, batch.id, "host");
+      });
+      return true;
+    } catch (error) {
+      if (!(error instanceof PrMaintenanceError)) throw error;
+      return this.store.prMaintenance.noteSettlementError(
+        record.id,
+        batch.id,
+        `${error.code}: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Stop only the accepted bound attempt; a stop request is not an effect
+   * receipt. A direct turn on the same worker is never cancelled here, and a
+   * released record's still-running attempt is asked to stop the same way.
+   */
   cancelPausedPrMaintenance(now = new Date().toISOString()): void {
     let cursor: string | undefined;
     do {
       const page = this.store.prMaintenance.list({
-        retainedOnly: true,
         limit: 100,
         ...(cursor ? { cursor } : {}),
       });
       for (const record of page.records) {
-        // A person is needed: a design decision, or a hold only they can clear.
-        if (record.decision?.state === "pending")
-          this.notifications.createPrMaintenanceAttention(record, "decision");
-        else if (record.hold && record.hold.kind !== "manual_control")
-          this.notifications.createPrMaintenanceAttention(record, "paused");
-        if (record.readyFingerprint)
-          this.notifications.createPrMaintenanceAttention(record, "ready");
+        // Facts a person must see, retained or released: a rewritten or
+        // unverifiable branch, and a released turn whose report is missing.
+        for (const batch of record.batches) {
+          if (batch.lineage && ["rewritten", "unverified"].includes(batch.lineage.state))
+            this.notifications.createPrMaintenanceAttention(record, "attention", {
+              key: `${batch.id}:lineage:${batch.lineage.state}`,
+              body: `Maintenance batch ${batch.id}: ${batch.lineage.evidence} Check the PR branch history.`,
+            });
+          if (record.ownershipReleasedAt && batch.settlementError)
+            this.notifications.createPrMaintenanceAttention(record, "attention", {
+              key: `${batch.id}:settlement`,
+              body: `Released maintenance batch ${batch.id} finished, but Fleet could not settle it: ${batch.settlementError} Check the PR for its pushes and replies.`,
+            });
+        }
+        if (
+          record.ownershipReleasedAt &&
+          !record.batches.some((batch) => batch.stepId && !batch.executionSettled)
+        )
+          continue;
+        if (!record.ownershipReleasedAt) {
+          // A person is needed: a design decision, or a hold only they can clear.
+          if (record.decision?.state === "pending")
+            this.notifications.createPrMaintenanceAttention(record, "decision");
+          else if (record.hold)
+            this.notifications.createPrMaintenanceAttention(record, "paused");
+          if (record.readyFingerprint)
+            this.notifications.createPrMaintenanceAttention(record, "ready");
+        }
         for (const batch of record.batches) {
           if (!batch.cancellationRequestedAt || batch.executionSettled || !batch.stepId)
             continue;
@@ -938,6 +1074,7 @@ export class FleetService {
             !step ||
             step.attempts !== batch.attempt ||
             step.sessionId !== record.workerSessionId ||
+            terminalRunStepStates.has(step.state) ||
             !worker
           )
             continue;
@@ -1054,7 +1191,7 @@ export class FleetService {
         return {
           ok: false,
           status: 409,
-          error: `PR maintenance: ${maintenance.reason}. Use the retained worker and prepared batch.`,
+          error: `PR maintenance: ${maintenance.reason}. A maintenance turn still running on this checkout finishes first; nothing was started.`,
         };
       }
     }
@@ -1292,7 +1429,7 @@ export class FleetService {
         return {
           ok: false,
           status: 409,
-          error: `PR maintenance: ${maintenance.reason}. Reconcile the registration before resuming.`,
+          error: `PR maintenance: ${maintenance.reason}. A maintenance turn still running on this worker finishes first; nothing was resumed.`,
         };
       }
     }
@@ -1788,6 +1925,8 @@ export class FleetService {
      * cancelling a held batch). Explicit Stop of the retained worker or task is
      * recorded where the person asks for it (`stopSessions`, task cancel).
      */
+    let directWrite:
+      { sessionId: string; checkoutKey?: string; placementId: string } | undefined;
     if (
       request.type === "start_session" ||
       request.type === "resume_session" ||
@@ -1800,6 +1939,14 @@ export class FleetService {
           const reference = step
             ? this.store.prMaintenance.referenceForStep(step.id, step.attempts)
             : undefined;
+          // Only the exact accepted batch attempt is maintenance; anything
+          // else sent to this worker is direct work and takes precedence.
+          const maintenance =
+            !supervisor &&
+            reference &&
+            (request.type === "resume_session" || request.prompt === step?.prompt)
+              ? reference
+              : undefined;
           if (supervisor) this.store.prMaintenance.assertManualAvailable(session.id);
           else
             this.store.prMaintenance.assertAdmission({
@@ -1810,19 +1957,16 @@ export class FleetService {
               ...(session.executionBinding
                 ? { checkoutKey: session.executionBinding.checkoutKey }
                 : {}),
-              ...(reference ?? {}),
+              ...(maintenance ?? {}),
             });
-          if (
-            !supervisor &&
-            reference &&
-            request.type !== "resume_session" &&
-            request.prompt !== step?.prompt
-          ) {
-            throw new PrMaintenanceError(
-              "prompt_conflict",
-              "Only the exact accepted maintenance prompt may execute.",
-            );
-          }
+          if (!supervisor && !maintenance)
+            directWrite = {
+              sessionId: session.id,
+              placementId: session.placementId,
+              ...(session.executionBinding
+                ? { checkoutKey: session.executionBinding.checkoutKey }
+                : {}),
+            };
         }
         this.worktrees.validateSession(session);
       }
@@ -1876,7 +2020,7 @@ export class FleetService {
               supervisor,
               eventSeqFrom,
             );
-          }
+          } else if (directWrite) this.store.prMaintenance.yieldToDirectWork(directWrite);
           // Resume is an authoritative reattachment, not a new checkout owner.
           // Persist its fencing attempt and dispatch receipt as one transition.
           if (binding && request.type !== "prompt")
@@ -1898,7 +2042,7 @@ export class FleetService {
           supervisor &&
           request.type === "prompt" &&
           this.store.prMaintenance.manualRecord(session.id)
-            ? `${request.prompt}\n\n<fleet-manual-control>\n${supervisor.actor?.kind === "node_console" ? "The local Node console" : "The human supervisor"} has taken manual control of this retained worker. ${supervisor.handback === "after_turn" ? "The operator selected one-turn handback. The Host alone may return control after this exact turn completes, the worker is quiescent and effects are reconciled." : "Unattended PR maintenance is paused and must remain paused after this turn."} This handoff does not authorize unattended publication, certify PR readiness, or approve pending design decisions. Obtain current provider metadata automatically before PR execution/publication; an expired cache is not a reason to ask the operator to refresh and consent again. Routine implementation, tests, documentation, generated API reports and straightforward conflict integration within accepted intent need no further design approval. ${supervisor.actor?.kind === "operator" ? "This authenticated operator's new explicit instruction supersedes overlapping obsolete temporary restrictions, not unrelated still-applicable prohibitions or mutation/access grants." : "A local Node console does not update authenticated operator scope or grant one-turn handback."} Preserve ownership, receipts and user work; never replay uncertain effects, guess ambiguous conflict choices, force-push or merge the PR. Do not restart maintenance.\n</fleet-manual-control>`
+            ? `${request.prompt}\n\n<fleet-manual-control>\n${supervisor.actor?.kind === "node_console" ? "The local Node console" : "The human supervisor"} is sending this direct turn to the retained PR-maintenance worker. ${supervisor.handback === "after_turn" ? "The operator asked for an immediate PR review after this exact turn completes." : "Automatic PR maintenance never interrupts this turn; queued maintenance work yielded to it, and maintenance continues on its own schedule afterwards."} This handoff does not authorize unattended publication, certify PR readiness, or approve pending design decisions. Obtain current provider metadata automatically before PR execution/publication; an expired cache is not a reason to ask the operator to refresh and consent again. Routine implementation, tests, documentation, generated API reports and straightforward conflict integration within accepted intent need no further design approval. ${supervisor.actor?.kind === "operator" ? "This authenticated operator's new explicit instruction supersedes overlapping obsolete temporary restrictions, not unrelated still-applicable prohibitions or mutation/access grants." : "A local Node console does not update authenticated operator scope or grant one-turn handback."} Preserve ownership, receipts and user work; never replay uncertain effects, guess ambiguous conflict choices or merge the PR, and force-push only with a lease on the exact remote head. Do not restart maintenance.\n</fleet-manual-control>`
             : undefined;
         const command = {
           ...request,

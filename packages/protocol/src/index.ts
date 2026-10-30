@@ -1135,6 +1135,20 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     sessionId: z.string().min(1),
     prompt: z.string().min(1),
     attachments: z.array(PromptAttachmentSchema).default([]),
+    /**
+     * Set only when this prompt dispatches a PR maintenance batch: the Node
+     * refuses it (`refusal: "checkout_precondition"`) unless the session's
+     * checkout is clean and HEAD is exactly `headSha`, so maintenance never
+     * writes over a person's uncommitted or unpublished work. Direct turns
+     * never carry it.
+     */
+    checkoutPrecondition: z
+      .object({
+        headSha: z.string().regex(/^[0-9a-f]{40}$/i),
+        requireClean: z.literal(true),
+      })
+      .strict()
+      .optional(),
   }),
   z.object({
     type: z.literal("cancel"),
@@ -1602,6 +1616,8 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
      * Node never sends it, so the plain `error` text remains the whole story.
      */
     recovery: ConsoleRecoverySchema.optional(),
+    /** Why a non-fatal refusal happened, when the Host acts on the reason. */
+    refusal: z.enum(["checkout_precondition"]).optional(),
   }),
   z.object({
     type: z.literal("session_cleanup_result"),
@@ -1854,6 +1870,12 @@ export const SESSION_ACTIVITY_CAPABILITY = "session-activity";
 
 /** Supports guarded deletion of an explicitly identified Fleet-owned session. */
 export const SESSION_RETENTION_CAPABILITY = "session-retention";
+
+/**
+ * A Node that honors a prompt's `checkoutPrecondition`. The Host never sends a
+ * PR maintenance batch to a Node without it.
+ */
+export const CHECKOUT_PRECONDITION_CAPABILITY = "checkout-precondition";
 
 /** A Node that retains reconnect batches until `outbox_flush_ack`. */
 export const OUTBOX_ACK_CAPABILITY = "outbox-ack";

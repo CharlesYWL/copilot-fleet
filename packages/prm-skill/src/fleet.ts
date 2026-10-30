@@ -105,14 +105,15 @@ const FLEET_WORKER_RULES = [
   "Make the smallest change that resolves each finding inside the baseline. If a fix needs a public API, schema, protocol, storage, dependency, architecture, trust-boundary or behavior change, stop all edits and report needs_human for the whole batch.",
   "Run every verification step. Never publish when verification fails.",
   "Publication is already authorized by the operator's grant when permissions.push is true; Fleet's normal command and publication approvals still apply. Do not ask for an extra approval only because a new commit exists.",
-  "Immediately before pushing, fetch the remote head ref: it must still equal pr.headSha or your own commit on top of it. Push normally to the exact head repository and full ref. Never force-push, rebase, reset, merge the PR, enable auto-merge/auto-complete, vote, or approve.",
+  "Immediately before pushing, fetch the remote head ref: it must still equal pr.headSha or your own commit on top of it. Push normally to the exact head repository and full ref, and report the push effect with expectedRemoteSha set to the remote head you fetched (the head your push replaced). Never force-push, rebase or reset the PR branch (except the conflict-resolution procedure when conflictResolution is true), merge the PR, enable auto-merge/auto-complete, vote, or approve.",
+  "Preserve user work: if the checkout has uncommitted changes or local commits you did not make, stop before editing and report every finding incomplete with nextAction describing what you found.",
   "Reply only when permissions.reply is true, once per finding in its original thread, without secrets. Resolve a thread only when permissions.resolveThreads is true and the fix or answer is visible.",
   "Stay within allowances.mutationAttemptsRemaining; stop and report at the limit.",
   "Record every remote write you attempted as an effect: known after you read it back (include providerId, your actor login, and the exact reply body), uncertain if you could not confirm it, not_performed if it never reached the provider. Never retry an uncertain write without checking the PR first.",
 ];
 
 const CONFLICT_RULE =
-  "Conflict resolution: merge the pinned pr.baseSha into the PR head branch (never rebase). Preserve accepted behavior and user work; report needs_human if any hunk is ambiguous.";
+  "Conflict resolution: fetch the base ref and rebase the PR head branch (exactly pr.headSha) onto the current base. Resolve only straightforward conflicts that keep both sides' accepted behavior, then run every verification step. Publish with a lease on the exact remote head — git push --force-with-lease=<headRef>:<pr.headSha> to the exact head repository and full ref — and report that push effect with force: true and expectedRemoteSha: pr.headSha. Stop without pushing and report needs_human if the remote head is no longer pr.headSha (or the lease is rejected), the checkout holds work you did not make, or any conflict is ambiguous or needs a design decision. Never merge the PR or push anywhere else.";
 
 const refuse = (code: string, message: string, problems: string[] = []): never => {
   throw new WorkContractError(code, message, problems);
@@ -281,6 +282,8 @@ export type FleetSettlement = {
     evidence?: string;
     attempts: number;
     usedAttempts: number;
+    force?: boolean;
+    expectedRemoteSha?: string;
   }>;
   usedMutations: number;
   published: boolean;
@@ -375,6 +378,10 @@ export const fleetSettlement = (input: {
             : `Worker could not confirm ${effect.kind} in ${WORK_REPORT_SCHEMA} ${report.batchId}.`,
       attempts: 1,
       usedAttempts: used,
+      ...(effect.expectedRemoteSha
+        ? { expectedRemoteSha: effect.expectedRemoteSha }
+        : {}),
+      ...(effect.force ? { force: true } : {}),
     };
   });
   const knownWithoutId = effects.filter(

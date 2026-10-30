@@ -80,6 +80,15 @@ export const workReportProblems = (order: WorkOrder, report: WorkReport): string
         `${finding.sourceId}: an addressed answer needs the reply's provider ID in responseIds.`,
       );
   }
+  // Fleet records every push as a fact. Without expectedRemoteSha the next
+  // observation checks the head against the commit it reported; it never
+  // strands the report.
+  for (const [index, effect] of report.effects.entries())
+    if (
+      effect.kind !== "push" &&
+      (effect.force || effect.expectedRemoteSha !== undefined)
+    )
+      problems.push(`effects[${index}]: only a push carries force or expectedRemoteSha.`);
   return problems;
 };
 
@@ -123,7 +132,7 @@ export const renderWorkerPrompt = (
     "",
     `Report shape (${WORK_REPORT_SCHEMA}): {"schema":"${WORK_REPORT_SCHEMA}","batchId":"${order.batchId}","summary":"...","mutationAttempts":N,`,
     '"findings":[{"sourceId","revision","outcome","stage","verifiedHeadSha?","repairCommit?","publishedCommit?","responseIds":[],"evidence":[],"nextAction?"}],',
-    '"effects":[{"kind":"push|thread_comment|discussion|review|thread_resolution","state":"known|uncertain|not_performed","providerId?","actor?","body?","commit?"}]}',
+    '"effects":[{"kind":"push|thread_comment|discussion|review|thread_resolution","state":"known|uncertain|not_performed","providerId?","actor?","body?","commit?","expectedRemoteSha (every attempted push: the remote head it replaced)","force? (only the leased conflict-resolution push)"}]}',
     `Outcomes: ${OutcomeSchema.options.join(", ")}. Stages, in order: ${STAGE_ORDER.join(", ")}.`,
   ].join("\n");
 

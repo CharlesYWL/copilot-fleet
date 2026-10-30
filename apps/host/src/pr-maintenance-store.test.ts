@@ -241,16 +241,20 @@ function accept(
 ) {
   const batch = record.batches.find((entry) => entry.id === batchId)!;
   return f.store.writeAtomically(() => {
-    const step = f.store.retryRunStepInSession(
-      f.task.id,
-      {
-        stepKey: "implementation",
-        title: "Repair",
-        prompt: batch.prompt,
-        placementId: f.placement.id,
-      },
-      f.worker.id,
-      0,
+    const step = f.store.prMaintenance.asMaintenanceDispatch(
+      { recordId: record.id, batchId },
+      () =>
+        f.store.retryRunStepInSession(
+          f.task.id,
+          {
+            stepKey: "implementation",
+            title: "Repair",
+            prompt: batch.prompt,
+            placementId: f.placement.id,
+          },
+          f.worker.id,
+          0,
+        ),
     );
     return f.store.prMaintenance.acceptBatch(
       f.lead.id,
@@ -1080,17 +1084,17 @@ describe("durable PR maintenance registry", () => {
       f.store.prMaintenance.manualConflicts(f.worker.id, fixture.first.id),
     ).toHaveLength(3);
     expect(f.store.prMaintenance.hasPendingManualExecution(f.worker.id)).toBe(true);
-    expect(() =>
-      f.store.prMaintenance.operatorAction(
-        record.id,
-        record.version,
-        {
-          action: "release",
-          reason: "Cannot erase ambiguity",
-        },
-        "operator",
-      ),
-    ).toThrow(/receipt/);
+    // Release always succeeds and keeps the ambiguous receipts as history.
+    const released = f.store.prMaintenance.operatorAction(
+      record.id,
+      record.version,
+      {
+        action: "release",
+        reason: "Cannot erase ambiguity",
+      },
+      "operator",
+    );
+    expect(released.ownershipReleasedAt).toBeDefined();
     expect(f.store.prMaintenance.exportBackup().manualConflicts).toHaveLength(3);
   });
 
@@ -1971,6 +1975,8 @@ describe("durable PR maintenance registry", () => {
     let record = observe(f, publishedRepair(f), {
       headSha: otherSha,
       fingerprint: "head-B",
+      // Provider compare evidence; without it the move would pause for a person.
+      headLineage: { fromSha: sha, fastForward: true, evidence: "compare: ahead 1" },
     });
     expect(() => prepare(f, record, "duplicate-B", "repair", otherSha)).toThrow(
       /unchanged/,
@@ -2292,34 +2298,35 @@ describe("durable PR maintenance registry", () => {
     });
   });
 
-  it("enforces one outstanding batch and no dispatch without retained identity", () => {
+  it("enforces one outstanding batch while direct work on the task stays admitted", () => {
     const f = setup();
     const record = prepare(
       f,
       observe(f, f.store.prMaintenance.enableFromOperator(f.input, "operator")),
     );
     expect(() => prepare(f, record, "second")).toThrow(/outstanding/);
+    // Maintenance never reserves the task, checkout or worker against direct work.
     expect(
-      f.store.prMaintenance.admission({ action: "dispatch", taskId: f.task.id }).reason,
-    ).toBe("maintenance_batch_required");
+      f.store.prMaintenance.admission({ action: "dispatch", taskId: f.task.id }),
+    ).toEqual({ allowed: true });
     expect(
       f.store.prMaintenance.admission({
         action: "dispatch",
         taskId: "replacement",
         placementId: f.placement.id,
-      }).reason,
-    ).toBe("resource_reserved");
+      }),
+    ).toEqual({ allowed: true });
     expect(
       f.store.prMaintenance.admission({ action: "discover", taskId: "unrelated" })
         .allowed,
     ).toBe(true);
-    expect(() =>
-      f.store.upsertRunStep(f.task.id, {
-        stepKey: "replacement",
-        title: "Replacement",
-        prompt: "Start over",
-      }),
-    ).toThrow(/retained/);
+    f.store.upsertRunStep(f.task.id, {
+      stepKey: "replacement",
+      title: "Replacement",
+      prompt: "Start over",
+    });
+    // A step elsewhere in the task leaves the prepared batch alone.
+    expect(f.store.prMaintenance.get(record.id)!.batches[0]!.state).toBe("prepared");
   });
 
   it("requires correlated execution and per-finding receipts, not a worker done message", () => {
@@ -2447,7 +2454,7 @@ describe("durable PR maintenance registry", () => {
     expect(record.counters.mutationAttempts).toBe(2);
   });
 
-  it("terminal closure fences queued execution and retains keys until confirmed settlement", () => {
+  it("terminal closure fences dispatched execution and retains keys until confirmed settlement", () => {
     const f = setup();
     let record = accept(
       f,
@@ -2456,6 +2463,8 @@ describe("durable PR maintenance registry", () => {
         observe(f, f.store.prMaintenance.enableFromOperator(f.input, "operator")),
       ),
     );
+    // The attempt reached the worker: it is not provably unsent.
+    f.store.updateRunStep(f.step.id, { state: "running", dispatchedAt: at });
     record = observe(f, record, {
       state: "closed",
       snapshotId: "closed-1",
@@ -2473,14 +2482,6 @@ describe("durable PR maintenance registry", () => {
         batchId: "batch-1",
       }).allowed,
     ).toBe(false);
-    expect(() =>
-      f.store.prMaintenance.operatorAction(
-        record.id,
-        record.version,
-        { action: "release", reason: "Timed out" },
-        "operator",
-      ),
-    ).toThrow(/Reconcile/);
     expect(f.store.hasSessionRetentionBlockers(f.worker.id, at)).toBe(true);
     f.store.updateRunStep(f.step.id, { state: "cancelled" });
     record = f.store.prMaintenance.checkpoint(
@@ -2520,6 +2521,7 @@ describe("durable PR maintenance registry", () => {
       ),
     );
     f.store.transitionSession(f.worker.id, "running");
+    f.store.updateRunStep(f.step.id, { state: "running", dispatchedAt: at });
     f.store.setSessionTransitionIntent(f.worker.id, "stop");
     f.store.setSessionControls(f.worker.id, { stopRequested: true });
     f.store.updateRunStep(f.step.id, { state: "cancelled" });

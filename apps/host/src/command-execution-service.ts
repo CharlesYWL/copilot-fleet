@@ -330,7 +330,7 @@ export class CommandExecutionService {
     if (!maintenance.allowed)
       throw new CommandConflict(
         "maintenance_target_reserved",
-        `PR maintenance reserves this task or checkout for its retained worker: ${maintenance.reason}. Run observation helpers in a separate lead context.`,
+        `PR maintenance blocks this command: ${maintenance.reason}. A maintenance turn still running on the checkout finishes first; another orchestrator's maintained task stays with its owner.`,
       );
     return { nodeId, path, ...(taskId ? { taskId } : {}) };
   }

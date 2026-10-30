@@ -1,5 +1,5 @@
 import type { FastifyBaseLogger } from "fastify";
-import type { FleetNode } from "@fleet/protocol";
+import { CHECKOUT_PRECONDITION_CAPABILITY, type FleetNode } from "@fleet/protocol";
 import { FleetStore } from "../store.js";
 import { FleetService } from "../fleet-service.js";
 import { OrchestratorEngine } from "./engine.js";
@@ -50,7 +50,7 @@ export function fleet(dbPath = ":memory:"): {
     arch: "x64",
     version: "0.1.0",
     revision: "test",
-    capabilities: ["copilot-acp", "host-yolo"],
+    capabilities: ["copilot-acp", "host-yolo", CHECKOUT_PRECONDITION_CAPABILITY],
     agents: [],
     maxSessions: 8,
   });
@@ -70,7 +70,7 @@ export function fleet(dbPath = ":memory:"): {
       arch: "x64",
       version: "0.1.0",
       revision: "test",
-      capabilities: ["copilot-acp", "host-yolo"],
+      capabilities: ["copilot-acp", "host-yolo", CHECKOUT_PRECONDITION_CAPABILITY],
       agents: [],
       maxSessions: 8,
     }).node;

@@ -408,19 +408,19 @@ No new polling service or credential changes are introduced.
 | Action | Maintenance effect |
 |---|---|
 | Task Approve / aggregate | Reject a pending design decision; readiness does not authorize completion or redesign |
-| Generic task reopen, bound worker prompt/resume | Check shared admission before mutation or dispatch; cannot clear a decision |
+| Generic task reopen, bound worker prompt/resume | Direct work is never reserved against; it waits only while a dispatched maintenance turn is executing on the same worker or checkout, and undispatched maintenance yields to it; cannot clear a decision |
 | Send back with instructions | Require exact record/decision versions and a nonempty bounded note; atomically preserve direction, task history and review resolution |
-| Pause or Stop/archive | Inhibit new repairs and request targeted cancellation; preserve accepted work/effects and pending human question |
+| Pause or Stop/archive | Stop automatic maintenance only: queued, undispatched batches settle as cancelled with zero effects and never replay; a running turn is asked to stop through its own receipts; direct worker turns are unaffected |
 | Delete/cleanup | Pause first; reject while ownership or unsettled work still protects the task/session |
 | Resume maintenance | Revalidate current binding/authorization and matching direction; does not undo an explicit worker Stop |
-| Release | Explicit operator disposition after settlement; retain history and require a new generation for later enablement |
+| Release | Always succeeds immediately and keeps history; nothing new starts afterwards, but a turn already running is still admitted, settled and recoverable (`work_report`) and keeps blocking direct writes on its worker/checkout until it settles; later enablement needs a new generation |
 | Observed merge/closure | Stop new work, drain accepted work/effects, then release only when settlement is established |
 
 `prepared`, `accepted`, `reconciling`, and `uncertain` batches remain outstanding.
 Worker “done”, Node offline, timeout, and a Stop request alone cannot settle
 publication or replies. Per-finding stages preserve a verified/published fix whose
 reply remains incomplete. An explicit pause does not silently resume on reconnect.
-Unknown execution/effects do not expire out of retention protection.
+Unknown execution/effects do not expire out of retention protection, including on a released record whose running turn has not settled.
 Paused ownership has no automatic expiry. The 30-day reminder asks an operator to
 resume or release; polling and reconnects do not renew that age.
 
@@ -434,7 +434,7 @@ No-login mode cannot provide an authenticated maintenance authorization.
 
 This pilot supports only an already eligible mutable Orchestrator worker.
 Published/sealed/cleaned managed results and standalone ownership handoff are not
-made mutable by maintenance. V1 never merges or force-pushes. Cadence and workflow
+made mutable by maintenance. Maintenance never merges. The only forced push it authorizes is a conflict-resolution rebase published with `--force-with-lease` on the exact head the batch was prepared from; any other forced push or unexpected replaced head is recorded as a fact and pauses maintenance for a person. A PR head that moves after a published batch to the commit the batch reported pushing, in a report the Host read from the worker, is explained and maintenance continues; a move nothing recorded explains pauses until a person resumes. Cadence and workflow
 budgets are best effort, not a hard SLA or shell sandbox; production repair rates
 and the proposed repeated model evaluations have not been established by unit
 tests.

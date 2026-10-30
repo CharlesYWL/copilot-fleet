@@ -66,7 +66,7 @@ const WORKER_RULES = [
   "Make the smallest change that resolves each finding within the accepted design. If a fix needs an API, schema, dependency, architecture, security-policy or behavior change, stop all edits and report needs_human for the whole batch.",
   "Run every verification command. Never publish when verification fails; report failed or incomplete instead.",
   "Ask the user before the first push or reply of this batch unless they already approved this batch in this conversation.",
-  "Before pushing, fetch the remote head ref. It must still equal pr.headSha (or a commit you created on top of it in this batch). Push normally to the exact head repository and ref; never force-push, rebase, reset, or merge the PR, and never enable auto-merge or auto-complete.",
+  "Before pushing, fetch the remote head ref. It must still equal pr.headSha (or a commit you created on top of it in this batch). Push normally to the exact head repository and ref, and report the push effect with expectedRemoteSha set to the remote head you fetched; never force-push, rebase, reset, or merge the PR, and never enable auto-merge or auto-complete.",
   "Reply only when permissions.reply is true, in the original thread, once per finding, without secrets. Resolve threads only when permissions.resolveThreads is true and the fix or answer is visible.",
   "Respect the remaining allowances. Stop and report when a limit would be exceeded.",
   "Report every finding with `prm report`. Record each remote action you attempted as an effect: known when you read it back, uncertain when you could not confirm it, not_performed when it failed before reaching the provider.",

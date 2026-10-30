@@ -353,13 +353,32 @@ export const PrMaintenanceScopeSchema = z
       message:
         "Observation-only maintenance is unsupported. Prepare a repair proposal for authenticated authorization.",
     }),
-    replies: z.boolean().default(false),
-    resolveThreads: z.boolean().default(false),
+    // One "Maintain this PR" grant covers repairs, normal pushes, replies and
+    // resolving addressed threads; the person can narrow it in place later.
+    replies: z.boolean().default(true),
+    resolveThreads: z.boolean().default(true),
     reviewers: z.array(id).max(20).default([]),
     retryChecks: z.boolean().default(false),
   })
   .strict();
 export type PrMaintenanceScope = z.infer<typeof PrMaintenanceScopeSchema>;
+
+/** An in-place edit of the current grant's optional permissions. */
+export const PrMaintenanceScopeEditSchema = z
+  .object({
+    baseline: text.optional(),
+    verification: text.optional(),
+    replies: z.boolean().optional(),
+    resolveThreads: z.boolean().optional(),
+    reviewers: z.array(id).max(20).optional(),
+    retryChecks: z.boolean().optional(),
+  })
+  .strict()
+  .refine(
+    (value) => Object.values(value).some((entry) => entry !== undefined),
+    "Change at least one permission.",
+  );
+export type PrMaintenanceScopeEdit = z.infer<typeof PrMaintenanceScopeEditSchema>;
 
 export const PrMaintenanceBudgetsSchema = z
   .object({
@@ -489,8 +508,25 @@ export const PrMaintenanceEffectSchema = z
     evidence: text.optional(),
     attempts: z.number().int().min(1).max(1_000).default(1),
     usedAttempts: z.number().int().min(0).max(1_000).optional(),
+    /**
+     * A history-rewriting push. Authorized only for a conflict-resolution
+     * repair leased on the exact remote HEAD the batch was prepared from; any
+     * other forced push is recorded as a fact and holds maintenance for a person.
+     */
+    force: z.boolean().optional(),
+    /** The remote head a push replaced, fetched immediately before pushing. */
+    expectedRemoteSha: sha.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.force && (value.kind !== "push" || !value.expectedRemoteSha))
+      ctx.addIssue({
+        code: "custom",
+        path: ["expectedRemoteSha"],
+        message:
+          "A forced push must be a push with the exact expected remote SHA (force-with-lease).",
+      });
+  });
 export type PrMaintenanceEffect = z.infer<typeof PrMaintenanceEffectSchema>;
 
 export const PrMaintenanceObservationSchema = z
@@ -522,6 +558,15 @@ export const PrMaintenanceObservationSchema = z
     draft: z.boolean().optional(),
     fingerprint: id.optional(),
     mergeability: z.enum(["mergeable", "conflicting", "unknown"]).default("unknown"),
+    /**
+     * Provider compare/ancestry evidence for `headSha` against an earlier head,
+     * when the helper can supply it. Without it a changed head after a
+     * maintenance push is explained only by the push the batch reported.
+     */
+    headLineage: z
+      .object({ fromSha: sha, fastForward: z.boolean(), evidence: text })
+      .strict()
+      .optional(),
     checks: z
       .array(
         z
@@ -682,7 +727,41 @@ export const PrMaintenanceBatchSchema = PrMaintenancePreparedBatchSchema.extend(
   attempt: z.number().int().positive().optional(),
   executionSettled: z.boolean().default(false),
   executionNotDispatched: z.boolean().optional(),
+  /** The worker's event range of this attempt, fixed when its execution settled. */
+  eventSeqFrom: z.number().int().nonnegative().optional(),
+  eventSeqTo: z.number().int().nonnegative().optional(),
+  /**
+   * How the PR head moved after this batch published: a provider-proven
+   * fast-forward, the commit this batch reported pushing (`reported`, or
+   * `leased_rewrite` for its leased conflict rewrite), a rewrite, or
+   * unverified when nothing recorded explains it. Only the last two hold
+   * maintenance for a person.
+   */
+  lineage: z
+    .object({
+      state: z.enum([
+        "fast_forward",
+        "reported",
+        "leased_rewrite",
+        "rewritten",
+        "unverified",
+      ]),
+      fromSha: sha,
+      toSha: sha,
+      at: time,
+      evidence: text,
+    })
+    .strict()
+    .optional(),
   evidence: text.optional(),
+  /** Why the Host could not settle this batch from its worker report automatically. */
+  settlementError: text.optional(),
+  /**
+   * Who supplied the report this batch settled from: the Host reading the
+   * worker's own output, or the orchestrator's `work_report` recovery. Only a
+   * Host-read report's pushes can explain a later PR head move.
+   */
+  reportSource: z.enum(["host", "lead"]).optional(),
   cancellationRequestedAt: time.optional(),
   reason: text.optional(),
   usedMutations: count.optional(),
@@ -794,7 +873,7 @@ export const PrMaintenanceCheckpointSchema = z.discriminatedUnion("kind", [
     })
     .strict()
     .describe(
-      "Settle a work-order batch from the worker's prm.work-report/1 after its attempt completed. The Host validates it against the stored work order and applies the normal settlement guards.",
+      "Recovery only: the Host settles a work-order batch from the worker's prm.work-report/1 automatically when its attempt completes. Use this when that automatic settlement could not read a valid report — supply the report you recovered, or omit it to retry reading the attempt. The Host applies the normal settlement guards.",
     ),
   z
     .object({
@@ -836,7 +915,18 @@ export const PrMaintenanceCheckpointSchema = z.discriminatedUnion("kind", [
 export type PrMaintenanceCheckpoint = z.infer<typeof PrMaintenanceCheckpointSchema>;
 
 export const PrMaintenanceOperatorActionSchema = z.discriminatedUnion("action", [
-  z.object({ action: z.literal("pause"), reason: text }).strict(),
+  z
+    .object({ action: z.literal("pause"), reason: text })
+    .strict()
+    .describe(
+      "Stop automatic maintenance. Direct work on the worker is unaffected; queued maintenance work is cancelled without effects and never replayed.",
+    ),
+  z
+    .object({ action: z.literal("scope"), scope: PrMaintenanceScopeEditSchema })
+    .strict()
+    .describe(
+      "Edit the current grant's permissions in place (replies, thread resolution, reviewers, CI retries, baseline, verification). Applies to the next prepared batch.",
+    ),
   z
     .object({
       action: z.literal("work"),
@@ -870,7 +960,10 @@ export const PrMaintenanceOperatorActionSchema = z.discriminatedUnion("action", 
       decisionId: id.optional(),
       decisionVersion: z.number().int().positive().optional(),
     })
-    .strict(),
+    .strict()
+    .describe(
+      "Stop maintaining this PR. Always succeeds and keeps the full history; queued work is cancelled without effects and a pending decision is withdrawn.",
+    ),
   z
     .object({
       action: z.literal("direction"),
@@ -949,13 +1042,16 @@ const workRequestSchema = z
   .strict();
 
 /**
- * The exceptional conditions that stop worker dispatch and new effects.
+ * The exceptional conditions that stop automatic maintenance.
  *
  * A hold is only ever set by an explicit act (operator/lead Pause, a worker or
- * task Stop, a manual takeover) or by a provider fact Fleet cannot work around
+ * task Stop) or by a provider fact Fleet cannot work around
  * (authentication/permission denial, a changed identity). Nothing else pauses
- * maintenance: stale evidence, timing, task review and orchestrator restarts
- * are handled by refreshing, not by holding.
+ * maintenance: stale evidence, timing, task review, direct work on the worker
+ * and orchestrator restarts are handled by refreshing or waiting, not by
+ * holding. A hold never refuses a person's or orchestrator's direct worker turn.
+ * `manual_control` is history only: a legacy manual-control hold is read as
+ * `paused`, which needs an explicit Resume.
  */
 export const PrMaintenanceHoldKindSchema = z.enum([
   "stopped",
@@ -976,6 +1072,19 @@ const holdSchema = z
   })
   .strict();
 export type PrMaintenanceHold = z.infer<typeof holdSchema>;
+
+/** A legacy manual-control hold becomes an explicit pause that one Resume clears. */
+const legacyManualPause = (hold: PrMaintenanceHold): PrMaintenanceHold =>
+  hold.kind === "manual_control"
+    ? {
+        ...hold,
+        kind: "paused",
+        reason: `Paused when a person took manual control: ${hold.reason}`.slice(
+          0,
+          8_192,
+        ),
+      }
+    : hold;
 
 export const PrMaintenanceReviewSourceSchema = z.enum([
   "enable",
@@ -1035,7 +1144,7 @@ const PrMaintenanceRegistrationV2Schema = z
     eligibilityEvidence: text,
     /** Provider terminal state; `active` covers every working phase. */
     lifecycle: z.enum(["active", "merged", "closed"]),
-    hold: holdSchema.optional(),
+    hold: holdSchema.transform(legacyManualPause).optional(),
     holdHistory: z.array(holdSchema).max(100).default([]),
     review: reviewSchema.optional(),
     reviewHistory: z.array(reviewSchema).max(50).default([]),
@@ -1059,6 +1168,20 @@ const PrMaintenanceRegistrationV2Schema = z
       .optional(),
     authorization: authorizationSchema,
     authorizationHistory: z.array(authorizationSchema).max(100).default([]),
+    /** In-place permission edits of the current grant, oldest first. */
+    scopeHistory: z
+      .array(
+        z
+          .object({
+            at: time,
+            actorId: id,
+            authorizationId: id,
+            previous: legacyScopeSchema,
+          })
+          .strict(),
+      )
+      .max(100)
+      .default([]),
     decision: PrMaintenanceDecisionSchema.optional(),
     decisionHistory: z.array(PrMaintenanceDecisionSchema).max(100).default([]),
     observation: PrMaintenanceObservationSchema.optional(),
@@ -1112,7 +1235,7 @@ const legacyRegistrationSchema = z
   .passthrough()
   .transform((value) => upgradeLegacyRegistration(value as Record<string, unknown>));
 
-/** Holds the v1 `pauseReason` strings map onto. Unknown reasons become `paused`. */
+/** Holds the v1 `pauseReason` strings map onto. Unknown reasons, and manual control, become `paused`. */
 const legacyHoldKind = (reason: string): PrMaintenanceHoldKind =>
   reason === "stopped"
     ? "stopped"
@@ -1120,9 +1243,7 @@ const legacyHoldKind = (reason: string): PrMaintenanceHoldKind =>
       ? "access"
       : ["remote_identity_changed", "continuation_identity_changed"].includes(reason)
         ? "identity"
-        : reason === "manual_control"
-          ? "manual_control"
-          : "paused";
+        : "paused";
 
 /**
  * Converts a v1 registration. Explicit pauses stay held until one Resume;
@@ -1395,13 +1516,15 @@ export function prMaintenanceStatus(
     const hold = record.hold;
     const actions: Record<PrMaintenanceHoldKind, string> = {
       stopped: "Resume maintenance to continue with the same worker.",
-      paused: "Resume maintenance, or answer the pending decision.",
+      paused:
+        "Automatic maintenance is paused; direct work on the worker is unaffected. Resume, answer the pending decision, or Release.",
       access:
         "Restore provider sign-in or permissions on the Node, then Resume maintenance.",
       identity:
         "The PR or its source branch changed identity. Confirm it is still the same PR, then Resume, or release it.",
+      // Retained only for records held before direct turns stopped pausing maintenance.
       manual_control:
-        "A person is driving the retained worker. Hand back, or Resume maintenance when done.",
+        "Held from an earlier manual takeover. Direct work no longer pauses maintenance; Resume to continue.",
     };
     return make(phase, hold.reason, actions[hold.kind], hold.kind, "resume");
   }
@@ -1438,7 +1561,7 @@ export function prMaintenanceStatus(
     return make(
       phase,
       "The retained worker is applying routine fixes.",
-      "Its result wakes the orchestrator to review the PR again.",
+      "Fleet settles the worker's report when the turn ends and reviews the PR again.",
     );
   if (phase === "reviewing")
     return make(

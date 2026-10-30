@@ -294,9 +294,14 @@ may still differ from `baseSha`; that difference alone is not an error.
 `mergeStatus=succeeded` alone is not readiness. Current conflicts remain
 conflicting; other states are unknown.
 Complete current conflicts produce a `merge-conflict` source with revision
-`<headSha>:<baseSha>`. Routine integration within accepted intent may use the same retained
-worker and exact-base `conflictResolution:true` repair batch, preserving user work and using
-a normal source-branch merge/push, never automatic rebase/reset/force-push or PR completion.
+`<headSha>:<baseSha>`. Routine integration within accepted intent uses the same retained
+worker and an exact-base `conflictResolution:true` work order: the worker rebases the PR source
+branch onto the live base, verifies, and force-pushes to the same source ref with a lease on the
+exact observed head (`git push --force-with-lease=<ref>:<headSha>`), stopping on unknown remote
+changes, user work or ambiguous hunks. Report `expectedRemoteSha` on every push; Fleet records any
+other forced push or unexpected replaced head as a fact and pauses for a person, as it does when
+the next PR head is not the commit the batch reported pushing.
+Never PR completion.
 An old iteration target is not the integration pin: use the live `baseSha`. Changed base
 requires fresh metadata/planning; ambiguous semantic choices still need a concise design decision.
 Generated API-report regeneration from accepted code needs no new design approval. Only actual
@@ -412,11 +417,12 @@ its authorized scope:
 
 Authenticated design direction resumes maintenance under that existing grant, not
 a new ADO permission. Routine repair/verification/ordinary publication
-does not require identical authorization again; replies, evidenced resolutions,
-named reviewer requests and check retries remain off unless separately present
-in the grant. One-turn manual handback is Host-owned after correlated settlement,
-quiescence and fresh pinned evidence; an ADO response or idle worker cannot
-clear Stop, ongoing takeover, an access hold or released ownership.
+does not require identical authorization again; replies and evidenced resolutions
+follow the grant (on by default, editable in place by the operator), while named
+reviewer requests and check retries remain off unless separately present in the
+grant. A person's direct turn never holds maintenance; a one-turn handback only
+requests a review after correlated settlement. An ADO response or idle worker cannot
+clear Stop, an access hold or released ownership.
 
 1. Verify remote project/repository GUIDs, exact **registered head repository**
    and case-sensitive **full head ref**, current HEAD, and baseline. For a
@@ -424,7 +430,8 @@ clear Stop, ongoing takeover, an access hold or released ownership.
 2. After tests and a committed repair, use ordinary Git with an explicit pinned
    remote and destination, e.g. `git push -- <registered-head-remote>
 HEAD:refs/heads/FixCase`. The ref is the actual registered ref, not a guessed
-   example. Never force-push, use a wildcard, or change the upstream to bypass
+   example. Never force-push (except the leased conflict rebase in a
+   `conflictResolution` work order), use a wildcard, or change the upstream to bypass
    the pin. An external update requires reconciliation.
 3. Use an existing authorized provider tool **after discovering its live
    schema**, or an explicitly authorized REST write facility. An ADO reply
@@ -437,8 +444,8 @@ HEAD:refs/heads/FixCase`. The ref is the actual registered ref, not a guessed
    are visible, with separate authorization and readback. A current resolved
    state alone cannot prove this worker performed the resolution.
 5. Never approve/set reviewer votes, merge, set auto-complete, bypass policies,
-   force-push, install tooling, or log in as part of maintenance. Unknown write
-   outcomes require settlement, not blind retries.
+   force-push outside the leased conflict rebase, install tooling, or log in as part
+   of maintenance. Unknown write outcomes require settlement, not blind retries.
 
 ## Public sources verified for this implementation
 

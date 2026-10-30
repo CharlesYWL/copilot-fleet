@@ -1,5 +1,4 @@
 import Fastify from "fastify";
-import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,8 +18,6 @@ import { mcpRoutes } from "../orchestrator/mcp-routes.js";
 import { orchestratorRoutes } from "./orchestrators.js";
 import { runRoutes } from "./runs.js";
 import { sessionRoutes } from "./sessions.js";
-import { FleetStore } from "../store.js";
-import { FleetService } from "../fleet-service.js";
 
 const fixtureUrl = new URL(
   "../../../node/src/fixtures/ado-maintenance.mjs",
@@ -208,7 +205,7 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
 }
 
 describe("authenticated PR maintenance controls", () => {
-  it("roundtrips 291675 helper observation bytes through exposed MCP and SQLite restart unchanged", async () => {
+  it("refuses relaying a 291675-byte helper observation through MCP and stores nothing", async () => {
     const directory = mkdtempSync(join(tmpdir(), "fleet-maintenance-handoff-"));
     const dbPath = join(directory, "host.sqlite");
     const state = await setup("azure-devops", dbPath);
@@ -278,66 +275,27 @@ describe("authenticated PR maintenance controls", () => {
       },
     });
     expect(rejected.statusCode).toBe(401);
-    const saved = await mcp("fleet_checkpoint_pr_maintenance", args);
-    expect(saved.ok, saved.text).toBe(true);
-    expect(JSON.stringify(JSON.parse(saved.text).lastAttempt)).toBe(serialized);
-    expect((await mcp("fleet_checkpoint_pr_maintenance", args)).ok).toBe(false);
-    const savedVersion = store.prMaintenance.get(record.id)!.version;
-    const overflow = await mcp("fleet_checkpoint_pr_maintenance", {
-      ...args,
-      expectedVersion: savedVersion,
-      checkpoint: {
-        kind: "observation",
-        observation: {
-          ...observation,
-          helperState: { oversized: "x".repeat(1_048_576) },
-        },
-      },
-    });
-    expect(overflow.ok).toBe(false);
-    expect(JSON.stringify(store.prMaintenance.get(record.id)!.lastAttempt)).toBe(
-      serialized,
-    );
-    await close();
-    const reopened = new FleetStore(dbPath);
-    const app = Fastify({ logger: false });
-    const restarted = new FleetService(reopened, app.log, "test");
-    const tokens = new LeadTokens(reopened);
-    await app.register(mcpRoutes, { service: restarted, tokens });
-    cleanup.push(async () => {
-      await app.close();
-      reopened.close();
-      rmSync(directory, { recursive: true, force: true });
-    });
-    const readback = await app.inject({
-      method: "POST",
-      url: "/mcp",
-      headers: {
-        authorization: `Bearer ${tokens.mint(state.leadSubject)}`,
-        accept: "application/json, text/event-stream",
-      },
-      payload: {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: { name: "fleet_get_pr_maintenance", arguments: { recordId: record.id } },
-      },
-    });
-    const restored = JSON.parse(readback.json().result.content[0].text);
-    expect(JSON.stringify(restored.lastAttempt)).toBe(serialized);
+    // The lead never relays a large observation; the Host ingests it from the
+    // helper's claim-bound Fleet command instead.
+    const before = store.prMaintenance.get(record.id)!;
+    const relayed = await mcp("fleet_checkpoint_pr_maintenance", args);
+    expect(relayed.ok).toBe(false);
+    expect(relayed.text).toContain("observation_relay_refused");
+    expect(relayed.text).toContain("maintenanceObservation");
+    expect(store.prMaintenance.get(record.id)).toEqual(before);
+    expect(store.prMaintenance.get(record.id)!.lastAttempt).toBeUndefined();
+    // Refused before any allowance was charged.
     expect(
-      createHash("sha256").update(JSON.stringify(restored.lastAttempt)).digest("hex"),
-    ).toBe(createHash("sha256").update(serialized).digest("hex"));
-    expect(
-      reopened.prMaintenance.remainingWake(
+      store.prMaintenance.remainingWake(
         leadId,
-        reopened.getSessionDispatchAttempt(leadId)!.commandId,
+        store.getSessionDispatchAttempt(leadId)!.commandId,
       ).requests,
     ).toBe(61);
     expect(Buffer.byteLength(cli.stdout)).toBe(291_959);
     expect(Buffer.byteLength(JSON.stringify(args))).toBe(291_797);
+    await close();
+    rmSync(directory, { recursive: true, force: true });
   });
-
   it("admits exactly one retained-worker batch from forty-thread complete helper evidence within the existing wake", async () => {
     const { store, service, leadId, worker, registration, authorize, mcp } =
       await setup("azure-devops");
@@ -366,13 +324,12 @@ describe("authenticated PR maintenance controls", () => {
       reviewsComplete: false,
     });
     expect(helper.observation.sources).toHaveLength(80);
-    const saved = await mcp("fleet_checkpoint_pr_maintenance", {
-      recordId: record.id,
-      expectedVersion: record.version,
-      checkpoint: { kind: "observation", observation: helper.observation },
+    // The Host ingests the helper's stdout itself (standing in for the receipt
+    // of its claim-bound Fleet command); the lead relays nothing.
+    record = store.prMaintenance.checkpoint(leadId, record.id, record.version, {
+      kind: "observation",
+      observation: helper.observation,
     });
-    expect(saved.ok, saved.text).toBe(true);
-    record = JSON.parse(saved.text);
     const batch = {
       id: "synthetic-repair-1",
       kind: "repair",
@@ -383,12 +340,18 @@ describe("authenticated PR maintenance controls", () => {
       scope: registration.scope.baseline,
       reservedMutations: 1,
     };
-    const prepared = await mcp("fleet_checkpoint_pr_maintenance", {
+    // A hand-built batch is refused from the lead; work orders are the lead's path.
+    const handBuilt = await mcp("fleet_checkpoint_pr_maintenance", {
       recordId: record.id,
       expectedVersion: record.version,
       checkpoint: { kind: "prepare_batch", batch },
     });
-    expect(prepared.ok, prepared.text).toBe(true);
+    expect(handBuilt.ok).toBe(false);
+    expect(handBuilt.text).toContain("work_order_required");
+    record = store.prMaintenance.checkpoint(leadId, record.id, record.version, {
+      kind: "prepare_batch",
+      batch: batch as never,
+    });
     const followUp = {
       sessionId: worker.id,
       prompt: batch.prompt,
@@ -444,13 +407,12 @@ describe("authenticated PR maintenance controls", () => {
     const helper = await observeFixture(
       fixtureInput(new Date().toISOString(), claim.observationAllowance.requests),
     );
-    const saved = await mcp("fleet_checkpoint_pr_maintenance", {
-      recordId: record.id,
-      expectedVersion: record.version,
-      checkpoint: { kind: "observation", observation: helper.observation },
+    // The Host ingests the helper's stdout itself (standing in for the receipt
+    // of its claim-bound Fleet command); the lead relays nothing.
+    record = store.prMaintenance.checkpoint(leadId, record.id, record.version, {
+      kind: "observation",
+      observation: helper.observation,
     });
-    expect(saved.ok, saved.text).toBe(true);
-    record = JSON.parse(saved.text);
     const [first, second] = record.observation!.sources;
     const plan = {
       batchId: "wo-ado-1",
@@ -478,7 +440,7 @@ describe("authenticated PR maintenance controls", () => {
         headSha: registration.headSha,
         headRef: registration.identity.headRef,
       },
-      permissions: { push: true, reply: false, resolveThreads: false },
+      permissions: { push: true, reply: true, resolveThreads: true },
     });
     expect(batch.sources).toEqual([first, second]);
     const accepted = await mcp("fleet_follow_up", {
@@ -509,7 +471,14 @@ describe("authenticated PR maintenance controls", () => {
         publishedCommit: published,
         evidence: ["Focused verification passed at the pushed commit."],
       })),
-      effects: [{ kind: "push", state: "known", commit: published }],
+      effects: [
+        {
+          kind: "push",
+          state: "known",
+          commit: published,
+          expectedRemoteSha: registration.headSha,
+        },
+      ],
     };
     let sequence = store.maxEventSequence(worker.id);
     for (const [type, payload] of [
@@ -625,6 +594,11 @@ describe("authenticated PR maintenance controls", () => {
       ).requests,
     ).toBe(0);
     const incidentId = record.incidents[0]!.id;
+    expect(record.review?.outcome).toBe("failed");
+    expect(record.batches).toHaveLength(0);
+    // A failure is not a hold.
+    expect(prMaintenanceStatus(record).hold).toBeUndefined();
+    // One recovery path: there is no alternate-evidence side channel.
     const attempt = {
       kind: "alternate_attempt",
       incidentId,
@@ -636,53 +610,40 @@ describe("authenticated PR maintenance controls", () => {
         evidenceRef: "session-local-test-metadata",
       },
     };
-    expect((await checkpoint(attempt)).ok).toBe(false);
+    const refused = await checkpoint(attempt);
+    expect(refused.ok).toBe(false);
+    expect(refused.text).toContain("observation_relay_refused");
+    // The next review runs the same helper again with its normal allowance.
     wake();
-    const recoveryVisit = await mcp("fleet_get_pr_maintenance", { takeDue: true });
-    expect(JSON.parse(recoveryVisit.text).record?.id, recoveryVisit.text).toBe(record.id);
-    expect(JSON.parse(recoveryVisit.text).observationAllowance.requests).toBe(1);
-    expect(JSON.parse(recoveryVisit.text).instruction).toContain("alternate_attempt");
-    // The recovery claim records itself on the review.
+    const retry = await mcp("fleet_get_pr_maintenance", { takeDue: true });
+    expect(JSON.parse(retry.text).record?.id, retry.text).toBe(record.id);
+    expect(JSON.parse(retry.text).observationAllowance.requests).toBe(39);
+    expect(JSON.parse(retry.text).instruction).toContain("only recovery path");
     record = store.prMaintenance.get(record.id)!;
-    const reserved = await checkpoint(attempt);
-    expect(reserved.ok, reserved.text).toBe(true);
-    record = JSON.parse(reserved.text);
-    const partial = await checkpoint({
-      kind: "alternate_observation",
-      incidentId,
-      resolutionId: attempt.resolutionId,
+    const recovered = await checkpoint({
+      kind: "observation",
       observation: {
         attemptedAt: new Date().toISOString(),
-        complete: false,
+        complete: true,
         requestsConsumed: 1,
         identity: registration.identity,
+        snapshotId: "recovered-snapshot",
         headSha: registration.headSha,
+        baseSha: "b".repeat(40),
         state: "open",
-        draft: true,
-        mergeability: "conflicting",
-        checksComplete: false,
-        reviewsComplete: false,
-        failure: "incomplete",
-        evidence:
-          "Fresh metadata only: draft and conflicts; policy/thread pages not fully collected.",
+        fingerprint: "recovered-snapshot",
+        evidence: "The same helper succeeded on the next review.",
       },
     });
-    expect(partial.ok, partial.text).toBe(true);
-    record = JSON.parse(partial.text);
-    expect(record.lastAttempt).toMatchObject({ draft: true, complete: false });
-    expect(record.lastError).toBeTruthy();
-    expect(record.readyFingerprint).toBeUndefined();
-    expect(record.batches).toHaveLength(0);
-    // A partial read is not a hold; the review concludes as failed, no work runs.
-    expect(prMaintenanceStatus(record).hold).toBeUndefined();
-    expect(record.review?.outcome).toBe("failed");
-    expect(record.incidents[0]!.attempts[0]).toMatchObject({
-      id: attempt.resolutionId,
-      state: "incomplete",
-      provenance: attempt.provenance,
+    expect(recovered.ok, recovered.text).toBe(true);
+    record = JSON.parse(recovered.text);
+    expect(record.incidents[0]).toMatchObject({
+      id: incidentId,
+      resolution: "observation",
     });
+    expect(record.incidents[0]!.resolvedAt).toBeTruthy();
+    expect(record.batches).toHaveLength(0);
   });
-
   it.each([
     [true, 39],
     [false, 0],
@@ -791,8 +752,9 @@ describe("authenticated PR maintenance controls", () => {
         scope: {
           baseline: run.objective,
           publicationAuthorized: true,
-          replies: false,
-          resolveThreads: false,
+          // One "Maintain this PR" grant by default.
+          replies: true,
+          resolveThreads: true,
           reviewers: [],
           retryChecks: false,
         },
@@ -960,6 +922,7 @@ describe("authenticated PR maintenance controls", () => {
       publicationEvidence:
         "Existing task grant permits ordinary pushes to this exact PR source ref.",
       replies: true,
+      resolveThreads: false,
     });
     expect(result.ok, result.text).toBe(true);
     expect(JSON.parse(result.text)).toMatchObject({
@@ -1368,7 +1331,7 @@ describe("authenticated PR maintenance controls", () => {
     expect(store.prMaintenance.get(enabled.id)?.hold?.kind).toBe("paused");
   });
 
-  it("cannot release or delete an unknown accepted effect even after Stop", async () => {
+  it("releases with an unknown accepted effect after Stop, keeping the effect as history", async () => {
     const { app, run, worker, leadId, registration, store, authorize } = await setup();
     let record = (await authorize()).json();
     record = store.prMaintenance.checkpoint(leadId, record.id, record.version, {
@@ -1411,16 +1374,14 @@ describe("authenticated PR maintenance controls", () => {
         operation: { action: "release", reason: "Stop was requested" },
       },
     });
-    expect(released.statusCode, released.body).toBe(409);
-    expect(
-      (await app.inject({ method: "DELETE", url: `/api/runs/${run.id}` })).statusCode,
-    ).toBe(409);
+    // Release always succeeds; the unknown effect stays in the released history.
+    expect(released.statusCode, released.body).toBe(200);
     expect(store.prMaintenance.get(record.id)).toMatchObject({
       lifecycle: "active",
       hold: expect.objectContaining({ kind: "stopped" }),
+      ownershipReleasedAt: expect.any(String),
       actions: [expect.objectContaining({ key: "notification-1", state: "reserved" })],
     });
-    expect(store.prMaintenance.get(record.id)?.ownershipReleasedAt).toBeUndefined();
     expect(store.getSession(worker.id)).toBeDefined();
   });
 });

@@ -1668,7 +1668,12 @@ describe("node reconnect socket ordering", () => {
         "original-operator",
       );
       const backup = store.prMaintenance.exportBackup();
-      backup.registrations[0]!.authorization.scope.publicationAuthorized = false;
+      // A retired observation-only grant never carried response permissions.
+      Object.assign(backup.registrations[0]!.authorization.scope, {
+        publicationAuthorized: false,
+        replies: false,
+        resolveThreads: false,
+      });
       store.writeAtomically(() => store.prMaintenance.importBackup(backup));
       record = store.prMaintenance.get(record.id)!;
       const client = await connect({ activeSessionIds: [worker.id], busySessionIds: [] });
@@ -1775,6 +1780,37 @@ describe("node reconnect socket ordering", () => {
 
     await waitFor(() => store.getSession(sessionId)?.state === "idle");
     expect(store.listNotifications().notifications).toEqual([]);
+  });
+
+  it("routes a maintenance checkout refusal to PR maintenance, and only from the session's Node", async () => {
+    const client = await connect({ activeSessionIds: [sessionId], busySessionIds: [] });
+    await waitFor(() => store.getSession(sessionId)?.state === "idle");
+    const refuse = vi.spyOn(service, "refusePrMaintenanceCheckout");
+    const reason =
+      "PR maintenance was not sent: the checkout has uncommitted changes that may be a person's work.";
+    send(client, {
+      type: "command_result",
+      commandId: "maintenance-prompt",
+      sessionId,
+      ok: false,
+      fatal: false,
+      error: reason,
+      refusal: "checkout_precondition",
+    });
+    await waitFor(() => refuse.mock.calls.length > 0);
+    expect(refuse).toHaveBeenCalledWith(sessionId, "maintenance-prompt", reason);
+    // An ordinary refusal does not touch maintenance.
+    send(client, {
+      type: "command_result",
+      commandId: "busy-prompt",
+      sessionId,
+      ok: false,
+      fatal: false,
+      error: "still working",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(refuse).toHaveBeenCalledTimes(1);
+    expect(client.readyState).toBe(WebSocket.OPEN);
   });
 
   it("settles a resume the Node refused instead of leaving it starting forever", async () => {

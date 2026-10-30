@@ -1965,6 +1965,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           ok: result.ok,
           fatal: result.fatal ?? true,
           ...(result.recovery ? { recovery: result.recovery } : {}),
+          ...(result.refusal ? { refusal: result.refusal } : {}),
           ...(result.executionBinding
             ? { executionBinding: result.executionBinding }
             : {}),

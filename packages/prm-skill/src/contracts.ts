@@ -372,6 +372,17 @@ export const WorkReportSchema = z
             actor: id.optional(),
             body: z.string().max(65_536).optional(),
             commit: sha.optional(),
+            force: z
+              .boolean()
+              .optional()
+              .describe(
+                "True only for the conflict-resolution push made with --force-with-lease.",
+              ),
+            expectedRemoteSha: sha
+              .optional()
+              .describe(
+                "Report for every attempted push: the remote head it replaced, fetched immediately before pushing (pr.headSha or your own earlier push). A forced push leases exactly this.",
+              ),
           })
           .strict(),
       )

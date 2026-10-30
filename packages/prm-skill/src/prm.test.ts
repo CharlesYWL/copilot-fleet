@@ -767,7 +767,7 @@ describe("plan, work order and report", () => {
           },
         ],
         [
-          { kind: "push", state: "known", commit: NEW_HEAD },
+          { kind: "push", state: "known", commit: NEW_HEAD, expectedRemoteSha: HEAD },
           {
             kind: "thread_comment",
             state: "known",
@@ -842,7 +842,7 @@ describe("plan, work order and report", () => {
             publishedCommit: NEW_HEAD,
           },
         ],
-        [{ kind: "push", state: "known", commit: NEW_HEAD }],
+        [{ kind: "push", state: "known", commit: NEW_HEAD, expectedRemoteSha: HEAD }],
         1,
       ),
     );
@@ -888,7 +888,12 @@ describe("plan, work order and report", () => {
       "--batch",
       batchId,
       "--input",
-      await reportFile(batchId, findings, [{ kind: "push", state: "uncertain" }], 1),
+      await reportFile(
+        batchId,
+        findings,
+        [{ kind: "push", state: "uncertain", expectedRemoteSha: HEAD }],
+        1,
+      ),
     );
     expect(uncertain).toMatchObject({
       batchState: "uncertain",
@@ -1000,7 +1005,7 @@ describe("plan, work order and report", () => {
             responseIds: ["R9"],
           },
         ],
-        [{ kind: "push", state: "known", commit: NEW_HEAD }],
+        [{ kind: "push", state: "known", commit: NEW_HEAD, expectedRemoteSha: HEAD }],
         2,
       ),
     );

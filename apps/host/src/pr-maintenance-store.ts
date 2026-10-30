@@ -51,8 +51,8 @@ import {
   type PrMaintenanceStatus,
   type CommandExecution,
   type SessionActor,
+  type SessionEvent,
   sessionActor,
-  sessionActorId,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
 import { notificationAttemptKey } from "./notifications/service.js";
@@ -65,6 +65,14 @@ const unsettledEffect = (effect: PrMaintenanceEffect) =>
 const neverSentEffect = (effect: PrMaintenanceEffect) =>
   effect.state === "not_performed" && effect.usedAttempts === 0;
 const nowIso = () => new Date().toISOString();
+/** A dispatched batch still outstanding, or bound to a step with no settled execution. */
+const releasedInFlightSql = (
+  table: string,
+) => `EXISTS (SELECT 1 FROM json_each(${table}.data, '$.batches') b
+  WHERE json_extract(b.value, '$.state') IN ('accepted', 'reconciling', 'uncertain')
+    OR (json_extract(b.value, '$.stepId') IS NOT NULL
+      AND COALESCE(json_extract(b.value, '$.executionSettled'), 0) = 0
+      AND json_extract(b.value, '$.state') NOT IN ('cancelled', 'superseded')))`;
 /** Only if the heartbeat schedule has no future time at all. */
 const ROUTINE_CHECK_FALLBACK_MS = 60 * 60_000;
 /** Unattended heartbeat checks are never closer together than this. */
@@ -340,6 +348,21 @@ export class PrMaintenanceStore {
   private retained(): PrMaintenanceRegistration[] {
     return this.db
       .prepare("SELECT data FROM pr_maintenance WHERE released_at IS NULL")
+      .all()
+      .map((row) => PrMaintenanceRegistrationSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  /**
+   * Retained records, plus released ones whose dispatched maintenance turn has
+   * not settled yet. Release never abandons such a turn: its result is still
+   * admitted, settled and recoverable, and it still blocks direct work on the
+   * same worker or checkout until it settles.
+   */
+  private live(): PrMaintenanceRegistration[] {
+    return this.db
+      .prepare(
+        `SELECT data FROM pr_maintenance WHERE released_at IS NULL OR ${releasedInFlightSql("pr_maintenance")}`,
+      )
       .all()
       .map((row) => PrMaintenanceRegistrationSchema.parse(JSON.parse(String(row.data))));
   }
@@ -690,14 +713,10 @@ export class PrMaintenanceStore {
     record.reviewHistory = record.reviewHistory.slice(-50);
     this.archiveManualCommands(record);
     const parsed = PrMaintenanceRegistrationSchema.parse(record);
-    if (
-      parsed.ownershipReleasedAt &&
-      (prMaintenanceUnsettled(parsed) || parsed.decision?.state === "pending")
-    )
-      refuse(
-        "unsettled",
-        "Released ownership cannot contain outstanding work, effects or human decisions.",
-      );
+    // Release always succeeds; unsettled work stays in the released history as
+    // evidence. Only a pending human decision cannot outlive ownership.
+    if (parsed.ownershipReleasedAt && parsed.decision?.state === "pending")
+      refuse("unsettled", "Released ownership cannot keep a pending human decision.");
     const data = JSON.stringify(parsed);
     if (Buffer.byteLength(data) > 2 * 1024 * 1024)
       refuse(
@@ -999,6 +1018,7 @@ export class PrMaintenanceStore {
             : {}),
         },
         authorizationHistory: [],
+        scopeHistory: [],
         lifecycle: "active",
         holdHistory: [],
         reviewHistory: [],
@@ -1043,10 +1063,11 @@ export class PrMaintenanceStore {
   }
 
   /**
-   * Records an exceptional hold. Undispatched work is cancelled and refunded;
-   * accepted in-flight work is asked to stop through its own receipts. Durable
-   * operator intent — routine-work requests and a pending review — survives:
-   * only an explicit operator Pause or Release cancels routine work.
+   * Records an exceptional hold. A hold stops automatic maintenance only:
+   * undispatched work settles at once as cancelled with no effects and never
+   * replays, and accepted in-flight work is asked to stop through its own
+   * receipts. Durable operator intent — routine-work requests — survives a
+   * hold; only Release cancels it. Direct worker turns are never affected.
    */
   private setHold(
     record: PrMaintenanceRegistration,
@@ -1063,49 +1084,22 @@ export class PrMaintenanceStore {
     delete record.readyFingerprint;
     if (record.review && !record.review.concludedAt)
       this.concludeReview(record, "held", at, reason);
-    if (origin.actor === "operator" && kind === "paused")
-      for (const request of record.workRequests) {
-        if (request.state !== "pending") continue;
-        request.state = "cancelled";
-        request.settledAt = at;
-        request.reason = reason;
-      }
     this.cancelUndispatched(record, reason, at);
   }
 
   /**
-   * Cancels work that has not reached the worker and asks accepted work to
-   * stop through its own receipts. Prepared batches are refunded; nothing
-   * dispatched is ever assumed cancelled.
+   * Settles work that has not reached the worker and asks accepted work to
+   * stop through its own receipts. Nothing dispatched is ever assumed
+   * cancelled.
    */
   private cancelUndispatched(
     record: PrMaintenanceRegistration,
     reason: string,
     at: string,
   ): void {
-    for (const batch of record.batches) {
-      if (!outstanding.has(batch.state)) continue;
-      batch.cancellationRequestedAt ??= at;
-      if (batch.state === "prepared") {
-        batch.state = "cancelled";
-        batch.executionSettled = true;
-        batch.executionNotDispatched = true;
-        batch.reason = reason;
-        batch.evidence =
-          "Dispatch was not accepted; cancelled transactionally before admission.";
-        batch.findings = batch.sources.map((source) => ({
-          source,
-          outcome: "incomplete",
-          stage: "not_attempted",
-          evidence: [],
-          responseRequired: true,
-          responseIds: [],
-          nextAction: "Prepare again after the hold is cleared.",
-          progress: false,
-        }));
-        this.refund(record, batch, 0, false);
-      }
-    }
+    this.cancelUnsent(record, reason, at, "Prepare again after the hold is cleared.");
+    for (const batch of record.batches)
+      if (outstanding.has(batch.state)) batch.cancellationRequestedAt ??= at;
   }
 
   private clearHold(record: PrMaintenanceRegistration, actorId: string, at: string) {
@@ -1558,73 +1552,188 @@ export class PrMaintenanceStore {
     );
   }
 
+  /** Whether a write targets this record's worker or checkout. */
+  private overlaps(
+    record: PrMaintenanceRegistration,
+    target: {
+      taskId?: string | undefined;
+      sessionId?: string | undefined;
+      checkoutKey?: string | undefined;
+      placementId?: string | undefined;
+    },
+  ): boolean {
+    if (target.sessionId === record.workerSessionId) return true;
+    if (target.checkoutKey && target.checkoutKey === record.checkoutKey) return true;
+    if (
+      target.placementId === record.placementId &&
+      record.checkoutKey.startsWith("placement:")
+    )
+      return true;
+    // A task-wide write with nothing narrower may touch the PR branch.
+    return (
+      !target.sessionId &&
+      !target.checkoutKey &&
+      !target.placementId &&
+      target.taskId === record.taskId
+    );
+  }
+
+  /** A maintenance turn that reached the worker and has not settled. */
+  private executingBatch(record: PrMaintenanceRegistration): boolean {
+    return record.batches.some(
+      (batch) =>
+        Boolean(batch.stepId) &&
+        !batch.executionSettled &&
+        !["cancelled", "superseded"].includes(batch.state) &&
+        !this.neverDispatched(record, batch),
+    );
+  }
+
+  /**
+   * Direct work still running on the retained worker or its checkout: a person's
+   * unsettled manual command, another orchestration step on the worker, or a
+   * different live session writing the same checkout.
+   */
+  private directWorkActive(record: PrMaintenanceRegistration, batch: PrMaintenanceBatch) {
+    if (this.hasPendingManualExecution(record.workerSessionId)) return true;
+    // The batch's own step attempt: bound once accepted, or being accepted now.
+    const own = batch.stepId
+      ? { stepId: batch.stepId, attempt: batch.attempt }
+      : this.accepting?.batchId === batch.id
+        ? this.accepting
+        : undefined;
+    if (
+      this.store
+        .listRunSteps(record.taskId)
+        .some(
+          (step) =>
+            step.sessionId === record.workerSessionId &&
+            !(own && step.id === own.stepId && step.attempts === own.attempt) &&
+            !["succeeded", "failed", "cancelled", "skipped"].includes(step.state),
+        )
+    )
+      return true;
+    return this.store
+      .listSessions()
+      .some(
+        (session) =>
+          session.id !== record.workerSessionId &&
+          session.runRole !== "lead" &&
+          ["starting", "running"].includes(session.state) &&
+          (session.executionBinding?.checkoutKey === record.checkoutKey ||
+            (record.checkoutKey.startsWith("placement:") &&
+              session.placementId === record.placementId)),
+      );
+  }
+
+  /**
+   * Settles maintenance work that never reached the worker — a prepared batch,
+   * or an accepted one whose dispatch receipt proves it was never sent — as
+   * cancelled with no effects. Its queued step is cancelled so it can never
+   * replay, and its allowance is refunded. Nothing dispatched is ever assumed
+   * cancelled.
+   */
+  private cancelUnsent(
+    record: PrMaintenanceRegistration,
+    reason: string,
+    at: string,
+    nextAction: string,
+  ): boolean {
+    let changed = false;
+    for (const batch of record.batches) {
+      if (!outstanding.has(batch.state) || !this.neverDispatched(record, batch)) continue;
+      if (batch.stepId)
+        this.store.updateRunStep(batch.stepId, {
+          state: "cancelled",
+          output: `Queued PR maintenance work was cancelled before dispatch: ${reason}`,
+        });
+      Object.assign(batch, {
+        state: "cancelled",
+        executionSettled: true,
+        executionNotDispatched: true,
+        cancellationRequestedAt: batch.cancellationRequestedAt ?? at,
+        updatedAt: at,
+        reason,
+        evidence: batch.stepId
+          ? "Host queue and dispatch receipt prove this attempt was never sent."
+          : "Dispatch was not accepted; cancelled transactionally before admission.",
+        findings: batch.sources.map((source) => ({
+          source,
+          outcome: "incomplete",
+          stage: "not_attempted",
+          evidence: [],
+          responseRequired: true,
+          responseIds: [],
+          nextAction,
+          progress: false,
+        })),
+        effects: [],
+      });
+      this.refund(record, batch, 0, false);
+      changed = true;
+    }
+    return changed;
+  }
+
+  /**
+   * Direct work takes precedence over maintenance that has not started.
+   *
+   * Called in the same transaction as a direct write to a maintained worker or
+   * checkout (a person's prompt, an orchestrator step, a resume). Undispatched
+   * maintenance batches settle as cancelled with no effects and never replay;
+   * the next review prepares fresh work from the PR as it then is. A
+   * maintenance turn already executing is never interrupted: the direct write
+   * waits for it (`maintenance_in_flight`), so nothing is written twice.
+   */
+  yieldToDirectWork(target: {
+    taskId?: string | undefined;
+    sessionId?: string | undefined;
+    checkoutKey?: string | undefined;
+    placementId?: string | undefined;
+  }): void {
+    this.store.writeAtomically(() => {
+      for (const record of this.live()) {
+        if (!this.overlaps(record, target)) continue;
+        if (this.executingBatch(record))
+          refuse(
+            "maintenance_in_flight",
+            "A PR maintenance turn is still running on this worker or checkout. Direct work waits for it to finish; nothing was sent.",
+          );
+        if (
+          this.cancelUnsent(
+            record,
+            "direct_work",
+            nowIso(),
+            "Direct work took precedence; the next review prepares this again if it is still needed.",
+          )
+        )
+          this.save(record);
+      }
+    });
+  }
+
+  /**
+   * A person's direct prompt or resume on a worker. Maintenance never reserves
+   * the worker against it; it only refuses a duplicate of an earlier direct
+   * command whose receipt is still unknown, or waits while a dispatched
+   * maintenance turn is still executing on the same worker or checkout.
+   */
   assertManualAvailable(sessionId: string): void {
     if (this.hasPendingManualExecution(sessionId))
       refuse(
         "execution_uncertain",
         "Waiting for receipts from an earlier manual prompt or resume on this worker. Fleet settles them when that turn completes or its Node confirms the process has ended; no work was replayed or stopped.",
       );
-    const record = this.manualRecord(sessionId);
-    if (!record) {
-      this.assertAdmission({ sessionId, action: "prompt" });
-      return;
-    }
-    this.assertNoPendingPermission(record);
-    const reason = this.binding(record);
-    if (reason)
-      refuse(reason, `Manual control cannot change the retained checkout: ${reason}.`);
-    if (
-      this.retained().some(
-        (other) => other.id !== record.id && other.checkoutKey === record.checkoutKey,
-      )
-    )
-      refuse(
-        "resource_reserved",
-        "Another retained registration reserves this checkout.",
-      );
-    if (
-      record.manualControl?.commands.some((command) =>
-        ["unknown", "accepted"].includes(command.state),
-      ) ||
-      record.incidents.some(
-        (incident) => incident.kind === "effects" && !incident.resolvedAt,
-      ) ||
-      record.actions.some(unsettledEffect) ||
-      record.batches.some(
-        (batch) =>
-          batch.effects.some(unsettledEffect) ||
-          (((outstanding.has(batch.state) &&
-            (batch.state !== "reconciling" || !batch.executionSettled)) ||
-            (batch.stepId && !batch.executionSettled)) &&
-            !this.neverDispatched(record, batch)),
-      )
-    )
-      refuse(
-        "execution_uncertain",
-        "Wait for correlated execution and effect receipts before manual control; no work was replayed or stopped.",
-      );
-    const queuedSteps = new Set(
-      record.batches
-        .filter((batch) => this.neverDispatched(record, batch))
-        .map((batch) => batch.stepId),
-    );
-    if (
-      this.store
-        .listRunSteps(record.taskId)
-        .some(
-          (step) =>
-            step.sessionId === sessionId &&
-            !["succeeded", "failed", "cancelled", "skipped"].includes(step.state) &&
-            !queuedSteps.has(step.id),
-        )
-    )
-      refuse(
-        "worker_busy",
-        "The retained worker still has an unsettled orchestration attempt.",
-      );
+    this.assertAdmission({ sessionId, action: "prompt" });
   }
 
-  /** Called only by trusted session routes, in the dispatch receipt transaction. */
+  /**
+   * Called only by trusted session routes, in the dispatch receipt transaction.
+   * Records the direct command's receipt for single-writer tracking and lets
+   * undispatched maintenance work yield to it. It sets no hold: maintenance
+   * continues on its own schedule after the direct turn, and a one-turn
+   * handback asks for a review as soon as that turn settles.
+   */
   beginManualControl(
     sessionId: string,
     command: SupervisorCommand,
@@ -1639,18 +1748,11 @@ export class PrMaintenanceStore {
       this.assertManualAvailable(sessionId);
       this.assertManualOperationUnambiguous(sessionId, command.id);
       const record = this.manualRecord(sessionId);
-      if (command.handback === "after_turn") {
-        if (!record || command.kind !== "prompt")
-          refuse(
-            "handback_unavailable",
-            "One-turn handback requires a retained maintenance worker prompt.",
-          );
-        if (record.hold && record.hold.kind !== "manual_control")
-          refuse(
-            "independent_hold",
-            `Handback cannot clear this hold: ${record.hold.reason}. Resume maintenance first.`,
-          );
-      }
+      if (command.handback === "after_turn" && (!record || command.kind !== "prompt"))
+        refuse(
+          "handback_unavailable",
+          "One-turn handback requires a retained maintenance worker prompt.",
+        );
       if (this.manualCommand(sessionId, command.id))
         refuse(
           "manual_duplicate",
@@ -1665,74 +1767,54 @@ export class PrMaintenanceStore {
         createdAt: now,
       });
       if (!record) return;
-      for (const batch of record.batches) {
-        if (!this.neverDispatched(record, batch) || !batch.stepId) continue;
-        this.store.updateRunStep(batch.stepId, {
-          state: "cancelled",
-          output:
-            "Supervisor took manual control before queued maintenance was dispatched.",
-        });
-        batch.state = "cancelled";
-        batch.executionSettled = true;
-        batch.executionNotDispatched = true;
-        batch.cancellationRequestedAt = now;
-        batch.updatedAt = now;
-        batch.reason = "manual_control";
-        batch.evidence =
-          "Host queue and dispatch receipt prove this attempt was never sent.";
-        this.refund(record, batch, 0, false);
-      }
-      const origin = { actor: actor.kind, actorId: sessionActorId(actor) };
-      // A manual takeover never overrides Stop, access or identity holds.
-      if (!record.hold || record.hold.kind === "manual_control")
-        this.setHold(
-          record,
-          "manual_control",
-          command.handback === "after_turn"
-            ? "A person is driving this worker for one turn; maintenance resumes after it."
-            : "A person took manual control of the retained worker.",
-          now,
-          origin,
-        );
-      record.manualControl ??= {
+      this.yieldToDirectWork({ sessionId });
+      const current = this.required(record.id);
+      current.manualControl ??= {
         ...(actor.kind === "operator" ? { operatorId: actor.operatorId } : {}),
         actor,
         takenAt: now,
         commands: [],
       };
-      delete record.manualControl.endedAt;
-      record.manualControl.commands.push({
+      delete current.manualControl.endedAt;
+      current.manualControl.commands.push({
         ...receipt,
         ...(command.handback ? { handback: command.handback } : {}),
       });
-      this.save(record);
+      this.save(current);
     });
   }
 
   /**
-   * Ends a one-turn handback once its exact command settled and the worker is
-   * idle again: the hold clears and a review is requested, with no second
-   * Resume. Called on every engine tick.
+   * Closes direct work once its commands settled and the worker is idle again.
+   * A one-turn handback then asks for a review with no separate Resume. A
+   * legacy manual-control hold is read as an explicit pause and is never
+   * cleared here. Called on every engine tick.
    */
   reconcileHandbacks(): boolean {
     return this.store.writeAtomically(() => {
       let changed = false;
       for (const record of this.retained()) {
-        if (record.hold?.kind !== "manual_control" || !record.manualControl) continue;
-        const last = record.manualControl.commands.at(-1);
-        if (!last || last.handback !== "after_turn") continue;
-        const command = this.manualCommand(record.workerSessionId, last.id);
+        if (!record.manualControl || record.manualControl.endedAt) continue;
         const worker = this.store.getSession(record.workerSessionId);
         if (
-          command?.state !== "settled" ||
           worker?.state !== "idle" ||
           worker.stopRequested ||
-          this.hasPendingManualExecution(record.workerSessionId)
+          this.hasPendingManualExecution(record.workerSessionId) ||
+          record.manualControl.commands.some((entry) => {
+            const command = this.manualCommand(record.workerSessionId, entry.id);
+            return !command || ["unknown", "accepted"].includes(command.state);
+          })
         )
           continue;
         const now = nowIso();
-        this.clearHold(record, last.operatorId ?? "operator", now);
-        this.requestReview(record, "handback", now, last.operatorId);
+        record.manualControl.endedAt = now;
+        const last = record.manualControl.commands.at(-1);
+        if (
+          last?.handback === "after_turn" &&
+          record.lifecycle === "active" &&
+          !record.hold
+        )
+          this.requestReview(record, "handback", now, last.operatorId);
         this.save(record);
         changed = true;
       }
@@ -1873,7 +1955,9 @@ export class PrMaintenanceStore {
     };
     record.counters.dispatchesSinceDirection = 0;
     record.findingAttempts = [];
-    if (record.hold?.kind === "paused") this.clearHold(record, actorId, at);
+    // A system hold (an unverified rewrite, a restored backup) needs Resume.
+    if (record.hold?.kind === "paused" && record.hold.actor !== "system")
+      this.clearHold(record, actorId, at);
     this.requestReview(record, "direction", at, actorId);
   }
 
@@ -1910,9 +1994,15 @@ export class PrMaintenanceStore {
         )
           return existing;
       }
-      const record = this.required(id, undefined, expectedVersion);
-      if (record.ownershipReleasedAt)
+      // Release always succeeds: it is idempotent and needs no fresh version.
+      const record =
+        action.action === "release"
+          ? this.required(id)
+          : this.required(id, undefined, expectedVersion);
+      if (record.ownershipReleasedAt) {
+        if (action.action === "release") return record;
         refuse("released", "Released maintenance needs explicit new enablement.");
+      }
       const now = nowIso();
       switch (action.action) {
         case "pause":
@@ -1921,17 +2011,48 @@ export class PrMaintenanceStore {
             actorId: operatorId,
           });
           break;
-        case "release": {
-          if (
-            prMaintenanceUnsettled(record) ||
-            this.hasPendingManualExecution(record.workerSessionId)
-          )
-            refuse(
-              "unsettled",
-              "Reconcile accepted execution, manual command receipts and unknown effects before releasing ownership.",
+        case "scope": {
+          if (record.lifecycle !== "active")
+            refuse("terminal", `The PR is ${record.lifecycle}; maintenance has ended.`);
+          const previous = record.authorization.scope;
+          const next = {
+            ...previous,
+            ...Object.fromEntries(
+              Object.entries(action.scope).filter(([, value]) => value !== undefined),
+            ),
+          };
+          if (isDeepStrictEqual(previous, next)) return record;
+          record.scopeHistory = [
+            ...record.scopeHistory,
+            {
+              at: now,
+              actorId: operatorId,
+              authorizationId: record.authorization.id,
+              previous,
+            },
+          ].slice(-100);
+          record.authorization = { ...record.authorization, scope: next };
+          delete record.readyFingerprint;
+          // Work prepared under the wider grant is re-prepared under the new one.
+          const narrowed =
+            (["replies", "resolveThreads", "retryChecks"] as const).some(
+              (key) => previous[key] && !next[key],
+            ) ||
+            previous.reviewers.some((reviewer) => !next.reviewers.includes(reviewer)) ||
+            previous.baseline !== next.baseline ||
+            previous.verification !== next.verification;
+          if (narrowed)
+            this.cancelUnsent(
+              record,
+              "scope_changed",
+              now,
+              "The maintenance scope changed; the next review prepares this under the new scope if it is still needed.",
             );
-          if (record.decision?.state === "pending") {
-            this.matchDecision(record, action.decisionId, action.decisionVersion);
+          break;
+        }
+        case "release": {
+          // Release keeps the whole history and never waits for reconciliation.
+          if (record.decision?.state === "pending")
             record.decision = {
               ...record.decision,
               state: "withdrawn",
@@ -1939,7 +2060,6 @@ export class PrMaintenanceStore {
               direction: action.reason,
               resolvedAt: now,
             };
-          }
           this.concludeReview(record, "held", now, action.reason);
           for (const request of record.workRequests)
             if (request.state === "pending")
@@ -1948,6 +2068,12 @@ export class PrMaintenanceStore {
                 settledAt: now,
                 reason: action.reason,
               });
+          this.cancelUnsent(record, "released", now, "Maintenance was released.");
+          for (const batch of record.batches)
+            if (outstanding.has(batch.state)) {
+              batch.cancellationRequestedAt ??= now;
+              batch.reason ??= "released";
+            }
           record.ownershipReleasedAt = now;
           record.retentionReleasedBy = operatorId;
           break;
@@ -2210,10 +2336,21 @@ export class PrMaintenanceStore {
   }
 
   /**
-   * What maintenance allows. Read-only refresh is refused only for Stop,
-   * manual control or released ownership; everything that writes is refused
-   * for any hold, pending decision or unknown effect. The underlying task's
-   * own state (awaiting review, completed) never blocks maintenance.
+   * What maintenance allows.
+   *
+   * Two kinds of writes reach a maintained worker or checkout:
+   * - Maintenance writes carry the exact record/generation/batch reference of
+   *   a prepared batch. They are refused for any hold, pending decision,
+   *   unknown effect, stale evidence, unavailable worker, or direct work still
+   *   running on the worker.
+   * - Direct writes — a person's or the orchestrator's own turn, a new step, a
+   *   resume — are never refused because a PR is maintained, paused or
+   *   released. One writer runs at a time: a direct write waits only while a
+   *   dispatched maintenance turn is still executing on the same worker or
+   *   checkout. Undispatched maintenance work yields to it (`yieldToDirectWork`).
+   *
+   * Read-only refresh is refused only for Stop or a terminal PR. The underlying
+   * task's own state (awaiting review, completed) never blocks maintenance.
    */
   admission(input: PrMaintenanceAdmission): PrMaintenanceAdmissionResult {
     const action = PrMaintenanceAdmissionSchema.parse(input);
@@ -2226,7 +2363,13 @@ export class PrMaintenanceStore {
     const placementId =
       action.placementId ??
       (session?.runRole !== "lead" ? session?.placementId : undefined);
-    const records = this.retained().filter(
+    const target = {
+      taskId: action.taskId,
+      sessionId: action.sessionId,
+      checkoutKey,
+      placementId,
+    };
+    const records = this.live().filter(
       (record) =>
         record.id === action.recordId ||
         record.taskId === action.taskId ||
@@ -2251,6 +2394,19 @@ export class PrMaintenanceStore {
       if (["cancel", "pause", "direction", "reconcile", "reopen"].includes(action.action))
         continue;
       if (action.action === "cleanup") return denied("maintenance_retention");
+      if (record.ownershipReleasedAt) {
+        // Released: its in-flight turn still settles and still holds the
+        // worker and checkout until it does, but nothing new starts.
+        if (["approve", "advance", "submit", "aggregate"].includes(action.action)) {
+          if (prMaintenanceUnsettled(record)) return denied("unsettled");
+          continue;
+        }
+        if (action.action === "discover") continue;
+        if (action.recordId === record.id && action.batchId) return denied("released");
+        if (this.overlaps(record, target) && this.executingBatch(record))
+          return denied("maintenance_in_flight");
+        continue;
+      }
       if (action.leadSessionId && action.leadSessionId !== record.leadSessionId)
         return denied("ownership");
       if (action.generation !== undefined && action.generation !== record.generation)
@@ -2258,17 +2414,26 @@ export class PrMaintenanceStore {
       if (action.action === "discover") {
         if (record.lifecycle !== "active") return denied("terminal");
         if (record.hold?.kind === "stopped") return denied("stopped");
-        if (record.hold?.kind === "manual_control") return denied("manual_control");
         continue;
       }
       // Task acceptance waits for in-flight maintenance, never for its review.
       if (["approve", "advance", "submit", "aggregate"].includes(action.action)) {
         if (prMaintenanceUnsettled(record)) return denied("unsettled");
-        if (record.workRequests.some((request) => request.state === "pending"))
+        if (
+          !record.hold &&
+          record.workRequests.some((request) => request.state === "pending")
+        )
           return denied("pending_operator_work");
         continue;
       }
-      // dispatch, execute, prompt, resume, publish: writes on the retained worker.
+      // dispatch, execute, prompt, resume, publish.
+      if (action.recordId !== record.id || !action.batchId) {
+        // A direct write. Maintenance never reserves anything against it; only
+        // a maintenance turn already executing here makes it wait its turn.
+        if (this.overlaps(record, target) && this.executingBatch(record))
+          return denied("maintenance_in_flight");
+        continue;
+      }
       if (record.lifecycle !== "active") return denied("terminal");
       if (record.hold) return denied(record.hold.kind);
       if (record.decision?.state === "pending") return denied("decision_pending");
@@ -2291,11 +2456,7 @@ export class PrMaintenanceStore {
         return denied("resource_reserved");
       if (action.sessionId && action.sessionId !== record.workerSessionId)
         return denied("worker_reserved");
-      if (
-        action.recordId !== record.id ||
-        action.generation !== record.generation ||
-        !action.batchId
-      )
+      if (action.generation !== record.generation)
         return denied("maintenance_batch_required");
       const batch = record.batches.find((entry) => entry.id === action.batchId);
       if (!batch || !outstanding.has(batch.state) || batch.cancellationRequestedAt)
@@ -2314,6 +2475,8 @@ export class PrMaintenanceStore {
         batch.state !== "accepted"
       )
         return denied("batch_not_accepted");
+      // One writer at a time: direct work on this worker or checkout goes first.
+      if (this.directWorkActive(record, batch)) return denied("direct_work_active");
       // The batch was prepared from fresh evidence for exactly this head; only
       // a newer observation of a different head invalidates it.
       if (!record.observation?.complete || batch.headSha !== record.observation.headSha)
@@ -2369,7 +2532,40 @@ export class PrMaintenanceStore {
       );
   }
 
-  /** Prevent plan replacement or ordinary retry from erasing reserved worker input. */
+  /** The prepared batch the current step write dispatches, set only by its follow-up. */
+  private dispatching: { recordId: string; batchId: string } | undefined;
+  /** The step attempt `acceptBatch` is binding, so it is not mistaken for direct work. */
+  private accepting: { batchId: string; stepId: string; attempt: number } | undefined;
+
+  /**
+   * Runs a step write that dispatches the exact prepared batch as maintenance
+   * work. Every other step write on the task is direct work, even one whose
+   * prompt happens to match a prepared batch.
+   */
+  asMaintenanceDispatch<T>(
+    reference: { recordId: string; batchId: string },
+    work: () => T,
+  ): T {
+    const previous = this.dispatching;
+    this.dispatching = { recordId: reference.recordId, batchId: reference.batchId };
+    try {
+      return work();
+    } finally {
+      this.dispatching = previous;
+    }
+  }
+
+  /**
+   * Gates a step write on a maintained task.
+   *
+   * The prepared batch dispatched by its maintenance follow-up
+   * (`asMaintenanceDispatch`) is admitted as maintenance work and must
+   * continue the retained worker's step with its exact prompt. Any other step
+   * write is direct work: maintenance never refuses it, except that it waits
+   * while a maintenance turn is still executing on the worker, and
+   * undispatched maintenance work yields to it so the queued batch can never
+   * overwrite or replay over it.
+   */
   assertPreparedStep(
     taskId: string,
     stepKey: string,
@@ -2377,18 +2573,22 @@ export class PrMaintenanceStore {
     placementId?: string,
     sessionId?: string,
   ): void {
-    for (const record of this.list({ taskId, retainedOnly: true, limit: 100 }).records) {
-      const batch = record.batches.find((entry) => entry.state === "prepared");
-      if (!batch)
-        refuse(
-          "maintenance_batch_required",
-          "Prepare a bounded maintenance batch before changing the retained worker's step.",
-        );
-      const step = this.store.getRunStepBySession(record.workerSessionId);
+    for (const record of this.live().filter((entry) => entry.taskId === taskId)) {
+      const workerStep = this.store.getRunStepBySession(record.workerSessionId);
+      const touchesWorker =
+        sessionId === record.workerSessionId || workerStep?.stepKey === stepKey;
+      const dispatching =
+        this.dispatching?.recordId === record.id ? this.dispatching : undefined;
+      if (!dispatching) {
+        if (touchesWorker) this.yieldToDirectWork({ sessionId: record.workerSessionId });
+        continue;
+      }
+      const batch = record.batches.find((entry) => entry.id === dispatching.batchId);
+      if (batch?.state === "prepared" && batch.prompt !== prompt)
+        refuse("prompt_conflict", "Retry must use the exact prepared prompt.");
       if (
-        !step ||
-        step.stepKey !== stepKey ||
-        batch.prompt !== prompt ||
+        !touchesWorker ||
+        workerStep?.stepKey !== stepKey ||
         (placementId && placementId !== record.placementId) ||
         (sessionId && sessionId !== record.workerSessionId)
       )
@@ -2402,7 +2602,7 @@ export class PrMaintenanceStore {
         sessionId: record.workerSessionId,
         recordId: record.id,
         generation: record.generation,
-        batchId: batch.id,
+        batchId: dispatching.batchId,
       });
     }
   }
@@ -2434,15 +2634,22 @@ export class PrMaintenanceStore {
           "Batch is already bound to a different step/attempt.",
         );
       }
-      this.assertAdmission({
-        action: "dispatch",
-        leadSessionId,
-        recordId: id,
-        generation,
-        batchId,
-        taskId: record.taskId,
-        sessionId: record.workerSessionId,
-      });
+      const accepting = { batchId, stepId, attempt };
+      const previous = this.accepting;
+      this.accepting = accepting;
+      try {
+        this.assertAdmission({
+          action: "dispatch",
+          leadSessionId,
+          recordId: id,
+          generation,
+          batchId,
+          taskId: record.taskId,
+          sessionId: record.workerSessionId,
+        });
+      } finally {
+        this.accepting = previous;
+      }
       const step = this.store.getRunStep(stepId);
       if (
         !step ||
@@ -2467,11 +2674,150 @@ export class PrMaintenanceStore {
     });
   }
 
+  /**
+   * The worker's events for exactly this batch's attempt: from the step's
+   * start to the end sequence fixed when its execution settled. Later direct
+   * work on the same worker is never read as this batch's report. Undefined
+   * until the execution settled.
+   */
+  batchEvents(recordId: string, batchId: string): SessionEvent[] | undefined {
+    const record = this.get(recordId);
+    const batch = record?.batches.find((entry) => entry.id === batchId);
+    if (
+      !record ||
+      !batch?.executionSettled ||
+      batch.eventSeqFrom === undefined ||
+      batch.eventSeqTo === undefined
+    )
+      return undefined;
+    const through = batch.eventSeqTo;
+    return this.store
+      .listEventsAfter(record.workerSessionId, batch.eventSeqFrom)
+      .filter((event) => event.sequence <= through);
+  }
+
+  /**
+   * The checkout precondition for the prompt that dispatches a maintenance
+   * batch: a clean checkout at exactly the head it was prepared from. Direct
+   * work never gets one.
+   */
+  checkoutPrecondition(
+    stepId: string,
+    attempt: number,
+  ): { headSha: string; requireClean: true } | undefined {
+    const reference = this.referenceForStep(stepId, attempt);
+    if (!reference) return undefined;
+    const batch = this.get(reference.recordId)?.batches.find(
+      (entry) => entry.id === reference.batchId,
+    );
+    return batch?.state === "accepted"
+      ? { headSha: batch.headSha, requireClean: true }
+      : undefined;
+  }
+
+  /**
+   * The Node refused a maintenance prompt because the checkout was dirty or
+   * not at the batch's head. Nothing ran: the step is cancelled, the batch
+   * settles with no effects, and a person decides what happens to the local
+   * work. Maintenance never overwrites it.
+   */
+  refuseCheckout(
+    stepId: string,
+    attempt: number,
+    reason: string,
+    code: "checkout_precondition" | "node_upgrade_required" = "checkout_precondition",
+  ): boolean {
+    return this.store.writeAtomically(() => {
+      const reference = this.referenceForStep(stepId, attempt);
+      if (!reference) return false;
+      const record = this.required(reference.recordId);
+      const batch = record.batches.find((entry) => entry.id === reference.batchId)!;
+      if (batch.state !== "accepted" || batch.effects.length) return false;
+      const at = nowIso();
+      const message = reason.slice(0, 4_000);
+      const nextAction =
+        code === "node_upgrade_required"
+          ? "Update the worker's Node, then give direction to continue."
+          : "Commit, stash or discard the local changes, or check out the PR head, then give direction to continue.";
+      this.store.updateRunStep(stepId, {
+        state: "cancelled",
+        output: `PR maintenance was not sent: ${message}`,
+      });
+      Object.assign(batch, {
+        state: "cancelled",
+        executionSettled: true,
+        executionNotDispatched: true,
+        updatedAt: at,
+        reason: code,
+        evidence: `The Node refused the maintenance prompt before the agent saw it: ${message}`,
+        findings: batch.sources.map((source) => ({
+          source,
+          outcome: "needs_human",
+          stage: "not_attempted",
+          evidence: [message],
+          responseRequired: true,
+          responseIds: [],
+          nextAction,
+          progress: false,
+        })),
+        effects: [],
+      });
+      this.refund(record, batch, 0, false);
+      if (!record.ownershipReleasedAt && record.decision?.state !== "pending")
+        this.raiseDecision(record, {
+          id: `checkout-${batch.id}`,
+          version: 1,
+          proposal:
+            `Fleet did not send maintenance batch ${batch.id}: ${message} ${code === "node_upgrade_required" ? "Fleet will not write to a checkout it cannot check for a person's work." : "The checkout may hold a person's work, so Fleet will not overwrite it."} ${nextAction}`.slice(
+              0,
+              8_000,
+            ),
+          headSha: batch.headSha,
+          scope: record.authorization.scope.baseline,
+        });
+      this.save(record);
+      return true;
+    });
+  }
+
+  /**
+   * Records who supplied the report a batch settled from, once. Only a report
+   * the Host read from the worker's own output can explain a later head move.
+   */
+  markReportSource(
+    id: string,
+    batchId: string,
+    source: "host" | "lead",
+  ): PrMaintenanceRegistration {
+    return this.store.writeAtomically(() => {
+      const record = this.required(id);
+      const batch = record.batches.find((entry) => entry.id === batchId);
+      if (!batch || batch.reportSource) return record;
+      batch.reportSource = source;
+      return this.save(record);
+    });
+  }
+
+  /** Records why automatic settlement from the worker report did not apply. */
+  noteSettlementError(id: string, batchId: string, error: string): boolean {
+    return this.store.writeAtomically(() => {
+      const record = this.required(id);
+      const batch = record.batches.find((entry) => entry.id === batchId);
+      const message = error.slice(0, 8_192);
+      if (!batch || !outstanding.has(batch.state) || batch.settlementError === message)
+        return false;
+      batch.settlementError = message;
+      batch.updatedAt = nowIso();
+      this.save(record);
+      return true;
+    });
+  }
+
   referenceForStep(
     stepId: string,
     attempt?: number,
   ): { recordId: string; generation: number; batchId: string } | undefined {
-    for (const record of this.retained()) {
+    for (const record of this.live()) {
       const batch = record.batches.find(
         (entry) =>
           entry.stepId === stepId &&
@@ -2482,6 +2828,30 @@ export class PrMaintenanceStore {
         return { recordId: record.id, generation: record.generation, batchId: batch.id };
     }
     return undefined;
+  }
+
+  /**
+   * What a released record still admits: the receipt, reconciliation and
+   * existing-effect outcomes of a batch that was dispatched before Release.
+   */
+  private releasedSettlement(
+    record: PrMaintenanceRegistration,
+    checkpoint: PrMaintenanceCheckpoint,
+  ): boolean {
+    const inFlight = record.batches.some(
+      (batch) =>
+        outstanding.has(batch.state) && batch.state !== "prepared" && batch.stepId,
+    );
+    if (checkpoint.kind === "batch")
+      return record.batches.some(
+        (batch) =>
+          batch.id === checkpoint.batchId &&
+          (outstanding.has(batch.state) || batch.state === checkpoint.state),
+      );
+    if (checkpoint.kind === "reconcile") return inFlight;
+    if (checkpoint.kind === "action")
+      return record.actions.some((effect) => effect.key === checkpoint.effect.key);
+    return false;
   }
 
   checkpoint(
@@ -2503,8 +2873,11 @@ export class PrMaintenanceStore {
       refuse("invalid_work_order", "Only a prepared batch can carry a work order.");
     return this.store.writeAtomically(() => {
       const record = this.required(id, leadSessionId, expectedVersion);
-      if (record.ownershipReleasedAt)
-        refuse("released", "Released history cannot admit new checkpoints or effects.");
+      if (record.ownershipReleasedAt && !this.releasedSettlement(record, checkpoint))
+        refuse(
+          "released",
+          "Released history admits only the settlement of a maintenance turn that was already running.",
+        );
       if (checkpoint.kind === "fallback") {
         const key = this.observationKey(checkpoint.observation, checkpoint.error);
         if (record.incidents.some((incident) => incident.lastObservationKey === key))
@@ -2723,7 +3096,12 @@ export class PrMaintenanceStore {
       } else {
         // Reconciliation evidence is recorded; a settled execution asks for a review.
         record.lastReconciliationEvidence = checkpoint.evidence;
-        if (checkpoint.immediateCheck && record.lifecycle === "active" && !record.hold)
+        if (
+          checkpoint.immediateCheck &&
+          record.lifecycle === "active" &&
+          !record.hold &&
+          !record.ownershipReleasedAt
+        )
           this.requestReview(record, "worker_result");
       }
       if (
@@ -3079,6 +3457,7 @@ export class PrMaintenanceStore {
       record.observationHostAt = hostAttemptedAt;
     else delete record.observationHostAt;
     record.lastSuccessAt = hostAttemptedAt;
+    if (!alternate) this.recordLineage(record, observation, hostAttemptedAt);
     if (record.review && !record.review.concludedAt)
       record.review.claimedAt ??= hostAttemptedAt;
     for (const batch of record.batches) {
@@ -3198,6 +3577,92 @@ export class PrMaintenanceStore {
     }
   }
 
+  /**
+   * After a maintenance batch published, the next head Fleet observes must be
+   * explained. Provider ancestry evidence (`headLineage`) decides when the
+   * helper supplies it. Otherwise the move is explained when the head is the
+   * resulting commit of the batch's own last known push, in a report the Host
+   * read from the worker itself: a normal push, or the leased conflict rewrite
+   * (unauthorized rewrites were already held when the batch settled). A report
+   * the orchestrator supplied explains nothing. Anything else is unverified. A
+   * rewrite or an unexplained move holds maintenance for a person; an
+   * explained move never does.
+   */
+  private recordLineage(
+    record: PrMaintenanceRegistration,
+    observation: PrMaintenanceObservation,
+    at: string,
+  ): void {
+    const batch = [...record.batches]
+      .reverse()
+      .find((entry) => entry.published && !outstanding.has(entry.state));
+    const head = observation.headSha;
+    if (!batch || batch.lineage || !head || head === batch.headSha) return;
+    // Only a report the Host read from the worker's own output is trusted here.
+    const pushed =
+      batch.reportSource === "host"
+        ? batch.effects
+            .filter((effect) => effect.kind === "push" && effect.state === "known")
+            .at(-1)
+        : undefined;
+    const lineage =
+      observation.headLineage?.fromSha === batch.headSha
+        ? observation.headLineage
+        : undefined;
+    const state = lineage
+      ? lineage.fastForward
+        ? "fast_forward"
+        : "rewritten"
+      : pushed?.headSha === head
+        ? pushed.force
+          ? "leased_rewrite"
+          : "reported"
+        : "unverified";
+    const evidence = lineage
+      ? lineage.evidence
+      : pushed?.headSha === head
+        ? `The new head is the commit batch ${batch.id} reported pushing (${pushed.key}${pushed.force ? `, leased on ${pushed.expectedRemoteSha}` : ""}).`
+        : `No push in a worker report the Host read explains the move from ${batch.headSha} to ${head}${batch.reportSource === "lead" ? "; this batch settled from a report the orchestrator supplied" : ""}.`;
+    batch.lineage = {
+      state,
+      fromSha: batch.headSha,
+      toSha: head,
+      at,
+      evidence: evidence.slice(0, 8_192),
+    };
+    if (state === "rewritten")
+      this.rewriteHold(
+        record,
+        `The PR head moved from ${batch.headSha} to ${head} without a fast-forward after maintenance batch ${batch.id}. Check the branch history, then Resume.`,
+        at,
+      );
+    else if (state === "unverified")
+      this.rewriteHold(
+        record,
+        `The PR head moved from ${batch.headSha} to ${head} after maintenance batch ${batch.id}, and no push that batch reported explains it. Check the branch history, then Resume.`,
+        at,
+      );
+  }
+
+  /**
+   * A system hold for an unauthorized or unverifiable branch rewrite. It
+   * replaces an orchestrator pause, which the orchestrator then cannot clear.
+   * A hold a person set keeps its kind and gains the reason; the attention
+   * notification comes from the batch's recorded lineage.
+   */
+  private rewriteHold(record: PrMaintenanceRegistration, reason: string, at: string) {
+    if (record.ownershipReleasedAt) return;
+    if (!record.hold || record.hold.actor === "lead") {
+      this.setHold(record, "paused", reason.slice(0, 8_192), at);
+      return;
+    }
+    if (record.hold.reason.includes(reason)) return;
+    record.hold = {
+      ...record.hold,
+      reason: `${record.hold.reason} Also: ${reason}`.slice(0, 8_192),
+    };
+  }
+
   private refund(
     record: PrMaintenanceRegistration,
     batch: PrMaintenanceBatch,
@@ -3266,7 +3731,9 @@ export class PrMaintenanceStore {
       );
     if (batch.executionSettled && !update.executionSettled)
       refuse("receipt_conflict", "A known execution receipt cannot become unknown.");
-    if (update.executionSettled && batch.stepId) {
+    // A receipt the Host already correlated stays a fact even if direct work
+    // later reuses the worker's step for a new attempt.
+    if (update.executionSettled && !batch.executionSettled && batch.stepId) {
       const step = this.store.getRunStep(batch.stepId);
       const worker = this.store.getSession(record.workerSessionId);
       if (
@@ -3285,6 +3752,9 @@ export class PrMaintenanceStore {
         );
       if (["cancelled", "skipped"].includes(step.state) && !step.dispatchedAt)
         batch.executionNotDispatched = true;
+      // The report is read from exactly this attempt's events, never later work.
+      batch.eventSeqFrom = step.eventSeqFrom;
+      batch.eventSeqTo = this.store.maxEventSequence(record.workerSessionId);
     }
     if (batch.published && !update.published)
       refuse("receipt_conflict", "A verified published repair cannot be erased.");
@@ -3348,6 +3818,40 @@ export class PrMaintenanceStore {
     }
     this.validateEffects(update.effects);
     this.preserveEffects(batch.effects, update.effects);
+    /*
+     * History is rewritten only to resolve a conflict, leased on the exact
+     * HEAD the batch was prepared from. Any other rewrite already happened, so
+     * it is recorded as the fact it is and the batch still settles; a person
+     * is asked to look before maintenance does anything else.
+     */
+    const rewrites: string[] = [];
+    const pushedHeads = new Set([batch.headSha]);
+    for (const effect of update.effects) {
+      if (effect.kind !== "push" || effect.state === "not_performed") continue;
+      const recorded = batch.effects.some(
+        (old) => old.key === effect.key && old.state === effect.state,
+      );
+      if (!recorded && effect.force) {
+        if (!batch.conflictResolution || batch.kind !== "repair")
+          rewrites.push(
+            `${effect.key} force-pushed outside a conflict-resolution repair (lease ${effect.expectedRemoteSha}).`,
+          );
+        else if (effect.expectedRemoteSha !== batch.headSha)
+          rewrites.push(
+            `${effect.key} force-pushed with a lease on ${effect.expectedRemoteSha}, not the head ${batch.headSha} this batch was prepared from.`,
+          );
+      } else if (
+        !recorded &&
+        effect.expectedRemoteSha &&
+        !pushedHeads.has(effect.expectedRemoteSha)
+      )
+        rewrites.push(
+          `${effect.key} was reported as a normal push but replaced ${effect.expectedRemoteSha}, which is neither this batch's head ${batch.headSha} nor an earlier push in it.`,
+        );
+      // A push without expectedRemoteSha is still recorded; the next
+      // observation decides whether the head it reported explains the move.
+      pushedHeads.add(effect.headSha);
+    }
     const final = !outstanding.has(update.state);
     const needsHuman = update.findings.filter(
       (finding) => finding.outcome === "needs_human",
@@ -3420,6 +3924,7 @@ export class PrMaintenanceStore {
         "Known mutation attempts cannot be refunded as unused.",
       );
     if (final) this.refund(record, batch, update.usedMutations!, published);
+    if (final) delete batch.settlementError;
     Object.assign(batch, {
       state: update.state,
       findings: update.findings,
@@ -3460,7 +3965,11 @@ export class PrMaintenanceStore {
     }
     // `uncertain` is reported as Reconciling (derived), not as a pause.
     let loopReason: string | undefined;
-    if (needsHuman.length && record.decision?.state !== "pending")
+    if (
+      needsHuman.length &&
+      record.decision?.state !== "pending" &&
+      !record.ownershipReleasedAt
+    )
       this.raiseDecision(record, {
         id: `finding-${batch.id}`,
         version: 1,
@@ -3519,7 +4028,8 @@ export class PrMaintenanceStore {
     if (
       loopReason &&
       record.decision?.state !== "pending" &&
-      record.lifecycle === "active"
+      record.lifecycle === "active" &&
+      !record.ownershipReleasedAt
     )
       this.raiseDecision(record, {
         id: `loop-${batch.id}`,
@@ -3528,6 +4038,24 @@ export class PrMaintenanceStore {
         headSha: record.observation?.headSha ?? batch.headSha,
         scope: record.authorization.scope.baseline,
       });
+    if (rewrites.length && !batch.lineage) {
+      const pushed = update.effects
+        .filter((effect) => effect.kind === "push" && effect.state !== "not_performed")
+        .at(-1);
+      const at = nowIso();
+      batch.lineage = {
+        state: "rewritten",
+        fromSha: batch.headSha,
+        toSha: pushed?.headSha ?? batch.headSha,
+        at,
+        evidence: rewrites.join(" ").slice(0, 8_192),
+      };
+      this.rewriteHold(
+        record,
+        `The PR branch history was rewritten in a way Fleet did not authorize; check the branch, then Resume. ${batch.lineage.evidence}`,
+        at,
+      );
+    }
     // Working → Reviewing: a settled worker result is reviewed immediately.
     if (
       final &&
@@ -3535,6 +4063,7 @@ export class PrMaintenanceStore {
       !batch.executionNotDispatched &&
       record.lifecycle === "active" &&
       !record.hold &&
+      !record.ownershipReleasedAt &&
       record.decision?.state !== "pending"
     )
       this.requestReview(record, "worker_result");
@@ -3578,6 +4107,8 @@ export class PrMaintenanceStore {
         old.actor !== effect.actor ||
         old.actionIdentity !== effect.actionIdentity ||
         old.attempts !== effect.attempts ||
+        old.force !== effect.force ||
+        old.expectedRemoteSha !== effect.expectedRemoteSha ||
         (!unsettledEffect(old) &&
           (old.usedAttempts ?? old.attempts) !==
             (effect.usedAttempts ?? effect.attempts)) ||
@@ -3720,7 +4251,7 @@ export class PrMaintenanceStore {
         .prepare(
           `SELECT 1 FROM pr_maintenance m
       LEFT JOIN sessions s ON s.id=?
-      WHERE m.released_at IS NULL AND
+      WHERE (m.released_at IS NULL OR ${releasedInFlightSql("m")}) AND
         (m.worker_session_id=? OR m.lead_session_id=? OR m.task_id=s.run_id OR
           EXISTS(SELECT 1 FROM sessions required WHERE
             (required.id=m.worker_session_id OR required.id=m.lead_session_id)
@@ -3748,7 +4279,7 @@ export class PrMaintenanceStore {
     if (
       this.db
         .prepare(
-          "SELECT 1 FROM pr_maintenance WHERE task_id=? AND released_at IS NULL LIMIT 1",
+          `SELECT 1 FROM pr_maintenance WHERE task_id=? AND (released_at IS NULL OR ${releasedInFlightSql("pr_maintenance")}) LIMIT 1`,
         )
         .get(taskId)
     )
@@ -4569,11 +5100,7 @@ export class PrMaintenanceStore {
     let count = 0;
     for (const record of this.retained()) {
       const hold = record.hold;
-      if (
-        !hold ||
-        hold.kind === "manual_control" ||
-        Date.parse(at) - Date.parse(hold.at) < 30 * 24 * 60 * 60 * 1_000
-      )
+      if (!hold || Date.parse(at) - Date.parse(hold.at) < 30 * 24 * 60 * 60 * 1_000)
         continue;
       notify(record);
       count++;
@@ -4661,7 +5188,7 @@ export class PrMaintenanceStore {
       if (!record.ownershipReleasedAt) {
         // Restored authority must be confirmed on this Host: hold for one Resume.
         delete record.review;
-        if (!record.hold || record.hold.kind === "manual_control")
+        if (!record.hold)
           this.setHold(
             record,
             "paused",

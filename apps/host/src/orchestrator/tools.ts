@@ -13,6 +13,7 @@ import {
   PrMaintenanceEnableSchema,
   PrMaintenanceIdentitySchema,
   parsePrMaintenanceUrl,
+  prMaintenanceActiveBatch,
   prMaintenanceProviderLabel,
   prMaintenanceSources,
   prMaintenanceWorkSources,
@@ -44,15 +45,12 @@ import {
   type WorkerRoutingReceipt,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
+import { FleetPlanSchema, fleetWorkOrder } from "@fleet/prm-skill/fleet";
 import {
-  FleetPlanSchema,
-  WorkContractError,
-  WorkOrderSchema,
-  WorkReportSchema,
-  extractWorkReport,
-  fleetSettlement,
-  fleetWorkOrder,
-} from "@fleet/prm-skill/fleet";
+  leadRelayRefusal,
+  workContract,
+  workReportCheckpoints,
+} from "../pr-maintenance-settlement.js";
 import { reservedSessionCount } from "../session-policy.js";
 import {
   DISPATCH_GUIDANCE,
@@ -637,8 +635,9 @@ export const PreparePrMaintenanceSchema = z
         "Repair-only proposal; verified existing task/publication authority and authenticated human approval are required. Observation-only enrollment is unsupported.",
       ),
     publicationEvidence: z.string().min(1).max(8_192).optional(),
-    replies: z.boolean().default(false),
-    resolveThreads: z.boolean().default(false),
+    // One "Maintain this PR" grant covers replies and resolving addressed threads.
+    replies: z.boolean().default(true),
+    resolveThreads: z.boolean().default(true),
     reviewers: z.array(z.string().min(1).max(512)).max(20).default([]),
     retryChecks: z.boolean().default(false),
     expectedVersion: z.number().int().positive().optional(),
@@ -1361,14 +1360,7 @@ export class FleetTools {
           const allowance = registry.remainingWake(this.leadSessionId, wakeId);
           if (!record)
             return { record: null, allowance, serverTime: new Date().toISOString() };
-          const recovery = record.incidents.some(
-            (incident) => incident.kind === "capability" && !incident.resolvedAt,
-          );
-          const defaultRequests = recovery
-            ? 1
-            : record.identity.provider === "azure-devops"
-              ? 39
-              : 8;
+          const defaultRequests = record.identity.provider === "azure-devops" ? 39 : 8;
           const requests = Math.min(
             parsed.reserveRequests ?? defaultRequests,
             allowance.requests,
@@ -1393,9 +1385,8 @@ export class FleetTools {
             },
             observationClaim,
             allowance: registry.remainingWake(this.leadSessionId, wakeId),
-            instruction: recovery
-              ? "Recovery review claimed. Read the incident, reserve alternate_attempt BEFORE authorized alternate provider I/O, then checkpoint alternate_observation. Do not rerun the failed helper just to satisfy this claim."
-              : "Review claimed. Run the helper once now with observationAllowance.deadlineAt unchanged. For a Fleet command, pass observationClaim as maintenanceObservation at creation; the Host ingests its exact stdout before the completion wake (recover with only executionId). Without a Fleet execution, checkpoint the exact observation with recordId, expectedVersion and checkpoint. Then classify: prepare_work_order + fleet_follow_up for routine work, fleet_escalate for a genuine design decision, or review_done when nothing is actionable.",
+            instruction:
+              "Review claimed. Run the helper once now as a Fleet command with observationAllowance.deadlineAt unchanged, passing observationClaim as maintenanceObservation at creation: the Host ingests its exact stdout itself (this is also the only recovery path — after a failure, the next review runs it again; recover a lost receipt with only executionId). Only a small observation (32 KiB or less) from a run outside Fleet may be checkpointed directly; never relay large ones. Then classify: prepare_work_order + fleet_follow_up for routine work, fleet_escalate for a genuine design decision, or review_done when nothing is actionable.",
           };
         });
       }
@@ -1460,6 +1451,11 @@ export class FleetTools {
           );
         }
         const input = LegacyCheckpointPrMaintenanceSchema.parse(parsed);
+        const relayed = leadRelayRefusal(
+          input.checkpoint,
+          registry.get(input.recordId, this.leadSessionId),
+        );
+        if (relayed) throw new PrMaintenanceError(relayed.code, relayed.message);
         if (input.checkpoint.kind === "prepare_work_order") {
           return this.prepareWorkOrder(
             input.recordId,
@@ -1554,9 +1550,10 @@ export class FleetTools {
   }
 
   /**
-   * Settle a work-order batch from the worker's prm.work-report/1. The report
-   * is a claim: Fleet's existing settlement still requires the correlated
-   * terminal RunStep, known effect evidence and allowance accounting.
+   * Recovery path for a work-order batch the Host could not settle on its own
+   * from the worker's report. The report is a claim: Fleet's existing
+   * settlement still requires the correlated terminal RunStep, known effect
+   * evidence and allowance accounting.
    */
   private settleWorkReport(
     recordId: string,
@@ -1568,89 +1565,34 @@ export class FleetTools {
     const batch = record?.batches.find((entry) => entry.id === checkpoint.batchId);
     if (!record || !batch)
       throw new PrMaintenanceError("batch_not_found", "No such maintenance batch.");
-    if (!batch.workOrder)
-      throw new PrMaintenanceError(
-        "not_a_work_order",
-        "This batch was prepared with a hand-written prompt; settle it with a batch checkpoint.",
-      );
-    const workOrder = this.workContract(() => WorkOrderSchema.parse(batch.workOrder));
-    let rawReport = checkpoint.report;
-    if (rawReport === undefined) {
-      const step = batch.stepId ? this.store.getRunStep(batch.stepId) : undefined;
-      if (!step)
-        throw new PrMaintenanceError(
-          "execution_unsettled",
-          "The batch has no accepted attempt to read a report from.",
-        );
-      const extracted = extractWorkReport(
-        workerOutput(
-          this.store.listEventsAfter(record.workerSessionId, step.eventSeqFrom),
-        ),
-      );
-      if ("error" in extracted)
-        throw new PrMaintenanceError(
-          "report_missing",
-          `${extracted.error} Supply the report explicitly or settle the batch as reconciling with evidence.`,
-        );
-      rawReport = extracted.report;
-    }
-    const report = this.workContract(() => WorkReportSchema.parse(rawReport));
-    const settlement = this.workContract(() =>
-      fleetSettlement({
-        batch,
-        workOrder,
-        report,
-        workerActor: `fleet-worker:${record.workerSessionId}`,
-      }),
-    );
-    const base = {
-      kind: "batch" as const,
-      batchId: batch.id,
-      generation: checkpoint.generation,
-      findings: settlement.findings,
-      effects: settlement.effects,
-      executionSettled: true,
-      evidence: settlement.evidence,
-      usedMutations: settlement.usedMutations,
-      published: settlement.published,
-    };
+    // Read only the batch attempt's own event range, never later direct work.
+    const events = registry.batchEvents(recordId, batch.id);
     const wakeId = this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId;
     let version = expectedVersion;
-    if (batch.state === "accepted" && settlement.state !== "uncertain") {
+    for (const settlement of workReportCheckpoints({
+      batch,
+      generation: checkpoint.generation,
+      workerSessionId: record.workerSessionId,
+      ...(checkpoint.report !== undefined ? { report: checkpoint.report } : {}),
+      ...(events ? { output: () => workerOutput(events) } : {}),
+    }))
       version = registry.checkpoint(
         this.leadSessionId,
         recordId,
         version,
-        { ...base, state: "reconciling", usedMutations: undefined },
+        settlement,
         wakeId,
       ).version;
-    }
-    // A needs_human finding raises the PR's design decision during settlement.
-    return registry.checkpoint(
-      this.leadSessionId,
+    // A report the lead supplied is a claim; it never explains a later head move.
+    return registry.markReportSource(
       recordId,
-      version,
-      { ...base, state: settlement.state },
-      wakeId,
+      batch.id,
+      checkpoint.report !== undefined ? "lead" : "host",
     );
   }
 
   private workContract<T>(action: () => T): T {
-    try {
-      return action();
-    } catch (error) {
-      if (error instanceof WorkContractError)
-        throw new PrMaintenanceError(error.code, error.message);
-      if (error instanceof z.ZodError)
-        throw new PrMaintenanceError(
-          "invalid_work_contract",
-          error.issues
-            .slice(0, 5)
-            .map((issue) => `${issue.path.join(".") || "$"}: ${issue.message}`)
-            .join("; "),
-        );
-      throw error;
-    }
+    return workContract(action);
   }
 
   /** Every task this orchestrator is running, newest last. */
@@ -3065,29 +3007,26 @@ export class FleetTools {
 
   /** Shared by discovery and dispatch so their advice cannot contradict each other. */
   private continuation(run: Run, step: RunStep, session?: FleetSession): Continuation {
+    // PR maintenance never reserves the worker against direct work; it only
+    // goes first while its own turn is already running there.
     const record = this.store.prMaintenance
       .list({ taskId: run.id, leadSessionId: this.leadSessionId, retainedOnly: true })
       .records.find((entry) => !session || entry.workerSessionId === session.id);
-    if (record) {
-      const status = this.store.prMaintenance.status(record);
-      if (status.phase === "waiting_for_decision")
+    if (record && session?.id === record.workerSessionId) {
+      const queued =
+        this.store.prMaintenance.referenceForStep(step.id, step.attempts) &&
+        step.state === "pending" &&
+        !step.dispatchedAt;
+      if (queued && session.state === "idle")
         return {
-          action: "wait_for_human",
-          reason: `PR maintenance ${record.id} is Waiting for Design Decision (${record.decision?.id}). The person answers in the PR maintenance panel or this conversation.`,
+          action: "follow_up",
+          reason:
+            "Queued PR maintenance work has not started; it yields to this direct turn, settles with no effects and is never replayed.",
         };
-      if (status.hold)
+      if (!queued && prMaintenanceActiveBatch(record))
         return {
-          action: "wait",
-          reason: `PR maintenance ${record.id}: ${status.label}. ${status.action}`,
-        };
-      if (
-        session?.id === record.workerSessionId &&
-        status.phase !== "merged" &&
-        status.phase !== "closed"
-      )
-        return {
-          action: "wait",
-          reason: `This worker is retained by PR maintenance ${record.id} (${status.label}). Send it work through a prepared maintenance batch from a <fleet-pr-review> turn, or call fleet_set_pr_maintenance action review.`,
+          action: "in_flight",
+          reason: `A PR maintenance turn (${record.id}) is running on this worker. A follow-up waits for it to finish; queued maintenance work yields to direct work.`,
         };
     }
     if (terminalRunStates.has(run.state) || run.state === "awaiting_human") {
@@ -3264,21 +3203,26 @@ export class FleetTools {
 
     try {
       this.store.writeAtomically(() => {
-        this.store.retryRunStepInSession(
-          run.id,
-          {
-            stepKey: step.stepKey,
-            title: step.title,
-            prompt,
-            category: step.category,
-            dependsOn: step.dependsOn,
-            placementId: step.placementId || owned.placementId,
-            phaseIndex: run.phaseIndex,
-            position: step.position,
-          },
-          owned.id,
-          this.store.maxEventSequence(owned.id),
-        );
+        const retry = () =>
+          this.store.retryRunStepInSession(
+            run.id,
+            {
+              stepKey: step.stepKey,
+              title: step.title,
+              prompt,
+              category: step.category,
+              dependsOn: step.dependsOn,
+              placementId: step.placementId || owned.placementId,
+              phaseIndex: run.phaseIndex,
+              position: step.position,
+            },
+            owned.id,
+            this.store.maxEventSequence(owned.id),
+          );
+        // Only the referenced batch is maintenance; any other prompt is direct work.
+        if (input.maintenance)
+          this.store.prMaintenance.asMaintenanceDispatch(input.maintenance, retry);
+        else retry();
         if (input.maintenance) {
           const retried = this.store.getRunStep(step.id)!;
           this.store.prMaintenance.acceptBatch(

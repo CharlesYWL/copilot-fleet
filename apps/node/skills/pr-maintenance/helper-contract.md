@@ -154,15 +154,16 @@ schemas are unchanged. When supplying `fallback.error`, use the string
 See the ADO contract for omitted default status states and encoded artifact
 separators; neither compatibility case weakens completeness or readiness gates.
 
-The exposed MCP route accepts the supported large object inline (32 MiB
-transport bound; helper state at most 1 MiB; total durable record at most 2 MiB).
-No filesystem-import capability or arbitrary path read is provided. A synthetic
-291,675-byte helper observation is covered from native CLI stdout through this
-authenticated, claimed MCP checkpoint, exact readback and SQLite restart.
-Read the record back and compare the serialized observation before treating
-the handoff as durable; a rejected request is not saved evidence and does not
-authorize another helper call. Owner/version/claim checks remain in force,
-including for large payloads. Genuine overflow stays incomplete/rejected.
+The Host ingests helper output itself from the claim-bound Fleet command (helper
+state at most 1 MiB; total durable record at most 2 MiB). The lead's MCP checkpoint
+refuses observations over 32 KiB and alternate-evidence checkpoints, so large
+observations are never relayed through a lead turn; a synthetic 291,675-byte relay
+is covered as refused with nothing stored. No filesystem-import capability or
+arbitrary path read is provided. Read the record back before treating a handoff as
+durable; a rejected request is not saved evidence and does not authorize another
+helper call. Owner/version/claim checks remain in force. Genuine overflow stays
+incomplete/rejected. After a failed observation the one recovery path is to run the
+same helper again on the next review.
 
 The async native fixture crosses command completion, a second accepted Host turn,
 raw execution pagination, checkpointing and SQLite restart with 291,675 observation
@@ -191,30 +192,23 @@ job due for action, but preparing/dispatching a repair still requires a **new cu
 bounded visit and remaining allowance**. Pause and pending-design holds may accept
 an otherwise exact same-scope read-only observation refresh without clearing the hold
 or authorizing action. Release blocks promotion beyond `lastAttempt`.
-Owner/binding/authorization/generation or
-manual-control scope changes still refuse admission. Portable restore revokes the
+Owner/binding/authorization/generation changes still refuse admission. Portable restore revokes the
 local accepted-preparation receipt and cannot acquire active receipt authority; raw
 command evidence and already-saved attempts remain readable under existing retention.
 Unbound historical commands cannot acquire this authority retroactively. Same-turn
 non-command observations retain the original claimed-visit checkpoint contract.
 
-An explicitly selected one-turn handback has a narrow Host-owned exception:
-after its correlated manual command completes and settles, read-only observations
-may reconcile that same pinned registration while manual control remains held.
-No repair dispatch is admitted until quiescence and effect settlement are proven.
-Ordinary ongoing takeover, later Stop, changed pins and released ownership do not
-receive this exception. Accepted pending batches may refresh evidence only when
-the Host proves the exact attempt was never dispatched and has no effects.
-Neither path resets a visit allowance, deadline, grant or accepted worker prompt.
-The selected-handback exception is checked at the exact observation claim's
-command binding, preparation and approval/dispatch rechecks; it never makes general
-paused-job discovery, repair or publication admissible. A pending permission on
-either the retained worker or its owning lead independently holds continuation,
-handback and observation. Review that request in its actual session. Accepted
-worker work remains unchanged across the hold and restart; resolution returns it
-to normal admission, not a new acceptance or allowance. A later Stop remains a
-durable hold after terminal acknowledgement, even when the historical manual-control
-record has no end timestamp.
+A person's direct turn on the retained worker never holds maintenance: read-only
+observations continue, queued maintenance work that never reached the worker yields
+to the direct turn (settled with no effects, never replayed), and no repair is
+dispatched while the direct turn is still running (one writer at a time). A one-turn
+handback requests a review as soon as its exact command settled and the worker is
+idle. Accepted pending batches may refresh evidence only when the Host proves the
+exact attempt was never dispatched and has no effects. Nothing resets a visit
+allowance, deadline, grant or accepted worker prompt. A pending permission on
+either the retained worker or its owning lead holds automatic continuation and
+observation; review that request in its actual session. A later Stop remains a
+durable hold after terminal acknowledgement.
 
 The proposal tool's `identity` is **not** the discovery `pr` object: pass a complete
 helper's `observation.identity` unchanged, or construct the same strict provider
