@@ -487,7 +487,7 @@ const NodeRow = ({
                 size="small"
                 icon={<ArrowSync20Regular />}
                 aria-label={`Update ${node.name}`}
-                title="Pull, rebuild and restart this node"
+                title="Pull, rebuild and restart this node, and update its Copilot CLI"
                 onClick={() => void onUpdate(node)}
               />
             )

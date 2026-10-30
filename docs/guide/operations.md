@@ -212,8 +212,8 @@ The Nodes tab compares each machine's commit with the Host's and marks it **Up
 to date**, **Update available**, or **Manual update**. **Update** on a row — or
 **Update all** above the table — tells those machines to `git fetch --prune`,
 `git reset --hard` onto the branch they track, `npm install --include=dev`,
-`npm run build:node`, and restart into the new build. Progress appears in the row
-as it happens.
+`npm run build:node`, run `copilot update`, and restart into the new build.
+Progress appears in the row as it happens.
 
 Build dependencies are included even when the Node runs as a production login
 service. An unchanged checkout only skips the build when the running process
@@ -237,6 +237,43 @@ development commits can share one version. Exact-release bundles and independent
 freshness/protocol-compatibility checks are planned in the
 [versioned-release spec](../superpowers/specs/2026-09-14-versioned-node-releases.md),
 not implemented by this version-declaration change.
+
+### Updating Copilot CLI with the node
+
+Every node and Host update also brings the machine's GitHub Copilot CLI up to
+date, so sessions started after the restart run the newest Copilot as well as
+the newest Fleet. After a successful build — or when the checkout was already
+current — the update runs `copilot update` with the same Copilot the node
+launches: the **Copilot command** from the node's settings (or
+`--copilot-command` / `FLEET_COPILOT_COMMAND`), otherwise `copilot` on `PATH`.
+It then reads `copilot --version` again and reports the result next to the
+Fleet one, for example _Updated to 3f2a9c1d7e4b; Copilot CLI updated from
+1.0.104 to 1.0.105_.
+
+`copilot update` downloads the new release into Copilot's own package cache, and
+the next Copilot process starts on it. Sessions already running keep the
+version they started with until they are restarted, which an update that
+restarts the node does anyway.
+
+A Copilot that cannot be updated never fails or blocks the Fleet update. The
+node restarts on its new build and the result says why Copilot was left alone:
+
+- **Not found.** Nothing answered to the configured command; install Copilot CLI
+  as the user that runs the node, or set the node's Copilot command.
+- **Installed with npm.** Copilot run from an npm installation cannot update
+  itself; run `npm install -g @github/copilot` on that machine. WinGet,
+  Homebrew and install-script installations update in place.
+- **Pinned.** `COPILOT_AUTO_UPDATE=false` in the node's environment pins
+  Copilot, and the update leaves it on its current version.
+- **Failed or timed out.** A network error, or a download that takes longer than
+  five minutes, leaves the current version in place; the next update tries
+  again.
+
+Nodes running the no-login demo adapter (`--mock-agent`) start no Copilot and
+skip this step. With Agency mode on, a node launches `agency copilot`, which
+resolves its own Copilot CLI. The update covers that Copilot only when Agency
+resolves the same installation, for example the `copilot` found on `PATH`.
+Update Agency itself with `agency update`.
 
 What it will not do:
 
@@ -334,8 +371,10 @@ is already what you want; a unit file that restarts only on failure needs
 **Settings → General → Update Host** does for the Host what **Update** does for
 a node: `git fetch --prune`, `git reset --hard` onto the branch the checkout
 tracks, `npm install --include=dev` and `npm run build` — the whole build, since
-the Node started beside the Host runs from the same checkout — and then restarts
-the Host and that Node **the way they were started**:
+the Node started beside the Host runs from the same checkout — then
+`copilot update` for the Copilot CLI that Node launches (see
+[Updating Copilot CLI with the node](#updating-copilot-cli-with-the-node)), and
+then restarts the Host and that Node **the way they were started**:
 
 | Started with                                  | Restarted with                                                                         |
 | --------------------------------------------- | -------------------------------------------------------------------------------------- |

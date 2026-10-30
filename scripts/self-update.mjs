@@ -403,6 +403,10 @@ export async function run(
     }
     const updater = await loadUpdater();
     const command = restartCommand(options.restart);
+    // Read with the Host task's environment applied above, so this is the
+    // Copilot CLI the Node beside the Host launches. An updater built before
+    // this existed has no such function, and the update leaves Copilot alone.
+    const copilotCommand = updater.localNodeCopilotCommand?.();
     const record = await updater.applyUpdate({
       statusFile: options.statusFile,
       updateId: options.updateId,
@@ -411,9 +415,10 @@ export async function run(
         buildScript: HOST_BUILD_SCRIPT,
         preserveLocalChanges: true,
         ...(options.runningRevision ? { runningRevision: options.runningRevision } : {}),
-        run: async (name, args, cwd) => {
+        ...(copilotCommand ? { copilotCommand } : {}),
+        run: async (name, args, cwd, runOptions) => {
           log(`$ ${name} ${args.join(" ")}`);
-          const result = await updater.runCommand(name, args, cwd);
+          const result = await updater.runCommand(name, args, cwd, runOptions);
           log(result.output);
           return result;
         },

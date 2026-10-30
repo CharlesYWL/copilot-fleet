@@ -651,7 +651,8 @@ Orchestrator 也可以使用它，见 [Chats as a destination](#chats-as-a-desti
 
 请先安装 Node.js，然后以实际运行 Node 的同一个系统用户执行 `copilot update` 和
 `copilot login`。最低版本是 Copilot CLI 1.0.69；更早的 ACP 版本可能在未登录时仍报告
-认证成功，导致 Host 上的会话一直等待却没有失败信息。在一个已检出的 Fleet 目录中执行
+认证成功，导致 Host 上的会话一直等待却没有失败信息。此后 Host 发起的每次 **Update** 也会
+执行 `copilot update`，见[随 Node 一起更新 Copilot CLI](#随-node-一起更新-copilot-cli)。在一个已检出的 Fleet 目录中执行
 （或者直接粘贴 Host 的 Nodes → Connect 卡片里给出的命令）：
 
 ![Settings → Nodes：新机器的注册命令，以及两台已注册节点的容量、平台、提交号和最后在线时间。](../screenshots/nodes.png)
@@ -1279,7 +1280,7 @@ UI。`npm run dev` 时你点开的页面是 Vite 的 `http://127.0.0.1:5173`，�
 Nodes 标签页会把每台机器的提交与 Host 的提交做比较，标记为 **Up to date**、
 **Update available** 或 **Manual update**。某一行上的 **Update** —— 或者表格上方的
 **Update all** —— 会让那些机器执行 `git fetch --prune`、对所跟踪分支做
-`git reset --hard`、`npm install --include=dev`、`npm run build:node`，然后重启进入新构建。过程会实时
+`git reset --hard`、`npm install --include=dev`、`npm run build:node`、`copilot update`，然后重启进入新构建。过程会实时
 显示在该行里。
 
 生产环境的登录服务也会安装构建所需的开发依赖。只有检出和正在运行的进程都已是目标提交，
@@ -1297,6 +1298,33 @@ Host 只会在重启后核对 Node 上报的提交与预期构建一致时报告
 精确发布包以及独立的版本新旧、协议兼容性判断仍属于
 [版本发布设计](../superpowers/specs/2026-09-14-versioned-node-releases.md)，
 本次集中版本声明并未实现这些更新行为。
+
+### 随 Node 一起更新 Copilot CLI
+
+每次 Node 或 Host 更新都会顺带把这台机器的 GitHub Copilot CLI 更新到最新版本，这样重启后
+新启动的会话既运行最新的 Fleet，也运行最新的 Copilot。构建成功之后（或检出本来就是最新时），
+更新会用 Node 实际启动的同一个 Copilot 执行 `copilot update`：即 Node 设置中的
+**Copilot command**（或 `--copilot-command` / `FLEET_COPILOT_COMMAND`），否则是 `PATH` 上的
+`copilot`。随后再次读取 `copilot --version`，并把结果和 Fleet 的结果一起报告，例如
+_Updated to 3f2a9c1d7e4b; Copilot CLI updated from 1.0.104 to 1.0.105_。
+
+`copilot update` 会把新版本下载到 Copilot 自己的包缓存中，下一个 Copilot 进程就会使用它。
+已经在运行的会话会继续使用启动时的版本，直到被重启；而需要重启 Node 的更新本来就会重启它们。
+
+Copilot 无法更新时，绝不会让 Fleet 更新失败或被阻塞。Node 仍会重启进入新构建，结果中会说明
+Copilot 为什么保持原样：
+
+- **找不到。** 配置的命令没有响应；请以运行 Node 的同一个用户安装 Copilot CLI，或设置 Node 的
+  Copilot command。
+- **通过 npm 安装。** 从 npm 安装运行的 Copilot 无法自我更新；请在那台机器上执行
+  `npm install -g @github/copilot`。WinGet、Homebrew 和安装脚本方式的安装可以原地更新。
+- **已固定版本。** Node 环境中的 `COPILOT_AUTO_UPDATE=false` 会固定 Copilot 版本，更新会让它
+  保持当前版本。
+- **失败或超时。** 网络错误，或下载超过五分钟，会保留当前版本；下次更新会再试。
+
+使用免登录演示适配器（`--mock-agent`）的 Node 不启动 Copilot，会跳过这一步。开启 Agency 模式时，
+Node 启动的是 `agency copilot`，它会自行解析使用哪个 Copilot CLI；只有当 Agency 解析到的是同一个
+安装（例如 `PATH` 上的 `copilot`）时，这次更新才会覆盖它。Agency 本身请用 `agency update` 更新。
 
 它不会做的事：
 
@@ -1373,7 +1401,8 @@ nssm start copilot-fleet-node
 
 **Settings → General → Update Host** 为 Host 做的事，和节点上的 **Update** 一样：
 `git fetch --prune`、`git reset --hard` 到检出所跟踪的分支、`npm install --include=dev`、
-`npm run build`（完整构建，因为 Host 旁边启动的 Node 也从同一个检出运行），然后**按原来的
+`npm run build`（完整构建，因为 Host 旁边启动的 Node 也从同一个检出运行），再为那个 Node
+启动的 Copilot CLI 执行 `copilot update`（见[随 Node 一起更新 Copilot CLI](#随-node-一起更新-copilot-cli)），然后**按原来的
 启动方式**重启 Host 和那个 Node：
 
 | 启动方式                                  | 重启方式                                                                     |

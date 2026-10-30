@@ -22,6 +22,7 @@ import {
   decodeFrame,
   errorMessage,
   sameHostUrl,
+  withCopilotNote,
   AuthenticatedEnvelopeSchema,
   type NodeBackup,
   type NodeToHostMessage,
@@ -45,6 +46,8 @@ import {
   forgetLauncherEnvironment,
   gitRevision,
   repoRoot,
+  resolveCopilotCommand,
+  usesMockAgent,
 } from "@fleet/protocol/runtime";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
 import { ACP_START_TIMEOUT_MS, AcpAgentFactory, MockAgentFactory } from "./agents.js";
@@ -150,6 +153,7 @@ import {
   RESTART_EXIT_CODE,
   RESTART_MODE_ENV,
   UPDATE_PARENT_PID_ENV,
+  describeCopilotUpdate,
   respawn,
   restartHandledBySupervisor,
   restartTarget,
@@ -308,7 +312,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     });
   };
 
-  const mockAgent = env.FLEET_MOCK_AGENT === "1";
+  const mockAgent = usesMockAgent(env);
 
   log(`copilot-fleet node ${VERSION}${REVISION ? ` (${REVISION})` : ""} starting`);
   log(`  name        ${settings.nodeName}`);
@@ -1249,6 +1253,10 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         report,
         beforeMutation: () => updateQuarantine.beforeMutation(),
         forceRebuild,
+        // The demo agent starts no Copilot, so there is none to bring up to date.
+        ...(mockAgent
+          ? {}
+          : { copilotCommand: resolveCopilotCommand(settings.copilotCommand, env) }),
       });
       // process.exit does not run finally; retire durable maintenance locks before restart.
       for (const lease of [...maintenanceLeases].reverse()) lease.release();
@@ -1257,10 +1265,14 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         report("failed", outcome.reason);
         return;
       }
+      const copilot = outcome.copilot
+        ? describeCopilotUpdate(outcome.copilot)
+        : undefined;
+      if (copilot) log(copilot);
       if (outcome.action === "none") {
         updateQuarantine.clear();
         log(`Self-update: ${outcome.reason}`);
-        report("up_to_date", outcome.reason);
+        report("up_to_date", withCopilotNote(outcome.reason, copilot));
         return;
       }
       updateQuarantine.built(outcome.revision);
@@ -1275,8 +1287,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         log("Updated, but a file watcher owns this process; not restarting");
         report(
           "failed",
-          `Updated to ${outcome.revision}, but this Node runs under a file watcher, which cannot restart it. ` +
-            `Stop this terminal and start it again with "npm run node" to run the new build under the supervisor.`,
+          withCopilotNote(
+            `Updated to ${outcome.revision}, but this Node runs under a file watcher, which cannot restart it. ` +
+              `Stop this terminal and start it again with "npm run node" to run the new build under the supervisor.`,
+            copilot,
+          ),
         );
         return;
       }
@@ -1296,11 +1311,13 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // before it looks. Without this a node whose address was corrected from
       // the config page comes back on the address it was launched with.
       await updateSettings((current) => current);
-      // The Host verifies this revision when the supervisor's child reconnects.
+      // The Host verifies this revision when the supervisor's child reconnects,
+      // and repeats what became of Copilot in the report it then makes.
       report(
         "restarting",
         `Updated to ${outcome.revision}; restarting`,
         outcome.revision,
+        copilot,
       );
       if (supervised) {
         log(`Exiting for the supervisor to restart (${RESTART_MODE_ENV}=exit)`);
@@ -1334,7 +1351,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       updating = false;
     }
 
-    function report(stage: NodeUpdateStage, detail: string, revision?: string): void {
+    function report(
+      stage: NodeUpdateStage,
+      detail: string,
+      revision?: string,
+      copilot?: string,
+    ): void {
       const message = `Self-update ${stage}: ${detail}`;
       if (stage === "failed") errorLog(message);
       else log(message);
@@ -1344,6 +1366,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         stage,
         detail,
         ...(revision ? { revision } : {}),
+        ...(copilot ? { copilot } : {}),
       });
     }
   }

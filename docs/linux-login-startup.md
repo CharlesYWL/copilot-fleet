@@ -119,7 +119,8 @@ systemd-run --user --unit=copilot-fleet-update-<id> --collect ...
 ```
 
 That unit runs `scripts/self-update.mjs` outside both Fleet units: it fetches,
-resets, runs `npm install --include=dev` and `npm run build`, then
+resets, runs `npm install --include=dev` and `npm run build`, runs
+`copilot update` for the Copilot CLI the Node launches, then
 `npm run service -- host+node restart` (or `host restart` when this checkout has
 no Node unit, or its Node unit was stopped). `--collect` removes the transient unit when it finishes,
 whether it succeeded or failed. A failed build restarts nothing. Output goes to

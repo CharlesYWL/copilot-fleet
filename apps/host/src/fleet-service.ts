@@ -25,6 +25,7 @@ import {
   terminalRunStepStates,
   terminalRunStates,
   terminalSessionStates,
+  withCopilotNote,
   type BrowserMessage,
   type AgentParams,
   type FleetNode,
@@ -233,6 +234,8 @@ export class FleetService {
       previousRevision: string;
       restarting: boolean;
       expectedRevision?: string;
+      /** What the Node said became of its Copilot CLI, for the report on its return. */
+      copilot?: string;
     }
   >();
   /** Suppresses disconnect bookkeeping while the Host itself is shutting down. */
@@ -2397,7 +2400,11 @@ export class FleetService {
     nodeId: string,
     stage: NodeUpdateStage,
     detail: string,
-    status?: { updateId: string; revision?: string | undefined },
+    status?: {
+      updateId: string;
+      revision?: string | undefined;
+      copilot?: string | undefined;
+    },
   ): void {
     const update = this.updatesInFlight.get(nodeId);
     if (status && update?.updateId !== status.updateId) {
@@ -2407,6 +2414,7 @@ export class FleetService {
     if (update && stage === "restarting") {
       update.restarting = true;
       if (status?.revision) update.expectedRevision = status.revision;
+      if (status?.copilot) update.copilot = status.copilot;
     }
     // Only these two end an update. Every other stage is progress, and leaving
     // the Node on the books through them is what lets the return be recognised.
@@ -2462,7 +2470,11 @@ export class FleetService {
       return;
     }
     this.log.info({ nodeId, revision: landed }, "Node returned from its update");
-    this.publishNodeUpdate(nodeId, "up_to_date", `Updated to ${landed.slice(0, 12)}`);
+    this.publishNodeUpdate(
+      nodeId,
+      "up_to_date",
+      withCopilotNote(`Updated to ${landed.slice(0, 12)}`, update.copilot),
+    );
   }
 
   /** Records a heartbeat, publishing only when a browser would render it. */

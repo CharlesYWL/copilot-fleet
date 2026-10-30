@@ -1486,6 +1486,24 @@ describe("settleUpdateOnReconnect", () => {
     expect(browser.sent.at(-1)?.detail).toBe("Updated to abcdef123456");
   });
 
+  it("repeats what became of the node's Copilot CLI when it returns", () => {
+    const { service, node, browser, stages } = updating();
+    const updateId = node.sent.find((frame) => frame.type === "update_node")!.updateId!;
+    service.publishNodeUpdate(node.nodeId, "restarting", "Updated to abcdef123456", {
+      updateId,
+      revision: "abcdef123456",
+      copilot: "Copilot CLI updated from 1.0.104 to 1.0.105",
+    });
+
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+
+    expect(stages()).toEqual(["checking", "restarting", "up_to_date"]);
+    // The return is the report the operator reads; the restarting one flashes by.
+    expect(browser.sent.at(-1)?.detail).toBe(
+      "Updated to abcdef123456; Copilot CLI updated from 1.0.104 to 1.0.105",
+    );
+  });
+
   it("stays silent when a node reconnects for any other reason", () => {
     // Tunnels drop and machines wake up; neither is an update finishing.
     const { service, enroll } = setup("host2222");

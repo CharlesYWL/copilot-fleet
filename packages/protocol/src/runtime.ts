@@ -46,6 +46,48 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
+/**
+ * The Copilot CLI a Node launches: the one its settings name, else
+ * `FLEET_COPILOT_COMMAND`, else whichever `copilot` is first on PATH.
+ *
+ * One answer for every caller, so that the Copilot an update brings up to date
+ * is the Copilot the Node's sessions then start.
+ */
+export const resolveCopilotCommand = (
+  configured: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string => configured || env.FLEET_COPILOT_COMMAND || "copilot";
+
+/** Whether a Node runs the deterministic demo agent, which starts no Copilot. */
+export const usesMockAgent = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env.FLEET_MOCK_AGENT === "1";
+
+/**
+ * The release a Copilot CLI reports, without its build suffix:
+ * `GitHub Copilot CLI 1.0.81-12.` is `1.0.81`.
+ */
+export const copilotVersionFromOutput = (output: string): string | undefined => {
+  const match =
+    output.match(/\bGitHub Copilot(?: CLI)?\s+(\d+)\.(\d+)\.(\d+)/i) ??
+    output.match(/\b(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]+)?\b/);
+  return match ? `${match[1]}.${match[2]}.${match[3]}` : undefined;
+};
+
+export type SpawnTarget = { command: string; shell: boolean };
+
+/**
+ * How to start a command an operator names, the way a prompt on this machine
+ * would.
+ *
+ * Native executables start directly. On Windows anything else — the `.cmd`
+ * shim an npm install puts on PATH, or a bare name that may resolve to one —
+ * only runs through a shell, where a path with spaces has to be quoted.
+ */
+export const spawnTarget = (command: string): SpawnTarget => {
+  const shell = process.platform === "win32" && !/\.(?:exe|com)$/i.test(command);
+  return { command: shell && /\s/.test(command) ? `"${command}"` : command, shell };
+};
+
 function moduleDirectory(): string {
   return dirname(fileURLToPath(import.meta.url));
 }

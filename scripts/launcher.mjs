@@ -236,6 +236,10 @@ export function createLauncher({
     log(
       `the Host asked for an update; pulling, installing and building before ${display} restarts`,
     );
+    // The Copilot CLI the Node beside the Host launches, so its sessions start
+    // on the newest Copilot after the restart. An updater built before this
+    // existed has no such function, and the update leaves Copilot alone.
+    const copilotCommand = updater.localNodeCopilotCommand?.(env);
     try {
       const record = await updater.applyUpdate({
         statusFile,
@@ -246,10 +250,11 @@ export function createLauncher({
           // Often somebody's working copy as well as the running Host.
           preserveLocalChanges: true,
           ...(revisionAtStart ? { runningRevision: revisionAtStart } : {}),
+          ...(copilotCommand ? { copilotCommand } : {}),
           // The terminal is where somebody might be watching; say what runs.
-          run: (command, commandArgs, cwd) => {
+          run: (command, commandArgs, cwd, runOptions) => {
             log(`${command} ${commandArgs.join(" ")}`);
-            return updater.runCommand(command, commandArgs, cwd);
+            return updater.runCommand(command, commandArgs, cwd, runOptions);
           },
         },
         restartCommand: display,

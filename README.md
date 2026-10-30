@@ -123,7 +123,7 @@ for private-IP HTTPS/WSS between reachable Windows Dev Boxes, without Dev Tunnel
 
 **Also included:**
 
-- **[Self-updating Nodes](docs/guide/operations.md#keeping-nodes-up-to-date)**: choose **Update** or **Update all** in the Nodes tab. A supervisor restarts each Node on the new build.
+- **[Self-updating Nodes](docs/guide/operations.md#keeping-nodes-up-to-date)**: choose **Update** or **Update all** in the Nodes tab. A supervisor restarts each Node on the new build, with its Copilot CLI brought up to date as well.
 - **[Survives restarts](docs/guide/operations.md#recovering-sessions-after-a-restart)**: Nodes buffer events while disconnected, and interrupted sessions can be resumed.
 - **[Host MCP forwarding](docs/guide/mcp-and-agency.md#host-authenticated-mcp-forwarding)**: share Host-authenticated MCP servers such as Figma with every Node.
 - **[Agency mode](docs/guide/mcp-and-agency.md#agency-mode)**: for Microsoft staff, launch sessions through `agency copilot` across the fleet.

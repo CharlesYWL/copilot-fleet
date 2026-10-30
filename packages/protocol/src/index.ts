@@ -954,6 +954,16 @@ export function updateFinished(stage: UpdateStage): boolean {
 }
 
 /**
+ * A finished update's detail, followed by what became of the Copilot CLI.
+ *
+ * Carried as text beside the stage rather than as a stage of its own: a
+ * Copilot that could not update leaves the update it rode along with a success,
+ * and older Hosts and browsers reject a stage they do not know.
+ */
+export const withCopilotNote = (detail: string, copilot: string | undefined): string =>
+  copilot ? `${detail}; ${copilot}` : detail;
+
+/**
  * How the Host process was started, which decides how it comes back.
  *
  * `dev`, `dev:tunnel` and `start` run under the launcher that `npm run dev`,
@@ -1638,6 +1648,12 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     detail: z.string().default(""),
     /** Built revision expected on reconnect; absent on older Nodes. */
     revision: z.string().min(1).optional(),
+    /**
+     * What became of this machine's Copilot CLI, as one line for the operator.
+     * Sent with "restarting" so the Host can repeat it when the Node returns,
+     * which is the report the operator sees; absent on older Nodes.
+     */
+    copilot: z.string().min(1).max(1_000).optional(),
   }),
   /**
    * Retained for older peers. The Host ignores this key: a legacy connection

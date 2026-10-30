@@ -667,6 +667,7 @@ export function registerNodeGateway(
                 updateId: message.updateId,
                 stage: message.stage,
                 detail: message.detail,
+                ...(message.copilot ? { copilot: message.copilot } : {}),
               },
               "Node self-update progress",
             );

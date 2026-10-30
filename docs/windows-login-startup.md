@@ -236,7 +236,8 @@ one-off, on-demand task for the same user (`CopilotFleetSelfUpdate-...`,
 InteractiveToken, least privilege, no triggers) and starts it. That task runs
 `scripts/self-update.mjs` outside both Fleet tasks with the Host task's saved
 environment: it fetches, resets, runs `npm install --include=dev` and
-`npm run build`, then `npm run service -- host+node restart` — or `host restart`
+`npm run build`, runs `copilot update` for the Copilot CLI the Node launches,
+then `npm run service -- host+node restart` — or `host restart`
 when this checkout has no Node task or the Node task was stopped — and deletes
 itself. A failed build restarts nothing. The task being active is not Fleet
 serving in it, so the restarted Host records the result itself: once it is

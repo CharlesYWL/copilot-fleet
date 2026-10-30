@@ -9,8 +9,10 @@ import {
 } from "@fleet/protocol/updater";
 
 export {
+  describeCopilotUpdate,
   runCommand,
   type CommandResult,
+  type CopilotUpdate,
   type RunCommand,
   type UpdateOutcome,
   type UpdateReport,

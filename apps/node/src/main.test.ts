@@ -665,6 +665,10 @@ it.each([false, true])(
         beforeMutation: expect.any(Function),
         forceRebuild: false,
       });
+      // The demo agent starts no Copilot, so the update names none to update.
+      expect(vi.mocked(updateCheckout).mock.lastCall![0]).not.toHaveProperty(
+        "copilotCommand",
+      );
       expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
         type: "update_status",
         updateId: "restart-service",
@@ -1150,6 +1154,71 @@ it("refuses self-update before invoking the updater with live sessions or pendin
     expect(routerOptions.admission!.reason).toBe("");
   } finally {
     await runtime.shutdown();
+    for (const listener of process.listeners("exit"))
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+  }
+});
+
+it("brings the Copilot CLI its sessions launch up to date and reports what became of it", async () => {
+  activeSessionIds = [];
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "0");
+  vi.stubEnv("FLEET_RESTART_MODE", "exit");
+  vi.stubEnv("FLEET_COPILOT_COMMAND", "C:\\Tools\\copilot.exe");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const exit = vi.spyOn(process, "exit").mockReturnValue(undefined as never);
+  const { loadCredentials } = await import("./config.js");
+  vi.mocked(loadCredentials).mockResolvedValueOnce({
+    hostUrl: credentials.hostUrl,
+    nodeId: credentials.nodeId,
+    name: credentials.name,
+    authProtocol: "legacy-secret",
+    secret: "test-secret",
+  });
+  const { updateCheckout } = await import("./updater.js");
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  try {
+    const socket = sockets[0]!;
+    await socket.open();
+    vi.mocked(updateCheckout).mockResolvedValueOnce({
+      action: "none",
+      reason: "Already up to date",
+      copilot: { ok: false, reason: "copilot was not found" },
+    });
+    await socket.receive({ type: "update_node", updateId: "current" });
+    expect(vi.mocked(updateCheckout).mock.lastCall![0].copilotCommand).toBe(
+      "C:\\Tools\\copilot.exe",
+    );
+    expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+      type: "update_status",
+      updateId: "current",
+      stage: "up_to_date",
+      detail: "Already up to date; Copilot CLI was not updated: copilot was not found",
+    });
+
+    vi.mocked(updateCheckout).mockResolvedValueOnce({
+      action: "restart",
+      revision: "abcdef123456",
+      copilot: { ok: true, version: "1.0.105", previousVersion: "1.0.104" },
+    });
+    await socket.receive({ type: "update_node", updateId: "newer" });
+    // Carried with "restarting" for the Host to repeat when this Node returns.
+    expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+      type: "update_status",
+      updateId: "newer",
+      stage: "restarting",
+      revision: "abcdef123456",
+      copilot: "Copilot CLI updated from 1.0.104 to 1.0.105",
+    });
+    expect(exit).toHaveBeenCalledExactlyOnceWith(75);
+  } finally {
+    await runtime.shutdown();
+    vi.mocked(updateCheckout).mockReset();
     for (const listener of process.listeners("exit"))
       if (!exits.includes(listener)) process.removeListener("exit", listener);
   }
