@@ -67,6 +67,12 @@ function Get-Error($Work) { try { $null=& $Work; return $null } catch { return $
 function Get-FleetIdentity([bool]$Runtime) { $script:Events.Add("identity:$Runtime"); return $script:Sid }
 function New-FleetScheduler { return $script:Service }
 function Get-FleetNow { return $script:Clock }
+$script:InstallerBusy=0
+function Test-FleetInstallerBusy {
+  $script:Events.Add('installer')
+  if ($script:InstallerBusy -gt 0) { $script:InstallerBusy--; return $true }
+  return $false
+}
 function Start-Sleep([int]$Milliseconds) {
   $script:Clock=$script:Clock.AddMilliseconds($Milliseconds)
   $script:Events.Add("sleep:$Milliseconds")
@@ -277,6 +283,38 @@ switch ($Scenario) {
     . $Controller -Action status -Manifest $script:ManifestPath
     Require ((Get-FleetIdentity $false) -eq $script:Sid) 'Wrong native identity'
   }
+  {$_ -like 'relaunch*'} {
+    $launches=Join-Path $PSScriptRoot 'runner-launches'
+    Remove-Item -LiteralPath $launches,$config.logPath -ErrorAction SilentlyContinue
+    $plan=switch($Scenario){'relaunch'{'[75,3221225786,0]'}default{'[75]'}}
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'runner-plan.json'),$plan)
+    if($Scenario -eq 'relaunchUnproven'){function Clear-FleetLaunchJob { $script:Events.Add('clear'); return $false }}
+    $script:InstallerBusy=2
+    $code=Invoke-FleetTask run $script:ManifestPath ''
+    $count=[int][IO.File]::ReadAllText($launches)
+    $log=[IO.File]::ReadAllText($config.logPath)
+    $notices=[regex]::Matches($log,'Another program stopped host \(exit -?\d+\); relaunching it once installers finish').Count
+    switch($Scenario){
+      'relaunch' {
+        Require ($code -eq 0 -and $count -eq 3 -and $notices -eq 2) "Did not relaunch: code=$code launches=$count notices=$notices"
+        Require ($log.Contains('stopped host (exit -1073741510)')) 'Did not relaunch after STATUS_CONTROL_C_EXIT'
+        Require ((Event-Count 'sleep:30000') -eq 2 -and (Event-Count 'sleep:5000') -eq 2 -and (Event-Count 'installer') -eq 4) 'Did not wait for the installer'
+        $orphan=[int][IO.File]::ReadAllText((Join-Path $PSScriptRoot 'runner-orphan'))
+        $left=@(Get-CimInstance Win32_Process -Filter "ProcessId=$orphan" | Where-Object { $_.CommandLine -like '*setInterval*' })
+        Require ($left.Count -eq 0) 'Relaunched beside a process left by the stopped launch'
+      }
+      'relaunchLimit' {
+        Require ($code -eq 75 -and $count -eq 6 -and $notices -eq 5) "Unbounded relaunch: code=$code launches=$count notices=$notices"
+        Require ($log.Contains('stopped host 6 times within an hour; not relaunching it')) 'Exhausted relaunches were not reported'
+        Remove-Item -LiteralPath $launches
+        Require ((Invoke-FleetTask run $script:ManifestPath $script:ResultPath) -eq 75 -and [IO.File]::ReadAllText($launches) -eq '1') 'Relaunched a probe'
+      }
+      'relaunchUnproven' {
+        Require ($code -eq 75 -and $count -eq 1 -and $notices -eq 0 -and (Event-Count 'clear') -eq 1) "Relaunched without proof: code=$code launches=$count"
+        Require ($log.Contains('Processes from the stopped host did not end; not relaunching it')) 'Unproven relaunch was not reported'
+      }
+    }
+  }
   'manifestValidation' {
     $original=[IO.File]::ReadAllText($script:ManifestPath)
     foreach($field in @('accountSid','schemaVersion','taskName','controllerPath')){
@@ -367,6 +405,31 @@ describe.skipIf(process.platform !== "win32")("Windows login task backend", () =
     for (const scenario of ["host", "lifecycle", "paths"])
       expect(run(scenario, powershell7)).toBe("OK");
   });
+
+  it("relaunches a runner another program stopped, a bounded number of times", () => {
+    // Exits with each code of the scenario's plan in turn, repeating the last.
+    // The first launch also leaves a process behind, as a killed Host can.
+    writeFileSync(
+      join(directory, "fixture-runner.mjs"),
+      `
+      import {spawn} from "node:child_process";
+      import {existsSync,readFileSync,writeFileSync} from "node:fs";
+      import {dirname,join} from "node:path";
+      const root=dirname(process.argv[2]);
+      const plan=JSON.parse(readFileSync(join(root,"runner-plan.json"),"utf8"));
+      const launches=join(root,"runner-launches");
+      const count=existsSync(launches)?Number(readFileSync(launches,"utf8"))+1:1;
+      writeFileSync(launches,String(count));
+      if (count===1) {
+        const orphan=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{detached:true,stdio:"ignore",windowsHide:true});
+        writeFileSync(join(root,"runner-orphan"),String(orphan.pid));
+        orphan.unref();
+      }
+      process.exitCode=plan[Math.min(count,plan.length)-1];`,
+    );
+    for (const scenario of ["relaunch", "relaunchLimit", "relaunchUnproven"])
+      expect(run(scenario)).toBe("OK");
+  }, 90_000);
 
   it("preserves probe arguments and startup error diagnostics", () => {
     run("host");

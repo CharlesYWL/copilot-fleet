@@ -145,18 +145,37 @@ tunnel/port flags persist. A failed preparation registers no new long-running
 task; retrying after enrollment reuses the saved key for that Host.
 
 Host/Node logon delays are 15/25 seconds, with no execution time limit. Both tasks
-retain Task Scheduler's ten one-minute failure retries, but those are an outer
-fallback, not the Node's in-process recovery mechanism.
+retain Task Scheduler's ten one-minute failure retries, but Windows uses them only
+when it cannot launch the task action: a task that exits with an error code is not
+restarted. They are not the Node's recovery mechanism.
 
 The Windows Node login runner retries an unexpectedly failed supervisor **at most
-four times per task invocation**, waiting **5, 15, 30, then 60 seconds**. The budget
+four times per runner launch**, waiting **5, 15, 30, then 60 seconds**. The budget
 does not reset after a long-running attempt. Each attempt, exit code/signal,
 verified process-tree termination, backoff, and exhausted budget is recorded in
 `runtime.log` with a `[login-recovery]` prefix, independently of Task Scheduler's
-Operational history setting. Exit 0 is a clean stop, not a crash. SIGINT/SIGTERM
-stop requests cancel backoff and prevent another attempt. Missing identity/config,
-spawn failures, unsafe cleanup, or log failures halt recovery rather than looping;
-launcher failures are also reported in `runtime.log.startup.log`.
+Operational history setting. Missing identity/config, spawn failures, unsafe
+cleanup, or log failures halt recovery rather than looping; launcher failures are
+also reported in `runtime.log.startup.log`.
+
+**Installers and other programs that stop Node.js.** `stop`, `restart`, and
+`uninstall` end the task through Task Scheduler without signalling it, so Ctrl+C or
+Ctrl+Break reaching the hidden task always comes from another program. Usually that
+is Windows Restart Manager: when winget, Intune, or any MSI installer upgrades
+Node.js, it sends Ctrl+C to every running `node.exe` so the file can be replaced.
+The runner cooperates. It stops the Node's whole process tree with the same proof
+that crash recovery requires, logs `Interrupted by SIGINT from another program`,
+and exits with code 75. A Node attempt that exits cleanly or with
+`STATUS_CONTROL_C_EXIT` is handled the same way, since inside the task only another
+program's Ctrl+C ends it like that; a Host interrupted this way is also relaunched.
+The task action, which is PowerShell rather than `node.exe`, then relaunches the
+runner, as it also does when Ctrl+C ends the runner before it can respond. It first
+ends anything the stopped launch left in the task's job, as `stop` would, and
+relaunches only once nothing else remains there. It then waits 30 seconds, and for
+as long as a Windows Installer transaction is running or `node.exe` is missing, so
+it never locks files an installer is replacing. It relaunches at most five times
+within an hour, then logs the count and stays stopped until `start`, reinstall, or
+the next sign-in.
 
 Each Node supervisor attempt has its **own kill-on-close Windows Job Object**.
 Before any retry, the runner requires proof that the previous attempt's entire
@@ -178,9 +197,10 @@ If an older updater is stuck, stop the Node service, run
 `npm run service -- node start` to load this fix once.
 
 **Installing runner changes is different from updating Node application code.**
-The task runs a copied runner under `%LOCALAPPDATA%`, while the runner loads the
-Node's production build from the checkout. Existing installations must stop the
-task, update/build the checkout, and reinstall the runner to gain crash recovery:
+The task runs a copied runner and task script under `%LOCALAPPDATA%`, while the
+runner loads the Node's production build from the checkout. Existing installations
+must stop the task, update/build the checkout, and reinstall to gain runner fixes
+such as crash recovery and relaunching after installers:
 
 ```powershell
 npm run service -- node stop
@@ -188,6 +208,8 @@ npm run build:node
 npm run service -- node install --existing-node --no-build
 ```
 
+A Host task needs the same once: `npm run service -- host stop`, `npm run build`,
+then `npm run service -- host install --no-build`.
 Run these in the updated checkout, preserving any nondefault install flags such as
 `--config-port`. A plain task start/restart or a Host-triggered application update
 does not refresh the installed runner copy.

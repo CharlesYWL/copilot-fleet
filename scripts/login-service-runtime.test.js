@@ -19,7 +19,11 @@ import {
   spawnManagedProcess,
   stopProcessTree,
 } from "../apps/node/src/process-quiescence.js";
-import { ensureNodeGithubAuth, run } from "./login-service-runner.mjs";
+import {
+  ensureNodeGithubAuth,
+  RELAUNCH_EXIT_CODE,
+  run,
+} from "./login-service-runner.mjs";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal();
@@ -337,6 +341,102 @@ it.each(["SIGINT", "SIGTERM"])(
       signalSource.emit(signal);
       await result;
     }
+  },
+);
+
+const WINDOWS_INTERRUPTS = ["SIGINT", "SIGBREAK"];
+
+managedIt.each([
+  ["SIGINT", RELAUNCH_EXIT_CODE, "Interrupted by SIGINT from another program"],
+  ["SIGBREAK", RELAUNCH_EXIT_CODE, "Interrupted by SIGBREAK from another program"],
+  ["SIGTERM", 0, "Stopped by SIGTERM; no further retries"],
+])(
+  "under Windows task semantics, %s stops the verified tree and exits %i",
+  async (signal, code, message) => {
+    const manifest = fixture(
+      "node",
+      'console.log("interrupt-ready");setInterval(()=>{},1000);',
+    );
+    const signalSource = new EventEmitter();
+    const manager = managed();
+    const result = observe(
+      run(manifest, {
+        processManager: manager,
+        signalSource,
+        retryDelaysMs: [1],
+        interruptSignals: WINDOWS_INTERRUPTS,
+      }),
+    );
+    try {
+      await expect
+        .poll(() => logged(manifest), { timeout: 15_000 })
+        .toContain("interrupt-ready");
+      signalSource.emit(signal);
+      await expect(result).resolves.toEqual({ code });
+      expect(manager.spawnManagedProcess).toHaveBeenCalledTimes(1);
+      expect(logged(manifest)).toContain("process tree verified terminated");
+      expect(logged(manifest)).toContain(message);
+      expect(logged(manifest)).not.toContain("Crash recovery retry");
+      expect(signalSource.listenerCount(signal)).toBe(0);
+    } finally {
+      signalSource.emit(signal);
+      await result;
+    }
+  },
+  45_000,
+);
+
+it.each([
+  ["a clean exit", 0],
+  ["STATUS_CONTROL_C_EXIT", 0xc000013a],
+])(
+  "under Windows task semantics, asks for a relaunch after %s instead of retrying",
+  async (_name, exitCode) => {
+    const manifest = fixture("node", "");
+    const manager = fakeManager(exitCode);
+    await expect(
+      run(manifest, {
+        processManager: manager,
+        retryDelaysMs: [1],
+        interruptSignals: WINDOWS_INTERRUPTS,
+      }),
+    ).resolves.toBe(RELAUNCH_EXIT_CODE);
+    expect(manager.spawnManagedProcess).toHaveBeenCalledTimes(1);
+    expect(logged(manifest)).toContain("another program interrupted it");
+    expect(logged(manifest)).not.toContain("Crash recovery retry");
+  },
+);
+
+it("asks for a relaunch when another program interrupts the Host", async () => {
+  const manifest = fixture("host", 'console.log("host-ready");setInterval(()=>{},1000);');
+  const signalSource = new EventEmitter();
+  const result = observe(
+    run(manifest, { signalSource, interruptSignals: WINDOWS_INTERRUPTS }),
+  );
+  try {
+    await expect
+      .poll(() => logged(manifest), { timeout: 15_000 })
+      .toContain("host-ready");
+    signalSource.emit("SIGBREAK");
+    await expect(result).resolves.toEqual({ code: RELAUNCH_EXIT_CODE });
+    expect(logged(manifest)).toContain("Host interrupted by SIGBREAK");
+    expect(signalSource.listenerCount("SIGBREAK")).toBe(0);
+  } finally {
+    signalSource.emit("SIGINT");
+    await result;
+  }
+}, 30_000);
+
+// Only Windows exit statuses carry STATUS_CONTROL_C_EXIT's full 32 bits.
+it.skipIf(process.platform !== "win32")(
+  "asks for a relaunch when Ctrl+C ends the Host first",
+  async () => {
+    const manifest = fixture("host", "process.exit(0xc000013a);");
+    await expect(run(manifest)).resolves.toBe(0xc000013a);
+    await expect(run(manifest, { interruptSignals: WINDOWS_INTERRUPTS })).resolves.toBe(
+      RELAUNCH_EXIT_CODE,
+    );
+    expect(logged(manifest)).toContain("Host interrupted by Ctrl+C");
   },
 );
 

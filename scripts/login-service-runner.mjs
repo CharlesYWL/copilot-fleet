@@ -245,6 +245,29 @@ async function rotateLog(path) {
 
 const NODE_CRASH_DELAYS_MS = [5_000, 15_000, 30_000, 60_000];
 
+/**
+ * Asks the Windows login-task controller to start this runner again.
+ *
+ * `EX_TEMPFAIL`, as for the Node's update restart: another program asked the
+ * workload to stop, and it should come back once that program is done. The
+ * controller is PowerShell, not node.exe, so it can wait for an installer that
+ * is replacing node.exe. Kept in step with windows-login-task.ps1.
+ */
+export const RELAUNCH_EXIT_CODE = 75;
+
+/**
+ * Console control events, which only another program can send a Windows login task.
+ *
+ * The task has no visible console, and `stop` ends it through Task Scheduler
+ * without signalling it, so Ctrl+C or Ctrl+Break never means the operator
+ * stopped it. Windows Restart Manager sends Ctrl+C to every node.exe before an
+ * installer replaces it, as when winget upgrades Node.js.
+ */
+export const WINDOWS_INTERRUPT_SIGNALS = ["SIGINT", "SIGBREAK"];
+
+/** How Windows reports a console process that Ctrl+C or Ctrl+Break ended. */
+const STATUS_CONTROL_C_EXIT = 0xc000013a;
+
 async function existingIdleNode(manifest) {
   const config = await importNodeModule(manifest, "config.js");
   const credentials = await config.loadCredentials();
@@ -259,11 +282,17 @@ async function runRecoveringNode(
   entry,
   log,
   nodeId,
-  { processManager, retryDelaysMs = NODE_CRASH_DELAYS_MS, signalSource = process },
+  {
+    processManager,
+    retryDelaysMs = NODE_CRASH_DELAYS_MS,
+    signalSource = process,
+    interruptSignals = [],
+  },
 ) {
   const { spawnManagedProcess, stopProcessTree } =
     processManager ?? (await importNodeModule(manifest, "process-quiescence.js"));
   const output = log.createWriteStream({ autoClose: false });
+  const interrupts = new Set(interruptSignals);
   let current;
   let cancelBackoff;
   let stopping;
@@ -284,7 +313,7 @@ async function runRecoveringNode(
       );
     });
   const signals = new Map();
-  for (const signal of ["SIGINT", "SIGTERM"]) {
+  for (const signal of new Set(["SIGINT", "SIGTERM", ...interrupts])) {
     const handler = () => {
       stopping ??= signal;
       cancelBackoff?.();
@@ -374,7 +403,18 @@ async function runRecoveringNode(
         `Attempt ${attempt + 1} exited (code=${result.code ?? "none"}, signal=${result.signal ?? "none"}); process tree verified terminated.`,
       );
       if (stopping) break;
-      if (result.code === 0 && !result.signal) {
+      const clean = result.code === 0 && !result.signal;
+      if (interrupts.size > 0 && (clean || result.code === STATUS_CONTROL_C_EXIT)) {
+        // The service's stop ends the whole task without signalling it, so a
+        // Windows task Node only stops this way when another program sends it
+        // Ctrl+C, possibly before this runner receives its own.
+        await record(
+          "Node stopped without a service stop, so another program interrupted it; exiting for the login task to relaunch.",
+        );
+        exitCode = RELAUNCH_EXIT_CODE;
+        break;
+      }
+      if (clean) {
         await record("Clean exit; not restarting.");
         break;
       }
@@ -402,7 +442,15 @@ async function runRecoveringNode(
       });
       if (logError) throw logError;
     }
-    if (stopping) await record(`Stopped by ${stopping}; no further retries.`);
+    if (stopping && interrupts.has(stopping)) {
+      await record(
+        `Interrupted by ${stopping} from another program, such as an installer replacing node.exe; exiting for the login task to relaunch.`,
+      );
+      exitCode = RELAUNCH_EXIT_CODE;
+    } else if (stopping) {
+      await record(`Stopped by ${stopping}; no further retries.`);
+      exitCode = 0;
+    }
   } catch (error) {
     fatalError = error;
     if (!logError) {
@@ -441,7 +489,15 @@ async function runRecoveringNode(
   return exitCode;
 }
 
+/**
+ * Runs the workload in this login service until it stops.
+ *
+ * `interruptSignals` are signals that only another program can send, which
+ * stop the workload and return RELAUNCH_EXIT_CODE instead of ending the
+ * service; main() uses WINDOWS_INTERRUPT_SIGNALS on Windows.
+ */
 export async function run(manifest, options = {}) {
+  const { signalSource = process, interruptSignals = [] } = options;
   await loadCheckoutEnvironment(manifest);
   const nodeId = manifest.kind === "node" ? await existingIdleNode(manifest) : undefined;
   const entry =
@@ -467,17 +523,32 @@ export async function run(manifest, options = {}) {
       stdio: ["ignore", log.fd, log.fd],
       env: { ...process.env, NODE_ENV: "production" },
     });
-    for (const signal of ["SIGINT", "SIGTERM"]) {
-      const handler = () => child.kill(signal);
+    let interrupted;
+    for (const signal of new Set(["SIGINT", "SIGTERM", ...interruptSignals])) {
+      const handler = () => {
+        if (!interruptSignals.includes(signal)) return child.kill(signal);
+        interrupted ??= signal;
+        // A Windows child cannot be sent Ctrl+Break; any kill ends it.
+        child.kill("SIGTERM");
+      };
       signals.set(signal, handler);
-      process.once(signal, handler);
+      signalSource.once(signal, handler);
     }
-    return await new Promise((done, reject) => {
+    const code = await new Promise((done, reject) => {
       child.once("error", reject);
       child.once("close", (code, signal) => done(signal ? 1 : (code ?? 1)));
     });
+    // Restart Manager sends the Host its own Ctrl+C, which can end it before
+    // this runner's arrives.
+    if (interruptSignals.length > 0 && code === STATUS_CONTROL_C_EXIT)
+      interrupted ??= "Ctrl+C";
+    if (!interrupted) return code;
+    await log.write(
+      `${new Date().toISOString()} [login-start] Host interrupted by ${interrupted} from another program, such as an installer replacing node.exe; exiting for the login task to relaunch.\n`,
+    );
+    return RELAUNCH_EXIT_CODE;
   } finally {
-    for (const [signal, handler] of signals) process.removeListener(signal, handler);
+    for (const [signal, handler] of signals) signalSource.removeListener(signal, handler);
     await log.close();
   }
 }
@@ -505,7 +576,9 @@ export async function main(argv = process.argv.slice(2)) {
     await rename(temporary, resultPath);
     return result.ok ? 0 : 1;
   }
-  return run(manifest);
+  return run(manifest, {
+    interruptSignals: process.platform === "win32" ? WINDOWS_INTERRUPT_SIGNALS : [],
+  });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
