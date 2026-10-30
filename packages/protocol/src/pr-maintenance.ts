@@ -756,6 +756,12 @@ export const PrMaintenanceBatchSchema = PrMaintenancePreparedBatchSchema.extend(
   evidence: text.optional(),
   /** Why the Host could not settle this batch from its worker report automatically. */
   settlementError: text.optional(),
+  /**
+   * Who supplied the report this batch settled from: the Host reading the
+   * worker's own output, or the orchestrator's `work_report` recovery. Only a
+   * Host-read report's pushes can explain a later PR head move.
+   */
+  reportSource: z.enum(["host", "lead"]).optional(),
   cancellationRequestedAt: time.optional(),
   reason: text.optional(),
   usedMutations: count.optional(),

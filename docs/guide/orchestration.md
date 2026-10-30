@@ -277,8 +277,9 @@ resets/deletes/stashes user work or merges the PR. Workers report the remote hea
 replaced (`expectedRemoteSha`). Any other forced push, or a push that replaced an unexpected head,
 is recorded as the fact it is; the batch still settles and maintenance pauses for a person. After a
 published batch, a new PR head that equals the commit the batch reported pushing (normal or leased)
-is explained and maintenance continues; a head move nothing recorded explains pauses until a person
-checks the branch and resumes. Fleet does not check ancestry itself. Before sending a
+is explained and maintenance continues, but only when the Host read that report from the worker
+itself; a report the orchestrator recovered with `work_report` explains nothing. A head move nothing
+trusted explains pauses until a person checks the branch and resumes. Fleet does not check ancestry itself. Before sending a
 batch, a Node that advertises the checkout-precondition capability refuses it unless the checkout is
 clean and at the batch's head; an older Node is never sent maintenance work (`node_upgrade_required`).
 Either way nothing runs and a person decides; direct turns are never checked.

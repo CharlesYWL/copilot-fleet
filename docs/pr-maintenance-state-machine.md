@@ -150,7 +150,9 @@ unrelated review, and never change the task state.
   way an attention notification is raised, also for released records.
   The next observation after a published batch records `reported` (or
   `leased_rewrite`) when the new head is the commit the batch reported
-  pushing, even without `expectedRemoteSha`, and maintenance continues;
+  pushing in a report the Host read from the worker (`reportSource: host`),
+  even without `expectedRemoteSha`, and maintenance continues; a report the
+  orchestrator recovered (`reportSource: lead`) explains nothing;
   `fast_forward` needs provider compare evidence (`headLineage`). A move
   nothing recorded explains is `unverified` and pauses until a person
   resumes. Fleet does not check ancestry itself. Unknown remote changes,

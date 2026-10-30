@@ -1573,10 +1573,47 @@ describe("PR maintenance state machine scenarios", () => {
         fromSha: headSha,
         toSha: "c".repeat(40),
       });
+      expect(record.batches[0]!.reportSource).toBe("host");
       expect(record.hold).toBeUndefined();
       expect(phase(record)).toBe("reviewing");
       world.service.cancelPausedPrMaintenance();
       expect(attentions()).toEqual([]);
+    });
+
+    it("never lets a recovered report explain another writer's push", () => {
+      const t = runningBatch("recovered-1");
+      finishWith(t, "Done, but no report.");
+      const other = "e".repeat(40);
+      const recovered = checkpoint(t.record.id, {
+        kind: "work_report",
+        batchId: "recovered-1",
+        generation: get(t.record.id).generation,
+        report: reportOf(
+          reportText({
+            batchId: "recovered-1",
+            findings: [addressed],
+            effects: [
+              { kind: "push", state: "known", commit: other, expectedRemoteSha: headSha },
+            ],
+          }),
+        ),
+      });
+      expect(recovered.ok, recovered.text).toBe(true);
+      let record = get(t.record.id);
+      expect(record.batches[0]).toMatchObject({
+        state: "succeeded",
+        published: true,
+        reportSource: "lead",
+      });
+      expect(record.hold).toBeUndefined();
+      vi.setSystemTime(Date.now() + 60_000);
+      record = review(t.record.id, { headSha: other });
+      expect(record.batches[0]!.lineage).toMatchObject({
+        state: "unverified",
+        toSha: other,
+      });
+      expect(record.batches[0]!.lineage?.evidence).toMatch(/orchestrator supplied/);
+      expect(record.hold).toMatchObject({ kind: "paused", actor: "system" });
     });
 
     it("maintains a PR while its task awaits a human, without touching the task", () => {
@@ -1748,7 +1785,7 @@ describe("PR maintenance state machine scenarios", () => {
         );
         world.service.cancelPausedPrMaintenance();
         expect(attentions().map((entry) => entry.body)).toEqual([
-          expect.stringContaining("No recorded maintenance push"),
+          expect.stringContaining("No push in a worker report the Host read"),
         ]);
       });
 

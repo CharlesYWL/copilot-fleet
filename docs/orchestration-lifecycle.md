@@ -434,7 +434,7 @@ No-login mode cannot provide an authenticated maintenance authorization.
 
 This pilot supports only an already eligible mutable Orchestrator worker.
 Published/sealed/cleaned managed results and standalone ownership handoff are not
-made mutable by maintenance. Maintenance never merges. The only forced push it authorizes is a conflict-resolution rebase published with `--force-with-lease` on the exact head the batch was prepared from; any other forced push or unexpected replaced head is recorded as a fact and pauses maintenance for a person. A PR head that moves after a published batch to the commit the batch reported pushing is explained and maintenance continues; a move nothing recorded explains pauses until a person resumes. Cadence and workflow
+made mutable by maintenance. Maintenance never merges. The only forced push it authorizes is a conflict-resolution rebase published with `--force-with-lease` on the exact head the batch was prepared from; any other forced push or unexpected replaced head is recorded as a fact and pauses maintenance for a person. A PR head that moves after a published batch to the commit the batch reported pushing, in a report the Host read from the worker, is explained and maintenance continues; a move nothing recorded explains pauses until a person resumes. Cadence and workflow
 budgets are best effort, not a hard SLA or shell sandbox; production repair rates
 and the proposed repeated model evaluations have not been established by unit
 tests.

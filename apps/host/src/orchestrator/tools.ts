@@ -1568,7 +1568,6 @@ export class FleetTools {
     // Read only the batch attempt's own event range, never later direct work.
     const events = registry.batchEvents(recordId, batch.id);
     const wakeId = this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId;
-    let current = record;
     let version = expectedVersion;
     for (const settlement of workReportCheckpoints({
       batch,
@@ -1576,17 +1575,20 @@ export class FleetTools {
       workerSessionId: record.workerSessionId,
       ...(checkpoint.report !== undefined ? { report: checkpoint.report } : {}),
       ...(events ? { output: () => workerOutput(events) } : {}),
-    })) {
-      current = registry.checkpoint(
+    }))
+      version = registry.checkpoint(
         this.leadSessionId,
         recordId,
         version,
         settlement,
         wakeId,
-      );
-      version = current.version;
-    }
-    return current;
+      ).version;
+    // A report the lead supplied is a claim; it never explains a later head move.
+    return registry.markReportSource(
+      recordId,
+      batch.id,
+      checkpoint.report !== undefined ? "lead" : "host",
+    );
   }
 
   private workContract<T>(action: () => T): T {

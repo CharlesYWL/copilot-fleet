@@ -2780,6 +2780,24 @@ export class PrMaintenanceStore {
     });
   }
 
+  /**
+   * Records who supplied the report a batch settled from, once. Only a report
+   * the Host read from the worker's own output can explain a later head move.
+   */
+  markReportSource(
+    id: string,
+    batchId: string,
+    source: "host" | "lead",
+  ): PrMaintenanceRegistration {
+    return this.store.writeAtomically(() => {
+      const record = this.required(id);
+      const batch = record.batches.find((entry) => entry.id === batchId);
+      if (!batch || batch.reportSource) return record;
+      batch.reportSource = source;
+      return this.save(record);
+    });
+  }
+
   /** Records why automatic settlement from the worker report did not apply. */
   noteSettlementError(id: string, batchId: string, error: string): boolean {
     return this.store.writeAtomically(() => {
@@ -3563,10 +3581,12 @@ export class PrMaintenanceStore {
    * After a maintenance batch published, the next head Fleet observes must be
    * explained. Provider ancestry evidence (`headLineage`) decides when the
    * helper supplies it. Otherwise the move is explained when the head is the
-   * resulting commit of the batch's own last known push: a normal push, or the
-   * leased conflict rewrite (unauthorized rewrites were already held when the
-   * batch settled). Anything else is unverified. A rewrite or an unexplained
-   * move holds maintenance for a person; an explained move never does.
+   * resulting commit of the batch's own last known push, in a report the Host
+   * read from the worker itself: a normal push, or the leased conflict rewrite
+   * (unauthorized rewrites were already held when the batch settled). A report
+   * the orchestrator supplied explains nothing. Anything else is unverified. A
+   * rewrite or an unexplained move holds maintenance for a person; an
+   * explained move never does.
    */
   private recordLineage(
     record: PrMaintenanceRegistration,
@@ -3578,9 +3598,13 @@ export class PrMaintenanceStore {
       .find((entry) => entry.published && !outstanding.has(entry.state));
     const head = observation.headSha;
     if (!batch || batch.lineage || !head || head === batch.headSha) return;
-    const pushed = batch.effects
-      .filter((effect) => effect.kind === "push" && effect.state === "known")
-      .at(-1);
+    // Only a report the Host read from the worker's own output is trusted here.
+    const pushed =
+      batch.reportSource === "host"
+        ? batch.effects
+            .filter((effect) => effect.kind === "push" && effect.state === "known")
+            .at(-1)
+        : undefined;
     const lineage =
       observation.headLineage?.fromSha === batch.headSha
         ? observation.headLineage
@@ -3598,7 +3622,7 @@ export class PrMaintenanceStore {
       ? lineage.evidence
       : pushed?.headSha === head
         ? `The new head is the commit batch ${batch.id} reported pushing (${pushed.key}${pushed.force ? `, leased on ${pushed.expectedRemoteSha}` : ""}).`
-        : `No recorded maintenance push or provider evidence explains the move from ${batch.headSha} to ${head}.`;
+        : `No push in a worker report the Host read explains the move from ${batch.headSha} to ${head}${batch.reportSource === "lead" ? "; this batch settled from a report the orchestrator supplied" : ""}.`;
     batch.lineage = {
       state,
       fromSha: batch.headSha,

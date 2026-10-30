@@ -1011,6 +1011,7 @@ export class FleetService {
             version,
             checkpoint,
           ).version;
+        this.store.prMaintenance.markReportSource(record.id, batch.id, "host");
       });
       return true;
     } catch (error) {
