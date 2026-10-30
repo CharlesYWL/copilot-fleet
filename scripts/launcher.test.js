@@ -137,8 +137,13 @@ describe("launcher", () => {
       expect(await options.restart("rev-after-update")).toBeUndefined();
       return { stage: "up_to_date", detail: "Updated to rev-after-update" };
     });
+    const localNodeCopilotCommand = vi.fn(() => "C:\\Tools\\copilot.exe");
     const { instance, spawned } = launcher({
-      loadUpdater: async () => ({ applyUpdate, runCommand: vi.fn() }),
+      loadUpdater: async () => ({
+        applyUpdate,
+        localNodeCopilotCommand,
+        runCommand: vi.fn(),
+      }),
     });
     await vi.waitFor(() => expect(spawned).toHaveLength(1));
     expect(spawned[0].env).toMatchObject({
@@ -173,9 +178,12 @@ describe("launcher", () => {
           // What the running processes were started from, not whatever HEAD
           // the reset moved to: that is what decides "already up to date".
           runningRevision: "rev-at-start",
+          // The Copilot the Node started beside the Host launches.
+          copilotCommand: "C:\\Tools\\copilot.exe",
         }),
       }),
     );
+    expect(localNodeCopilotCommand).toHaveBeenCalledWith({ KEEP: "me" });
     await vi.waitFor(() =>
       expect(spawned[0].child.exitCode ?? spawned[0].child.signalCode).not.toBeNull(),
     );

@@ -119,7 +119,7 @@ worker 回去修复发现的问题。
 
 **还包括：**
 
-- **[Node 自动更新](docs/guide/operations.md#keeping-nodes-up-to-date)**：在 Nodes 页选择 **Update** 或 **Update all**，由 supervisor 在新构建上重启 Node。
+- **[Node 自动更新](docs/guide/operations.md#keeping-nodes-up-to-date)**：在 Nodes 页选择 **Update** 或 **Update all**，由 supervisor 在新构建上重启 Node，并同时把它的 Copilot CLI 更新到最新版本。
 - **[重启不丢会话](docs/guide/operations.md#recovering-sessions-after-a-restart)**：Node 断线期间缓存事件，被中断的会话可以恢复。
 - **[Host MCP 转发](docs/guide/mcp-and-agency.md#host-authenticated-mcp-forwarding)**：把 Host 上已认证的 MCP（如 Figma）共享给所有 Node。
 - **[Agency 模式](docs/guide/mcp-and-agency.md#agency-mode)**：面向微软员工，让整个 fleet 通过 `agency copilot` 启动会话。

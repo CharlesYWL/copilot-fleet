@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { errorMessage } from "@fleet/protocol";
+import { resolveCopilotCommand } from "@fleet/protocol/runtime";
 import { z } from "zod";
 import { copilotLaunchArgs, type ContextTier } from "./agents.js";
 import {
@@ -354,8 +355,7 @@ export class CopilotSessionDiscovery {
   private async openProcess(
     onUpdate: (update: acp.SessionUpdate) => void,
   ): Promise<DiscoveryConnection> {
-    const executable =
-      this.options.getCopilotCommand() || process.env.FLEET_COPILOT_COMMAND || "copilot";
+    const executable = resolveCopilotCommand(this.options.getCopilotCommand());
     const args = copilotLaunchArgs(false, this.options.getContextTier());
     const viaShell = process.platform === "win32";
     const command = viaShell && executable.includes(" ") ? `"${executable}"` : executable;

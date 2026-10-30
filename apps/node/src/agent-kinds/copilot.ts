@@ -6,6 +6,7 @@ import {
   type PromptAttachment,
   type StartupConfig,
 } from "@fleet/protocol";
+import { copilotVersionFromOutput } from "@fleet/protocol/runtime";
 import {
   agentOutput,
   resolveCopilotLaunch,
@@ -19,6 +20,8 @@ import type {
   AgentSessionHandle,
   UsageContext,
 } from "./types.js";
+
+export { copilotVersionFromOutput };
 
 export const MIN_COPILOT_ACP_AUTH_VERSION = "1.0.69";
 
@@ -72,13 +75,6 @@ export async function copilotSupportsContextTier(
     // Launch will report the underlying failure; old CLIs must not get this flag.
     return false;
   }
-}
-
-export function copilotVersionFromOutput(output: string): string | undefined {
-  const match =
-    output.match(/\bGitHub Copilot(?: CLI)?\s+(\d+)\.(\d+)\.(\d+)/i) ??
-    output.match(/\b(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]+)?\b/);
-  return match ? `${match[1]}.${match[2]}.${match[3]}` : undefined;
 }
 
 function compareVersions(left: string, right: string): number {

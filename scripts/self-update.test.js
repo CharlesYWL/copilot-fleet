@@ -332,6 +332,8 @@ describe("self-update", () => {
         buildScript: "build",
         preserveLocalChanges: true,
         runningRevision: "abc123def456",
+        // The Copilot the Node beside the Host launches comes up to date too.
+        copilotCommand: "C:\\Tools\\copilot.exe",
       });
       expect(options.restartCommand).toBe("npm run service -- host+node restart");
       // The tasks running is not Fleet serving in them; the new Host confirms.
@@ -343,7 +345,15 @@ describe("self-update", () => {
       { ...parseArguments(["run", ...valid]), statusFile: status },
       {
         root: "C:\\Fleet",
-        loadUpdater: async () => ({ applyUpdate, runCommand: vi.fn() }),
+        loadUpdater: async () => ({
+          applyUpdate,
+          // Read only once the Host task's environment is in place.
+          localNodeCopilotCommand: () => {
+            expect(process.env.FLEET_TEST_ENV).toBe("from-manifest");
+            return "C:\\Tools\\copilot.exe";
+          },
+          runCommand: vi.fn(),
+        }),
         environment: () => ({ FLEET_TEST_ENV: "from-manifest" }),
         restart,
         removeTask,
@@ -385,5 +395,25 @@ describe("self-update", () => {
     const log = readFileSync(join(status, "..", "self-update.log"), "utf8");
     expect(log).toContain("Could not load the Host task's environment (no manifest)");
     expect(log).toContain("failed: npm run build: TS2345");
+  });
+
+  it("leaves Copilot alone with an updater built before it could update Copilot", async () => {
+    const status = join(directory(), "self-update.json");
+    const applyUpdate = vi.fn(async (options) => {
+      expect(options.checkout).not.toHaveProperty("copilotCommand");
+      return { stage: "up_to_date", detail: "Already up to date" };
+    });
+    const code = await run(
+      { ...parseArguments(["run", ...valid]), statusFile: status },
+      {
+        root: "C:\\Fleet",
+        loadUpdater: async () => ({ applyUpdate, runCommand: vi.fn() }),
+        environment: () => ({}),
+        restart: vi.fn(),
+        removeTask: vi.fn(),
+      },
+    );
+    expect(code).toBe(0);
+    expect(applyUpdate).toHaveBeenCalledOnce();
   });
 });

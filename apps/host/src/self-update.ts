@@ -8,6 +8,7 @@ import {
   MUTUAL_AUTH_PROTOCOL,
   errorMessage,
   updateFinished,
+  withCopilotNote,
   type FleetSession,
   type HostLaunchMode,
   type HostUpdateStatus,
@@ -745,7 +746,7 @@ export class HostSelfUpdate {
     }
     return this.finish(record, {
       stage: "up_to_date",
-      detail: `Updated to ${record.revision}`,
+      detail: withCopilotNote(`Updated to ${record.revision}`, record.copilot),
     });
   }
 

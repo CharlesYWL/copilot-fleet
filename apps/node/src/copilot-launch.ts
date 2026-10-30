@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { resolveCopilotCommand, spawnTarget } from "@fleet/protocol/runtime";
 
 export type CopilotLaunch = {
   command: string;
@@ -72,7 +73,7 @@ export async function resolveCopilotLaunch(
     }
   }
   return {
-    command: copilotCommand || process.env.FLEET_COPILOT_COMMAND || "copilot",
+    command: resolveCopilotCommand(copilotCommand),
     args: [],
     provider: "copilot",
     ...(agencyMode
@@ -85,16 +86,7 @@ export async function resolveCopilotLaunch(
 }
 
 /** Native executables do not need a shell; npm's Windows shims do. */
-export function copilotSpawnTarget(command: string): {
-  command: string;
-  shell: boolean;
-} {
-  const shell = process.platform === "win32" && !/\.(?:exe|com)$/i.test(command);
-  return {
-    command: shell && /\s/.test(command) ? `"${command}"` : command,
-    shell,
-  };
-}
+export const copilotSpawnTarget = spawnTarget;
 
 /** Bounded metadata probes; never invoke an interactive agent command here. */
 export function agentOutput(

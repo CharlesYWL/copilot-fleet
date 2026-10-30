@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -11,15 +11,25 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve, win32 } from "node:path";
+import { parseEnv } from "node:util";
 import { z } from "zod";
 import {
   UpdateStageSchema,
   errorMessage,
   updateFinished,
+  withCopilotNote,
   type UpdateStage,
 } from "./index.js";
-import { isProcessAlive } from "./runtime.js";
+import {
+  copilotVersionFromOutput,
+  envFilePath,
+  isProcessAlive,
+  nodeConfigDirectory,
+  resolveCopilotCommand,
+  spawnTarget,
+  usesMockAgent,
+} from "./runtime.js";
 
 /**
  * Bringing a Fleet checkout up to date: the one procedure the Host and every
@@ -38,14 +48,88 @@ export type UpdateReport = (stage: UpdateStage, detail: string) => void;
 
 export type CommandResult = { ok: boolean; output: string };
 
+export type RunCommandOptions = {
+  /**
+   * Stop the command after this long and report it as failed. Unbounded when
+   * absent: an install or a build takes as long as it takes.
+   */
+  timeoutMs?: number;
+};
+
 export type RunCommand = (
   command: string,
   args: readonly string[],
   cwd: string,
+  options?: RunCommandOptions,
 ) => Promise<CommandResult>;
 
 /** What may be joined into a Windows command line: words, never shell syntax. */
 const SHELL_SAFE = /^[A-Za-z0-9:._=-]+$/;
+
+/**
+ * An executable path an operator configured, which may hold spaces, a drive
+ * colon and letters of any script, but nothing cmd.exe would act on — no `&`,
+ * `|`, `<`, `>`, `^`, `%`, `!` or quote. `spawnTarget` quotes it.
+ */
+const SHELL_SAFE_PATH = /^[\p{L}\p{N}_ :.\\/()+~'@#$-]+$/u;
+
+type Started = ChildProcess | { refused: string };
+
+/** Joins a command line for a shell, refusing anything the shell would act on. */
+function throughShell(
+  command: string,
+  args: readonly string[],
+  options: SpawnOptions,
+): Started {
+  // Joined rather than passed alongside the command because Node deprecates
+  // the combination (DEP0190). The arguments are literals from this module
+  // plus a script name, and anything else is refused outright.
+  if (!args.every((argument) => SHELL_SAFE.test(argument))) {
+    return { refused: `refusing to pass "${args.join(" ")}" through a shell` };
+  }
+  return spawn([command, ...args].join(" "), { ...options, shell: true });
+}
+
+/**
+ * Starts one update step.
+ *
+ * `npm.cmd` is a batch file, which Windows will only run through a shell; git
+ * is a real executable and never goes near one. That matters: git's arguments
+ * include the name of the upstream branch, and a ref may contain `&` or `|` —
+ * joined into a command line, that is a second command. Anything else is a
+ * command an operator configured, such as their Copilot CLI, started the way
+ * the Node starts it.
+ */
+function startCommand(command: string, args: readonly string[], cwd: string): Started {
+  const options: SpawnOptions = { cwd, windowsHide: true };
+  if (command === "git") return spawn(command, [...args], options);
+  if (command === "npm") {
+    return process.platform === "win32"
+      ? throughShell("npm.cmd", args, options)
+      : spawn(command, [...args], options);
+  }
+  // Nobody is at its prompt, so it is given nothing to wait on.
+  const unattended: SpawnOptions = { ...options, stdio: ["ignore", "pipe", "pipe"] };
+  const target = spawnTarget(command);
+  if (!target.shell) return spawn(target.command, [...args], unattended);
+  if (!SHELL_SAFE_PATH.test(command)) {
+    return { refused: `refusing to run "${command}" through a shell` };
+  }
+  return throughShell(target.command, args, unattended);
+}
+
+/** Stops a step and whatever it started: a shell's child outlives the shell. */
+function stopTree(child: ChildProcess): void {
+  if (process.platform !== "win32" || child.pid === undefined) {
+    child.kill();
+    return;
+  }
+  spawn(
+    win32.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"),
+    ["/PID", String(child.pid), "/T", "/F"],
+    { windowsHide: true, stdio: "ignore" },
+  ).once("error", () => child.kill());
+}
 
 /**
  * Runs one update step without blocking the event loop.
@@ -54,35 +138,46 @@ const SHELL_SAFE = /^[A-Za-z0-9:._=-]+$/;
  * `npm install`, which outlasts the Host's heartbeat timeout: the Host decided
  * the Node had died and closed the socket mid-update, so the update it had just
  * asked for reported nothing and looked like a crash.
+ *
+ * A step that outlives its `timeoutMs` is stopped and reported at once, rather
+ * than when its output closes: a shell's grandchild can hold that open long
+ * after the shell itself is gone.
  */
-export const runCommand: RunCommand = (command, args, cwd) =>
+export const runCommand: RunCommand = (command, args, cwd, { timeoutMs } = {}) =>
   new Promise((done) => {
-    // `npm.cmd` is a batch file, which Windows will only run through a shell;
-    // git is a real executable and never goes near one. That matters: git's
-    // arguments include the name of the upstream branch, and a ref may contain
-    // `&` or `|` — joined into a command line, that is a second command.
-    //
-    // npm's arguments are joined rather than passed alongside the command
-    // because Node deprecates the combination (DEP0190). They are literals from
-    // this module plus a script name, and anything else is refused outright.
-    const viaShell = process.platform === "win32" && command === "npm";
-    if (viaShell && !args.every((argument) => SHELL_SAFE.test(argument))) {
-      done({ ok: false, output: `refusing to pass "${args.join(" ")}" through a shell` });
+    const child = startCommand(command, args, cwd);
+    if ("refused" in child) {
+      done({ ok: false, output: child.refused });
       return;
     }
-    const child = viaShell
-      ? spawn(["npm.cmd", ...args].join(" "), { cwd, shell: true, windowsHide: true })
-      : spawn(command, [...args], { cwd, windowsHide: true });
     let output = "";
     const collect = (chunk: Buffer) => {
       output += chunk.toString("utf8");
       // A failing install can print megabytes; only the tail is ever shown.
       if (output.length > 64_000) output = output.slice(-32_000);
     };
+    const timer =
+      timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            stopTree(child);
+            const text = output.trim();
+            done({
+              ok: false,
+              output: `timed out after ${timeoutMs / 1_000}s${text ? `: ${text}` : ""}`,
+            });
+          }, timeoutMs);
+    timer?.unref();
     child.stdout?.on("data", collect);
     child.stderr?.on("data", collect);
-    child.once("error", (error) => done({ ok: false, output: error.message }));
-    child.once("close", (code) => done({ ok: code === 0, output: output.trim() }));
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      done({ ok: false, output: error.message });
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      done({ ok: code === 0, output: output.trim() });
+    });
   });
 
 export type UpdateOptions = {
@@ -106,11 +201,149 @@ export type UpdateOptions = {
    * before the reset, rather than only when the update was asked for.
    */
   preserveLocalChanges?: boolean;
+  /**
+   * The Copilot CLI to bring up to date once the build has succeeded, the way
+   * this installation's Node launches it. Absent: Copilot is left alone.
+   */
+  copilotCommand?: string;
 };
 
+/**
+ * What became of the Copilot CLI an update was asked to bring up to date.
+ *
+ * Never a reason to stop: a Copilot that could not update keeps running the
+ * version it had, and the update reports that alongside the Fleet result.
+ */
+export type CopilotUpdate =
+  { ok: true; version: string; previousVersion?: string } | { ok: false; reason: string };
+
+/** Longest a Copilot download may take before the update moves on without it. */
+export const COPILOT_UPDATE_TIMEOUT_MS = 5 * 60_000;
+/** Longest `copilot --version` may take; it answers in under a second. */
+const COPILOT_VERSION_TIMEOUT_MS = 30_000;
+
+/**
+ * Copilot's own switch for its updates. An operator who set it to `false` has
+ * pinned the Copilot this machine runs, and an update leaves it there.
+ */
+export const COPILOT_AUTO_UPDATE_ENV = "COPILOT_AUTO_UPDATE";
+
+/** How spawn, and cmd.exe on Windows, say there is no such command. */
+const NOT_FOUND = /\bENOENT\b|is not recognized as an internal or external command/i;
+
+/** The last thing a failed command printed, which is where it says why. */
+const lastLine = (output: string): string =>
+  output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1)
+    ?.slice(-300) ?? "";
+
+/**
+ * Brings this machine's Copilot CLI up to date with `copilot update`.
+ *
+ * That command downloads the newest release into Copilot's own package cache,
+ * and the next Copilot process starts on it — every session after this update.
+ * Standalone installations (WinGet, Homebrew, the install script) do this; one
+ * that runs Copilot as JavaScript from npm cannot, says so, and stays a manual
+ * `npm install -g @github/copilot`.
+ *
+ * The version is read again afterwards rather than taken from the command's
+ * words, because the version that now starts is the fact that matters.
+ */
+export async function updateCopilotCli(
+  command: string,
+  cwd: string,
+  run: RunCommand = runCommand,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<CopilotUpdate> {
+  if (env[COPILOT_AUTO_UPDATE_ENV]?.toLowerCase() === "false") {
+    return {
+      ok: false,
+      reason: `${COPILOT_AUTO_UPDATE_ENV}=false pins the version on this machine`,
+    };
+  }
+  const readVersion = () =>
+    run(command, ["--version"], cwd, { timeoutMs: COPILOT_VERSION_TIMEOUT_MS });
+  const before = await readVersion();
+  if (!before.ok) {
+    return {
+      ok: false,
+      reason: NOT_FOUND.test(before.output)
+        ? `${command} was not found`
+        : `${command} --version: ${lastLine(before.output) || "failed"}`,
+    };
+  }
+  const updated = await run(command, ["update"], cwd, {
+    timeoutMs: COPILOT_UPDATE_TIMEOUT_MS,
+  });
+  if (!updated.ok) {
+    const npmInstall = /running js directly/i.test(updated.output)
+      ? " (an npm installation; update it with npm install -g @github/copilot)"
+      : "";
+    return {
+      ok: false,
+      reason: `${command} update: ${lastLine(updated.output) || "failed"}${npmInstall}`,
+    };
+  }
+  const version = copilotVersionFromOutput((await readVersion()).output);
+  if (!version) {
+    return { ok: false, reason: `${command} --version did not report a version` };
+  }
+  const previousVersion = copilotVersionFromOutput(before.output);
+  return { ok: true, version, ...(previousVersion ? { previousVersion } : {}) };
+}
+
+/** One line for an operator: the Copilot CLI now in use, or why it is not newer. */
+export function describeCopilotUpdate(result: CopilotUpdate): string {
+  if (!result.ok) return `Copilot CLI was not updated: ${result.reason}`;
+  if (!result.previousVersion) return `Copilot CLI is on ${result.version}`;
+  return result.previousVersion === result.version
+    ? `Copilot CLI ${result.version} is the latest`
+    : `Copilot CLI updated from ${result.previousVersion} to ${result.version}`;
+}
+
+/**
+ * The Copilot CLI the Node on this machine launches, for an updater that runs
+ * outside it — the launcher, or the one-off task beside a login service — or
+ * undefined when that Node runs the demo agent and launches none.
+ *
+ * Resolved the way that Node resolves it: its saved settings, then
+ * `FLEET_COPILOT_COMMAND` from the environment or the checkout's `.env` (which
+ * the Node loads and these updaters do not), then `copilot` on PATH.
+ */
+export function localNodeCopilotCommand(
+  env: NodeJS.ProcessEnv = process.env,
+  envFile: string = envFilePath(),
+): string | undefined {
+  const effective = { ...readEnvFile(envFile), ...env };
+  if (usesMockAgent(effective)) return undefined;
+  try {
+    const saved = JSON.parse(
+      readFileSync(join(nodeConfigDirectory(effective), "settings.json"), "utf8"),
+    ) as { copilotCommand?: unknown };
+    if (typeof saved.copilotCommand === "string") {
+      return resolveCopilotCommand(saved.copilotCommand, effective);
+    }
+  } catch {
+    // No Node has saved settings here; it would fall back the same way.
+  }
+  return resolveCopilotCommand(undefined, effective);
+}
+
+/** A `.env` file's variables, or none when there is no readable file. */
+function readEnvFile(path: string): NodeJS.ProcessEnv {
+  try {
+    return parseEnv(readFileSync(path, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
 export type UpdateOutcome =
-  | { action: "restart"; revision: string }
-  | { action: "none"; reason: string }
+  | { action: "restart"; revision: string; copilot?: CopilotUpdate }
+  | { action: "none"; reason: string; copilot?: CopilotUpdate }
   | { action: "failed"; reason: string };
 
 /** Names the branch this checkout tracks, the same one `git pull` would merge. */
@@ -282,6 +515,12 @@ export function describeUncommittedChanges(repoRoot: string, files: string[]): s
  * restarted here at all: a build that fails leaves the caller's processes
  * running the code they already had, which is the one property every caller
  * depends on.
+ *
+ * Given a `copilotCommand`, the Copilot CLI is brought up to date as the last
+ * step — after a successful build, or on a checkout that was already current —
+ * so the sessions this installation starts next run the newest Copilot as well
+ * as the newest Fleet. Its result rides along with the outcome; it never turns
+ * a good Fleet update into a failed one.
  */
 export function updateCheckout({
   repoRoot,
@@ -292,6 +531,7 @@ export function updateCheckout({
   beforeMutation,
   forceRebuild = false,
   preserveLocalChanges = false,
+  copilotCommand,
 }: UpdateOptions): Promise<UpdateOutcome> {
   return (async () => {
     report("checking", "Inspecting the checkout");
@@ -327,6 +567,16 @@ export function updateCheckout({
   })();
 
   async function updateLocked(): Promise<UpdateOutcome> {
+    const fleet = await updateFleet();
+    if (fleet.action === "failed" || copilotCommand === undefined) return fleet;
+    // Reported under an existing stage: an older Host or browser rejects one
+    // it does not know, and this is still the work before the restart.
+    report("building", `${copilotCommand} update`);
+    const copilot = await updateCopilotCli(copilotCommand, repoRoot, run);
+    return { ...fleet, copilot };
+  }
+
+  async function updateFleet(): Promise<UpdateOutcome> {
     const before = await run("git", ["rev-parse", "HEAD"], repoRoot);
     if (!before.ok) {
       return { action: "failed", reason: `git rev-parse: ${before.output}` };
@@ -429,6 +679,12 @@ export const UpdateRecordSchema = z.object({
   confirmRestart: z.enum(["updater", "host"]).default("updater"),
   /** The process doing the work, so a reader can tell a live update from a dead one. */
   updaterPid: z.number().int().positive().optional(),
+  /**
+   * What became of the Copilot CLI, as one line for the operator, once the
+   * update has tried it. Kept apart from `detail` so the Host that confirms a
+   * restart can still say it after replacing the detail with its own.
+   */
+  copilot: z.string().optional(),
 });
 export type UpdateRecord = z.infer<typeof UpdateRecordSchema>;
 
@@ -549,12 +805,17 @@ export async function applyUpdate({
     } catch (error) {
       outcome = { action: "failed", reason: errorMessage(error) };
     }
-    if (outcome.action === "none") {
-      write({ stage: "up_to_date", detail: outcome.reason });
-      return record;
-    }
     if (outcome.action === "failed") {
       write({ stage: "failed", detail: outcome.reason });
+      return record;
+    }
+    const copilot = outcome.copilot ? describeCopilotUpdate(outcome.copilot) : undefined;
+    if (outcome.action === "none") {
+      write({
+        stage: "up_to_date",
+        detail: withCopilotNote(outcome.reason, copilot),
+        ...(copilot ? { copilot } : {}),
+      });
       return record;
     }
 
@@ -563,6 +824,7 @@ export async function applyUpdate({
       detail: `Updated to ${outcome.revision}; restarting with ${restartCommand}`,
       revision: outcome.revision,
       restartRequestedAt: now().toISOString(),
+      ...(copilot ? { copilot } : {}),
     });
     // Confirmation belongs to the new Host; a heartbeat must not replace its outcome.
     if (confirmRestart === "host") clearInterval(heartbeat);
@@ -578,7 +840,10 @@ export async function applyUpdate({
     } else if (failure) {
       write({ stage: "failed", detail: failure });
     } else if (confirmRestart === "updater") {
-      write({ stage: "up_to_date", detail: `Updated to ${outcome.revision}` });
+      write({
+        stage: "up_to_date",
+        detail: withCopilotNote(`Updated to ${outcome.revision}`, copilot),
+      });
     }
     return record;
   }

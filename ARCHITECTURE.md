@@ -856,6 +856,19 @@ stop; without the distinction, Ctrl-C would bring the Node straight back. The
 built-in supervisor restarts on that status and forwards every other exit, so a
 crash stays a crash instead of becoming a loop.
 
+The same update also runs `copilot update` for the Copilot CLI the Node
+launches, as its last step before the restart: after a successful build, or on
+a checkout that was already current. It is reported, never enforced. Copilot
+downloads a release into its own package cache and the next process starts on
+it, so the restart that follows is what puts every new session on it; a Copilot
+that is missing, installed with npm, pinned by `COPILOT_AUTO_UPDATE=false`, or
+offline keeps its version and the Fleet update carries on regardless. The
+result travels with the `restarting` report and the Host repeats it when the
+Node returns, because that is the report the operator reads. The step reports
+progress under the existing `building` stage and its result as text beside the
+stage: a Host or browser validates update stages against its own copy of the
+enum, and one that predates a new stage would reject it.
+
 Nodes running Sessions are refused rather than queued. An update restarts the
 process and every agent it hosts dies with it, so the choice of when to lose
 that work belongs to a person, not to a retry loop.

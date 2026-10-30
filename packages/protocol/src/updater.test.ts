@@ -12,12 +12,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { UpdateStage } from "./index.js";
 import {
   CHECKOUT_LOCK,
+  COPILOT_AUTO_UPDATE_ENV,
+  COPILOT_UPDATE_TIMEOUT_MS,
   applyUpdate,
   checkoutLockHolder,
+  describeCopilotUpdate,
+  localNodeCopilotCommand,
   lockCheckout,
   readUpdateRecord,
   runCommand,
   updateCheckout,
+  updateCopilotCli,
   writeUpdateRecord,
   type CommandResult,
   type UpdateRecord,
@@ -304,6 +309,259 @@ describe("updateCheckout", () => {
   });
 });
 
+describe("updateCheckout with a Copilot CLI", () => {
+  const buildScript = "build:node";
+  const copilot = "copilot";
+  const version = (release: string) => ok(`GitHub Copilot CLI ${release}.`);
+
+  it("updates Copilot after the build, before anything restarts", async () => {
+    const stages: [UpdateStage, string][] = [];
+    const { run, calls } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
+      "copilot --version": [version("1.0.104"), version("1.0.105")],
+    });
+    const outcome = await updateCheckout({
+      repoRoot: gitCheckout(),
+      buildScript,
+      report: (stage, detail) => stages.push([stage, detail]),
+      run,
+      copilotCommand: copilot,
+    });
+
+    expect(outcome).toEqual({
+      action: "restart",
+      revision: "new222222222",
+      copilot: { ok: true, version: "1.0.105", previousVersion: "1.0.104" },
+    });
+    // After the build, so a Fleet update that fails changes nothing on the machine.
+    expect(calls.slice(-4)).toEqual([
+      "npm run build:node",
+      "copilot --version",
+      "copilot update",
+      "copilot --version",
+    ]);
+    // An existing stage: older Hosts and browsers reject one they do not know.
+    expect(stages.at(-1)).toEqual(["building", "copilot update"]);
+  });
+
+  it("still updates Copilot when the checkout was already current", async () => {
+    const { run, calls } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("same11111111"), ok("same11111111")],
+      "copilot --version": [version("1.0.105"), version("1.0.105")],
+    });
+    const outcome = await updateCheckout({
+      repoRoot: gitCheckout(),
+      buildScript,
+      report: () => {},
+      run,
+      copilotCommand: copilot,
+    });
+
+    expect(outcome).toEqual({
+      action: "none",
+      reason: "Already up to date",
+      copilot: { ok: true, version: "1.0.105", previousVersion: "1.0.105" },
+    });
+    expect(calls).toContain("copilot update");
+    expect(calls.some((call) => call.startsWith("npm "))).toBe(false);
+  });
+
+  it("leaves Copilot alone when the Fleet update failed", async () => {
+    const { run, calls } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
+      "npm run build:node": [{ ok: false, output: "TS2345" }],
+    });
+    const outcome = await updateCheckout({
+      repoRoot: gitCheckout(),
+      buildScript,
+      report: () => {},
+      run,
+      copilotCommand: copilot,
+    });
+
+    expect(outcome).toEqual({ action: "failed", reason: "npm run build:node: TS2345" });
+    expect(calls.some((call) => call.startsWith("copilot"))).toBe(false);
+  });
+
+  it("does not let a Copilot that could not update fail the Fleet update", async () => {
+    const { run } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
+      "copilot --version": [version("1.0.104")],
+      "copilot update": [
+        {
+          ok: false,
+          output: "Checking for updates...\nError during update: TypeError: terminated",
+        },
+      ],
+    });
+    const outcome = await updateCheckout({
+      repoRoot: gitCheckout(),
+      buildScript,
+      report: () => {},
+      run,
+      copilotCommand: copilot,
+    });
+
+    expect(outcome).toEqual({
+      action: "restart",
+      revision: "new222222222",
+      copilot: {
+        ok: false,
+        reason: "copilot update: Error during update: TypeError: terminated",
+      },
+    });
+  });
+
+  it("is not asked about Copilot unless the caller names one", async () => {
+    const { run, calls } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
+    });
+    const outcome = await updateCheckout({
+      repoRoot: gitCheckout(),
+      buildScript,
+      report: () => {},
+      run,
+    });
+    expect(outcome).toEqual({ action: "restart", revision: "new222222222" });
+    expect(calls.some((call) => call.startsWith("copilot"))).toBe(false);
+  });
+});
+
+describe("updateCopilotCli", () => {
+  const root = tmpdir();
+  const version = (release: string) => ok(`GitHub Copilot CLI ${release}.`);
+
+  it("reports the version that now starts, and the one it replaced", async () => {
+    const timeouts: (number | undefined)[] = [];
+    const { run } = scriptedRun({
+      "C:\\Tools\\copilot.exe --version": [version("1.0.104-3"), version("1.0.105")],
+    });
+    const result = await updateCopilotCli(
+      "C:\\Tools\\copilot.exe",
+      root,
+      (command, args, cwd, options) => {
+        timeouts.push(options?.timeoutMs);
+        return run(command, args, cwd);
+      },
+      {},
+    );
+    expect(result).toEqual({ ok: true, version: "1.0.105", previousVersion: "1.0.104" });
+    // Bounded: an unattended update must not hang on a download or a prompt.
+    expect(timeouts).toHaveLength(3);
+    expect(timeouts.every((timeout) => timeout !== undefined && timeout > 0)).toBe(true);
+    expect(timeouts[1]).toBe(COPILOT_UPDATE_TIMEOUT_MS);
+  });
+
+  it("says when there is no Copilot to update", async () => {
+    const { run, calls } = scriptedRun({
+      "copilot --version": [
+        {
+          ok: false,
+          output:
+            "'copilot' is not recognized as an internal or external command,\noperable program or batch file.",
+        },
+      ],
+    });
+    expect(await updateCopilotCli("copilot", root, run, {})).toEqual({
+      ok: false,
+      reason: "copilot was not found",
+    });
+    expect(calls).toEqual(["copilot --version"]);
+  });
+
+  it("points an npm installation at npm, which is the only thing that updates it", async () => {
+    const { run } = scriptedRun({
+      "copilot --version": [version("1.0.104")],
+      "copilot update": [
+        { ok: false, output: "Update is not supported when running js directly." },
+      ],
+    });
+    const result = await updateCopilotCli("copilot", root, run, {});
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.reason).toContain("npm install -g @github/copilot");
+  });
+
+  it("leaves a Copilot its operator pinned where it is", async () => {
+    const { run, calls } = scriptedRun({});
+    const result = await updateCopilotCli("copilot", root, run, {
+      [COPILOT_AUTO_UPDATE_ENV]: "False",
+    });
+    expect(result).toEqual({
+      ok: false,
+      reason: "COPILOT_AUTO_UPDATE=false pins the version on this machine",
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it("does not claim a version it could not read afterwards", async () => {
+    const { run } = scriptedRun({
+      "copilot --version": [version("1.0.104"), ok("")],
+    });
+    expect(await updateCopilotCli("copilot", root, run, {})).toEqual({
+      ok: false,
+      reason: "copilot --version did not report a version",
+    });
+  });
+});
+
+describe("describeCopilotUpdate", () => {
+  it("says what changed, what stayed current, and why nothing did", () => {
+    expect(
+      describeCopilotUpdate({ ok: true, version: "1.0.105", previousVersion: "1.0.104" }),
+    ).toBe("Copilot CLI updated from 1.0.104 to 1.0.105");
+    expect(
+      describeCopilotUpdate({ ok: true, version: "1.0.105", previousVersion: "1.0.105" }),
+    ).toBe("Copilot CLI 1.0.105 is the latest");
+    expect(describeCopilotUpdate({ ok: true, version: "1.0.105" })).toBe(
+      "Copilot CLI is on 1.0.105",
+    );
+    expect(describeCopilotUpdate({ ok: false, reason: "copilot was not found" })).toBe(
+      "Copilot CLI was not updated: copilot was not found",
+    );
+  });
+});
+
+describe("localNodeCopilotCommand", () => {
+  /** A Node config directory and an empty `.env`, as a fresh machine has. */
+  function machine(settings?: Record<string, unknown>, envFileText = "") {
+    const config = temporary("fleet-node-config-");
+    if (settings) writeFileSync(join(config, "settings.json"), JSON.stringify(settings));
+    const envFile = join(temporary("fleet-env-"), ".env");
+    writeFileSync(envFile, envFileText);
+    return { env: { FLEET_NODE_CONFIG_DIR: config }, envFile };
+  }
+
+  it("takes the Copilot the Node's saved settings name", () => {
+    const { env, envFile } = machine({ copilotCommand: "C:\\Tools\\copilot.exe" });
+    expect(
+      localNodeCopilotCommand({ ...env, FLEET_COPILOT_COMMAND: "other" }, envFile),
+    ).toBe("C:\\Tools\\copilot.exe");
+  });
+
+  it("falls back as the Node does: environment, then .env, then PATH", () => {
+    const blank = machine({ copilotCommand: "" }, "FLEET_COPILOT_COMMAND=from-dotenv\n");
+    expect(
+      localNodeCopilotCommand(
+        { ...blank.env, FLEET_COPILOT_COMMAND: "from-env" },
+        blank.envFile,
+      ),
+    ).toBe("from-env");
+    expect(localNodeCopilotCommand(blank.env, blank.envFile)).toBe("from-dotenv");
+    const fresh = machine();
+    expect(localNodeCopilotCommand(fresh.env, fresh.envFile)).toBe("copilot");
+  });
+
+  it("names none for a Node that runs the demo agent", () => {
+    const { env, envFile } = machine(undefined, "FLEET_MOCK_AGENT=1\n");
+    expect(localNodeCopilotCommand(env, envFile)).toBeUndefined();
+  });
+});
+
 describe("update records", () => {
   const record = (changes: Partial<UpdateRecord> = {}): UpdateRecord => ({
     updateId: "update-1",
@@ -466,6 +724,67 @@ describe("applyUpdate", () => {
       },
     });
     expect(final).toMatchObject({ stage: "failed", detail: "spawn EPERM" });
+  });
+
+  it("records what became of Copilot for the Host that confirms the restart", async () => {
+    const statusFile = join(temporary(), "self-update.json");
+    const { run } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
+      "copilot --version": [
+        ok("GitHub Copilot CLI 1.0.104."),
+        ok("GitHub Copilot CLI 1.0.105."),
+      ],
+    });
+    const final = await applyUpdate({
+      statusFile,
+      updateId: "update-copilot",
+      checkout: {
+        repoRoot: gitCheckout(),
+        buildScript: "build",
+        copilotCommand: "copilot",
+        run,
+      },
+      restartCommand: "npm run dev",
+      confirmRestart: "host",
+      restart: async () => undefined,
+    });
+    // Apart from the detail, which the confirming Host replaces with its own.
+    expect(final).toMatchObject({
+      stage: "restarting",
+      copilot: "Copilot CLI updated from 1.0.104 to 1.0.105",
+    });
+    expect(readUpdateRecord(statusFile)?.copilot).toBe(final.copilot);
+  });
+
+  it("says what became of Copilot when there was no Fleet update to restart for", async () => {
+    const statusFile = join(temporary(), "self-update.json");
+    const { run } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("same11111111111"), ok("same11111111111")],
+      "copilot --version": [ok("GitHub Copilot CLI 1.0.104.")],
+      "copilot update": [{ ok: false, output: "Error during update: offline" }],
+    });
+    const restart = vi.fn(async () => undefined);
+    const final = await applyUpdate({
+      statusFile,
+      updateId: "update-current",
+      checkout: {
+        repoRoot: gitCheckout(),
+        buildScript: "build",
+        runningRevision: "same11111111",
+        copilotCommand: "copilot",
+        run,
+      },
+      restartCommand: "npm start",
+      restart,
+    });
+    expect(restart).not.toHaveBeenCalled();
+    expect(final).toMatchObject({
+      stage: "up_to_date",
+      detail:
+        "Already up to date; Copilot CLI was not updated: copilot update: Error during update: offline",
+    });
   });
 });
 
@@ -645,6 +964,41 @@ describe.runIf(process.platform === "win32")("runCommand on Windows", () => {
       ok: false,
       output: 'refusing to pass "run build&calc" through a shell',
     });
+  });
+
+  it("will not hand a shell a configured command it would act on", async () => {
+    await expect(
+      runCommand("C:\\Tools\\copilot.cmd & calc", ["update"], tmpdir()),
+    ).resolves.toEqual({
+      ok: false,
+      output: 'refusing to run "C:\\Tools\\copilot.cmd & calc" through a shell',
+    });
+  });
+
+  it("runs a configured shim whose path has spaces in it", async () => {
+    const directory = join(temporary("fleet copilot "), "bin dir");
+    mkdirSync(directory);
+    const shim = join(directory, "copilot.cmd");
+    writeFileSync(shim, "@echo GitHub Copilot CLI %1\r\n");
+    await expect(runCommand(shim, ["--version"], tmpdir())).resolves.toEqual({
+      ok: true,
+      output: "GitHub Copilot CLI --version",
+    });
+  });
+});
+
+describe("runCommand time limits", () => {
+  it("stops a step that outlives its limit and says so", async () => {
+    const started = Date.now();
+    const result = await runCommand(
+      process.execPath,
+      ["-e", "console.log('waiting'); setTimeout(() => {}, 60000)"],
+      tmpdir(),
+      { timeoutMs: 1_000 },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.output).toMatch(/^timed out after 1s/);
+    expect(Date.now() - started).toBeLessThan(15_000);
   });
 });
 describe("applyUpdate confirmation and heartbeat", () => {

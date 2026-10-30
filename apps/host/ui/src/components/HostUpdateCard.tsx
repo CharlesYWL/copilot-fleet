@@ -143,8 +143,9 @@ export const HostUpdateCard = ({ status, revision }: HostUpdateCardProps) => {
           <br />
           <Text className={styles.caption}>
             Pulls the newest commit of the branch this checkout tracks, installs
-            dependencies and builds, then restarts the Host and the Node started beside it
-            the way they were started. A build that fails restarts nothing.
+            dependencies and builds, updates this machine&apos;s Copilot CLI, then
+            restarts the Host and the Node started beside it the way they were started. A
+            build that fails restarts nothing.
           </Text>
         </div>
         <Button

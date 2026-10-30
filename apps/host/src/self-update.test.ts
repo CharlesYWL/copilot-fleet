@@ -607,6 +607,21 @@ describe("HostSelfUpdate", () => {
       update.close();
     });
 
+    it("says what became of Copilot in the outcome it confirms", () => {
+      const { update, statusFile } = subject();
+      writeUpdateRecord(
+        statusFile,
+        launched({ copilot: "Copilot CLI updated from 1.0.104 to 1.0.105" }),
+      );
+      update.start();
+      update.ready();
+      expect(update.status().update).toMatchObject({
+        stage: "up_to_date",
+        detail: "Updated to new222222222; Copilot CLI updated from 1.0.104 to 1.0.105",
+      });
+      update.close();
+    });
+
     it("waits for the Node beside it to come back on the new build before confirming", () => {
       let clock = Date.parse("2026-09-24T09:00:00.000Z");
       let node = { online: false, revision: "old111111111" };
