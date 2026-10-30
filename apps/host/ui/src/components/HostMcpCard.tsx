@@ -174,7 +174,11 @@ export const HostMcpCard = ({
   const suspended = view?.suspended ?? false;
 
   return (
-    <section className={styles.card} aria-label="Host MCP forwarding">
+    <section
+      className={styles.card}
+      aria-label="Host MCP forwarding"
+      data-setting-id="security.host-mcp"
+    >
       <div className={styles.header}>
         <Text weight="semibold" size={400}>
           Host MCP forwarding

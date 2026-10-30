@@ -213,6 +213,7 @@ const ProviderCard = ({
     <section
       className={`${styles.card} ${isPrimary ? styles.primaryCard : ""}`}
       aria-label={spec.label}
+      data-setting-id={`tunnel.provider.${spec.id}`}
     >
       <div className={styles.row}>
         <div>
@@ -399,7 +400,7 @@ export const TunnelPanel = () => {
 
   return (
     <div className={styles.panel}>
-      <div>
+      <div data-setting-id="tunnel">
         <Title3 as="h1">Remote access</Title3>
         <br />
         <Text className={styles.caption}>

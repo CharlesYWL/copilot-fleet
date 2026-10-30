@@ -397,7 +397,7 @@ export function WorkerModelRoutingControl({
     });
 
   return (
-    <div className={styles.control}>
+    <div className={styles.control} data-setting-id="general.worker-routing">
       <div className={styles.row}>
         <div className={styles.label}>
           <Text weight="semibold">Worker model routing</Text>

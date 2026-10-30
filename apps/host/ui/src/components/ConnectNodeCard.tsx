@@ -317,7 +317,11 @@ export const ConnectNodeCard = () => {
     ...(enrollment.corpDirectCa ? { corpDirectCa: enrollment.corpDirectCa } : {}),
   };
   return (
-    <section className={styles.card} aria-label="Connect a machine">
+    <section
+      className={styles.card}
+      aria-label="Connect a machine"
+      data-setting-id="nodes.connect"
+    >
       <div>
         <Title3 as="h2" data-tour="connect-node">
           Connect a machine

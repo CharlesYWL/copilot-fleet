@@ -41,6 +41,8 @@ export type ModelDefaultsCardProps = {
   reasoningEffort?: string | undefined;
   busy: boolean;
   onChange: (patch: { model?: string; reasoningEffort?: string }) => void;
+  /** Where the Settings search lands for this card; see `settings-search`. */
+  settingId?: string;
   children?: ReactNode;
 };
 
@@ -60,6 +62,7 @@ export function ModelDefaultsCard({
   reasoningEffort,
   busy,
   onChange,
+  settingId,
   children,
 }: ModelDefaultsCardProps) {
   const styles = useStyles();
@@ -72,7 +75,11 @@ export function ModelDefaultsCard({
   const effortChoices = observedChoices(agentSessions, "reasoning_effort");
 
   return (
-    <section className={styles.card} aria-label={`${label} model defaults`}>
+    <section
+      className={styles.card}
+      aria-label={`${label} model defaults`}
+      data-setting-id={settingId}
+    >
       <div className={styles.row}>
         <Text weight="semibold">Default {label} model</Text>
         <Dropdown

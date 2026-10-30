@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type DragEvent,
+  type FocusEvent,
   type KeyboardEvent,
 } from "react";
 import {
@@ -16,6 +17,7 @@ import {
   DialogContent,
   DialogSurface,
   DialogTitle,
+  SearchBox,
   Text,
   Tree,
   TreeItem,
@@ -23,6 +25,8 @@ import {
   makeStyles,
   mergeClasses,
   tokens,
+  type InputOnChangeData,
+  type SearchBoxChangeEvent,
   type TreeOpenChangeData,
 } from "@fluentui/react-components";
 import {
@@ -36,6 +40,7 @@ import {
   Flow20Regular,
   Folder20Regular,
   MoreHorizontal20Regular,
+  Search20Regular,
   Server20Regular,
   Settings20Regular,
   Star20Filled,
@@ -48,7 +53,17 @@ import type {
   SessionEvent,
   Workspace,
 } from "@fleet/protocol";
-import { groupSessionsByWorkspace } from "../lib/session-groups";
+import {
+  groupSessionsByWorkspace,
+  type SessionWorkspaceGroup,
+} from "../lib/session-groups";
+import { searchTerms } from "../lib/search-text";
+import { useSearchBoxClear } from "../hooks/useSearchBoxClear";
+import {
+  countSearchMatches,
+  filterSessionGroups,
+  filterSessions,
+} from "../lib/session-search";
 import {
   DRAG_MIME,
   decodeDrag,
@@ -69,8 +84,24 @@ import {
   type TreeReading,
 } from "../lib/tree-collapse";
 import { StatusIndicator } from "./StatusIndicator";
+import { HighlightedText } from "./HighlightedText";
 import { statusVisuals } from "../theme";
 import type { AppView } from "../App";
+
+/**
+ * What the down arrow moves to from the search box: the first result.
+ *
+ * Results are tagged rather than found by role, so section controls such as
+ * "Manage favorites" are stepped over on the way.
+ */
+const FIRST_RESULT_SELECTOR = '[data-search-result], [role="treeitem"]';
+
+/** Every collapsible row of the tree: each workspace, and each node under one. */
+const branchKeys = (groups: readonly SessionWorkspaceGroup[]): string[] =>
+  groups.flatMap((group) => [
+    workspaceKey(group.workspaceId),
+    ...group.nodes.map((item) => nodeKey(group.workspaceId, item.nodeId)),
+  ]);
 
 const useStyles = makeStyles({
   sidebar: {
@@ -86,6 +117,53 @@ const useStyles = makeStyles({
     overflowY: "auto",
     overflowX: "hidden",
     padding: "10px 8px",
+  },
+  /**
+   * The "Fleet" heading row, which also holds the session search.
+   *
+   * Collapsed it is the label with a search button at its end; opened, the
+   * same row becomes the search box, so searching costs no extra line. While
+   * open it sticks to the top of the list, so the box stays in reach as the
+   * results scroll under it.
+   */
+  fleetHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "4px",
+    minHeight: "32px",
+    paddingRight: "2px",
+  },
+  fleetHeaderOpen: {
+    position: "sticky",
+    top: "-10px",
+    zIndex: 3,
+    margin: "-10px -8px 4px",
+    padding: "10px 8px 6px",
+    background: tokens.colorNeutralBackground2,
+  },
+  searchBox: {
+    flexGrow: 1,
+    width: "100%",
+    maxWidth: "100%",
+  },
+  /** Read out by assistive technology, invisible on screen. */
+  visuallyHidden: {
+    position: "absolute",
+    width: "1px",
+    height: "1px",
+    margin: "-1px",
+    padding: 0,
+    overflow: "hidden",
+    clip: "rect(0 0 0 0)",
+    whiteSpace: "nowrap",
+    ...shorthands.borderStyle("none"),
+  },
+  /** A section's title while searching, when it is held open and cannot fold. */
+  sectionHeading: {
+    display: "flex",
+    alignItems: "center",
+    gap: "4px",
   },
   sectionLabel: {
     display: "block",
@@ -321,6 +399,7 @@ const useStyles = makeStyles({
   favoriteHeader: {
     display: "flex",
     alignItems: "center",
+    justifyContent: "space-between",
   },
   favoriteManage: {
     flexShrink: 0,
@@ -443,6 +522,26 @@ export const Sidebar = ({
   const [deleteLead, setDeleteLead] = useState<FleetSession>();
   const [deletingLead, setDeletingLead] = useState(false);
   const [dropTarget, setDropTarget] = useState<{ key: string; edge: DropEdge }>();
+  /*
+   * The search narrows every section to what it names and holds open the
+   * branches it found, without touching the folds the tree keeps for itself:
+   * those go on being tracked underneath, so clearing the box puts the tree
+   * back exactly as it would have been. Folding a branch by hand during a
+   * search lasts until the search changes, since a new search is a new
+   * question and its answers should all be visible.
+   */
+  const [query, setQuery] = useState("");
+  /** Whether the search box is out; it folds back into an icon once cleared. */
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchClosed, setSearchClosed] = useState<{
+    query: string;
+    keys: ReadonlySet<string>;
+  }>({ query: "", keys: new Set() });
+  const resultsRef = useRef<HTMLDivElement>(null);
+  const searchToggleRef = useRef<HTMLButtonElement>(null);
+  const terms = useMemo(() => searchTerms(query), [query]);
+  const searching = terms.length > 0;
+  const clearSearch = useSearchBoxClear("Close session search", searchOpen);
   const { updatePlacement, reorderPlacements, reorderWorkspaces, reorderSessions } =
     useCatalog();
 
@@ -456,16 +555,48 @@ export const Sidebar = ({
     () => groupSessionsByWorkspace(sessions, nodes, workspaces, placements),
     [sessions, nodes, workspaces, placements],
   );
+  /** The tree as shown: every group, or only what the search found. */
+  const visibleGroups = useMemo(
+    () => filterSessionGroups(groups, terms),
+    [groups, terms],
+  );
+  const visibleFavorites = useMemo(
+    () => filterSessions(favoriteSessions, terms),
+    [favoriteSessions, terms],
+  );
+  const visibleLeads = useMemo(
+    () => filterSessions(leadSessions, terms),
+    [leadSessions, terms],
+  );
+  const visibleDismissed = useMemo(
+    () => filterSessions(dismissedLeadSessions, terms),
+    [dismissedLeadSessions, terms],
+  );
+  const matchCount = searching
+    ? countSearchMatches(visibleGroups, [
+        ...visibleFavorites,
+        ...visibleLeads,
+        ...visibleDismissed,
+      ])
+    : 0;
+  /** A fold made during this search; cleared by moving on to another one. */
+  const closedInSearch = searchClosed.query === query ? searchClosed.keys : undefined;
   const openItems = useMemo(
     () =>
-      groups
-        .flatMap((group) => [
-          workspaceKey(group.workspaceId),
-          ...group.nodes.map((item) => nodeKey(group.workspaceId, item.nodeId)),
-        ])
-        .filter((key) => !closedItems.has(key)),
-    [groups, closedItems],
+      searching
+        ? branchKeys(visibleGroups).filter((key) => !closedInSearch?.has(key))
+        : branchKeys(groups).filter((key) => !closedItems.has(key)),
+    [searching, visibleGroups, closedInSearch, groups, closedItems],
   );
+  /*
+   * Sections hold what they found open while searching, and do not offer the
+   * fold: a collapsed Favorites hiding the one match would be the search
+   * failing silently. The operator's own choice comes back with the clear.
+   */
+  const showFavorites = searching ? visibleFavorites.length > 0 : true;
+  const favoritesOpen = searching || !favoritesClosed;
+  const conversationsOpen = searching || !conversationsClosed;
+  const dismissedOpen = searching || !dismissedClosed;
 
   /*
    * A row folds itself away once nothing under it is running, and opens again
@@ -495,7 +626,7 @@ export const Sidebar = ({
 
   const handleOpenChange = (_event: unknown, data: TreeOpenChangeData) => {
     const key = String(data.value);
-    setClosedItems((previous) => {
+    const toggle = (previous: ReadonlySet<string>) => {
       const next = new Set(previous);
       if (data.open) {
         next.delete(key);
@@ -503,7 +634,66 @@ export const Sidebar = ({
         next.add(key);
       }
       return next;
-    });
+    };
+    if (searching) {
+      setSearchClosed((previous) => ({
+        query,
+        keys: toggle(previous.query === query ? previous.keys : new Set()),
+      }));
+      return;
+    }
+    setClosedItems(toggle);
+  };
+
+  /** Opens the search box in place of the "Fleet" label and puts the caret in it. */
+  const handleOpenSearch = () => setSearchOpen(true);
+
+  /** Empties and folds the search away, handing focus back to its button. */
+  const closeSearch = () => {
+    setQuery("");
+    setSearchOpen(false);
+  };
+
+  /*
+   * Focus goes back to the search button when the box folds away, so a
+   * keyboard user is never left on a removed element. (The box focuses
+   * itself as it opens.)
+   */
+  const searchWasOpen = useRef(false);
+  useEffect(() => {
+    if (!searchOpen && searchWasOpen.current) searchToggleRef.current?.focus();
+    searchWasOpen.current = searchOpen;
+  }, [searchOpen]);
+
+  const handleSearchChange = (event: SearchBoxChangeEvent, data: InputOnChangeData) => {
+    // The clear button reports an empty value through a click; that closes it.
+    if (event.type === "click") {
+      closeSearch();
+      return;
+    }
+    setQuery(data.value);
+  };
+
+  /** Escape closes the search; the down arrow steps into the first result. */
+  const handleSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeSearch();
+      return;
+    }
+    if (event.key !== "ArrowDown" || !searching) return;
+    const first = resultsRef.current?.querySelector<HTMLElement>(FIRST_RESULT_SELECTOR);
+    if (!first) return;
+    event.preventDefault();
+    first.focus();
+  };
+
+  /** An empty box gives its row back to the label once focus leaves it. */
+  const handleSearchBlur = (event: FocusEvent<HTMLSpanElement>) => {
+    if (query) return;
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setSearchOpen(false);
   };
 
   const handleSessionKeyDown = (sessionId: string) => (event: KeyboardEvent) => {
@@ -514,39 +704,102 @@ export const Sidebar = ({
 
   return (
     <nav className={styles.sidebar} aria-label="Fleet navigation">
-      <div className={styles.scroll}>
-        <Text as="span" className={styles.sectionLabel}>
-          Fleet
-        </Text>
-        <div className={styles.favoriteHeader}>
-          <button
-            type="button"
-            className={mergeClasses(styles.sectionLabel, styles.sectionDisclosure)}
-            aria-expanded={!favoritesClosed}
-            aria-label={favoritesClosed ? "Show favorites" : "Hide favorites"}
-            onClick={() => setFavoritesClosed((closed) => !closed)}
-          >
-            {favoritesClosed ? (
-              <ChevronRight20Regular aria-hidden="true" />
-            ) : (
-              <ChevronDown20Regular aria-hidden="true" />
-            )}
-            <Star20Filled aria-hidden="true" />
-            <span>Favorites</span>
-          </button>
-          <button
-            type="button"
-            className={styles.favoriteManage}
-            aria-label="Manage favorites"
-            title="Manage favorites"
-            onClick={onManageFavorites}
-          >
-            <MoreHorizontal20Regular aria-hidden="true" />
-          </button>
+      <div className={styles.scroll} ref={resultsRef}>
+        <div
+          className={mergeClasses(
+            styles.fleetHeader,
+            searchOpen && styles.fleetHeaderOpen,
+          )}
+          role="search"
+          aria-label="Session search"
+        >
+          {searchOpen ? (
+            <SearchBox
+              // Mounted only when the icon is clicked, so focus goes straight in.
+              autoFocus
+              className={styles.searchBox}
+              size="small"
+              value={query}
+              placeholder="Search sessions, nodes, projects"
+              aria-label="Search sessions"
+              onChange={handleSearchChange}
+              onKeyDown={handleSearchKeyDown}
+              onBlur={handleSearchBlur}
+              {...clearSearch}
+            />
+          ) : (
+            <>
+              <Text as="span" className={styles.sectionLabel}>
+                Fleet
+              </Text>
+              <button
+                ref={searchToggleRef}
+                type="button"
+                className={styles.favoriteManage}
+                aria-label="Search sessions"
+                title="Search sessions, nodes and projects"
+                aria-expanded={false}
+                onClick={handleOpenSearch}
+              >
+                <Search20Regular aria-hidden="true" />
+              </button>
+            </>
+          )}
+          <span className={styles.visuallyHidden} role="status" aria-live="polite">
+            {searching
+              ? matchCount === 0
+                ? "No matches"
+                : `${matchCount} ${matchCount === 1 ? "match" : "matches"}`
+              : ""}
+          </span>
         </div>
-        {!favoritesClosed &&
-          (favoriteSessions.length > 0 ? (
-            favoriteSessions.map((favorite) => {
+        {searching && matchCount === 0 && (
+          <p className={styles.empty}>
+            No sessions, nodes or projects match “{query.trim()}”.
+          </p>
+        )}
+        {showFavorites && (
+          <div className={styles.favoriteHeader}>
+            {searching ? (
+              <Text
+                as="span"
+                className={mergeClasses(styles.sectionLabel, styles.sectionHeading)}
+              >
+                <Star20Filled aria-hidden="true" />
+                <span>Favorites</span>
+              </Text>
+            ) : (
+              <button
+                type="button"
+                className={mergeClasses(styles.sectionLabel, styles.sectionDisclosure)}
+                aria-expanded={!favoritesClosed}
+                aria-label={favoritesClosed ? "Show favorites" : "Hide favorites"}
+                onClick={() => setFavoritesClosed((closed) => !closed)}
+              >
+                {favoritesClosed ? (
+                  <ChevronRight20Regular aria-hidden="true" />
+                ) : (
+                  <ChevronDown20Regular aria-hidden="true" />
+                )}
+                <Star20Filled aria-hidden="true" />
+                <span>Favorites</span>
+              </button>
+            )}
+            <button
+              type="button"
+              className={styles.favoriteManage}
+              aria-label="Manage favorites"
+              title="Manage favorites"
+              onClick={onManageFavorites}
+            >
+              <MoreHorizontal20Regular aria-hidden="true" />
+            </button>
+          </div>
+        )}
+        {showFavorites &&
+          favoritesOpen &&
+          (visibleFavorites.length > 0 ? (
+            visibleFavorites.map((favorite) => {
               const lead = favorite.runRole === "lead";
               return (
                 <div className={styles.favoriteEntry} key={`favorite:${favorite.id}`}>
@@ -554,6 +807,7 @@ export const Sidebar = ({
                     type="button"
                     className={styles.favoriteLink}
                     title={sessionLabel(favorite)}
+                    data-search-result
                     onClick={() =>
                       lead
                         ? onSelectLeadSession(favorite.id)
@@ -570,7 +824,9 @@ export const Sidebar = ({
                       )}
                       variant="icon"
                     />
-                    <span className={styles.sessionName}>{sessionLabel(favorite)}</span>
+                    <span className={styles.sessionName}>
+                      <HighlightedText text={sessionLabel(favorite)} terms={terms} />
+                    </span>
                   </button>
                 </div>
               );
@@ -588,65 +844,71 @@ export const Sidebar = ({
           Two controls, side by side, rather than one inside the other: a
           button nested in a button is invalid, and the outer row ended up
           announcing itself as "Hide conversations Orchestrator".
+
+          While searching, the row shows only when a conversation matched, as
+          the heading those matches sit under; the fold is not offered because
+          the matches are held open.
         */}
-        <div
-          className={mergeClasses(
-            styles.orchestrationRow,
-            (view === "orchestrator" || view === "orchestrator-task") &&
-              styles.orchestrationActive,
-          )}
-        >
-          {leadSessions.length > 0 && (
+        {(!searching || visibleLeads.length > 0) && (
+          <div
+            className={mergeClasses(
+              styles.orchestrationRow,
+              (view === "orchestrator" || view === "orchestrator-task") &&
+                styles.orchestrationActive,
+            )}
+          >
+            {leadSessions.length > 0 && !searching && (
+              <button
+                type="button"
+                className={styles.disclosure}
+                aria-expanded={!conversationsClosed}
+                aria-label={
+                  conversationsClosed ? "Show conversations" : "Hide conversations"
+                }
+                title={conversationsClosed ? "Show conversations" : "Hide conversations"}
+                onClick={() => setConversationsClosed((closed) => !closed)}
+              >
+                {conversationsClosed ? (
+                  <ChevronRight20Regular aria-hidden="true" />
+                ) : (
+                  <ChevronDown20Regular aria-hidden="true" />
+                )}
+              </button>
+            )}
             <button
               type="button"
-              className={styles.disclosure}
-              aria-expanded={!conversationsClosed}
-              aria-label={
-                conversationsClosed ? "Show conversations" : "Hide conversations"
-              }
-              title={conversationsClosed ? "Show conversations" : "Hide conversations"}
-              onClick={() => setConversationsClosed((closed) => !closed)}
+              className={styles.orchestration}
+              aria-current={view === "orchestrator" ? "page" : undefined}
+              onClick={() => onSelectView("orchestrator")}
             >
-              {conversationsClosed ? (
-                <ChevronRight20Regular aria-hidden="true" />
-              ) : (
-                <ChevronDown20Regular aria-hidden="true" />
+              <Flow20Regular aria-hidden="true" />
+              <span
+                className={styles.orchestrationLabel}
+                data-tour="orchestrator-navigation"
+              >
+                Orchestrator
+              </span>
+              {attentionCount > 0 && (
+                <span
+                  className={styles.attentionBadge}
+                  title={`${attentionCount} waiting for you`}
+                >
+                  {attentionCount}
+                </span>
+              )}
+              {liveWorkCount > 0 && (
+                <span className={styles.orchestrationCount}>{liveWorkCount}</span>
               )}
             </button>
-          )}
-          <button
-            type="button"
-            className={styles.orchestration}
-            aria-current={view === "orchestrator" ? "page" : undefined}
-            onClick={() => onSelectView("orchestrator")}
-          >
-            <Flow20Regular aria-hidden="true" />
-            <span
-              className={styles.orchestrationLabel}
-              data-tour="orchestrator-navigation"
-            >
-              Orchestrator
-            </span>
-            {attentionCount > 0 && (
-              <span
-                className={styles.attentionBadge}
-                title={`${attentionCount} waiting for you`}
-              >
-                {attentionCount}
-              </span>
-            )}
-            {liveWorkCount > 0 && (
-              <span className={styles.orchestrationCount}>{liveWorkCount}</span>
-            )}
-          </button>
-        </div>
+          </div>
+        )}
         {/*
           A conversation belongs to the orchestrator, not to the workspace its
           process happens to run in. They are filtered out of the session tree
           for the same reason, so these are their only way in.
         */}
-        {!conversationsClosed &&
-          leadSessions.map((lead) => {
+        {conversationsOpen &&
+          visibleLeads.map((lead) => {
             const open = view === "session" && selectedSessionId === lead.id;
             return (
               <button
@@ -658,10 +920,13 @@ export const Sidebar = ({
                 )}
                 aria-current={open ? "page" : undefined}
                 title={sessionLabel(lead)}
+                data-search-result
                 onClick={() => onSelectLeadSession(lead.id)}
               >
                 <Chat20Regular aria-hidden="true" />
-                <span className={styles.orchestrationLabel}>{sessionLabel(lead)}</span>
+                <span className={styles.orchestrationLabel}>
+                  <HighlightedText text={sessionLabel(lead)} terms={terms} />
+                </span>
                 <StatusIndicator
                   descriptor={sessionStatusDescriptor(
                     lead,
@@ -672,7 +937,7 @@ export const Sidebar = ({
               </button>
             );
           })}
-        {leadSessions.length > 0 && !conversationsClosed && (
+        {leadSessions.length > 0 && !conversationsClosed && !searching && (
           <button
             type="button"
             className={styles.leadRow}
@@ -683,38 +948,45 @@ export const Sidebar = ({
             <span className={styles.orchestrationLabel}>New conversation</span>
           </button>
         )}
-        {dismissedLeadSessions.length > 0 && (
+        {visibleDismissed.length > 0 && (
           <>
-            <button
-              type="button"
-              className={mergeClasses(styles.sectionLabel, styles.sectionDisclosure)}
-              aria-expanded={!dismissedClosed}
-              aria-label={
-                dismissedClosed
-                  ? "Show dismissed orchestrators"
-                  : "Hide dismissed orchestrators"
-              }
-              onClick={() => setDismissedClosed((closed) => !closed)}
-            >
-              {dismissedClosed ? (
-                <ChevronRight20Regular aria-hidden="true" />
-              ) : (
-                <ChevronDown20Regular aria-hidden="true" />
-              )}
-              <span>Dismissed orchestrators</span>
-            </button>
-            {!dismissedClosed &&
-              dismissedLeadSessions.map((lead) => (
+            {searching ? (
+              <Text as="span" className={styles.sectionLabel}>
+                Dismissed orchestrators
+              </Text>
+            ) : (
+              <button
+                type="button"
+                className={mergeClasses(styles.sectionLabel, styles.sectionDisclosure)}
+                aria-expanded={!dismissedClosed}
+                aria-label={
+                  dismissedClosed
+                    ? "Show dismissed orchestrators"
+                    : "Hide dismissed orchestrators"
+                }
+                onClick={() => setDismissedClosed((closed) => !closed)}
+              >
+                {dismissedClosed ? (
+                  <ChevronRight20Regular aria-hidden="true" />
+                ) : (
+                  <ChevronDown20Regular aria-hidden="true" />
+                )}
+                <span>Dismissed orchestrators</span>
+              </button>
+            )}
+            {dismissedOpen &&
+              visibleDismissed.map((lead) => (
                 <div className={styles.favoriteEntry} key={lead.id}>
                   <button
                     type="button"
                     className={styles.favoriteLink}
                     title={`Restore ${sessionLabel(lead)}`}
+                    data-search-result
                     onClick={() => onRestoreLeadSession?.(lead.id)}
                   >
                     <Chat20Regular aria-hidden="true" />
                     <span className={styles.orchestrationLabel}>
-                      {sessionLabel(lead)}
+                      <HighlightedText text={sessionLabel(lead)} terms={terms} />
                     </span>
                     <span>Restore</span>
                   </button>
@@ -730,18 +1002,22 @@ export const Sidebar = ({
               ))}
           </>
         )}
-        <Text as="span" className={styles.sectionLabel}>
-          Agents
-        </Text>
+        {(!searching || visibleGroups.length > 0) && (
+          <Text as="span" className={styles.sectionLabel}>
+            Agents
+          </Text>
+        )}
         {groups.length === 0 ? (
-          <p className={styles.empty}>No workspaces yet.</p>
-        ) : (
+          searching ? null : (
+            <p className={styles.empty}>No workspaces yet.</p>
+          )
+        ) : visibleGroups.length === 0 ? null : (
           <Tree
             aria-label="Sessions by workspace"
             openItems={openItems}
             onOpenChange={handleOpenChange}
           >
-            {groups.map((group) => {
+            {visibleGroups.map((group) => {
               // Chats is the fleet's own row rather than one of the operator's
               // projects: it cannot be reordered, and a checkout dropped on it
               // would be refused by the Host — so it does not offer either.
@@ -824,7 +1100,7 @@ export const Sidebar = ({
                       });
                     }}
                   >
-                    {group.workspaceName}
+                    <HighlightedText text={group.workspaceName} terms={terms} />
                   </TreeItemLayout>
                   <Tree>
                     {group.nodes.length === 0 ? (
@@ -923,7 +1199,7 @@ export const Sidebar = ({
                               );
                             }}
                           >
-                            {nodeGroup.nodeName}
+                            <HighlightedText text={nodeGroup.nodeName} terms={terms} />
                           </TreeItemLayout>
                           <Tree>
                             {nodeGroup.sessions.map((session) => {
@@ -985,9 +1261,21 @@ export const Sidebar = ({
                                       if (payload?.kind !== "session") return;
                                       event.preventDefault();
                                       event.stopPropagation();
-                                      const siblings = nodeGroup.sessions.map(
-                                        (entry) => entry.id,
-                                      );
+                                      // Every session on this node, not only the
+                                      // ones a search left showing: the Host
+                                      // numbers what it is sent from zero, so a
+                                      // filtered list would collide with the
+                                      // positions of the rows it left out.
+                                      const siblings = (
+                                        groups
+                                          .find(
+                                            (entry) =>
+                                              entry.workspaceId === group.workspaceId,
+                                          )
+                                          ?.nodes.find(
+                                            (entry) => entry.nodeId === nodeGroup.nodeId,
+                                          )?.sessions ?? nodeGroup.sessions
+                                      ).map((entry) => entry.id);
                                       // Sessions belong to the machine that runs
                                       // them, so one dragged from another node is
                                       // not something this list can accept.
@@ -1034,7 +1322,10 @@ export const Sidebar = ({
                                           .filter(Boolean)
                                           .join(" · ")}
                                       >
-                                        {sessionLabel(session)}
+                                        <HighlightedText
+                                          text={sessionLabel(session)}
+                                          terms={terms}
+                                        />
                                       </span>
                                     </span>
                                   </TreeItemLayout>

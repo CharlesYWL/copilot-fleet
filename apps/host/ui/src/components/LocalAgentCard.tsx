@@ -222,7 +222,11 @@ export const LocalAgentCard = ({
 
   if (!view || !draft) {
     return (
-      <section className={styles.card} aria-label="Local agent API">
+      <section
+        className={styles.card}
+        aria-label="Local agent API"
+        data-setting-id="security.local-agent"
+      >
         <Text weight="semibold">Local agent API</Text>
         {loadError ? (
           <MessageBar intent="warning">
@@ -401,7 +405,11 @@ export const LocalAgentCard = ({
 
   const badge = STATUS[status.state];
   return (
-    <section className={styles.card} aria-label="Local agent API">
+    <section
+      className={styles.card}
+      aria-label="Local agent API"
+      data-setting-id="security.local-agent"
+    >
       <div>
         <Text weight="semibold">Local agent API</Text>
         <br />

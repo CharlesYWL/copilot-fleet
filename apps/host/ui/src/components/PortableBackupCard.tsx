@@ -206,7 +206,11 @@ export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardPr
   };
 
   return (
-    <section className={styles.card} aria-label="Move this Host">
+    <section
+      className={styles.card}
+      aria-label="Move this Host"
+      data-setting-id="security.portable-backup"
+    >
       <div>
         <Text weight="semibold">Move this Host</Text>
         <br />

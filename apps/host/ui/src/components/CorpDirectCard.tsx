@@ -116,6 +116,7 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
     <section
       className={`${styles.card} ${isPrimary ? styles.primaryCard : ""}`}
       aria-label="Corp direct (private IP)"
+      data-setting-id="tunnel.provider.corp-direct"
     >
       <div className={styles.row}>
         <div className={styles.heading}>
