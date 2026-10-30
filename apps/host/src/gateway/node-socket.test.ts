@@ -1798,7 +1798,7 @@ describe("node reconnect socket ordering", () => {
       refusal: "checkout_precondition",
     });
     await waitFor(() => refuse.mock.calls.length > 0);
-    expect(refuse).toHaveBeenCalledWith(sessionId, reason);
+    expect(refuse).toHaveBeenCalledWith(sessionId, "maintenance-prompt", reason);
     // An ordinary refusal does not touch maintenance.
     send(client, {
       type: "command_result",

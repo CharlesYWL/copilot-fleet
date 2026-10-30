@@ -1,6 +1,7 @@
 import {
   canTransitionRun,
   canTransitionRunStep,
+  CHECKOUT_PRECONDITION_CAPABILITY,
   eventPayload,
   heartbeatIntervalLabel,
   isWritingCategory,
@@ -671,6 +672,29 @@ export class OrchestratorEngine {
       return false;
     }
 
+    // Only the prompt dispatching a maintenance batch checks the checkout first,
+    // and only a Node that honors that check may receive one.
+    const precondition = this.store.prMaintenance.checkoutPrecondition(
+      step.id,
+      step.attempts,
+    );
+    if (
+      precondition &&
+      !this.store
+        .getNode(session.nodeId)
+        ?.capabilities.includes(CHECKOUT_PRECONDITION_CAPABILITY)
+    ) {
+      if (
+        this.store.prMaintenance.refuseCheckout(
+          step.id,
+          step.attempts,
+          "node_upgrade_required: this worker's Node is too old to verify that the checkout is clean and at the PR head. Update the Node before maintenance can write there.",
+          "node_upgrade_required",
+        )
+      )
+        this.service.publishSnapshot();
+      return true;
+    }
     this.store.updateRunStep(step.id, {
       state: "starting",
       eventSeqFrom: this.store.maxEventSequence(session.id),
@@ -683,11 +707,6 @@ export class OrchestratorEngine {
      * as this prompt's completion before the Node has even acknowledged it.
      */
     this.turnComplete.delete(session.id);
-    // Only the prompt dispatching a maintenance batch checks the checkout first.
-    const precondition = this.store.prMaintenance.checkoutPrecondition(
-      step.id,
-      step.attempts,
-    );
     const sent = this.service.dispatch(session.nodeId, {
       type: "prompt",
       sessionId: session.id,

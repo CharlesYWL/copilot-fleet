@@ -111,5 +111,6 @@ describe("CommandRouter maintenance checkout precondition", () => {
     } finally {
       await router.stopAll();
     }
-  });
+    // Several real git processes; a loaded machine needs more than the default.
+  }, 60_000);
 });

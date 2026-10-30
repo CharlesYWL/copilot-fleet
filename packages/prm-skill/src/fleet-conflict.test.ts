@@ -120,10 +120,16 @@ describe("Fleet conflict rebase contract", () => {
     expect(normal.effects[0]).not.toHaveProperty("force");
   });
 
-  it("requires the replaced remote head on every attempted push", () => {
-    expect(workReportProblems(order(false).workOrder, report({}))).toEqual([
-      expect.stringContaining("must report expectedRemoteSha"),
-    ]);
+  it("accepts a push without the replaced head; Fleet records it as unverified", () => {
+    expect(workReportProblems(order(false).workOrder, report({}))).toEqual([]);
+    expect(
+      fleetSettlement({
+        batch: order(false).batch,
+        workOrder: order(false).workOrder,
+        report: report({}),
+        workerActor: "worker",
+      }).effects[0],
+    ).not.toHaveProperty("expectedRemoteSha");
     expect(
       workReportProblems(order(false).workOrder, report({ state: "not_performed" })),
     ).toEqual([]);

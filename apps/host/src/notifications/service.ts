@@ -531,14 +531,17 @@ export class NotificationService {
 
   createPrMaintenanceAttention(
     record: PrMaintenanceRegistration,
-    reason: "paused" | "ready" | "long_pause" | "decision",
+    reason: "paused" | "ready" | "long_pause" | "decision" | "attention",
+    attention?: { key: string; body: string },
   ): InsertNotificationResult {
     const identity =
       reason === "ready"
         ? record.readyFingerprint
         : reason === "decision"
           ? `${record.decision?.id}:${record.decision?.version}`
-          : `${record.hold?.kind}:${record.hold?.at}`;
+          : reason === "attention"
+            ? attention?.key
+            : `${record.hold?.kind}:${record.hold?.at}`;
     return this.insert({
       sourceKey: `pr-maintenance:${record.id}:${record.authorization.id}:${reason}:${digest(identity ?? "")}`,
       category: "orchestration",
@@ -551,7 +554,9 @@ export class NotificationService {
             ? "PR maintenance: Waiting for Design Decision"
             : reason === "long_pause"
               ? "Resume or release PR maintenance"
-              : "PR maintenance is on hold",
+              : reason === "attention"
+                ? "PR maintenance needs your attention"
+                : "PR maintenance is on hold",
       body:
         reason === "ready"
           ? "Current feedback, checks and reviews permit readiness. Fleet will not merge the PR."
@@ -559,7 +564,12 @@ export class NotificationService {
             ? `${record.decision?.proposal ?? "A design decision is needed."} Give direction in the task's PR maintenance panel or tell the orchestrator; maintenance resumes automatically.`
             : reason === "long_pause"
               ? "Maintenance has been held for 30 days. Continuity remains protected until an operator releases it."
-              : `${record.hold?.reason ?? "Maintenance is held."} Open the task's PR maintenance panel to Resume.`,
+              : reason === "attention"
+                ? (attention?.body ?? "PR maintenance needs your attention.").slice(
+                    0,
+                    8_000,
+                  )
+                : `${record.hold?.reason ?? "Maintenance is held."} Open the task's PR maintenance panel to Resume.`,
       subject: {
         type: "run",
         id: record.taskId,

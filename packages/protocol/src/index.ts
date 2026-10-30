@@ -1871,6 +1871,12 @@ export const SESSION_ACTIVITY_CAPABILITY = "session-activity";
 /** Supports guarded deletion of an explicitly identified Fleet-owned session. */
 export const SESSION_RETENTION_CAPABILITY = "session-retention";
 
+/**
+ * A Node that honors a prompt's `checkoutPrecondition`. The Host never sends a
+ * PR maintenance batch to a Node without it.
+ */
+export const CHECKOUT_PRECONDITION_CAPABILITY = "checkout-precondition";
+
 /** A Node that retains reconnect batches until `outbox_flush_ack`. */
 export const OUTBOX_ACK_CAPABILITY = "outbox-ack";
 

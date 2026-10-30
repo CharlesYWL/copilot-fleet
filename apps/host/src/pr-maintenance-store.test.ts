@@ -1975,6 +1975,8 @@ describe("durable PR maintenance registry", () => {
     let record = observe(f, publishedRepair(f), {
       headSha: otherSha,
       fingerprint: "head-B",
+      // Provider compare evidence; without it the move would pause for a person.
+      headLineage: { fromSha: sha, fastForward: true, evidence: "compare: ahead 1" },
     });
     expect(() => prepare(f, record, "duplicate-B", "repair", otherSha)).toThrow(
       /unchanged/,

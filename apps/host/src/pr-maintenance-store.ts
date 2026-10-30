@@ -1955,7 +1955,9 @@ export class PrMaintenanceStore {
     };
     record.counters.dispatchesSinceDirection = 0;
     record.findingAttempts = [];
-    if (record.hold?.kind === "paused") this.clearHold(record, actorId, at);
+    // A system hold (an unverified rewrite, a restored backup) needs Resume.
+    if (record.hold?.kind === "paused" && record.hold.actor !== "system")
+      this.clearHold(record, actorId, at);
     this.requestReview(record, "direction", at, actorId);
   }
 
@@ -2719,7 +2721,12 @@ export class PrMaintenanceStore {
    * settles with no effects, and a person decides what happens to the local
    * work. Maintenance never overwrites it.
    */
-  refuseCheckout(stepId: string, attempt: number, reason: string): boolean {
+  refuseCheckout(
+    stepId: string,
+    attempt: number,
+    reason: string,
+    code: "checkout_precondition" | "node_upgrade_required" = "checkout_precondition",
+  ): boolean {
     return this.store.writeAtomically(() => {
       const reference = this.referenceForStep(stepId, attempt);
       if (!reference) return false;
@@ -2728,6 +2735,10 @@ export class PrMaintenanceStore {
       if (batch.state !== "accepted" || batch.effects.length) return false;
       const at = nowIso();
       const message = reason.slice(0, 4_000);
+      const nextAction =
+        code === "node_upgrade_required"
+          ? "Update the worker's Node, then give direction to continue."
+          : "Commit, stash or discard the local changes, or check out the PR head, then give direction to continue.";
       this.store.updateRunStep(stepId, {
         state: "cancelled",
         output: `PR maintenance was not sent: ${message}`,
@@ -2737,7 +2748,7 @@ export class PrMaintenanceStore {
         executionSettled: true,
         executionNotDispatched: true,
         updatedAt: at,
-        reason: "checkout_precondition",
+        reason: code,
         evidence: `The Node refused the maintenance prompt before the agent saw it: ${message}`,
         findings: batch.sources.map((source) => ({
           source,
@@ -2746,8 +2757,7 @@ export class PrMaintenanceStore {
           evidence: [message],
           responseRequired: true,
           responseIds: [],
-          nextAction:
-            "Commit, stash or discard the local changes, or check out the PR head, then give direction to continue.",
+          nextAction,
           progress: false,
         })),
         effects: [],
@@ -2758,7 +2768,7 @@ export class PrMaintenanceStore {
           id: `checkout-${batch.id}`,
           version: 1,
           proposal:
-            `Fleet did not send maintenance batch ${batch.id}: ${message} The checkout may hold a person's work, so Fleet will not overwrite it. Commit, stash or discard the local changes (or check out ${batch.headSha}), then give direction to continue.`.slice(
+            `Fleet did not send maintenance batch ${batch.id}: ${message} ${code === "node_upgrade_required" ? "Fleet will not write to a checkout it cannot check for a person's work." : "The checkout may hold a person's work, so Fleet will not overwrite it."} ${nextAction}`.slice(
               0,
               8_000,
             ),
@@ -3552,9 +3562,10 @@ export class PrMaintenanceStore {
   /**
    * After a maintenance batch published, the next head Fleet observes must be
    * a fast-forward of the head the batch was prepared from, unless the batch
-   * recorded its own leased conflict rewrite. Provider ancestry evidence
-   * decides when the helper supplies it; without it the change is recorded as
-   * unverified. A proven rewrite holds maintenance for a person.
+   * recorded its own leased conflict rewrite. Only provider ancestry evidence
+   * (`headLineage`) proves a fast-forward; no helper supplies it yet, so any
+   * other head move is recorded as unverified. A rewrite or an unverified move
+   * holds maintenance for a person.
    */
   private recordLineage(
     record: PrMaintenanceRegistration,
@@ -3592,13 +3603,37 @@ export class PrMaintenanceStore {
       at,
       evidence: evidence.slice(0, 8_192),
     };
-    if (state === "rewritten" && !forced && !record.hold && !record.ownershipReleasedAt)
-      this.setHold(
+    if (state === "rewritten" && !forced)
+      this.rewriteHold(
         record,
-        "paused",
         `The PR head moved from ${batch.headSha} to ${head} without a fast-forward after maintenance batch ${batch.id}, and no leased rewrite was recorded. Check the branch history, then Resume.`,
         at,
       );
+    else if (state === "unverified")
+      this.rewriteHold(
+        record,
+        `The PR head moved from ${batch.headSha} to ${head} after maintenance batch ${batch.id}, and Fleet has no evidence that this was a fast-forward. Check the branch history, then Resume.`,
+        at,
+      );
+  }
+
+  /**
+   * A system hold for an unauthorized or unverifiable branch rewrite. It
+   * replaces an orchestrator pause, which the orchestrator then cannot clear.
+   * A hold a person set keeps its kind and gains the reason; the attention
+   * notification comes from the batch's recorded lineage.
+   */
+  private rewriteHold(record: PrMaintenanceRegistration, reason: string, at: string) {
+    if (record.ownershipReleasedAt) return;
+    if (!record.hold || record.hold.actor === "lead") {
+      this.setHold(record, "paused", reason.slice(0, 8_192), at);
+      return;
+    }
+    if (record.hold.reason.includes(reason)) return;
+    record.hold = {
+      ...record.hold,
+      reason: `${record.hold.reason} Also: ${reason}`.slice(0, 8_192),
+    };
   }
 
   private refund(
@@ -3763,6 +3798,7 @@ export class PrMaintenanceStore {
      * is asked to look before maintenance does anything else.
      */
     const rewrites: string[] = [];
+    const unverified: string[] = [];
     const pushedHeads = new Set([batch.headSha]);
     for (const effect of update.effects) {
       if (effect.kind !== "push" || effect.state === "not_performed") continue;
@@ -3785,6 +3821,10 @@ export class PrMaintenanceStore {
       )
         rewrites.push(
           `${effect.key} was reported as a normal push but replaced ${effect.expectedRemoteSha}, which is neither this batch's head ${batch.headSha} nor an earlier push in it.`,
+        );
+      else if (!recorded && effect.state === "known" && !effect.expectedRemoteSha)
+        unverified.push(
+          `${effect.key} was reported without the remote head it replaced, so Fleet cannot tell whether it rewrote history.`,
         );
       pushedHeads.add(effect.headSha);
     }
@@ -3974,15 +4014,24 @@ export class PrMaintenanceStore {
         headSha: record.observation?.headSha ?? batch.headSha,
         scope: record.authorization.scope.baseline,
       });
-    if (rewrites.length && !record.ownershipReleasedAt && !record.hold)
-      this.setHold(
+    if ((rewrites.length || unverified.length) && !batch.lineage) {
+      const pushed = update.effects
+        .filter((effect) => effect.kind === "push" && effect.state !== "not_performed")
+        .at(-1);
+      const at = nowIso();
+      batch.lineage = {
+        state: rewrites.length ? "rewritten" : "unverified",
+        fromSha: batch.headSha,
+        toSha: pushed?.headSha ?? batch.headSha,
+        at,
+        evidence: [...rewrites, ...unverified].join(" ").slice(0, 8_192),
+      };
+      this.rewriteHold(
         record,
-        "paused",
-        `The PR branch history was rewritten in a way Fleet did not authorize; check the branch before maintenance continues, then Resume. ${rewrites.join(" ")}`.slice(
-          0,
-          8_192,
-        ),
+        `${rewrites.length ? "The PR branch history was rewritten in a way Fleet did not authorize" : "Fleet cannot verify how a maintenance push changed the PR branch"}; check the branch, then Resume. ${batch.lineage.evidence}`,
+        at,
       );
+    }
     // Working → Reviewing: a settled worker result is reviewed immediately.
     if (
       final &&

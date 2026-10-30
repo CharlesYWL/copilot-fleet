@@ -186,11 +186,11 @@ human decisions. Review the new pinned proposal while authenticated; the old gra
 Reauthorization starts a review immediately. Terminal/released jobs cannot be revived this way;
 do not release ownership or replace the worker automatically. Existing execution approvals remain effective.
 Never delete user work, deploy, change credentials/access, introduce unapproved designs, or merge the PR / enable
-auto-complete. History is rewritten only for a straightforward merge conflict: the worker rebases the PR branch onto
-the current base, verifies, and force-pushes to the same PR branch with an exact lease
-(`--force-with-lease=<headRef>:<pr.headSha>`), reporting the push with `force: true` and `expectedRemoteSha`. It
-stops without pushing on unknown remote changes, user work, ambiguous conflicts or design questions. Without a specific reviewer grant, consume external reviews and notify the human once:
-do not choose reviewers or add a blanket review stage.
+auto-complete. History is rewritten only for a straightforward merge conflict: the worker rebases the PR branch onto the current base,
+verifies, and force-pushes to the same PR branch with an exact lease (`--force-with-lease=<headRef>:<pr.headSha>`), reporting the
+push with `force: true` and `expectedRemoteSha`. It stops without pushing on unknown remote changes, user work, ambiguous conflicts
+or design questions. Other rewrites, pushes without `expectedRemoteSha` and unverified head moves get a system pause only the person
+clears; tell them. Without a specific reviewer grant, consume external reviews and notify the human once: do not choose reviewers or add a blanket review stage.
 
 Held registrations keep ownership/retention. After 30 days on hold, the Host notifies once to resume or release;
 unknown work never expires, but Release always succeeds and keeps it as history. A portable restore is held for one

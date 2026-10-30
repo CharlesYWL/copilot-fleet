@@ -273,12 +273,15 @@ Straightforward conflicts use an exact-HEAD/exact-live-base conflict work order:
 clean checkout, rebases the PR branch onto the current base, preserves accepted semantics, verifies,
 and force-pushes to the same PR branch with an exact lease on the observed HEAD. It stops without
 pushing on unknown remote changes, user work, ambiguous conflicts or design questions, and never
-resets/deletes/stashes user work or merges the PR. Every reported push names the remote head it
-replaced (`expectedRemoteSha`). Any other forced push, or a push that replaced an unexpected head,
-is recorded as the fact it is, the batch still settles, and maintenance holds for a person. The next
-observation checks the new head is a fast-forward (provider ancestry evidence when available,
-otherwise recorded as unverified). Before dispatching a batch the Node checks that the checkout is
-clean and at the batch's head; otherwise nothing is sent and a person decides.
+resets/deletes/stashes user work or merges the PR. Workers report the remote head each push
+replaced (`expectedRemoteSha`). Any other forced push, a push that replaced an unexpected head, or a
+push reported without that head is recorded as the fact it is; the batch still settles and
+maintenance pauses for a person. Fleet does not verify ancestry itself: no provider helper supplies
+compare evidence yet, so when the PR head moves after a published batch the move is recorded as
+unverified and maintenance pauses until a person checks the branch and resumes. Before sending a
+batch, a Node that advertises the checkout-precondition capability refuses it unless the checkout is
+clean and at the batch's head; an older Node is never sent maintenance work (`node_upgrade_required`).
+Either way nothing runs and a person decides; direct turns are never checked.
 Moved pins require fresh planning; conflicting evidence never proves readiness.
 
 **Asynchronous helper receipts:** claim a due visit, then immediately dispatch the

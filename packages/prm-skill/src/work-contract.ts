@@ -80,19 +80,14 @@ export const workReportProblems = (order: WorkOrder, report: WorkReport): string
         `${finding.sourceId}: an addressed answer needs the reply's provider ID in responseIds.`,
       );
   }
-  for (const [index, effect] of report.effects.entries()) {
-    const label = `effects[${index}]`;
-    if (effect.kind !== "push") {
-      if (effect.force || effect.expectedRemoteSha !== undefined)
-        problems.push(`${label}: only a push carries force or expectedRemoteSha.`);
-      continue;
-    }
-    // Fleet records any forced push as a fact; whether it was authorized is its call.
-    if (effect.state !== "not_performed" && !effect.expectedRemoteSha)
-      problems.push(
-        `${label}: a push must report expectedRemoteSha, the remote head it replaced (fetched immediately before pushing).`,
-      );
-  }
+  // Fleet records every push as a fact. A push without expectedRemoteSha is
+  // unverifiable and holds maintenance; it never strands the report.
+  for (const [index, effect] of report.effects.entries())
+    if (
+      effect.kind !== "push" &&
+      (effect.force || effect.expectedRemoteSha !== undefined)
+    )
+      problems.push(`effects[${index}]: only a push carries force or expectedRemoteSha.`);
   return problems;
 };
 

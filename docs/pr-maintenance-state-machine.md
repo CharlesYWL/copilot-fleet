@@ -141,18 +141,26 @@ unrelated review, and never change the task state.
 - Never merge or enable auto-complete. History is rewritten only to resolve a
   straightforward merge conflict in a `conflictResolution` batch: the worker
   rebases onto the current base and force-pushes to the same PR branch with
-  `--force-with-lease` on the exact HEAD the batch was prepared from. Every
-  reported push names the head it replaced (`expectedRemoteSha`). Any other
-  forced push, or a push that replaced an unexpected head, is recorded as a
-  fact, the batch settles, and a system `paused` hold asks a person to look.
-  The next observation records whether the new head is a fast-forward of the
-  batch head (`batch.lineage`: `fast_forward`, `leased_rewrite`,
-  `rewritten` → hold, or `unverified` without provider ancestry evidence).
-  Unknown remote changes, user work, ambiguous conflicts and design questions
-  stop the worker without pushing.
-- Maintenance dispatch only: the Node refuses the batch prompt unless the
-  checkout is clean and HEAD is the batch's head; the batch settles unsent and
-  a design decision asks a person what to do with the local work.
+  `--force-with-lease` on the exact HEAD the batch was prepared from. Workers
+  report the head each push replaced (`expectedRemoteSha`). Any other forced
+  push, a push that replaced an unexpected head, or a push reported without
+  that head is recorded as a fact (`batch.lineage` `rewritten` or
+  `unverified`), the batch settles, and a system `paused` hold asks a person
+  to look. It replaces an orchestrator pause (which the orchestrator then
+  cannot clear); a person's hold keeps its kind and gains the reason. Either
+  way an attention notification is raised, also for released records.
+  Fleet does not verify ancestry: the next observation records `fast_forward`
+  only from provider compare evidence (`headLineage`), which no helper
+  supplies yet, so a head move after a published batch is normally
+  `unverified` and pauses until a person resumes. Unknown remote changes,
+  user work, ambiguous conflicts and design questions stop the worker without
+  pushing.
+- Maintenance dispatch only: a Node advertising `checkout-precondition`
+  refuses the batch prompt unless the checkout is clean and HEAD is the
+  batch's head; an older Node is never sent the prompt
+  (`node_upgrade_required`). Either way the batch settles unsent with zero
+  effects and a design decision asks a person. A refusal counts only for the
+  exact dispatched command while its step is still starting.
 - Exact provider/repository/PR/source-ref identity and retained worker binding.
 - Explicit Stop, authentication and identity holds.
 - Uncertain effects are reconciled before new effects or retries.

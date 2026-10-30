@@ -856,11 +856,27 @@ export class FleetService {
 
   /**
    * The Node refused a maintenance prompt because its checkout was dirty or off
-   * the batch's head. The batch settles unsent and a person decides.
+   * the batch's head. Only a refusal of the exact prompt the current dispatch
+   * attempt sent for that step counts, and only while the step is still
+   * starting; a stale or late refusal never cancels a running batch.
    */
-  refusePrMaintenanceCheckout(sessionId: string, reason: string): void {
+  refusePrMaintenanceCheckout(
+    sessionId: string,
+    commandId: string,
+    reason: string,
+  ): void {
     const step = this.store.getRunStepBySession(sessionId);
-    if (!step) return;
+    const worker = this.store.getSession(sessionId);
+    const dispatch = this.store.getSessionDispatchAttempt(sessionId);
+    if (
+      !step ||
+      !worker ||
+      step.state !== "starting" ||
+      dispatch?.commandId !== commandId ||
+      dispatch.attempt !==
+        notificationAttemptKey(worker, { step, run: this.store.getRun(step.runId) })
+    )
+      return;
     if (!this.store.prMaintenance.refuseCheckout(step.id, step.attempts, reason)) return;
     this.publishRunSteps(step.runId, this.store.listRunSteps(step.runId));
     this.publishSnapshot();
@@ -1020,6 +1036,20 @@ export class FleetService {
         ...(cursor ? { cursor } : {}),
       });
       for (const record of page.records) {
+        // Facts a person must see, retained or released: a rewritten or
+        // unverifiable branch, and a released turn whose report is missing.
+        for (const batch of record.batches) {
+          if (batch.lineage && ["rewritten", "unverified"].includes(batch.lineage.state))
+            this.notifications.createPrMaintenanceAttention(record, "attention", {
+              key: `${batch.id}:lineage:${batch.lineage.state}`,
+              body: `Maintenance batch ${batch.id}: ${batch.lineage.evidence} Check the PR branch history.`,
+            });
+          if (record.ownershipReleasedAt && batch.settlementError)
+            this.notifications.createPrMaintenanceAttention(record, "attention", {
+              key: `${batch.id}:settlement`,
+              body: `Released maintenance batch ${batch.id} finished, but Fleet could not settle it: ${batch.settlementError} Check the PR for its pushes and replies.`,
+            });
+        }
         if (
           record.ownershipReleasedAt &&
           !record.batches.some((batch) => batch.stepId && !batch.executionSettled)
