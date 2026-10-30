@@ -274,11 +274,11 @@ clean checkout, rebases the PR branch onto the current base, preserves accepted 
 and force-pushes to the same PR branch with an exact lease on the observed HEAD. It stops without
 pushing on unknown remote changes, user work, ambiguous conflicts or design questions, and never
 resets/deletes/stashes user work or merges the PR. Workers report the remote head each push
-replaced (`expectedRemoteSha`). Any other forced push, a push that replaced an unexpected head, or a
-push reported without that head is recorded as the fact it is; the batch still settles and
-maintenance pauses for a person. Fleet does not verify ancestry itself: no provider helper supplies
-compare evidence yet, so when the PR head moves after a published batch the move is recorded as
-unverified and maintenance pauses until a person checks the branch and resumes. Before sending a
+replaced (`expectedRemoteSha`). Any other forced push, or a push that replaced an unexpected head,
+is recorded as the fact it is; the batch still settles and maintenance pauses for a person. After a
+published batch, a new PR head that equals the commit the batch reported pushing (normal or leased)
+is explained and maintenance continues; a head move nothing recorded explains pauses until a person
+checks the branch and resumes. Fleet does not check ancestry itself. Before sending a
 batch, a Node that advertises the checkout-precondition capability refuses it unless the checkout is
 clean and at the batch's head; an older Node is never sent maintenance work (`node_upgrade_required`).
 Either way nothing runs and a person decides; direct turns are never checked.

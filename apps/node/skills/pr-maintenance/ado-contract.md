@@ -299,8 +299,8 @@ worker and an exact-base `conflictResolution:true` work order: the worker rebase
 branch onto the live base, verifies, and force-pushes to the same source ref with a lease on the
 exact observed head (`git push --force-with-lease=<ref>:<headSha>`), stopping on unknown remote
 changes, user work or ambiguous hunks. Report `expectedRemoteSha` on every push; Fleet records any
-other forced push, unexpected replaced head or missing `expectedRemoteSha` as a fact and pauses
-for a person.
+other forced push or unexpected replaced head as a fact and pauses for a person, as it does when
+the next PR head is not the commit the batch reported pushing.
 Never PR completion.
 An old iteration target is not the integration pin: use the live `baseSha`. Changed base
 requires fresh metadata/planning; ambiguous semantic choices still need a concise design decision.

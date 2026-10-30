@@ -1561,6 +1561,24 @@ describe("PR maintenance state machine scenarios", () => {
       expect(get(t.record.id).review).toMatchObject({ source: "worker_result" });
     });
 
+    it("does not pause after a routine fix, its normal push and the next observation", () => {
+      const t = enable();
+      review(t.record.id);
+      dispatchRoutine(t.record.id, t.worker.id);
+      finishWorker(t, t.record.id);
+      vi.setSystemTime(Date.now() + 60_000);
+      const record = review(t.record.id, { headSha: "c".repeat(40) });
+      expect(record.batches[0]!.lineage).toMatchObject({
+        state: "reported",
+        fromSha: headSha,
+        toSha: "c".repeat(40),
+      });
+      expect(record.hold).toBeUndefined();
+      expect(phase(record)).toBe("reviewing");
+      world.service.cancelPausedPrMaintenance();
+      expect(attentions()).toEqual([]);
+    });
+
     it("maintains a PR while its task awaits a human, without touching the task", () => {
       const t = enable("awaiting_human");
       review(t.record.id);
@@ -1698,28 +1716,39 @@ describe("PR maintenance state machine scenarios", () => {
         expect(record.hold?.reason).toMatch(/reported as a normal push but replaced/);
       });
 
-      it("settles a push reported without the head it replaced as unverified and pauses for a person", () => {
+      it("settles a push reported without the head it replaced; its reported commit explains the next head", () => {
         vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
-        const t = enable();
-        review(t.record.id);
-        expect(checkpoint(t.record.id, plan("no-lease")).ok).toBe(true);
-        expect(follow(t.record.id, t.worker.id, "no-lease").ok).toBe(true);
-        finishWith(t, conflictReport("no-lease", {}));
-        const record = get(t.record.id);
-        const batch = record.batches[0]!;
-        // Never stranded: the push is a fact and the batch settles.
-        expect(batch.settlementError).toBeUndefined();
-        expect(batch).toMatchObject({ state: "succeeded", published: true });
-        expect(batch.lineage).toMatchObject({
-          state: "unverified",
-          fromSha: headSha,
-          toSha: published,
-        });
-        expect(record.hold).toMatchObject({ kind: "paused", actor: "system" });
-        expect(record.hold?.reason).toMatch(/cannot verify how a maintenance push/);
+        const pushedWithoutLease = (observed: string) => {
+          const t = enable();
+          review(t.record.id);
+          expect(checkpoint(t.record.id, plan("no-lease")).ok).toBe(true);
+          expect(follow(t.record.id, t.worker.id, "no-lease").ok).toBe(true);
+          finishWith(t, conflictReport("no-lease", {}));
+          let record = get(t.record.id);
+          // Never stranded: the push is a fact and the batch settles.
+          expect(record.batches[0]!.settlementError).toBeUndefined();
+          expect(record.batches[0]).toMatchObject({
+            state: "succeeded",
+            published: true,
+          });
+          expect(record.hold).toBeUndefined();
+          vi.setSystemTime(Date.now() + 60_000);
+          record = review(t.record.id, { headSha: observed });
+          release(t.record.id, "next scenario");
+          return record;
+        };
+        const explained = pushedWithoutLease(published);
+        expect(explained.batches[0]!.lineage?.state).toBe("reported");
+        expect(explained.hold).toBeUndefined();
+        const unexplained = pushedWithoutLease("d".repeat(40));
+        expect(unexplained.batches[0]!.lineage?.state).toBe("unverified");
+        expect(unexplained.hold).toMatchObject({ kind: "paused", actor: "system" });
+        expect(unexplained.hold?.reason).toMatch(
+          /no push that batch reported explains it/,
+        );
         world.service.cancelPausedPrMaintenance();
         expect(attentions().map((entry) => entry.body)).toEqual([
-          expect.stringContaining("without the remote head it replaced"),
+          expect.stringContaining("No recorded maintenance push"),
         ]);
       });
 
@@ -1809,16 +1838,23 @@ describe("PR maintenance state machine scenarios", () => {
           );
           return observed;
         };
-        const unverified = run(published, undefined);
-        expect(unverified.batches[0]!.lineage).toMatchObject({
-          state: "unverified",
+        // The batch's own reported push explains the move: no pause.
+        const reported = run(published, undefined);
+        expect(reported.batches[0]!.lineage).toMatchObject({
+          state: "reported",
           fromSha: headSha,
           toSha: published,
         });
-        // No provider ancestry evidence: a person checks the branch.
+        expect(reported.hold).toBeUndefined();
+        // Nothing recorded explains this head: a person checks the branch.
+        const unverified = run("d".repeat(40), undefined);
+        expect(unverified.batches[0]!.lineage).toMatchObject({
+          state: "unverified",
+          toSha: "d".repeat(40),
+        });
         expect(unverified.hold).toMatchObject({ kind: "paused", actor: "system" });
         expect(unverified.hold?.reason).toMatch(
-          /no evidence that this was a fast-forward/,
+          /no push that batch reported explains it/,
         );
         const forward = run(published, {
           fromSha: headSha,
@@ -1837,6 +1873,9 @@ describe("PR maintenance state machine scenarios", () => {
         const leased = run(published, undefined, true);
         expect(leased.batches[0]!.lineage?.state).toBe("leased_rewrite");
         expect(leased.hold).toBeUndefined();
+        const movedPastLease = run("d".repeat(40), undefined, true);
+        expect(movedPastLease.batches[0]!.lineage?.state).toBe("unverified");
+        expect(movedPastLease.hold?.kind).toBe("paused");
       });
     });
 

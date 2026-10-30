@@ -381,7 +381,7 @@ export const WorkReportSchema = z
             expectedRemoteSha: sha
               .optional()
               .describe(
-                "Report for every attempted push: the remote head it replaced, fetched immediately before pushing (pr.headSha or your own earlier push). A forced push leases exactly this. Without it Fleet cannot verify the push and pauses maintenance for a person.",
+                "Report for every attempted push: the remote head it replaced, fetched immediately before pushing (pr.headSha or your own earlier push). A forced push leases exactly this.",
               ),
           })
           .strict(),

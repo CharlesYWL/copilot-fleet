@@ -80,8 +80,9 @@ export const workReportProblems = (order: WorkOrder, report: WorkReport): string
         `${finding.sourceId}: an addressed answer needs the reply's provider ID in responseIds.`,
       );
   }
-  // Fleet records every push as a fact. A push without expectedRemoteSha is
-  // unverifiable and holds maintenance; it never strands the report.
+  // Fleet records every push as a fact. Without expectedRemoteSha the next
+  // observation checks the head against the commit it reported; it never
+  // strands the report.
   for (const [index, effect] of report.effects.entries())
     if (
       effect.kind !== "push" &&

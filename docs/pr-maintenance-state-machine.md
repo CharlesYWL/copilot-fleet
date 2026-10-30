@@ -143,16 +143,17 @@ unrelated review, and never change the task state.
   rebases onto the current base and force-pushes to the same PR branch with
   `--force-with-lease` on the exact HEAD the batch was prepared from. Workers
   report the head each push replaced (`expectedRemoteSha`). Any other forced
-  push, a push that replaced an unexpected head, or a push reported without
-  that head is recorded as a fact (`batch.lineage` `rewritten` or
-  `unverified`), the batch settles, and a system `paused` hold asks a person
-  to look. It replaces an orchestrator pause (which the orchestrator then
+  push, or a push that replaced an unexpected head, is recorded as a fact
+  (`batch.lineage` `rewritten`), the batch settles, and a system `paused` hold
+  asks a person to look. It replaces an orchestrator pause (which the orchestrator then
   cannot clear); a person's hold keeps its kind and gains the reason. Either
   way an attention notification is raised, also for released records.
-  Fleet does not verify ancestry: the next observation records `fast_forward`
-  only from provider compare evidence (`headLineage`), which no helper
-  supplies yet, so a head move after a published batch is normally
-  `unverified` and pauses until a person resumes. Unknown remote changes,
+  The next observation after a published batch records `reported` (or
+  `leased_rewrite`) when the new head is the commit the batch reported
+  pushing, even without `expectedRemoteSha`, and maintenance continues;
+  `fast_forward` needs provider compare evidence (`headLineage`). A move
+  nothing recorded explains is `unverified` and pauses until a person
+  resumes. Fleet does not check ancestry itself. Unknown remote changes,
   user work, ambiguous conflicts and design questions stop the worker without
   pushing.
 - Maintenance dispatch only: a Node advertising `checkout-precondition`

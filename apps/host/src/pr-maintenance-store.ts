@@ -3561,11 +3561,12 @@ export class PrMaintenanceStore {
 
   /**
    * After a maintenance batch published, the next head Fleet observes must be
-   * a fast-forward of the head the batch was prepared from, unless the batch
-   * recorded its own leased conflict rewrite. Only provider ancestry evidence
-   * (`headLineage`) proves a fast-forward; no helper supplies it yet, so any
-   * other head move is recorded as unverified. A rewrite or an unverified move
-   * holds maintenance for a person.
+   * explained. Provider ancestry evidence (`headLineage`) decides when the
+   * helper supplies it. Otherwise the move is explained when the head is the
+   * resulting commit of the batch's own last known push: a normal push, or the
+   * leased conflict rewrite (unauthorized rewrites were already held when the
+   * batch settled). Anything else is unverified. A rewrite or an unexplained
+   * move holds maintenance for a person; an explained move never does.
    */
   private recordLineage(
     record: PrMaintenanceRegistration,
@@ -3577,25 +3578,27 @@ export class PrMaintenanceStore {
       .find((entry) => entry.published && !outstanding.has(entry.state));
     const head = observation.headSha;
     if (!batch || batch.lineage || !head || head === batch.headSha) return;
-    const forced = batch.effects.find(
-      (effect) =>
-        effect.kind === "push" && effect.force && effect.state !== "not_performed",
-    );
-    const lineage = observation.headLineage;
-    const state = forced
-      ? batch.conflictResolution && forced.expectedRemoteSha === batch.headSha
-        ? "leased_rewrite"
+    const pushed = batch.effects
+      .filter((effect) => effect.kind === "push" && effect.state === "known")
+      .at(-1);
+    const lineage =
+      observation.headLineage?.fromSha === batch.headSha
+        ? observation.headLineage
+        : undefined;
+    const state = lineage
+      ? lineage.fastForward
+        ? "fast_forward"
         : "rewritten"
-      : lineage?.fromSha === batch.headSha
-        ? lineage.fastForward
-          ? "fast_forward"
-          : "rewritten"
+      : pushed?.headSha === head
+        ? pushed.force
+          ? "leased_rewrite"
+          : "reported"
         : "unverified";
-    const evidence = forced
-      ? `Batch ${batch.id} recorded forced push ${forced.key} leased on ${forced.expectedRemoteSha}.`
-      : lineage?.fromSha === batch.headSha
-        ? lineage.evidence
-        : `No provider ancestry evidence relates ${head} to ${batch.headSha}; the move is unverified.`;
+    const evidence = lineage
+      ? lineage.evidence
+      : pushed?.headSha === head
+        ? `The new head is the commit batch ${batch.id} reported pushing (${pushed.key}${pushed.force ? `, leased on ${pushed.expectedRemoteSha}` : ""}).`
+        : `No recorded maintenance push or provider evidence explains the move from ${batch.headSha} to ${head}.`;
     batch.lineage = {
       state,
       fromSha: batch.headSha,
@@ -3603,16 +3606,16 @@ export class PrMaintenanceStore {
       at,
       evidence: evidence.slice(0, 8_192),
     };
-    if (state === "rewritten" && !forced)
+    if (state === "rewritten")
       this.rewriteHold(
         record,
-        `The PR head moved from ${batch.headSha} to ${head} without a fast-forward after maintenance batch ${batch.id}, and no leased rewrite was recorded. Check the branch history, then Resume.`,
+        `The PR head moved from ${batch.headSha} to ${head} without a fast-forward after maintenance batch ${batch.id}. Check the branch history, then Resume.`,
         at,
       );
     else if (state === "unverified")
       this.rewriteHold(
         record,
-        `The PR head moved from ${batch.headSha} to ${head} after maintenance batch ${batch.id}, and Fleet has no evidence that this was a fast-forward. Check the branch history, then Resume.`,
+        `The PR head moved from ${batch.headSha} to ${head} after maintenance batch ${batch.id}, and no push that batch reported explains it. Check the branch history, then Resume.`,
         at,
       );
   }
@@ -3798,7 +3801,6 @@ export class PrMaintenanceStore {
      * is asked to look before maintenance does anything else.
      */
     const rewrites: string[] = [];
-    const unverified: string[] = [];
     const pushedHeads = new Set([batch.headSha]);
     for (const effect of update.effects) {
       if (effect.kind !== "push" || effect.state === "not_performed") continue;
@@ -3822,10 +3824,8 @@ export class PrMaintenanceStore {
         rewrites.push(
           `${effect.key} was reported as a normal push but replaced ${effect.expectedRemoteSha}, which is neither this batch's head ${batch.headSha} nor an earlier push in it.`,
         );
-      else if (!recorded && effect.state === "known" && !effect.expectedRemoteSha)
-        unverified.push(
-          `${effect.key} was reported without the remote head it replaced, so Fleet cannot tell whether it rewrote history.`,
-        );
+      // A push without expectedRemoteSha is still recorded; the next
+      // observation decides whether the head it reported explains the move.
       pushedHeads.add(effect.headSha);
     }
     const final = !outstanding.has(update.state);
@@ -4014,21 +4014,21 @@ export class PrMaintenanceStore {
         headSha: record.observation?.headSha ?? batch.headSha,
         scope: record.authorization.scope.baseline,
       });
-    if ((rewrites.length || unverified.length) && !batch.lineage) {
+    if (rewrites.length && !batch.lineage) {
       const pushed = update.effects
         .filter((effect) => effect.kind === "push" && effect.state !== "not_performed")
         .at(-1);
       const at = nowIso();
       batch.lineage = {
-        state: rewrites.length ? "rewritten" : "unverified",
+        state: "rewritten",
         fromSha: batch.headSha,
         toSha: pushed?.headSha ?? batch.headSha,
         at,
-        evidence: [...rewrites, ...unverified].join(" ").slice(0, 8_192),
+        evidence: rewrites.join(" ").slice(0, 8_192),
       };
       this.rewriteHold(
         record,
-        `${rewrites.length ? "The PR branch history was rewritten in a way Fleet did not authorize" : "Fleet cannot verify how a maintenance push changed the PR branch"}; check the branch, then Resume. ${batch.lineage.evidence}`,
+        `The PR branch history was rewritten in a way Fleet did not authorize; check the branch, then Resume. ${batch.lineage.evidence}`,
         at,
       );
     }

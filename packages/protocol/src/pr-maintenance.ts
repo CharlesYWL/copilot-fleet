@@ -561,7 +561,7 @@ export const PrMaintenanceObservationSchema = z
     /**
      * Provider compare/ancestry evidence for `headSha` against an earlier head,
      * when the helper can supply it. Without it a changed head after a
-     * maintenance push is recorded as unverified.
+     * maintenance push is explained only by the push the batch reported.
      */
     headLineage: z
       .object({ fromSha: sha, fastForward: z.boolean(), evidence: text })
@@ -731,14 +731,21 @@ export const PrMaintenanceBatchSchema = PrMaintenancePreparedBatchSchema.extend(
   eventSeqFrom: z.number().int().nonnegative().optional(),
   eventSeqTo: z.number().int().nonnegative().optional(),
   /**
-   * How the PR head moved after this batch published, from the next
-   * observation: a fast-forward, the leased conflict rewrite this batch
-   * recorded, a rewrite (held for a person), or unverified when the provider
-   * offered no ancestry evidence.
+   * How the PR head moved after this batch published: a provider-proven
+   * fast-forward, the commit this batch reported pushing (`reported`, or
+   * `leased_rewrite` for its leased conflict rewrite), a rewrite, or
+   * unverified when nothing recorded explains it. Only the last two hold
+   * maintenance for a person.
    */
   lineage: z
     .object({
-      state: z.enum(["fast_forward", "leased_rewrite", "rewritten", "unverified"]),
+      state: z.enum([
+        "fast_forward",
+        "reported",
+        "leased_rewrite",
+        "rewritten",
+        "unverified",
+      ]),
       fromSha: sha,
       toSha: sha,
       at: time,
