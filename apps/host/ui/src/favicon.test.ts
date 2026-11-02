@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import mark from "./assets/copilot-fleet-mark.svg?raw";
 import favicon from "./assets/favicon.svg?raw";
 import nodeFavicon from "../../../node/public/favicon.svg?raw";
+import nodeAppIcon from "../../../node/public/icon.svg?raw";
 import appIcon from "../public/icon.svg?raw";
 import manifestSource from "../public/manifest.webmanifest?raw";
 import hostPage from "../index.html?raw";
@@ -22,10 +23,14 @@ describe("tab icon", () => {
     expect(paths(favicon)).toEqual(paths(mark));
   });
 
-  it("is the same file on the Node console", () => {
+  it("draws the same mark with a machine badge on the Node console", () => {
     // The Node serves its page from public/, outside this build, so it keeps its
-    // own copy rather than importing this one.
-    expect(nodeFavicon).toBe(favicon);
+    // own copy of the paths. A badge tells an installed Node console apart from
+    // the Host beside it in the taskbar.
+    expect(paths(nodeFavicon)).toEqual(paths(mark));
+    expect(nodeFavicon).toContain('class="node-badge"');
+    expect(nodeFavicon).not.toBe(favicon);
+    expect(nodeAppIcon).toBe(nodeFavicon);
   });
 
   it("is linked from every page that loads the console", () => {

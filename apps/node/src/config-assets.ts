@@ -12,9 +12,17 @@ export type ConfigAsset = { body: string | Buffer; contentType: string };
  * path: this listener answers a browser, and there is no reason for it to be
  * able to read any other file on the machine.
  */
-const ASSETS: Record<string, { file: string; contentType: string }> = {
+const ASSETS: Record<string, { file: string; contentType: string; binary?: true }> = {
   "/": { file: "index.html", contentType: "text/html; charset=utf-8" },
   "/favicon.svg": { file: "favicon.svg", contentType: "image/svg+xml" },
+  // What Edge and Chrome read to install this console as its own app.
+  "/manifest.webmanifest": {
+    file: "manifest.webmanifest",
+    contentType: "application/manifest+json",
+  },
+  "/icon.svg": { file: "icon.svg", contentType: "image/svg+xml" },
+  "/icon-192.png": { file: "icon-192.png", contentType: "image/png", binary: true },
+  "/icon-512.png": { file: "icon-512.png", contentType: "image/png", binary: true },
   "/config.css": { file: "config.css", contentType: "text/css; charset=utf-8" },
   "/config.js": {
     file: "config.js",
@@ -223,8 +231,9 @@ export function configAsset(
   if (!entry) return undefined;
   const cached = cache.get(pathname);
   if (cached) return cached;
+  const file = join(publicDirectory(), entry.file);
   const asset: ConfigAsset = {
-    body: readFileSync(join(publicDirectory(), entry.file), "utf8"),
+    body: entry.binary ? readFileSync(file) : readFileSync(file, "utf8"),
     contentType: entry.contentType,
   };
   cache.set(pathname, asset);
