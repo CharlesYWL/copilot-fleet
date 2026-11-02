@@ -50,17 +50,21 @@ export const initFleetSessions = () => {
               {
                 type: "button",
                 className: "session-item" + (session.id === selected ? " selected" : ""),
-                dataset: { fleetSessionId: session.id },
+                dataset: { fleetSessionId: session.id, state: session.state },
+                ariaPressed: String(session.id === selected),
               },
               [
                 el("span", {
                   className: "session-item-title",
                   textContent: fleetSessionLabel(session),
                 }),
-                el("span", {
-                  className: "session-item-meta",
-                  textContent: `${session.workspaceName} · ${session.state}`,
-                }),
+                el("span", { className: "session-item-meta" }, [
+                  `${session.workspaceName} · `,
+                  el("span", {
+                    className: "session-item-status",
+                    textContent: session.state,
+                  }),
+                ]),
               ],
             ),
           )
