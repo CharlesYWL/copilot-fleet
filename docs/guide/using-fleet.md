@@ -155,6 +155,25 @@ Permissions are also announced outside the page, with a tab-title count and a
 desktop notification that survives until it is clicked, because a request blocks
 its agent until the node's timeout expires.
 
+## Running the console as a desktop app
+
+Edge and Chrome can install the Host console as its own app. Open the console on
+the Host machine (`http://localhost:8787`), then choose **Apps → Install Copilot
+Fleet** from the browser menu (or the install icon at the end of the address
+bar). It opens in a separate window with no address bar, gets its own taskbar
+and Start menu entry, and can be pinned or set to start at sign-in from
+`edge://apps`.
+
+The installed app shares the browser's sign-in, so there is nothing new to set
+up. It shows the unread count on its taskbar icon as well as in the window
+title, and desktop notifications are attributed to the app rather than the
+browser. The Host still has to be running for the window to load, so pair it
+with the login service (`npm run service -- host install`).
+
+Install from the address you normally use. The app belongs to that origin:
+`localhost`, `127.0.0.1` and a tunnel hostname are three different apps with
+three different sign-ins.
+
 ## Navigating long conversations
 
 The right-hand prompt rail shows up to 40 marks, or fewer when the transcript

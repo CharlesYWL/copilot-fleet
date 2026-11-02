@@ -108,6 +108,34 @@ const advanceElection = async (milliseconds: number): Promise<void> => {
 };
 
 describe("useNotificationDelivery", () => {
+  it("mirrors the unread count onto the installed app's badge", () => {
+    const setAppBadge = vi.fn(() => Promise.resolve());
+    const clearAppBadge = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "setAppBadge", {
+      configurable: true,
+      value: setAppBadge,
+    });
+    Object.defineProperty(navigator, "clearAppBadge", {
+      configurable: true,
+      value: clearAppBadge,
+    });
+    try {
+      const input = delivery([], { unreadCount: 2 });
+      const { rerender } = renderHook(({ value }) => useNotificationDelivery(value), {
+        initialProps: { value: input },
+      });
+      expect(document.title).toBe("(2) Copilot Fleet");
+      expect(setAppBadge).toHaveBeenLastCalledWith(2);
+
+      rerender({ value: { ...input, unreadCount: 0 } });
+      expect(document.title).toBe("Copilot Fleet");
+      expect(clearAppBadge).toHaveBeenCalledOnce();
+    } finally {
+      Reflect.deleteProperty(navigator, "setAppBadge");
+      Reflect.deleteProperty(navigator, "clearAppBadge");
+    }
+  });
+
   it("delivers a new record once without redelivering a later upsert", async () => {
     const notification = item();
     const input = delivery([update(1, notification)]);
