@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Notification as FleetNotification } from "@fleet/protocol";
 import { playChime } from "../lib/chime";
+import { showAppBadge } from "../lib/app-badge";
 import {
   claimLiveNotification,
   type LiveNotificationClaim,
@@ -64,6 +65,7 @@ export function useNotificationDelivery(input: {
   useEffect(() => {
     document.title =
       input.unreadCount > 0 ? `(${input.unreadCount}) ${BASE_TITLE}` : BASE_TITLE;
+    showAppBadge(input.unreadCount);
   }, [input.unreadCount]);
 
   useEffect(() => {
