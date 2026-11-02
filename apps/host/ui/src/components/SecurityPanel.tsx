@@ -399,7 +399,9 @@ export const SecurityPanel = () => {
   if (data.status.state === "no-auth") {
     return (
       <div className={styles.panel}>
-        <Title3 as="h1">Security</Title3>
+        <Title3 as="h1" data-setting-id="security">
+          Security
+        </Title3>
         <MessageBar intent="warning">
           <MessageBarBody>
             Microsoft sign-in is off. Anyone who can reach this Host can operate Fleet.
@@ -417,14 +419,16 @@ export const SecurityPanel = () => {
             <MessageBarBody>{error}</MessageBarBody>
           </MessageBar>
         )}
-        <MicrosoftSignInSetup status={data.status} onChanged={load} />
+        <div data-setting-id="security.sign-in-setup">
+          <MicrosoftSignInSetup status={data.status} onChanged={load} />
+        </div>
       </div>
     );
   }
 
   return (
     <div className={styles.panel}>
-      <div>
+      <div data-setting-id="security">
         <Title3 as="h1">Security</Title3>
         <br />
         <Text className={styles.caption}>
@@ -537,7 +541,11 @@ function IdentityCard({
 }) {
   const styles = useStyles();
   return (
-    <section className={styles.card} aria-label="This Host">
+    <section
+      className={styles.card}
+      aria-label="This Host"
+      data-setting-id="security.host"
+    >
       <Text weight="semibold">This Host</Text>
       <div className={styles.facts}>
         <Text className={styles.caption}>Signed in as</Text>
@@ -623,7 +631,11 @@ function MicrosoftConfigurationCard({
   };
 
   return (
-    <section className={styles.card} aria-label="Microsoft sign-in configuration">
+    <section
+      className={styles.card}
+      aria-label="Microsoft sign-in configuration"
+      data-setting-id="security.microsoft-config"
+    >
       <Text weight="semibold">Microsoft sign-in configuration</Text>
       <Text className={styles.caption}>
         The current configuration stays active until you sign in through the new
@@ -697,7 +709,11 @@ function PasswordCard({
         ? "The passwords do not match."
         : undefined;
   return (
-    <section className={styles.card} aria-label="Password sign-in">
+    <section
+      className={styles.card}
+      aria-label="Password sign-in"
+      data-setting-id="security.password"
+    >
       <Text weight="semibold">Password sign-in</Text>
       {enabling ? (
         <Text className={styles.caption}>
@@ -838,7 +854,11 @@ function EraseAuthCard({
   };
 
   return (
-    <section className={styles.card} aria-label="Erase auth settings">
+    <section
+      className={styles.card}
+      aria-label="Erase auth settings"
+      data-setting-id="security.erase"
+    >
       <Text weight="semibold">Erase auth settings</Text>
       <Text className={styles.caption}>
         Return this Host to sign-in setup without restarting the Host or Nodes. Node
@@ -970,7 +990,11 @@ function DeviceFlowCard({
   };
 
   return (
-    <section className={styles.card} aria-label="Device sign-in">
+    <section
+      className={styles.card}
+      aria-label="Device sign-in"
+      data-setting-id="security.device"
+    >
       <div className={styles.row}>
         <Text weight="semibold">Device sign-in</Text>
         <Badge
@@ -1019,7 +1043,11 @@ function PendingCard({
   const styles = useStyles();
   if (pending.length === 0) return null;
   return (
-    <section className={styles.card} aria-label="Waiting for approval">
+    <section
+      className={styles.card}
+      aria-label="Waiting for approval"
+      data-setting-id="security.pending"
+    >
       <Text weight="semibold">Waiting for approval</Text>
       <Text className={styles.caption}>
         Redeeming an invitation only puts an identity forward. Check that this is the
@@ -1179,7 +1207,11 @@ function AdministratorsCard({
   };
 
   return (
-    <section className={styles.card} aria-label="Administrators">
+    <section
+      className={styles.card}
+      aria-label="Administrators"
+      data-setting-id="security.administrators"
+    >
       <div className={styles.row}>
         <Text weight="semibold">Administrators</Text>
         <Badge appearance="outline">{administrators.length}</Badge>
@@ -1372,7 +1404,11 @@ function NodeMigrationCard({
   const styles = useStyles();
   const { total, mutualAuth, legacy } = enrollment.nodeAuthentication;
   return (
-    <section className={styles.card} aria-label="Node authentication">
+    <section
+      className={styles.card}
+      aria-label="Node authentication"
+      data-setting-id="security.node-auth"
+    >
       <Text weight="semibold">Node authentication</Text>
       <Text>
         {mutualAuth} of {total} Node{total === 1 ? "" : "s"} authenticate with their own
@@ -1417,7 +1453,11 @@ function NodeMigrationCard({
 function AuditCard({ events }: { events: AuditEvent[] }) {
   const styles = useStyles();
   return (
-    <section className={styles.card} aria-label="Security audit">
+    <section
+      className={styles.card}
+      aria-label="Security audit"
+      data-setting-id="security.audit"
+    >
       <Text weight="semibold">Security audit</Text>
       <Text className={styles.caption}>
         Local to this Host and kept to the newest ten thousand entries. Claim codes,

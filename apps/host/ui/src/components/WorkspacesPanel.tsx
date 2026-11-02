@@ -264,7 +264,7 @@ export const WorkspacesPanel = ({
 
   return (
     <div className={styles.panel}>
-      <div className={styles.head}>
+      <div className={styles.head} data-setting-id="workspaces">
         <Title3 as="h1">Workspaces &amp; placements</Title3>
         <br />
         <Text className={styles.caption}>
@@ -273,7 +273,7 @@ export const WorkspacesPanel = ({
       </div>
 
       <div className={styles.columns}>
-        <section className={styles.card}>
+        <section className={styles.card} data-setting-id="workspaces.create">
           <Text
             weight="semibold"
             className={styles.cardTitle}
@@ -307,7 +307,7 @@ export const WorkspacesPanel = ({
           </form>
         </section>
 
-        <section className={styles.card}>
+        <section className={styles.card} data-setting-id="workspaces.placement">
           <Text weight="semibold" className={styles.cardTitle} data-tour="add-placement">
             Add placement
           </Text>
@@ -491,6 +491,7 @@ const WorkspaceCard = ({
 
   return (
     <article
+      data-setting-id={`workspace:${workspace.id}`}
       className={mergeClasses(
         styles.workspaceCard,
         dropState === "accept" && styles.dropAccept,

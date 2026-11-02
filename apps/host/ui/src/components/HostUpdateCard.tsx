@@ -136,7 +136,11 @@ export const HostUpdateCard = ({ status, revision }: HostUpdateCardProps) => {
   };
 
   return (
-    <section className={styles.card} aria-label="Update Host">
+    <section
+      className={styles.card}
+      aria-label="Update Host"
+      data-setting-id="general.host-update"
+    >
       <div className={styles.row}>
         <div>
           <Text weight="semibold">Update Host</Text>

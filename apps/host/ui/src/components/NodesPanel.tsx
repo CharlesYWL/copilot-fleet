@@ -226,7 +226,7 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
 
   return (
     <div className={styles.panel}>
-      <div className={styles.head}>
+      <div className={styles.head} data-setting-id="nodes">
         <Title3 as="h1">Nodes</Title3>
         <br />
         <Text className={styles.caption}>
@@ -236,7 +236,7 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
       </div>
       <ConnectNodeCard />
       {stale.length > 0 && (
-        <div className={styles.updateAll}>
+        <div className={styles.updateAll} data-setting-id="nodes.update-all">
           <Text>
             {stale.length} node{stale.length === 1 ? " is" : "s are"} behind the Host.
           </Text>
@@ -255,6 +255,7 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
         role="region"
         aria-label="Node inventory, scroll horizontally for more columns"
         tabIndex={0}
+        data-setting-id="nodes.inventory"
       >
         <Table className={styles.table} aria-label="Registered nodes">
           <TableHeader>
@@ -380,7 +381,7 @@ const NodeRow = ({
   };
 
   return (
-    <TableRow>
+    <TableRow data-setting-id={`node:${node.id}`}>
       <TableCell className={styles.colStatus}>
         <span className={styles.statusCell}>
           <StatusIndicator

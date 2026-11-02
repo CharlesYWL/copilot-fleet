@@ -162,7 +162,7 @@ export function OrchestratorPanel({
 
   return (
     <div className={styles.panel}>
-      <div>
+      <div data-setting-id="orchestrator">
         <Title3 as="h1">Orchestrator</Title3>
         <br />
         <Text className={styles.caption}>
@@ -175,7 +175,11 @@ export function OrchestratorPanel({
           <MessageBarBody>{error}</MessageBarBody>
         </MessageBar>
       )}
-      <section className={styles.card} aria-label="Orchestrator agent">
+      <section
+        className={styles.card}
+        aria-label="Orchestrator agent"
+        data-setting-id="orchestrator.agent"
+      >
         <Field label="Preferred agent">
           <Dropdown
             className={styles.dropdown}
@@ -274,6 +278,7 @@ export function OrchestratorPanel({
         <ModelDefaultsCard
           key={kind}
           kind={kind}
+          settingId={`orchestrator.model.${kind}`}
           sessions={sessions}
           model={defaults.orchestratorModels?.[kind] ?? ""}
           reasoningEffort={
@@ -347,7 +352,11 @@ function HeartbeatScheduleCard({
         ? `Next: ${upcoming.map(heartbeatTime).join(" \u00b7 ")}`
         : null;
   return (
-    <section className={styles.card} aria-label="Orchestrator heartbeat">
+    <section
+      className={styles.card}
+      aria-label="Orchestrator heartbeat"
+      data-setting-id="orchestrator.heartbeat"
+    >
       <div>
         <Text weight="semibold">Orchestrator heartbeat</Text>
         <br />

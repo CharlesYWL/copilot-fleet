@@ -260,7 +260,7 @@ export const GeneralPanel = ({
   } = defaults;
   return (
     <div className={styles.panel}>
-      <div>
+      <div data-setting-id="general">
         <Title3 as="h1">Session defaults</Title3>
         <br />
         <Text className={styles.caption}>
@@ -275,7 +275,11 @@ export const GeneralPanel = ({
         </MessageBar>
       )}
 
-      <section className={styles.card} aria-label="Managed worktree isolation">
+      <section
+        className={styles.card}
+        aria-label="Managed worktree isolation"
+        data-setting-id="general.managed-worktrees"
+      >
         <div className={styles.row}>
           <div>
             <Text weight="semibold">Managed worktree isolation</Text>
@@ -302,7 +306,7 @@ export const GeneralPanel = ({
           push or delete a checkout.
         </Text>
         {defaults.managedWorktreePolicy && (
-          <details>
+          <details data-setting-id="general.managed-worktrees.quotas">
             <summary>Managed retention and quotas</summary>
             <ManagedQuotaEditor
               policy={defaults.managedWorktreePolicy}
@@ -314,7 +318,11 @@ export const GeneralPanel = ({
       </section>
 
       {onStartTour && (
-        <section className={styles.card} aria-label="Getting started">
+        <section
+          className={styles.card}
+          aria-label="Getting started"
+          data-setting-id="general.tour"
+        >
           <Text weight="semibold" data-tour="tour-help">
             Getting started
           </Text>
@@ -335,7 +343,11 @@ export const GeneralPanel = ({
         </section>
       )}
 
-      <section className={styles.card} aria-label="Default context window">
+      <section
+        className={styles.card}
+        aria-label="Default context window"
+        data-setting-id="general.long-context"
+      >
         <div className={styles.row}>
           <div>
             <Text weight="semibold">Long context by default</Text>
@@ -363,7 +375,7 @@ export const GeneralPanel = ({
         </Text>
       </section>
 
-      <section className={styles.card}>
+      <section className={styles.card} data-setting-id="general.yolo">
         <div className={styles.row}>
           <div>
             <Text weight="semibold" data-tour="session-defaults">
@@ -392,7 +404,11 @@ export const GeneralPanel = ({
       )}
 
       {agencyModeAvailable && (
-        <section className={styles.card} aria-label="Agency mode">
+        <section
+          className={styles.card}
+          aria-label="Agency mode"
+          data-setting-id="general.agency"
+        >
           <div className={styles.row}>
             <div>
               <div className={styles.settingTitle}>
@@ -429,7 +445,7 @@ export const GeneralPanel = ({
         </section>
       )}
 
-      <section className={styles.card}>
+      <section className={styles.card} data-setting-id="general.auto-resume">
         <div className={styles.row}>
           <div>
             <Text weight="semibold">Reconnect sessions automatically</Text>
@@ -449,7 +465,7 @@ export const GeneralPanel = ({
         </div>
       </section>
 
-      <section className={styles.card}>
+      <section className={styles.card} data-setting-id="general.lifecycle-notifications">
         <div className={styles.row}>
           <div>
             <Text weight="semibold">Lifecycle notifications</Text>
@@ -473,6 +489,7 @@ export const GeneralPanel = ({
       </section>
 
       <ModelDefaultsCard
+        settingId="general.model"
         sessions={sessions}
         model={model}
         reasoningEffort={reasoningEffort}
@@ -484,7 +501,11 @@ export const GeneralPanel = ({
 
       {hostUpdate && <HostUpdateCard status={hostUpdate} revision={hostRevision} />}
 
-      <section className={styles.card} aria-label="Fleet data archive">
+      <section
+        className={styles.card}
+        aria-label="Fleet data archive"
+        data-setting-id="general.data"
+      >
         <div>
           <Text weight="semibold">Export fleet data</Text>
           <br />

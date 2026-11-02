@@ -138,7 +138,11 @@ export const DiagnosticsPanel = () => {
   )?.slice(-MAX_VISIBLE_LOG_ENTRIES);
 
   return (
-    <section className={styles.panel} aria-label="Diagnostics">
+    <section
+      className={styles.panel}
+      aria-label="Diagnostics"
+      data-setting-id="diagnostics"
+    >
       <div className={styles.head}>
         <div>
           <Title3>Host runtime logs</Title3>
