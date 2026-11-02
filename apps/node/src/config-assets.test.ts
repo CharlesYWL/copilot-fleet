@@ -165,4 +165,37 @@ describe("config assets", () => {
       '<link rel="icon" type="image/svg+xml" href="/favicon.svg" />',
     );
   });
+
+  it("can be installed as its own app, distinct from the Host", () => {
+    expect(configAsset("/")?.body).toContain(
+      '<link rel="manifest" href="/manifest.webmanifest" />',
+    );
+    const manifest = configAsset("/manifest.webmanifest");
+    expect(manifest?.contentType).toBe("application/manifest+json");
+    const parsed = JSON.parse(String(manifest?.body)) as {
+      name: string;
+      display: string;
+      start_url: string;
+      icons: { src: string }[];
+    };
+    expect(parsed.name).toBe("Copilot Fleet Node");
+    expect(parsed.display).toBe("standalone");
+    expect(parsed.start_url).toBe("/");
+    for (const { src } of parsed.icons) {
+      expect(configAsset(src), src).toBeDefined();
+    }
+    expect(configAsset("/icon.svg")?.body).toBe(configAsset("/favicon.svg")?.body);
+  });
+
+  it("serves the app icons as unaltered PNG bytes", () => {
+    for (const path of ["/icon-192.png", "/icon-512.png"]) {
+      const icon = configAsset(path);
+      expect(icon?.contentType).toBe("image/png");
+      expect(Buffer.isBuffer(icon?.body)).toBe(true);
+      // The PNG signature survives only if the file was not decoded as text.
+      expect((icon?.body as Buffer).subarray(0, 8)).toEqual(
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+    }
+  });
 });

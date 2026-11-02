@@ -220,6 +220,19 @@ Use the config page to retarget the node when a tunnel
 hands out a new URL — the node reconnects in place, so no restart is needed and
 running sessions survive.
 
+### Installing the Node console as an app
+
+Edge and Chrome can install the config page as its own app, separate from the
+Host console. Open it on the Node machine (`http://127.0.0.1:8788`), then choose
+**⋯ → Apps → Install Copilot Fleet Node** (or the install icon in the address
+bar). Its icon is the Fleet mark with a green machine badge, so it is easy to
+tell apart from the Host app in the taskbar.
+
+An installed app is tied to its exact address, port included. Because the config
+page moves to the next free port when 8788 is taken, pin it with
+`--config-port 8788` (or `FLEET_NODE_CONFIG_PORT`) before installing; otherwise a
+restart onto another port leaves the app opening a page that is not there.
+
 ### Shared worker chat and offline continuation
 
 When visiting a worker VM to inspect UI work, open this Node page's **Sessions**
