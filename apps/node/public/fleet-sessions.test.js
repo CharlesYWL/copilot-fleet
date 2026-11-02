@@ -11,9 +11,15 @@ const html = readFileSync(
   "utf8",
 );
 const page = html.slice(html.indexOf("<body>") + 6, html.indexOf("</body>"));
+const stylesheet = document.createElement("style");
+stylesheet.textContent = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "config.css"),
+  "utf8",
+);
 const reply = (body) => Promise.resolve({ ok: true, json: async () => body });
 
 beforeEach(() => {
+  document.head.append(stylesheet);
   document.body.innerHTML = page;
   vi.stubGlobal(
     "fetch",
@@ -39,10 +45,62 @@ beforeEach(() => {
 afterEach(() => {
   window.dispatchEvent(new Event("pagehide"));
   vi.unstubAllGlobals();
+  stylesheet.remove();
   document.body.innerHTML = "";
 });
 
 describe("lazy Node session shell", () => {
+  it.each([
+    ["queued", "#8994ab"],
+    ["starting", "#6c8cff"],
+    ["running", "#6c8cff"],
+    ["idle", "#8994ab"],
+    ["cancelling", "#f7bf61"],
+    ["offline", "#ff6b7a"],
+    ["stopped", "#8994ab"],
+    ["completed", "#4ad6a7"],
+    ["failed", "#ff6b7a"],
+  ])("shows the Host status color for unselected %s sessions", async (state, color) => {
+    vi.mocked(fetch).mockImplementation(() =>
+      reply({
+        sessions: [{ id: "one", name: "First", workspaceName: "Workspace", state }],
+      }),
+    );
+    initFleetSessions();
+    await vi.waitFor(() => expect($("fleetSessionList").textContent).toContain("First"));
+    const row = document.querySelector('[data-fleet-session-id="one"]');
+    expect(row.dataset.state).toBe(state);
+    expect(row.getAttribute("aria-pressed")).toBe("false");
+    expect(row.querySelector(".session-item-status").textContent).toBe(state);
+    expect(getComputedStyle(row).getPropertyValue("--session-status-color")).toBe(color);
+    expect(getComputedStyle(row).boxShadow).toContain("var(--session-status-color)");
+  });
+
+  it("keeps status colors when selection moves between sessions", async () => {
+    initFleetSessions();
+    await vi.waitFor(() => expect($("fleetSessionList").textContent).toContain("First"));
+    document.querySelector('[data-fleet-session-id="one"]').click();
+    let selected = document.querySelector("#fleetSessionList .selected");
+    expect(selected.dataset.fleetSessionId).toBe("one");
+    expect(selected.getAttribute("aria-pressed")).toBe("true");
+    expect(getComputedStyle(selected).getPropertyValue("--session-status-color")).toBe(
+      "#8994ab",
+    );
+
+    document.querySelector('[data-fleet-session-id="two"]').click();
+    selected = document.querySelector("#fleetSessionList .selected");
+    expect(selected.dataset.fleetSessionId).toBe("two");
+    expect(selected.getAttribute("aria-pressed")).toBe("true");
+    expect(getComputedStyle(selected).getPropertyValue("--session-status-color")).toBe(
+      "#6c8cff",
+    );
+    const previous = document.querySelector('[data-fleet-session-id="one"]');
+    expect(previous.getAttribute("aria-pressed")).toBe("false");
+    expect(getComputedStyle(previous).getPropertyValue("--session-status-color")).toBe(
+      "#8994ab",
+    );
+  });
+
   it("labels and searches unnamed sessions using the initial prompt", async () => {
     vi.mocked(fetch).mockImplementation(() =>
       reply({

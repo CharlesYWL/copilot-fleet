@@ -343,7 +343,39 @@ h3 {
 }
 
 .session-item.selected {
-  box-shadow: inset 3px 0 var(--accent);
+  border-color: var(--muted);
+}
+
+.session-item:focus-visible {
+  outline-color: var(--text);
+}
+
+/* Match Host's status palette in apps/host/ui/src/theme.ts. */
+.session-item[data-state] {
+  --session-status-color: #8994ab;
+  box-shadow: inset 3px 0 var(--session-status-color);
+}
+
+.session-item[data-state="starting"],
+.session-item[data-state="running"] {
+  --session-status-color: #6c8cff;
+}
+
+.session-item[data-state="cancelling"] {
+  --session-status-color: #f7bf61;
+}
+
+.session-item[data-state="offline"],
+.session-item[data-state="failed"] {
+  --session-status-color: #ff6b7a;
+}
+
+.session-item[data-state="completed"] {
+  --session-status-color: #4ad6a7;
+}
+
+.session-item-status {
+  color: var(--session-status-color);
 }
 
 .session-item-title,
