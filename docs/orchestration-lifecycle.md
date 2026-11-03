@@ -368,8 +368,12 @@ The default task action sends a preparation request (optional PR URL only) to it
 existing Orchestrator through the existing prompt delivery mechanism. Durable
 deliveries deduplicate while pending; a settled request can be deliberately retried.
 `fleet_prepare_pr_maintenance` validates fresh provider metadata against the URL,
-derives the owned task baseline and sole coding worker, and returns explicit
-choices rather than guessing when ambiguous. `fleet_propose_pr_maintenance`
+derives the owned task baseline and sole retained task session, and returns every
+task-owned retained session as a readable choice when ambiguous. An explicit
+`workerSessionId` selects that exact task session; it does not select by role.
+Historical `implement`, `test`, `explore`, `review-quick`, `review-deep`,
+worker/reviewer routing role and session `readOnly` do not determine maintenance
+eligibility or authority. `fleet_propose_pr_maintenance`
 retains the advanced exact-scope capability. Both save a durable, unapproved
 proposal for an existing eligible worker. They change neither task state nor
 maintenance authority and dispatches no worker. The operator receives an existing
@@ -380,9 +384,23 @@ again; task approval is not maintenance approval. Proposals survive backup and
 restart without acquiring authority. Read them through
 `fleet_get_pr_maintenance(taskId)` or the existing task discovery surfaces.
 Preparation is repair-only; there is no observation-only default and an explicit
-observe mode is unsupported. `publicationEvidence` for verified existing task and
-publication authority is required; without it preparation is refused
-(`publication_evidence_required`) and no proposal or write grant is created.
+observe mode is unsupported. Prior publication is not required: the Host never
+infers eligibility from tool details, transcripts, model prose or an earlier
+push. `publicationEvidence` is optional context only. A signed-in operator's
+exact task/PR/session grant supplies repair authority; preparation creates no
+grant, registration, worker dispatch or provider effect.
+
+An approved maintenance attempt receives normal writing-capacity and exclusive
+checkout admission even when its retained session originated as read-only.
+This is an admission view of the accepted batch, not a rewrite of the session's
+historical role, category or `readOnly`. The Node reserves writer capacity for
+the maintenance turn without discarding the retained reader reservation, and
+revalidates the existing repository/checkout lease
+before checking the clean, exact PR head and invoking the agent. Direct turns
+retain their normal historical admission. Exact task ownership, valid
+workspace/checkout binding, conflicting-writer and unknown-effect fences,
+identity checks and authenticated approval remain mandatory. Merge and
+auto-complete remain forbidden.
 Replies, thread resolution, named reviewer requests and CI retries default off and
 must be requested separately. The returned mode and action flags mirror the stored
 proposal. Operator approval cannot silently reinterpret read-only scope as repair authority.

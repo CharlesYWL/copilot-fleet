@@ -1080,49 +1080,53 @@ describe("PR maintenance task controls", () => {
     expect(enableTaskMaintenance).not.toHaveBeenCalled();
   });
 
-  it("reviews a prefilled proposal without copying JSON and authorizes only its captured reference", async () => {
-    const pending = proposal();
-    const enabled = { ...registration(), lifecycle: "active" as const };
-    vi.mocked(getTaskMaintenance)
-      .mockResolvedValueOnce({ records: [], proposal: pending, canAuthorize: true })
-      .mockResolvedValue({ records: [enabled], canAuthorize: true });
-    vi.mocked(authorizeTaskMaintenanceProposal).mockResolvedValue(enabled);
-    render(
-      <FluentProvider theme={fleetDarkTheme}>
-        <PrMaintenancePanel
-          run={{ ...task, state: "completed" }}
-          sessions={[worker]}
-          onChange={vi.fn()}
-        />
-      </FluentProvider>,
-    );
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Review PR maintenance proposal" }),
-    );
-    const dialog = screen.getByRole("dialog");
-    expect(
-      within(dialog).queryByRole("textbox", { name: "Registration proposal" }),
-    ).toBeNull();
-    expect(within(dialog).getByText(/Original coder/)).toBeTruthy();
-    const authorize = within(dialog).getByRole("button", {
-      name: "Maintain this PR",
-    });
-    expect(
-      within(dialog).getByRole("checkbox", {
-        name: "I authorize maintaining this PR: code repairs, normal pushes, and the responses above. No merge, no unapproved design changes, and a force-push only to finish a conflict rebase leased on the exact PR head.",
-      }),
-    ).toBeTruthy();
-    expect((authorize as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(within(dialog).getByRole("checkbox"));
-    fireEvent.click(authorize);
-    await waitFor(() =>
-      expect(authorizeTaskMaintenanceProposal).toHaveBeenCalledWith(task.id, {
-        id: "proposal",
-        version: 1,
-      }),
-    );
-    expect(enableTaskMaintenance).not.toHaveBeenCalled();
-  });
+  it.each(["worker", "reviewer"] as const)(
+    "reviews a prefilled %s proposal without copying JSON and authorizes only its captured reference",
+    async (runRole) => {
+      const pending = proposal();
+      const enabled = { ...registration(), lifecycle: "active" as const };
+      vi.mocked(getTaskMaintenance)
+        .mockResolvedValueOnce({ records: [], proposal: pending, canAuthorize: true })
+        .mockResolvedValue({ records: [enabled], canAuthorize: true });
+      vi.mocked(authorizeTaskMaintenanceProposal).mockResolvedValue(enabled);
+      render(
+        <FluentProvider theme={fleetDarkTheme}>
+          <PrMaintenancePanel
+            run={{ ...task, state: "completed" }}
+            sessions={[{ ...worker, runRole, readOnly: true }]}
+            onChange={vi.fn()}
+          />
+        </FluentProvider>,
+      );
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Review PR maintenance proposal" }),
+      );
+      const dialog = screen.getByRole("dialog");
+      expect(
+        within(dialog).queryByRole("textbox", { name: "Registration proposal" }),
+      ).toBeNull();
+      expect(within(dialog).getByText(/Original coder/)).toBeTruthy();
+      const authorize = within(dialog).getByRole("button", {
+        name: "Maintain this PR",
+      });
+      expect(
+        within(dialog).getByRole("checkbox", {
+          name: "I authorize maintaining this PR: code repairs, normal pushes, and the responses above. No merge, no unapproved design changes, and a force-push only to finish a conflict rebase leased on the exact PR head.",
+        }),
+      ).toBeTruthy();
+      expect((authorize as HTMLButtonElement).disabled).toBe(true);
+      expect(within(dialog).getByRole("checkbox").hasAttribute("disabled")).toBe(false);
+      fireEvent.click(within(dialog).getByRole("checkbox"));
+      fireEvent.click(authorize);
+      await waitFor(() =>
+        expect(authorizeTaskMaintenanceProposal).toHaveBeenCalledWith(task.id, {
+          id: "proposal",
+          version: 1,
+        }),
+      );
+      expect(enableTaskMaintenance).not.toHaveBeenCalled();
+    },
+  );
 
   it("does not retarget an open authorization dialog when the Orchestrator revises the proposal", async () => {
     const pending = proposal();

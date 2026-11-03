@@ -605,7 +605,9 @@ export const PreparePrMaintenanceSchema = z
       .string()
       .min(1)
       .optional()
-      .describe("Existing task coder; omit to resolve the sole eligible worker."),
+      .describe(
+        "Retained session of this exact task; omit to select its sole retained session.",
+      ),
     prUrl: z.string().min(1).max(4_096),
     identity: PrMaintenanceIdentitySchema,
     headSha: PrMaintenanceEnableSchema.shape.headSha,
@@ -621,7 +623,7 @@ export const PreparePrMaintenanceSchema = z
       .min(1)
       .max(8_192)
       .describe(
-        "Retrievable exact identity/refs/HEAD evidence. Fresh metadata-only evidence is not complete observation or readiness; repair preparation also requires existing publication authority.",
+        "Retrievable exact identity/refs/HEAD evidence. Fresh metadata-only evidence is not complete observation or readiness; repair authority requires signed-in operator authorization.",
       ),
     verification: z.string().min(1).max(8_192),
     eligibilityEvidence: z.string().min(1).max(8_192),
@@ -632,9 +634,16 @@ export const PreparePrMaintenanceSchema = z
       })
       .default("repair")
       .describe(
-        "Repair-only proposal; verified existing task/publication authority and authenticated human approval are required. Observation-only enrollment is unsupported.",
+        "Repair-only proposal for an existing task/session; authenticated operator approval grants maintenance authority. Observation-only enrollment is unsupported.",
       ),
-    publicationEvidence: z.string().min(1).max(8_192).optional(),
+    publicationEvidence: z
+      .string()
+      .min(1)
+      .max(8_192)
+      .optional()
+      .describe(
+        "Optional publication context; prior publication does not determine worker eligibility or maintenance authority.",
+      ),
     // One "Maintain this PR" grant covers replies and resolving addressed threads.
     replies: z.boolean().default(true),
     resolveThreads: z.boolean().default(true),
@@ -1051,7 +1060,7 @@ export class FleetTools {
     try {
       return ok(JSON.stringify(action()));
     } catch (error) {
-      if (error instanceof PrMaintenanceError) {
+      if (error instanceof PrMaintenanceError || error instanceof CommandConflict) {
         return refuse(`${error.code}: ${error.message}`);
       }
       throw error;
@@ -1171,11 +1180,6 @@ export class FleetTools {
 
   preparePrMaintenance(input: z.infer<typeof PreparePrMaintenanceSchema>): ToolResult {
     return this.maintenanceResult(() => {
-      if (!input.publicationEvidence)
-        throw new PrMaintenanceError(
-          "publication_evidence_required",
-          "Repair preparation requires verified existing task and publication authority. Observation-only enrollment is unsupported; no proposal or write grant was created.",
-        );
       let url;
       try {
         url = parsePrMaintenanceUrl(input.prUrl);
@@ -1226,19 +1230,20 @@ export class FleetTools {
         };
       const task = tasks[0]!;
       const workerIds = new Set(
-        this.store
-          .listRunSteps(task.id)
-          .filter((step) => isWritingCategory(step.category))
-          .map((step) => step.sessionId),
+        this.store.listRunSteps(task.id).map((step) => step.sessionId),
       );
       const workers = this.store
         .listSessions()
         .filter(
           (session) =>
             session.runId === task.id &&
-            session.runRole === "worker" &&
             workerIds.has(session.id) &&
             (!input.workerSessionId || session.id === input.workerSessionId),
+        );
+      if (input.workerSessionId && workers.length === 0)
+        throw new PrMaintenanceError(
+          "ownership",
+          "That retained session does not belong to this exact task.",
         );
       if (workers.length !== 1)
         return {
@@ -1249,7 +1254,7 @@ export class FleetTools {
             name: worker.name,
           })),
           instruction:
-            "Resolve the existing coder from task evidence; never create a replacement worker.",
+            "Choose a retained session of this task; historical role and read-only category do not select one for you.",
         };
       const baseline = [
         task.objective,
@@ -1278,7 +1283,9 @@ export class FleetTools {
           eligibilityEvidence: [
             input.eligibilityEvidence,
             `Metadata observed ${input.observedAt} via ${input.method}: ${input.evidence}`,
-            `Verified publication path: ${input.publicationEvidence}`,
+            ...(input.publicationEvidence
+              ? [`Additional publication context: ${input.publicationEvidence}`]
+              : []),
           ].join("\n"),
           ...(input.expectedVersion ? { expectedVersion: input.expectedVersion } : {}),
         }),

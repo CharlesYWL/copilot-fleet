@@ -35,7 +35,11 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
-async function setup(provider: "github" | "azure-devops" = "github", dbPath?: string) {
+async function setup(
+  provider: "github" | "azure-devops" = "github",
+  dbPath?: string,
+  history?: { category: string; readOnly: boolean; runRole: "worker" | "reviewer" },
+) {
   const state = fleet(dbPath);
   const { store, service, leadId } = state;
   store.transitionSession(leadId, "starting");
@@ -52,12 +56,21 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
     "repair",
     false,
     "Retained worker",
-    { runId: run.id, runRole: "worker" },
+    {
+      runId: run.id,
+      runRole: history?.runRole ?? "worker",
+      readOnly: history?.readOnly ?? false,
+    },
   );
   store.transitionSession(worker.id, "starting");
   store.transitionSession(worker.id, "idle");
   const [step] = store.replaceRunSteps(run.id, [
-    { stepKey: "repair", title: "Repair", prompt: "repair", category: "implement" },
+    {
+      stepKey: "repair",
+      title: "Repair",
+      prompt: "repair",
+      category: history?.category ?? "implement",
+    },
   ]);
   store.updateRunStep(step!.id, { state: "succeeded", sessionId: worker.id });
   const registration = PrMaintenanceEnableSchema.parse({
@@ -779,7 +792,7 @@ describe("authenticated PR maintenance controls", () => {
     },
   );
 
-  it("never expands a read-only task into publication or feedback mutations when preparation omits permissions", async () => {
+  it("proposes repair authority for operator review without granting it from historical read-only task scope", async () => {
     const { store, run, registration, mcp } = await setup("azure-devops");
     const objective =
       "Observe the linked PR only. No repair, publication, review changes or merge.";
@@ -798,9 +811,15 @@ describe("authenticated PR maintenance controls", () => {
         "No verified mutable checkout or publication path; observation-only scope.",
     };
     const result = await mcp("fleet_prepare_pr_maintenance", input);
-    expect(result.ok, result.text).toBe(false);
-    expect(result.text).toContain("publication authority");
-    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+    expect(result.ok, result.text).toBe(true);
+    expect(JSON.parse(result.text)).toMatchObject({
+      status: "awaiting_operator_authorization",
+    });
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    expect(proposal.registration.scope).toMatchObject({
+      baseline: objective,
+      publicationAuthorized: true,
+    });
     expect(store.prMaintenance.list().records).toHaveLength(0);
     const mutation = await mcp("fleet_prepare_pr_maintenance", {
       ...input,
@@ -812,8 +831,9 @@ describe("authenticated PR maintenance controls", () => {
       ...input,
       mode: "repair",
     });
-    expect(noPublicationEvidence.ok, noPublicationEvidence.text).toBe(false);
-    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+    expect(noPublicationEvidence.ok, noPublicationEvidence.text).toBe(true);
+    expect(store.prMaintenance.getProposal(run.id)?.id).toBe(proposal.id);
+    expect(store.prMaintenance.list().records).toEqual([]);
   });
 
   it("rejects explicit legacy observation mode through the exposed preparation MCP", async () => {
@@ -1383,5 +1403,278 @@ describe("authenticated PR maintenance controls", () => {
       actions: [expect.objectContaining({ key: "notification-1", state: "reserved" })],
     });
     expect(store.getSession(worker.id)).toBeDefined();
+  });
+});
+
+describe("role-agnostic PR maintenance preparation", () => {
+  const taskWorker = async (
+    category = "explore",
+    readOnly = true,
+    role: "worker" | "reviewer" = "worker",
+  ) => {
+    const state = await setup("azure-devops", undefined, {
+      category,
+      readOnly,
+      runRole: role,
+    });
+    const { store, run } = state;
+    const worker = state.worker;
+    const [step] = store.replaceRunSteps(run.id, [
+      { stepKey: "retained", title: category, prompt: "Historical work", category },
+    ]);
+    store.updateRunStep(step!.id, {
+      state: "succeeded",
+      sessionId: worker.id,
+      placementId: worker.placementId,
+    });
+    store.updateRun(run.id, { state: "awaiting_human" });
+    const registration = {
+      ...state.registration,
+      workerSessionId: worker.id,
+      identity: {
+        ...state.registration.identity,
+        prNumber: 1149305,
+        headRef: "refs/heads/dev/charlesyin/schema-designer-fk-history",
+      },
+      headSha: "849ca5216623f55ef97443adca783c2ba61a5bcb",
+    };
+    const input = {
+      taskId: run.id,
+      workerSessionId: worker.id,
+      prUrl: prMaintenanceUrl(registration.identity),
+      identity: registration.identity,
+      headSha: registration.headSha,
+      observedAt: new Date().toISOString(),
+      method: "provider_mcp",
+      evidence: "Fresh exact provider PR metadata.",
+      publicationEvidence: "Request an authenticated maintenance grant for this task.",
+      verification: registration.scope.verification,
+      eligibilityEvidence: "Existing retained checkout and maintenance tools verified.",
+    };
+    return { ...state, worker, step: step!, registration, input };
+  };
+
+  it.each([
+    ["implement", false, "worker"],
+    ["test", false, "worker"],
+    ["explore", true, "worker"],
+    ["review-quick", true, "reviewer"],
+    ["review-deep", true, "reviewer"],
+    ["implement", true, "worker"],
+  ] as const)(
+    "proposes the exact task's %s session, readOnly=%s, role=%s without publication provenance",
+    async (category, readOnly, role) => {
+      const { store, service, run, worker, step, input, mcp, app } = await taskWorker(
+        category,
+        readOnly,
+        role,
+      );
+      const sessions = store.listSessions();
+      const steps = store.listRunSteps(run.id);
+      const commands = store.commands.prompts();
+      const dispatch = vi.spyOn(service, "dispatch");
+      const view = await app.inject({
+        method: "GET",
+        url: `/api/runs/${run.id}/pr-maintenance`,
+        headers: { "fixture-browser": "yes" },
+      });
+      expect(view.statusCode, view.body).toBe(200);
+      expect(view.json()).not.toHaveProperty("unsupportedReason");
+      const result = await mcp("fleet_prepare_pr_maintenance", input);
+      expect(result.ok, result.text).toBe(true);
+      expect(JSON.parse(result.text), result.text).toMatchObject({
+        status: "awaiting_operator_authorization",
+        taskId: run.id,
+      });
+      const proposal = store.prMaintenance.getProposal(run.id)!;
+      expect(proposal.registration).toMatchObject({
+        workerSessionId: worker.id,
+        identity: input.identity,
+        headSha: input.headSha,
+      });
+      expect(store.prMaintenance.list().records).toEqual([]);
+      expect(store.listSessions()).toEqual(sessions);
+      expect(store.listRunSteps(run.id)).toEqual(steps);
+      expect(store.commands.prompts()).toEqual(commands);
+      expect(dispatch).not.toHaveBeenCalled();
+      const payload = {
+        action: "authorize_proposal",
+        proposalId: proposal.id,
+        expectedVersion: proposal.version,
+      };
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/runs/${run.id}/pr-maintenance`,
+            payload,
+          })
+        ).statusCode,
+      ).toBe(403);
+      const approval = await app.inject({
+        method: "POST",
+        url: `/api/runs/${run.id}/pr-maintenance`,
+        headers: { "fixture-browser": "yes" },
+        payload,
+      });
+      expect(approval.statusCode, approval.body).toBe(200);
+      expect(approval.json()).toMatchObject({
+        workerSessionId: worker.id,
+        authorization: { operatorId: "real-browser-principal" },
+      });
+      expect(store.getSession(worker.id)).toMatchObject({ readOnly, runRole: role });
+      expect(store.getRunStep(step.id)?.category).toBe(category);
+      expect(store.getRun(run.id)?.state).toBe("awaiting_human");
+    },
+  );
+
+  it.each(["explore", "review-deep"])(
+    "returns every retained session as a choice and accepts explicit %s selection",
+    async (selected) => {
+      const f = await taskWorker();
+      const reviewer = f.store.createSession(
+        f.store.getPlacement(f.worker.placementId)!,
+        "Historical review",
+        false,
+        "Retained reviewer",
+        { runId: f.run.id, runRole: "reviewer", readOnly: true },
+      );
+      f.store.transitionSession(reviewer.id, "starting");
+      f.store.transitionSession(reviewer.id, "idle");
+      const step = f.store.upsertRunStep(f.run.id, {
+        stepKey: "review",
+        title: "Review",
+        prompt: "Historical review",
+        category: "review-deep",
+      });
+      f.store.updateRunStep(step.id, {
+        sessionId: reviewer.id,
+        state: "succeeded",
+        placementId: reviewer.placementId,
+      });
+      const choice = await f.mcp("fleet_prepare_pr_maintenance", {
+        ...f.input,
+        workerSessionId: undefined,
+      });
+      expect(choice.ok, choice.text).toBe(true);
+      expect(JSON.parse(choice.text)).toMatchObject({
+        status: "needs_worker_choice",
+        workers: expect.arrayContaining([
+          { workerSessionId: f.worker.id, name: f.worker.name },
+          { workerSessionId: reviewer.id, name: "Retained reviewer" },
+        ]),
+      });
+      expect(JSON.parse(choice.text).workers).toHaveLength(2);
+      expect(f.store.prMaintenance.getProposal(f.run.id)).toBeUndefined();
+      const workerSessionId = selected === "explore" ? f.worker.id : reviewer.id;
+      const result = await f.mcp("fleet_prepare_pr_maintenance", {
+        ...f.input,
+        workerSessionId,
+      });
+      expect(result.ok, result.text).toBe(true);
+      expect(
+        f.store.prMaintenance.getProposal(f.run.id)?.registration.workerSessionId,
+      ).toBe(workerSessionId);
+      expect(f.store.prMaintenance.list().records).toEqual([]);
+    },
+  );
+
+  it("selects the sole retained reviewer without requiring prior publication authority", async () => {
+    const f = await taskWorker("review-deep", true, "reviewer");
+    const result = await f.mcp("fleet_prepare_pr_maintenance", {
+      ...f.input,
+      workerSessionId: undefined,
+      publicationEvidence: undefined,
+    });
+    expect(result.ok, result.text).toBe(true);
+    expect(JSON.parse(result.text)).toMatchObject({
+      status: "awaiting_operator_authorization",
+    });
+    expect(
+      f.store.prMaintenance.getProposal(f.run.id)?.registration.workerSessionId,
+    ).toBe(f.worker.id);
+    expect(f.store.prMaintenance.list().records).toEqual([]);
+  });
+
+  it("rejects unrelated and missing explicit sessions without creating a proposal", async () => {
+    const f = await taskWorker("implement", false);
+    const other = f.store.createRun({
+      workspaceId: f.run.workspaceId,
+      name: "Other task",
+      objective: "Unrelated task",
+    });
+    const session = f.store.createSession(
+      f.store.getPlacement(f.worker.placementId)!,
+      "Other task worker",
+      false,
+      "",
+      { runId: other.id, runRole: "worker" },
+    );
+    for (const workerSessionId of [session.id, "deleted-session"]) {
+      const result = await f.mcp("fleet_prepare_pr_maintenance", {
+        ...f.input,
+        workerSessionId,
+      });
+      expect(result.ok, result.text).toBe(false);
+    }
+    expect(f.store.prMaintenance.getProposal(f.run.id)).toBeUndefined();
+    expect(f.store.prMaintenance.list().records).toEqual([]);
+  });
+
+  it.each([
+    "missing-checkout",
+    "wrong-workspace",
+    "wrong-node",
+    "missing-node",
+    "active-worker",
+    "conflicting-writer",
+    "unknown-command",
+  ])("keeps %s admission fenced for a retained review session", async (invalid) => {
+    const f = await taskWorker("review-deep", true, "reviewer");
+    const { store, worker } = f;
+    if (["missing-checkout", "wrong-workspace", "wrong-node"].includes(invalid)) {
+      const get = store.getPlacement.bind(store);
+      vi.spyOn(store, "getPlacement").mockImplementation((id) => {
+        const placement = get(id);
+        if (id !== worker.placementId || !placement) return placement;
+        if (invalid === "missing-checkout") return undefined;
+        return {
+          ...placement,
+          ...(invalid === "wrong-workspace" ? { workspaceId: "foreign-workspace" } : {}),
+          ...(invalid === "wrong-node" ? { nodeId: "foreign-node" } : {}),
+        };
+      });
+    }
+    if (invalid === "missing-node") {
+      const get = store.getNode.bind(store);
+      vi.spyOn(store, "getNode").mockImplementation((id) =>
+        id === worker.nodeId ? undefined : get(id),
+      );
+    }
+    if (invalid === "active-worker") store.transitionSession(worker.id, "running");
+    if (invalid === "conflicting-writer") {
+      const writer = store.createSession(
+        store.getPlacement(worker.placementId)!,
+        "Another active writer",
+        false,
+        "",
+      );
+      store.transitionSession(writer.id, "starting");
+      store.transitionSession(writer.id, "running");
+    }
+    if (invalid === "unknown-command")
+      store.commands.putFence({
+        taskId: f.run.id,
+        executionId: "unknown-execution",
+        revision: 1,
+        state: "observation_required",
+        changedAt: new Date().toISOString(),
+      });
+    const dispatch = vi.spyOn(f.service, "dispatch");
+    const result = await f.mcp("fleet_prepare_pr_maintenance", f.input);
+    expect(result.ok, result.text).toBe(false);
+    expect(store.prMaintenance.getProposal(f.run.id)).toBeUndefined();
+    expect(store.prMaintenance.list().records).toEqual([]);
+    expect(dispatch).not.toHaveBeenCalled();
   });
 });

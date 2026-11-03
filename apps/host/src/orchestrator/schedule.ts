@@ -20,6 +20,8 @@ import {
 import {
   capacityFor,
   reservedSessionCount,
+  sessionAdmissionKinds,
+  type AdmissionSession,
   type SessionKind,
 } from "../session-policy.js";
 
@@ -153,11 +155,13 @@ export type ScheduleException = {
 };
 
 export type ScheduleInput = {
+  /** Exact approved maintenance attempts, independent of historical task/worker roles. */
+  maintenanceStepIds?: ReadonlySet<string>;
   workspaceReady?: boolean;
   parkableSessionIds?: ReadonlySet<string>;
   run: Run;
   steps: readonly RunStep[];
-  sessions: readonly FleetSession[];
+  sessions: readonly AdmissionSession[];
   nodes: readonly FleetNode[];
   placements: readonly Placement[];
   repositoryCapabilities?: readonly PlacementRepositoryCapability[];
@@ -217,17 +221,17 @@ const isInFlight = (state: RunStepState) => state === "starting" || state === "r
  * Shared by scheduling, placement and manual Resume admission.
  */
 export function holdsCheckout(
-  session: FleetSession,
+  session: AdmissionSession,
   node: FleetNode | undefined,
 ): boolean {
+  const writing = !session.readOnly || Boolean(session.maintenanceWriting);
   const strict =
     Boolean(session.executionBinding?.worktreeId) ||
-    (!session.readOnly &&
-      Boolean(node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)));
+    (writing && Boolean(node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)));
   return (
     session.runRole !== "lead" &&
     !terminalSessionStates.has(session.state) &&
-    (strict || (!session.readOnly && session.state !== "idle"))
+    (strict || (writing && session.state !== "idle"))
   );
 }
 
@@ -238,11 +242,14 @@ export function holdsCheckout(
  * retain exclusive process ownership, even when their role is read-only.
  */
 export function checkoutOccupants(
-  target: FleetSession,
-  sessions: readonly FleetSession[],
+  target: AdmissionSession,
+  sessions: readonly AdmissionSession[],
   nodes: readonly FleetNode[],
 ): FleetSession[] {
-  const needsLease = Boolean(target.executionBinding?.worktreeId) || !target.readOnly;
+  const needsLease =
+    Boolean(target.executionBinding?.worktreeId) ||
+    !target.readOnly ||
+    target.maintenanceWriting;
   if (!needsLease) return [];
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const key = checkoutLockKey(target);
@@ -261,7 +268,11 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
   const holdEveryPending = (value: StepHold) => {
     for (const step of steps) if (step.state === "pending") hold(step, value);
   };
-  if (terminalRunStates.has(run.state)) return [];
+  if (
+    terminalRunStates.has(run.state) &&
+    !(run.state === "completed" && input.maintenanceStepIds?.size)
+  )
+    return [];
   if (run.state === "awaiting_approval") {
     holdEveryPending({
       code: "task_held",
@@ -287,7 +298,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
    * back without paying to reconstruct their context. Archive stops but retains
    * them for the same reason if the task is reopened later.
    */
-  const heldByHuman = run.state === "awaiting_human";
+  const heldByHuman = run.state === "awaiting_human" || run.state === "completed";
 
   /*
    * A Host that just restarted has not heard from anyone yet, and every session
@@ -485,9 +496,10 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
     input.workspaceReady ??
     (run.workspaceBinding?.effectiveMode !== "managed" ||
       run.workspaceBinding.initialization === "ready");
-  const parallelBudget = heldByHuman
-    ? 0
-    : run.policy.maxParallel - inFlight.length - activeRetries.length;
+  const parallelBudget =
+    heldByHuman && !input.maintenanceStepIds?.size
+      ? 0
+      : run.policy.maxParallel - inFlight.length - activeRetries.length;
   const dispatched = new Set<string>();
   const awaitingPerson: StepHold = {
     code: "task_held",
@@ -495,7 +507,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       "The task is waiting for a person's review; nothing new is dispatched until it is approved, sent back or reopened.",
   };
   const budgetHold = (): StepHold =>
-    heldByHuman
+    heldByHuman && !input.maintenanceStepIds?.size
       ? awaitingPerson
       : {
           code: "parallel_limit",
@@ -510,6 +522,10 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
 
   for (const step of steps) {
     if (effectiveState(step) !== "pending") continue;
+    if (heldByHuman && !input.maintenanceStepIds?.has(step.id)) {
+      hold(step, awaitingPerson);
+      continue;
+    }
     const retryWorkspaceReady =
       Boolean(step.sessionId) &&
       step.workspaceState === "ready" &&
@@ -716,7 +732,12 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         continue;
       }
 
-      const kind: SessionKind = session.readOnly ? "read-only" : "writing";
+      const kinds = sessionAdmissionKinds(session);
+      const kind =
+        kinds.find(
+          (candidate) =>
+            remainingCapacity(node, reservedFor(node.id, candidate), candidate) <= 0,
+        ) ?? kinds[0];
       const reserved = reservedFor(node.id, kind);
       const limit = capacityFor(node, kind);
       let exceptionId: string | undefined;
@@ -727,7 +748,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
             (candidate) =>
               candidate.nodeId === node.id &&
               !terminalSessionStates.has(candidate.state) &&
-              Boolean(candidate.readOnly) === (kind === "read-only"),
+              sessionAdmissionKinds(candidate).includes(kind),
           )
           .map((candidate) => candidate.id);
         // The approved exception spends only the reserved margin. A Node that
@@ -754,7 +775,11 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         }
       }
 
-      reservedByNode.set(key(node.id, kind), reserved + 1);
+      for (const admittedKind of kinds)
+        reservedByNode.set(
+          key(node.id, admittedKind),
+          reservedFor(node.id, admittedKind) + 1,
+        );
       if (needsLease) writingInFlight.add(retryKey);
       started += 1;
       dispatched.add(step.id);

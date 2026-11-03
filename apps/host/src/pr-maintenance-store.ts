@@ -15,7 +15,6 @@ import {
   prMaintenanceSources,
   prMaintenanceStatus,
   prMaintenanceProviderKey,
-  isWritingCategory,
   terminalRunStepStates,
   PrMaintenanceAdmissionSchema,
   PrMaintenanceBackupSchema,
@@ -55,6 +54,7 @@ import {
   sessionActor,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
+import type { AdmissionSession } from "./session-policy.js";
 import { notificationAttemptKey } from "./notifications/service.js";
 
 const outstanding = new Set(["prepared", "accepted", "reconciling", "uncertain"]);
@@ -485,18 +485,15 @@ export class PrMaintenanceStore {
           task.state,
         ) ||
         worker.stopRequested ||
-        this.hasPendingManualExecution(worker.id) ||
         !(
           worker.state === "idle" ||
           (["completed", "stopped"].includes(worker.state) && worker.agentSessionId)
         ) ||
-        this.store
-          .listRunSteps(task.id)
-          .some(
-            (step) =>
-              step.sessionId === worker.id &&
-              !["succeeded", "failed", "cancelled", "skipped"].includes(step.state),
-          )
+        this.directWorkActive({
+          taskId: task.id,
+          workerSessionId: worker.id,
+          ...binding,
+        })
       )
         refuse(
           "proposal_not_ready",
@@ -804,17 +801,21 @@ export class PrMaintenanceStore {
       !lead ||
       task.leadSessionId !== lead.id ||
       lead.runRole !== "lead" ||
-      worker.runId !== task.id ||
-      worker.runRole !== "worker"
+      worker.runId !== task.id
     )
       return "binding_unavailable";
     if (!this.store.listRunSteps(task.id).some((step) => step.sessionId === worker.id))
       return "worker_not_owned";
+    const placement = this.store.getPlacement(record.placementId);
     if (
       worker.placementId !== record.placementId ||
-      !this.store.getPlacement(record.placementId)
+      worker.workspaceId !== task.workspaceId ||
+      !placement ||
+      placement.workspaceId !== task.workspaceId ||
+      placement.nodeId !== worker.nodeId
     )
       return "binding_changed";
+    if (!this.store.getNode(worker.nodeId)) return "binding_unavailable";
     const execution = worker.executionBinding;
     if (
       execution?.quarantined ||
@@ -874,7 +875,6 @@ export class PrMaintenanceStore {
       !lead ||
       lead.runRole !== "lead" ||
       worker.runId !== task.id ||
-      worker.runRole !== "worker" ||
       !this.store.listRunSteps(task.id).some((step) => step.sessionId === worker.id)
     )
       refuse(
@@ -882,18 +882,33 @@ export class PrMaintenanceStore {
         "Enablement requires the task's existing lead-owned worker, not a standalone or replacement session.",
       );
     this.store.assertRunMutable(task.id);
+    this.store.commands.assertTaskUnfenced(task.id);
     this.store.assertSessionMutable(lead.id);
     this.store.assertSessionMutable(worker.id);
-    if (
-      !this.store
-        .listRunSteps(task.id)
-        .some((step) => step.sessionId === worker.id && isWritingCategory(step.category))
-    )
-      refuse(
-        "read_only_task",
-        "Repair maintenance requires the task's existing writing worker; read-only categories cannot be upgraded.",
-      );
     return { task, worker, lead };
+  }
+
+  /** Approved maintenance reserves writing capacity without rewriting session history. */
+  sessionsForAdmission(): AdmissionSession[] {
+    const writers = new Set(
+      this.live()
+        .filter((record) =>
+          record.batches.some(
+            (batch) =>
+              batch.stepId &&
+              !batch.executionSettled &&
+              !["cancelled", "superseded"].includes(batch.state),
+          ),
+        )
+        .map((record) => record.workerSessionId),
+    );
+    return this.store
+      .listSessions()
+      .map((session) =>
+        session.readOnly && writers.has(session.id)
+          ? { ...session, maintenanceWriting: true }
+          : session,
+      );
   }
 
   /** This is an operator-route seam; never expose it as an MCP/model capability. */
@@ -949,14 +964,13 @@ export class PrMaintenanceStore {
       }
       if (
         !["idle", "completed", "stopped"].includes(worker.state) ||
-        this.hasPendingManualExecution(worker.id) ||
-        this.store
-          .listRunSteps(task.id)
-          .some(
-            (step) =>
-              step.sessionId === worker.id &&
-              !["succeeded", "failed", "cancelled", "skipped"].includes(step.state),
-          )
+        this.directWorkActive({
+          taskId: task.id,
+          workerSessionId: worker.id,
+          placementId: worker.placementId,
+          checkoutKey:
+            worker.executionBinding?.checkoutKey ?? `placement:${worker.placementId}`,
+        })
       ) {
         refuse(
           "worker_busy",
@@ -1594,12 +1608,18 @@ export class PrMaintenanceStore {
    * unsettled manual command, another orchestration step on the worker, or a
    * different live session writing the same checkout.
    */
-  private directWorkActive(record: PrMaintenanceRegistration, batch: PrMaintenanceBatch) {
+  private directWorkActive(
+    record: Pick<
+      PrMaintenanceRegistration,
+      "taskId" | "workerSessionId" | "placementId" | "checkoutKey"
+    >,
+    batch?: PrMaintenanceBatch,
+  ) {
     if (this.hasPendingManualExecution(record.workerSessionId)) return true;
     // The batch's own step attempt: bound once accepted, or being accepted now.
-    const own = batch.stepId
+    const own = batch?.stepId
       ? { stepId: batch.stepId, attempt: batch.attempt }
-      : this.accepting?.batchId === batch.id
+      : batch && this.accepting?.batchId === batch.id
         ? this.accepting
         : undefined;
     if (
