@@ -152,13 +152,18 @@ Ask the Orchestrator to create a maintenance job, or use the task panel's prepar
 action. It discovers the **Azure DevOps or GitHub** PR from existing task evidence;
 the only optional input is its URL (including legacy `organization.visualstudio.com`
 links). `fleet_prepare_pr_maintenance` fills the approved task baseline and existing
-coder, verifies fresh provider metadata, and stores an unapproved proposal.
+retained session, verifies fresh provider metadata, and stores an unapproved proposal.
+Selection is role-agnostic: historical category, worker/reviewer role, `readOnly`
+and prior publication do not decide eligibility. If there is one task-owned
+retained session, Fleet selects it; otherwise it returns all retained task
+sessions for explicit selection. Unrelated or unavailable bindings remain refused.
 Preparation does not require accepting the whole task: a released job's old review
 or a compatible completed task can retain an open PR. Task state, acceptance history
 and actual unresolved decisions stay unchanged. Preparation never revives a released
 grant or dispatches work; authenticated scope authorization and repair admission remain separate.
-Preparation is **repair-only**, backed by verified existing task and publication
-authority. One **Maintain this PR** grant covers code repairs, normal pushes, replies
+Preparation is **repair-only** and grants no repair authority. A signed-in
+operator's exact task/PR/session authorization supplies that authority.
+One **Maintain this PR** grant covers code repairs, normal pushes, replies
 and resolving addressed threads by default; named reviewers and CI retries are
 requested separately and default off. After authorization the task panel shows these
 permissions as checkboxes that edit the grant in place. Legacy observation-only proposals cannot be approved
@@ -190,12 +195,14 @@ Use **Review PR maintenance proposal** to review the proposed exact provider/PR,
 repository identities, head/base refs, retained worker and checkout, task/design
 baseline, verification, and helper/credential/publication evidence. Confirmation
 is an authenticated browser action, not an MCP approval or a review comment.
-Maintenance is repair-only and requires verified existing task/publication
-prerequisites. Omitted mode prepares a repair proposal; explicit observation-only
+Maintenance is repair-only and requires a valid retained checkout, exact PR
+identity and signed-in operator authorization, not a prior push or inferred
+publication report. Omitted mode prepares a repair proposal; explicit observation-only
 requests are rejected, never converted into write permission. Replies and
 addressed-thread resolution are on by default and editable in place; reviewer
 requests and retries default off. Unsupported
-bindings and read-only worker categories cannot be enabled. Sign-in is
+bindings cannot be enabled. Approved maintenance uses normal writer admission
+and checkout fencing without changing the session's historical role. Sign-in is
 required for these authorization controls, including on a no-login Host.
 
 Legacy observation-only records, proposals and backups remain readable. They

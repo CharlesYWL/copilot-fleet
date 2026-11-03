@@ -20,7 +20,11 @@ import {
   type WorkerResumeSession,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
-import { capacityFor, type SessionKind } from "../session-policy.js";
+import {
+  capacityFor,
+  sessionAdmissionKinds,
+  type SessionKind,
+} from "../session-policy.js";
 import { WorkerResumeConflict } from "../worker-resume-store.js";
 import {
   executionKey,
@@ -436,9 +440,12 @@ export class WorkerResumeService {
       if (!maintenance.allowed)
         return `Waiting on PR maintenance: ${maintenance.reason}.`;
     }
-    const sessions = this.store.listSessions();
+    const sessions = this.store.prMaintenance.sessionsForAdmission();
     const localPath = step.executionBinding?.cwd ?? placement.localPath;
-    const needsLease = Boolean(session.executionBinding?.worktreeId) || !session.readOnly;
+    const needsLease =
+      Boolean(reference) ||
+      Boolean(session.executionBinding?.worktreeId) ||
+      !session.readOnly;
     const sharing = sessions.filter((candidate) => {
       if (
         !needsLease ||
@@ -460,12 +467,28 @@ export class WorkerResumeService {
       return `${localPath} on ${node.name} is in use by ${sharing
         .map((candidate) => candidate.name || candidate.id)
         .join(", ")}; the required checkout lease cannot be shared.`;
-    const kind: SessionKind = session.readOnly ? "read-only" : "writing";
+    const kinds = sessionAdmissionKinds(
+      sessions.find((entry) => entry.id === session.id) ?? session,
+    );
+    const kind =
+      kinds.find(
+        (candidateKind) =>
+          remainingCapacity(
+            node,
+            sessions.filter(
+              (candidate) =>
+                candidate.nodeId === node.id &&
+                !terminalSessionStates.has(candidate.state) &&
+                sessionAdmissionKinds(candidate).includes(candidateKind),
+            ).length,
+            candidateKind,
+          ) <= 0,
+      ) ?? kinds[0];
     const holders = sessions.filter(
       (candidate) =>
         candidate.nodeId === node.id &&
         !terminalSessionStates.has(candidate.state) &&
-        Boolean(candidate.readOnly) === (kind === "read-only"),
+        sessionAdmissionKinds(candidate).includes(kind),
     );
     const reserved = holders.length;
     const limit = capacityFor(node, kind);

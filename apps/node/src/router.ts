@@ -151,6 +151,7 @@ type SessionSlot = {
    * then refuses — which costs the whole connection, not just the step.
    */
   kind: SessionKind;
+  maintenanceWriting?: boolean;
 };
 
 type LaunchCommand = Extract<NodeCommand, { type: "start_session" | "resume_session" }>;
@@ -434,28 +435,55 @@ export class CommandRouter {
       // Admission itself is in flight: cleanup must not stop the process while
       // physical checkout/lease validation is waiting on the filesystem.
       await this.withActivity(slot, async () => {
-        await this.revalidate(slot, command.executionBinding);
-        if (command.checkoutPrecondition)
-          await this.assertCheckout(slot, command.checkoutPrecondition.headSha);
-        slot.ticket?.revalidate();
-        this.assertNotDeleting(command.sessionId, slot.agentSessionId);
-        if (this.slots.get(command.sessionId) !== slot || slot.agent !== agent) {
-          throw new CommandRefused("Session changed during prompt admission");
-        }
-        // Refused rather than dropped: acknowledge only after admission, but
-        // keep the turn tracked without making the Host wait for its completion.
-        if (
-          agent.busy ||
-          this.options.leadDeliveries?.reserved(command.sessionId, slot.agentSessionId)
-        ) {
-          agent.resync();
+        if (slot.maintenanceWriting)
           throw new CommandRefused(
-            `${agentKindLabels[slot.launch?.agentParams?.kind ?? "copilot"]} is still working on the previous turn; wait for it to finish or cancel it`,
+            "The retained session is still performing maintenance.",
           );
+        const writing =
+          Boolean(command.checkoutPrecondition) && slot.kind === "read-only";
+        if (writing) {
+          const held = [
+            ...new Map([...this.reconciliation, ...this.slots]).values(),
+          ].filter(
+            (other) => other.kind === "writing" || other.maintenanceWriting,
+          ).length;
+          if (held >= this.maxSessions)
+            throw new CommandRefused("Node is at capacity for writing work");
+          slot.maintenanceWriting = true;
         }
-        void this.withActivity(slot, () =>
-          agent.prompt(command.prompt, command.attachments),
-        ).catch(() => undefined);
+        let prompted = false;
+        try {
+          await this.revalidate(slot, command.executionBinding);
+          if (command.checkoutPrecondition)
+            await this.assertCheckout(slot, command.checkoutPrecondition.headSha);
+          slot.ticket?.revalidate();
+          this.assertNotDeleting(command.sessionId, slot.agentSessionId);
+          if (this.slots.get(command.sessionId) !== slot || slot.agent !== agent) {
+            throw new CommandRefused("Session changed during prompt admission");
+          }
+          // Refused rather than dropped: acknowledge only after admission, but
+          // keep the turn tracked without making the Host wait for its completion.
+          if (
+            agent.busy ||
+            this.options.leadDeliveries?.reserved(command.sessionId, slot.agentSessionId)
+          ) {
+            agent.resync();
+            throw new CommandRefused(
+              `${agentKindLabels[slot.launch?.agentParams?.kind ?? "copilot"]} is still working on the previous turn; wait for it to finish or cancel it`,
+            );
+          }
+          const turn = this.withActivity(slot, () =>
+            agent.prompt(command.prompt, command.attachments),
+          );
+          prompted = true;
+          void turn
+            .finally(() => {
+              if (writing && !mustKeepProcess(agent)) delete slot.maintenanceWriting;
+            })
+            .catch(() => undefined);
+        } finally {
+          if (writing && !prompted) delete slot.maintenanceWriting;
+        }
       });
     } else {
       await this.withActivity(slot, async () => {
@@ -839,7 +867,7 @@ export class CommandRouter {
     }
     const kind: SessionKind = command.readOnly ? "read-only" : "writing";
     const held = [...new Map([...this.reconciliation, ...this.slots]).values()].filter(
-      (slot) => slot.kind === kind,
+      (slot) => slot.kind === kind || (kind === "writing" && slot.maintenanceWriting),
     ).length;
     if (held >= this.maxSessions) {
       return Promise.reject(new Error(`Node is at capacity for ${kind} work`));
@@ -1403,6 +1431,7 @@ export class CommandRouter {
       }
     }
     const state = eventPayload(event, "state")?.state;
+    if (state === "idle" && !mustKeepProcess(slot.agent)) delete slot.maintenanceWriting;
     if (
       slot.deliveryId &&
       event.type === "turn_complete" &&

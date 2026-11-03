@@ -221,7 +221,7 @@ export class OrchestratorEngine {
           run.workspaceBinding.aggregationState === "in_progress"
         )
           this.service.worktrees.advanceAggregation(run.id);
-        continue;
+        if (run.state !== "completed") continue;
       }
       this.tickRun(run.id, nowMs);
     }
@@ -260,7 +260,19 @@ export class OrchestratorEngine {
 
   tickRun(runId: string, nowMs = Date.now()): void {
     const run = this.store.getRun(runId);
-    if (!run || terminalRunStates.has(run.state)) {
+    if (!run) return;
+    let steps = this.store.listRunSteps(runId);
+    const maintenanceSteps = new Set(
+      steps
+        .filter((step) =>
+          this.store.prMaintenance.referenceForStep(step.id, step.attempts),
+        )
+        .map((step) => step.id),
+    );
+    if (
+      terminalRunStates.has(run.state) &&
+      !(run.state === "completed" && maintenanceSteps.size)
+    ) {
       this.holdsByRun.delete(runId);
       return;
     }
@@ -302,18 +314,23 @@ export class OrchestratorEngine {
       return;
     }
 
-    let steps = this.store.listRunSteps(runId);
-    const sessions = this.store.listSessions();
+    const sessions = this.store.prMaintenance.sessionsForAdmission();
     const completedTurns = new Set<string>();
     for (const session of sessions) {
       if (
         (session.runId && session.runId !== runId) ||
-        (session.runRole !== "worker" && session.runRole !== "reviewer")
+        (!session.runId && session.runRole !== "worker" && session.runRole !== "reviewer")
       ) {
         continue;
       }
       const step = this.store.getRunStepBySession(session.id);
       if (!step || step.runId !== runId) continue;
+      if (
+        session.runRole !== "worker" &&
+        session.runRole !== "reviewer" &&
+        !maintenanceSteps.has(step.id)
+      )
+        continue;
       const completion = this.store.getSessionTurnCompletion(session.id);
       const attempt = notificationAttemptKey(session, {
         step,
@@ -357,9 +374,13 @@ export class OrchestratorEngine {
       steps = this.store.listRunSteps(runId);
     }
     const holds = new Map<string, StepHold>();
+    const scheduledSteps = steps.map((step) =>
+      maintenanceSteps.has(step.id) ? { ...step, category: "implement" } : step,
+    );
     const actions = planNextActions({
       run,
-      steps,
+      steps: scheduledSteps,
+      maintenanceStepIds: maintenanceSteps,
       sessions,
       nodes: this.store
         .listNodes()

@@ -36,6 +36,15 @@ export function configUnsupportedReason(
 
 /** What a session is allowed to do, which is what its capacity is counted against. */
 export type SessionKind = "writing" | "read-only";
+export type AdmissionSession = FleetSession & { maintenanceWriting?: boolean };
+
+/** Maintenance borrows a writer slot without discarding the retained reader slot. */
+export function sessionAdmissionKinds(
+  session: AdmissionSession,
+): readonly [SessionKind, ...SessionKind[]] {
+  if (!session.readOnly) return ["writing"];
+  return session.maintenanceWriting ? ["writing", "read-only"] : ["read-only"];
+}
 
 /**
  * Sessions a node is still on the hook for, counted by what they may do.
@@ -56,7 +65,7 @@ export type SessionKind = "writing" | "read-only";
  * is true until an orchestrator decides to look at thirty things at once.
  */
 export function reservedSessionCount(
-  sessions: readonly FleetSession[],
+  sessions: readonly AdmissionSession[],
   nodeId: string,
   kind: SessionKind = "writing",
 ): number {
@@ -68,7 +77,12 @@ export function reservedSessionCount(
     // never went through the schema — a fixture, or anything hand-built — has
     // the field missing rather than false, and `undefined === false` would put
     // it in neither bucket and quietly stop counting it at all.
-    if (Boolean(session.readOnly) === (kind === "read-only")) reserved += 1;
+    if (
+      kind === "read-only"
+        ? Boolean(session.readOnly)
+        : !session.readOnly || session.maintenanceWriting
+    )
+      reserved += 1;
   }
   return reserved;
 }

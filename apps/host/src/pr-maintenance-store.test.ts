@@ -1475,7 +1475,7 @@ describe("durable PR maintenance registry", () => {
     },
   );
 
-  it("does not let API or advanced proposals upgrade an original read-only worker category", () => {
+  it("lets an operator grant maintenance to a retained session independently of its original review category", () => {
     const f = setup();
     f.store.upsertRunStep(f.task.id, {
       stepKey: f.step.stepKey,
@@ -1484,13 +1484,16 @@ describe("durable PR maintenance registry", () => {
       category: "review",
     });
     f.store.updateRunStep(f.step.id, { sessionId: f.worker.id, state: "succeeded" });
-    expect(() => f.store.prMaintenance.propose(f.lead.id, f.input)).toThrow(
-      /read-only categories/,
-    );
-    expect(() => f.store.prMaintenance.enableFromOperator(f.input, "operator")).toThrow(
-      /read-only categories/,
-    );
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
     expect(f.store.prMaintenance.list().records).toEqual([]);
+    const record = f.store.prMaintenance.authorizeProposal(
+      f.task.id,
+      proposal.id,
+      proposal.version,
+      "operator",
+    );
+    expect(record.workerSessionId).toBe(f.worker.id);
+    expect(f.store.getRunStep(f.step.id)?.category).toBe("review");
   });
 
   it.each([

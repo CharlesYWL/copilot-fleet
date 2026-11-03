@@ -58,6 +58,11 @@ describe("PR maintenance orchestration", () => {
     claimVisit = true,
     provider: "github" | "azure-devops" = "github",
     withObservation = true,
+    history: {
+      category: string;
+      readOnly: boolean;
+      runRole: "worker" | "reviewer";
+    } = { category: "implement", readOnly: false, runRole: "worker" },
   ) => {
     const providerIdentity =
       provider === "azure-devops"
@@ -86,7 +91,8 @@ describe("PR maintenance orchestration", () => {
     world.store.updateRun(run.id, { leadSessionId: lead.id, state: "running" });
     const worker = world.store.createSession(placement, "original brief", true, "Coder", {
       runId: run.id,
-      runRole: "worker",
+      runRole: history.runRole,
+      readOnly: history.readOnly,
     });
     world.store.transitionSession(worker.id, "starting");
     world.store.transitionSession(worker.id, "running");
@@ -95,7 +101,7 @@ describe("PR maintenance orchestration", () => {
       stepKey: "implement",
       title: "Implement",
       prompt: "original brief",
-      category: "implement",
+      category: history.category,
       placementId: placement.id,
     });
     world.store.updateRunStep(step.id, { sessionId: worker.id, state: "succeeded" });
@@ -1315,5 +1321,111 @@ describe("PR maintenance orchestration", () => {
         leadSessionId: next.id,
       }).allowed,
     ).toBe(true);
+  });
+
+  it.each([
+    { category: "explore", readOnly: true, runRole: "worker" as const },
+    { category: "review-deep", readOnly: true, runRole: "reviewer" as const },
+  ])(
+    "dispatches an approved maintenance write through the retained $category session",
+    (history) => {
+      const { run, worker, step, record } = setup(true, "github", true, history);
+      world.store.updateRun(run.id, { state: "awaiting_human" });
+      const dispatch = vi.spyOn(world.service, "dispatch");
+      const prepared = prepare(record.id);
+      const followed = tools.followUp({
+        sessionId: worker.id,
+        prompt: prepared.batches[0]!.prompt,
+        maintenance: reference(record.id),
+      });
+      expect(followed.ok, followed.text).toBe(true);
+      expect(dispatch).toHaveBeenCalledWith(
+        worker.nodeId,
+        expect.objectContaining({
+          type: "prompt",
+          sessionId: worker.id,
+          checkoutPrecondition: { headSha, requireClean: true },
+        }),
+      );
+      expect(world.store.getRunStep(step.id)).toMatchObject({
+        category: history.category,
+        state: "starting",
+      });
+      expect(world.store.getSession(worker.id)).toMatchObject({
+        readOnly: true,
+        runRole: history.runRole,
+      });
+      expect(world.store.getRun(run.id)?.state).toBe("awaiting_human");
+      expect(
+        world.store.prMaintenance
+          .sessionsForAdmission()
+          .find((entry) => entry.id === worker.id)?.readOnly,
+      ).toBe(true);
+      expect(
+        world.store.prMaintenance
+          .sessionsForAdmission()
+          .find((entry) => entry.id === worker.id)?.maintenanceWriting,
+      ).toBe(true);
+      expect(
+        world.store.prMaintenance.admission({
+          action: "execute",
+          taskId: run.id,
+          placementId: worker.placementId,
+        }),
+      ).toMatchObject({ allowed: false, reason: "maintenance_in_flight" });
+    },
+  );
+
+  it("resumes a historically read-only reviewer in the normal maintenance writer pool", () => {
+    const history = {
+      category: "review-deep",
+      readOnly: true,
+      runRole: "reviewer" as const,
+    };
+    const { run, worker, step, record } = setup(true, "github", true, history);
+    world.service.handleEvent({
+      eventId: "reviewer-native",
+      sessionId: worker.id,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "retained-reviewer-native" },
+      createdAt: new Date().toISOString(),
+    });
+    world.store.transitionSession(worker.id, "stopped");
+    world.store.updateRun(run.id, { state: "completed" });
+    const dispatch = vi.spyOn(world.service, "dispatch");
+    const prepared = prepare(record.id);
+    const result = tools.followUp({
+      sessionId: worker.id,
+      prompt: prepared.batches[0]!.prompt,
+      maintenance: reference(record.id),
+    });
+    expect(result.ok, result.text).toBe(true);
+    expect(dispatch).toHaveBeenCalledWith(
+      worker.nodeId,
+      expect.objectContaining({
+        type: "resume_session",
+        sessionId: worker.id,
+        readOnly: true,
+        agentSessionId: "retained-reviewer-native",
+      }),
+      expect.anything(),
+    );
+    world.store.transitionSession(worker.id, "idle");
+    world.engine.tick();
+    expect(dispatch).toHaveBeenCalledWith(
+      worker.nodeId,
+      expect.objectContaining({
+        type: "prompt",
+        sessionId: worker.id,
+        checkoutPrecondition: { headSha, requireClean: true },
+      }),
+    );
+    expect(world.store.getSession(worker.id)).toMatchObject({
+      readOnly: true,
+      runRole: "reviewer",
+    });
+    expect(world.store.getRunStep(step.id)?.category).toBe("review-deep");
+    expect(world.store.getRun(run.id)?.state).toBe("completed");
   });
 });

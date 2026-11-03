@@ -187,12 +187,13 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     const run = store.getRun(id);
     if (!run) return reply.code(404).send({ error: "Task not found" });
     const records = maintenanceForTask(id);
+    const retainedIds = new Set(store.listRunSteps(id).map((step) => step.sessionId));
     const workers = store
       .listSessions()
-      .filter((session) => session.runId === id && session.runRole === "worker");
+      .filter((session) => session.runId === id && retainedIds.has(session.id));
     const unsupportedReason =
       !run.leadSessionId || workers.length === 0
-        ? "Maintenance requires an existing Orchestrator-owned task worker; standalone handoff is unsupported."
+        ? "Maintenance requires a retained session of the exact Orchestrator-owned task; standalone handoff is unsupported."
         : run.workspaceBinding?.effectiveMode === "managed" &&
             (store.listRunSteps(id).some((step) => Boolean(step.resultSha)) ||
               run.workspaceBinding.aggregationState !== "not_started")
@@ -263,7 +264,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           ? `Requested PR URL: ${JSON.stringify(prUrl)}`
           : "Discover the PR URL from this task's outputs and existing worker evidence. Ask only for the PR URL or an ambiguous choice if needed.",
         "Read fleet_get_task and fleet_get_pr_maintenance. Verify fresh provider metadata using the packaged helper or an already-authorized provider MCP/CLI.",
-        "Use fleet_prepare_pr_maintenance for repair-only maintenance with verified existing task/publication authority. Optional remote actions default off. Record prerequisite limitations truthfully; missing repair authority blocks enrollment, not an observation-only default.",
+        "Use fleet_prepare_pr_maintenance for a repair-only proposal bound to this task and a retained session, regardless of historical category, reviewer role or readOnly. Prior publication evidence is not required. Only signed-in operator authorization of the exact PR/task/session grant permits maintenance repairs. Optional remote actions default off. Record checkout and identity limitations truthfully; preparation itself grants no authority.",
         "A released job's old task review or a compatible completed task does not require whole-task acceptance to create this unapproved proposal. Preserve task state, acceptance history and actual unresolved design decisions; preparation never revives a released grant or dispatches repairs.",
         ...(retained
           ? [

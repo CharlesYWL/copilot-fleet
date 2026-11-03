@@ -91,6 +91,7 @@ import {
 import {
   capacityFor,
   reservedSessionCount,
+  sessionAdmissionKinds,
   yoloUnsupportedReason,
 } from "./session-policy.js";
 
@@ -1214,8 +1215,11 @@ export class FleetService {
     if (hostUpdating) return { ok: false, status: 409, error: hostUpdating };
     const kind = input.readOnly ? "read-only" : "writing";
     if (
-      reservedSessionCount(this.store.listSessions(), node.id, kind) >=
-      capacityFor(node, kind)
+      reservedSessionCount(
+        this.store.prMaintenance.sessionsForAdmission(),
+        node.id,
+        kind,
+      ) >= capacityFor(node, kind)
     ) {
       return {
         ok: false,
@@ -1371,13 +1375,14 @@ export class FleetService {
    * immediately afterwards: the Node queues it behind session initialization.
    */
   resumeCheckoutProblem(sessionId: string): { code: string; error: string } | undefined {
-    const target = this.store.getSession(sessionId);
-    if (!target || !["worker", "reviewer"].includes(target.runRole)) return undefined;
-    const occupants = checkoutOccupants(
-      target,
-      this.store.listSessions(),
-      this.store.listNodes(),
-    );
+    const sessions = this.store.prMaintenance.sessionsForAdmission();
+    const target = sessions.find((session) => session.id === sessionId);
+    if (
+      !target ||
+      (!["worker", "reviewer"].includes(target.runRole) && !target.maintenanceWriting)
+    )
+      return undefined;
+    const occupants = checkoutOccupants(target, sessions, this.store.listNodes());
     if (!occupants.length) return undefined;
     const where =
       this.store.getPlacement(target.placementId)?.localPath ?? "its checkout";
@@ -1468,15 +1473,21 @@ export class FleetService {
     if (agentProblem) return { ok: false, status: 409, error: agentProblem };
     const hostUpdating = this.hostUpdate?.blocksNodeWork(node.id);
     if (hostUpdating) return { ok: false, status: 409, error: hostUpdating };
-    const kind = session.readOnly ? "read-only" : "writing";
-    if (
-      reservedSessionCount(this.store.listSessions(), node.id, kind) >=
-      capacityFor(node, kind)
-    ) {
+    const admissionSessions = this.store.prMaintenance.sessionsForAdmission();
+    const kinds = sessionAdmissionKinds(
+      manual
+        ? session
+        : (admissionSessions.find((entry) => entry.id === session.id) ?? session),
+    );
+    const fullKind = kinds.find(
+      (kind) =>
+        reservedSessionCount(admissionSessions, node.id, kind) >= capacityFor(node, kind),
+    );
+    if (fullKind) {
       return {
         ok: false,
         status: 409,
-        error: `Node is at capacity for ${kind} work`,
+        error: `Node is at capacity for ${fullKind} work`,
       };
     }
     const unsupported = yoloUnsupportedReason(node, session.yolo);
@@ -2632,17 +2643,22 @@ export class FleetService {
     if (candidates.length === 0) return;
 
     // Counted per kind, the same split the dispatch path and the Node use.
-    let reservedWriting = reservedSessionCount(this.store.listSessions(), nodeId);
-    let reservedReading = reservedSessionCount(
-      this.store.listSessions(),
-      nodeId,
-      "read-only",
-    );
+    const admissionSessions = this.store.prMaintenance.sessionsForAdmission();
+    let reservedWriting = reservedSessionCount(admissionSessions, nodeId);
+    let reservedReading = reservedSessionCount(admissionSessions, nodeId, "read-only");
     let resumed = 0;
     for (const session of candidates) {
-      const kind = session.readOnly ? "read-only" : "writing";
-      const held = kind === "read-only" ? reservedReading : reservedWriting;
-      if (held >= capacityFor(node, kind)) continue;
+      const kinds = sessionAdmissionKinds(
+        admissionSessions.find((entry) => entry.id === session.id) ?? session,
+      );
+      if (
+        kinds.some(
+          (kind) =>
+            (kind === "read-only" ? reservedReading : reservedWriting) >=
+            capacityFor(node, kind),
+        )
+      )
+        continue;
       if (this.store.prMaintenance.hasPendingManualExecution(session.id)) continue;
       const retained = this.store.prMaintenance.manualRecord(session.id);
       if (retained?.manualControl && !retained.manualControl.endedAt) {
@@ -2654,8 +2670,10 @@ export class FleetService {
           operationId: randomUUID(),
         });
         if (result.ok) {
-          if (kind === "read-only") reservedReading += 1;
-          else reservedWriting += 1;
+          for (const kind of kinds) {
+            if (kind === "read-only") reservedReading += 1;
+            else reservedWriting += 1;
+          }
           resumed += 1;
         }
         continue;
@@ -2722,8 +2740,10 @@ export class FleetService {
           cause: "automatic_resume",
         }),
       );
-      if (kind === "read-only") reservedReading += 1;
-      else reservedWriting += 1;
+      for (const kind of kinds) {
+        if (kind === "read-only") reservedReading += 1;
+        else reservedWriting += 1;
+      }
       resumed += 1;
     }
     if (resumed > 0) {
@@ -3162,9 +3182,14 @@ export class FleetService {
   }
 
   private runStepAttemptContext(session: FleetSession): NotificationAttemptContext {
-    if (session.runRole !== "worker" && session.runRole !== "reviewer") return {};
     const step = this.store.getRunStepBySession(session.id);
     if (!step || (session.runId && step.runId !== session.runId)) return {};
+    if (
+      session.runRole !== "worker" &&
+      session.runRole !== "reviewer" &&
+      !this.store.prMaintenance.referenceForStep(step.id, step.attempts)
+    )
+      return {};
     return { step, run: this.store.getRun(step.runId) };
   }
 
@@ -3200,7 +3225,8 @@ export class FleetService {
     event: SessionEvent,
     context: NotificationAttemptContext,
   ): boolean {
-    if (session.runRole !== "worker" && session.runRole !== "reviewer") return false;
+    if (session.runRole !== "worker" && session.runRole !== "reviewer" && !context.step)
+      return false;
     if (
       !["state", "turn_complete", "error", "permission", "permission_result"].includes(
         event.type,

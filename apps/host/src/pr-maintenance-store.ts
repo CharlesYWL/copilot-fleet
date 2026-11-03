@@ -15,9 +15,6 @@ import {
   prMaintenanceSources,
   prMaintenanceStatus,
   prMaintenanceProviderKey,
-  prMaintenanceUrl,
-  eventPayload,
-  isWritingCategory,
   terminalRunStepStates,
   PrMaintenanceAdmissionSchema,
   PrMaintenanceBackupSchema,
@@ -54,10 +51,10 @@ import {
   type CommandExecution,
   type SessionActor,
   type SessionEvent,
-  type RunStep,
   sessionActor,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
+import type { AdmissionSession } from "./session-policy.js";
 import { notificationAttemptKey } from "./notifications/service.js";
 
 const outstanding = new Set(["prepared", "accepted", "reconciling", "uncertain"]);
@@ -459,8 +456,6 @@ export class PrMaintenanceStore {
       const { task, worker, lead } = this.ownedWorker(
         registration.taskId,
         registration.workerSessionId,
-        registration.identity,
-        registration.headSha,
       );
       if (lead.id !== leadSessionId)
         refuse("ownership", "Only the task's owning lead can propose maintenance.");
@@ -490,18 +485,15 @@ export class PrMaintenanceStore {
           task.state,
         ) ||
         worker.stopRequested ||
-        this.hasPendingManualExecution(worker.id) ||
         !(
           worker.state === "idle" ||
           (["completed", "stopped"].includes(worker.state) && worker.agentSessionId)
         ) ||
-        this.store
-          .listRunSteps(task.id)
-          .some(
-            (step) =>
-              step.sessionId === worker.id &&
-              !["succeeded", "failed", "cancelled", "skipped"].includes(step.state),
-          )
+        this.directWorkActive({
+          taskId: task.id,
+          workerSessionId: worker.id,
+          ...binding,
+        })
       )
         refuse(
           "proposal_not_ready",
@@ -664,12 +656,7 @@ export class PrMaintenanceStore {
     const reason = this.binding(record);
     if (reason)
       refuse(reason, "The retained binding is not eligible for repair authorization.");
-    const { task, worker } = this.ownedWorker(
-      registration.taskId,
-      registration.workerSessionId,
-      registration.identity,
-      registration.headSha,
-    );
+    const { task, worker } = this.ownedWorker(record.taskId, record.workerSessionId);
     if (
       !["running", "awaiting_lead", "awaiting_human", "completed"].includes(task.state) ||
       worker.stopRequested ||
@@ -814,17 +801,21 @@ export class PrMaintenanceStore {
       !lead ||
       task.leadSessionId !== lead.id ||
       lead.runRole !== "lead" ||
-      worker.runId !== task.id ||
-      worker.runRole !== "worker"
+      worker.runId !== task.id
     )
       return "binding_unavailable";
     if (!this.store.listRunSteps(task.id).some((step) => step.sessionId === worker.id))
       return "worker_not_owned";
+    const placement = this.store.getPlacement(record.placementId);
     if (
       worker.placementId !== record.placementId ||
-      !this.store.getPlacement(record.placementId)
+      worker.workspaceId !== task.workspaceId ||
+      !placement ||
+      placement.workspaceId !== task.workspaceId ||
+      placement.nodeId !== worker.nodeId
     )
       return "binding_changed";
+    if (!this.store.getNode(worker.nodeId)) return "binding_unavailable";
     const execution = worker.executionBinding;
     if (
       execution?.quarantined ||
@@ -874,100 +865,7 @@ export class PrMaintenanceStore {
     return undefined;
   }
 
-  workerEligible(
-    taskId: string,
-    workerSessionId: string,
-    identity: PrMaintenanceIdentity,
-    headSha: string,
-  ): boolean {
-    const worker = this.store.getSession(workerSessionId);
-    if (
-      !worker ||
-      worker.runId !== taskId ||
-      worker.runRole !== "worker" ||
-      worker.readOnly
-    )
-      return false;
-    const steps = this.store
-      .listRunSteps(taskId)
-      .filter((step) => step.sessionId === worker.id);
-    return steps.some(
-      (step) =>
-        isWritingCategory(step.category) ||
-        (step.category === "explore" &&
-          step.state === "succeeded" &&
-          this.publishedHead(step, steps, identity, headSha)),
-    );
-  }
-
-  private publishedHead(
-    step: RunStep,
-    steps: RunStep[],
-    identity: PrMaintenanceIdentity,
-    headSha: string,
-  ): boolean {
-    const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const published = new RegExp(
-      `(?:^|\\n)[ \\t]*(?:Published|Created)(?: draft)? (?:PR|pull request):? ${escape(prMaintenanceUrl(identity))}(?![\\w/.-])`,
-    );
-    const pins = [
-      prMaintenanceUrl(identity),
-      identity.headRepository,
-      identity.headRef,
-      headSha,
-    ].map((pin) => new RegExp(`(?<![\\w/.-])${escape(pin)}(?![\\w/.-])`));
-    const commands = new Set(
-      [identity.headRef, identity.headRef.slice("refs/heads/".length)].flatMap((ref) =>
-        ["", "-u ", "--set-upstream "].flatMap((flag) => [
-          `git push ${flag}origin ${ref}`,
-          `git push ${flag}origin HEAD:${ref}`,
-        ]),
-      ),
-    );
-    const nextAttempt = Math.min(
-      ...steps
-        .filter((candidate) => candidate.eventSeqFrom > step.eventSeqFrom)
-        .map((candidate) => candidate.eventSeqFrom),
-    );
-    const pushes = new Map<string, boolean>();
-    let report = "";
-    for (const event of this.store.listEventsAfter(step.sessionId, step.eventSeqFrom)) {
-      if (event.sequence > nextAttempt) break;
-      const tool = eventPayload(event, "tool");
-      if (tool?.toolCallId) {
-        if (tool.detail) {
-          if (tool.kind === "execute" && commands.has(tool.detail))
-            pushes.set(tool.toolCallId, false);
-          else pushes.delete(tool.toolCallId);
-        }
-        if (tool.status === "failed" || tool.error) pushes.delete(tool.toolCallId);
-        else if (tool.status === "completed" && pushes.has(tool.toolCallId))
-          pushes.set(tool.toolCallId, true);
-      }
-      report += eventPayload(event, "agent_text")?.text ?? "";
-      const turn = eventPayload(event, "turn_complete");
-      if (!turn) continue;
-      // A command summary alone is not publication evidence: require the same
-      // completed turn's report to agree with every current PR/source/head pin.
-      if (
-        turn.stopReason === "end_turn" &&
-        [...pushes.values()].some(Boolean) &&
-        published.test(report) &&
-        pins.every((pin) => pin.test(report))
-      )
-        return true;
-      pushes.clear();
-      report = "";
-    }
-    return false;
-  }
-
-  private ownedWorker(
-    taskId: string,
-    workerSessionId: string,
-    identity: PrMaintenanceIdentity,
-    headSha: string,
-  ) {
+  private ownedWorker(taskId: string, workerSessionId: string) {
     const task = this.store.getRun(taskId);
     const worker = this.store.getSession(workerSessionId);
     const lead = task && this.store.getSession(task.leadSessionId);
@@ -977,7 +875,6 @@ export class PrMaintenanceStore {
       !lead ||
       lead.runRole !== "lead" ||
       worker.runId !== task.id ||
-      worker.runRole !== "worker" ||
       !this.store.listRunSteps(task.id).some((step) => step.sessionId === worker.id)
     )
       refuse(
@@ -985,14 +882,33 @@ export class PrMaintenanceStore {
         "Enablement requires the task's existing lead-owned worker, not a standalone or replacement session.",
       );
     this.store.assertRunMutable(task.id);
+    this.store.commands.assertTaskUnfenced(task.id);
     this.store.assertSessionMutable(lead.id);
     this.store.assertSessionMutable(worker.id);
-    if (!this.workerEligible(taskId, workerSessionId, identity, headSha))
-      refuse(
-        "read_only_task",
-        "Repair maintenance requires the task's existing writing worker or a writable retained publisher with durable evidence for this exact PR head/ref; read-only categories without publication provenance are ineligible, and read-only workers cannot be upgraded.",
-      );
     return { task, worker, lead };
+  }
+
+  /** Approved maintenance reserves writing capacity without rewriting session history. */
+  sessionsForAdmission(): AdmissionSession[] {
+    const writers = new Set(
+      this.live()
+        .filter((record) =>
+          record.batches.some(
+            (batch) =>
+              batch.stepId &&
+              !batch.executionSettled &&
+              !["cancelled", "superseded"].includes(batch.state),
+          ),
+        )
+        .map((record) => record.workerSessionId),
+    );
+    return this.store
+      .listSessions()
+      .map((session) =>
+        session.readOnly && writers.has(session.id)
+          ? { ...session, maintenanceWriting: true }
+          : session,
+      );
   }
 
   /** This is an operator-route seam; never expose it as an MCP/model capability. */
@@ -1014,8 +930,6 @@ export class PrMaintenanceStore {
       const { task, worker, lead } = this.ownedWorker(
         parsed.taskId,
         parsed.workerSessionId,
-        parsed.identity,
-        parsed.headSha,
       );
       const retained = this.retained();
       const previous = retained.find(
@@ -1050,14 +964,13 @@ export class PrMaintenanceStore {
       }
       if (
         !["idle", "completed", "stopped"].includes(worker.state) ||
-        this.hasPendingManualExecution(worker.id) ||
-        this.store
-          .listRunSteps(task.id)
-          .some(
-            (step) =>
-              step.sessionId === worker.id &&
-              !["succeeded", "failed", "cancelled", "skipped"].includes(step.state),
-          )
+        this.directWorkActive({
+          taskId: task.id,
+          workerSessionId: worker.id,
+          placementId: worker.placementId,
+          checkoutKey:
+            worker.executionBinding?.checkoutKey ?? `placement:${worker.placementId}`,
+        })
       ) {
         refuse(
           "worker_busy",
@@ -1695,12 +1608,18 @@ export class PrMaintenanceStore {
    * unsettled manual command, another orchestration step on the worker, or a
    * different live session writing the same checkout.
    */
-  private directWorkActive(record: PrMaintenanceRegistration, batch: PrMaintenanceBatch) {
+  private directWorkActive(
+    record: Pick<
+      PrMaintenanceRegistration,
+      "taskId" | "workerSessionId" | "placementId" | "checkoutKey"
+    >,
+    batch?: PrMaintenanceBatch,
+  ) {
     if (this.hasPendingManualExecution(record.workerSessionId)) return true;
     // The batch's own step attempt: bound once accepted, or being accepted now.
-    const own = batch.stepId
+    const own = batch?.stepId
       ? { stepId: batch.stepId, attempt: batch.attempt }
-      : this.accepting?.batchId === batch.id
+      : batch && this.accepting?.batchId === batch.id
         ? this.accepting
         : undefined;
     if (

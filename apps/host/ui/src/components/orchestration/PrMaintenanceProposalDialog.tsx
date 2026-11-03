@@ -68,10 +68,7 @@ export function PrMaintenanceProposalDialog({
   const styles = useStyles();
   const candidate = proposal.registration;
   const worker = sessions.find((entry) => entry.id === candidate.workerSessionId);
-  const matchesTask =
-    candidate.taskId === taskId &&
-    worker?.runId === taskId &&
-    worker.runRole === "worker";
+  const matchesTask = candidate.taskId === taskId && worker?.runId === taskId;
   const changed =
     currentProposal?.id !== proposal.id || currentProposal.version !== proposal.version;
   const disabled =
