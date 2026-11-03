@@ -383,6 +383,21 @@ Preparation is repair-only; there is no observation-only default and an explicit
 observe mode is unsupported. `publicationEvidence` for verified existing task and
 publication authority is required; without it preparation is refused
 (`publication_evidence_required`) and no proposal or write grant is created.
+Worker selection and operator enablement share the same eligibility check. An
+existing writable worker normally qualifies through an `implement` or `test`
+step. A retained worker whose original step was `explore` can also qualify when
+that task-owned step succeeded and its durable, completed turn records both an
+explicit normal push to the exact source ref and an affirmative publication
+report matching the current PR URL, source repository, full ref and head SHA.
+The bounded fallback recognizes `git push [-u|--set-upstream] origin [HEAD:]<ref>`
+with a full or short ref, followed in the same turn by `Published PR: <URL>` or
+`Created [draft] PR: <URL>` (also `pull request`). Missing, truncated, compound,
+failed, forced or mismatched push evidence does not qualify. A report alone,
+fresh metadata, or the preparation caller's claim cannot supply this provenance.
+Reviewer sessions and sessions marked `readOnly` remain ineligible. No category,
+session permission, task state or checkout binding is rewritten. This is only
+retained-worker selection: existing task/publication authority, normal binding
+and readiness checks, and authenticated maintenance approval remain mandatory.
 Replies, thread resolution, named reviewer requests and CI retries default off and
 must be requested separately. The returned mode and action flags mirror the stored
 proposal. Operator approval cannot silently reinterpret read-only scope as repair authority.

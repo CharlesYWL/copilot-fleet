@@ -1225,20 +1225,19 @@ export class FleetTools {
             "Choose the existing task from its PR/work evidence; do not create a task or guess.",
         };
       const task = tasks[0]!;
-      const workerIds = new Set(
-        this.store
-          .listRunSteps(task.id)
-          .filter((step) => isWritingCategory(step.category))
-          .map((step) => step.sessionId),
-      );
       const workers = this.store
         .listSessions()
         .filter(
           (session) =>
             session.runId === task.id &&
             session.runRole === "worker" &&
-            workerIds.has(session.id) &&
-            (!input.workerSessionId || session.id === input.workerSessionId),
+            (!input.workerSessionId || session.id === input.workerSessionId) &&
+            this.store.prMaintenance.workerEligible(
+              task.id,
+              session.id,
+              identity,
+              input.headSha,
+            ),
         );
       if (workers.length !== 1)
         return {

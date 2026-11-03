@@ -8,6 +8,7 @@ import {
   PrMaintenanceEnableSchema,
   prMaintenanceUrl,
   prMaintenanceStatus,
+  type SessionEvent,
 } from "@fleet/protocol";
 import { z } from "zod";
 import { fleet } from "../orchestrator/fleet-harness.js";
@@ -35,7 +36,11 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
-async function setup(provider: "github" | "azure-devops" = "github", dbPath?: string) {
+async function setup(
+  provider: "github" | "azure-devops" = "github",
+  dbPath?: string,
+  readOnly = false,
+) {
   const state = fleet(dbPath);
   const { store, service, leadId } = state;
   store.transitionSession(leadId, "starting");
@@ -52,7 +57,7 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
     "repair",
     false,
     "Retained worker",
-    { runId: run.id, runRole: "worker" },
+    { runId: run.id, runRole: "worker", readOnly },
   );
   store.transitionSession(worker.id, "starting");
   store.transitionSession(worker.id, "idle");
@@ -201,6 +206,106 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
     mcp,
     leadToken,
     close,
+  };
+}
+
+async function retainedPublisher(readOnly = false) {
+  const state = await setup("azure-devops", undefined, readOnly);
+  const { store, run, worker, step, registration } = state;
+  const identity = {
+    ...registration.identity,
+    prNumber: 1149305,
+    headRef: "refs/heads/dev/charlesyin/schema-designer-fk-history",
+  };
+  const headSha = "849ca5216623f55ef97443adca783c2ba61a5bcb";
+  const prUrl = prMaintenanceUrl(identity);
+  const report = [
+    `Published PR: ${prUrl}`,
+    `Source repository: ${identity.headRepository}`,
+    `Source ref: ${identity.headRef}`,
+    `Published head: ${headSha}`,
+    "Implemented, committed and normal-pushed the requested change; PR created.",
+  ].join("\n");
+  store.upsertRunStep(run.id, {
+    stepKey: step.stepKey,
+    title: step.title,
+    prompt: "Implement, verify and publish the requested change within task authority.",
+    category: "explore",
+  });
+  store.updateRunStep(step.id, {
+    state: "succeeded",
+    sessionId: worker.id,
+    output: report,
+  });
+  const events: Pick<SessionEvent, "type" | "payload">[] = [
+    {
+      type: "tool",
+      payload: {
+        toolCallId: "publish-existing-branch",
+        title: "powershell",
+        status: "in_progress",
+        kind: "execute",
+        detail: `git push origin HEAD:${identity.headRef}`,
+      },
+    },
+    {
+      type: "tool",
+      payload: { toolCallId: "publish-existing-branch", status: "completed" },
+    },
+    { type: "agent_text", payload: { text: report } },
+    { type: "turn_complete", payload: { stopReason: "end_turn" } },
+  ];
+  const recordPublication = (sessionId = worker.id) => {
+    for (const [index, event] of events.entries())
+      store.appendEvent({
+        ...event,
+        eventId: `${sessionId}:retained-publication-${index}`,
+        sessionId,
+        sequence: index + 1,
+        createdAt: new Date().toISOString(),
+      });
+  };
+  const reviewer = store.createSession(
+    store.getPlacement(worker.placementId)!,
+    "Read-only review of the published change.",
+    false,
+    "Retained reviewer",
+    { runId: run.id, runRole: "reviewer", readOnly: true },
+  );
+  store.transitionSession(reviewer.id, "starting");
+  store.transitionSession(reviewer.id, "idle");
+  const review = store.upsertRunStep(run.id, {
+    stepKey: "review-published-change",
+    title: "Review",
+    prompt: "Review only; do not write or publish.",
+    category: "review-deep",
+  });
+  store.updateRunStep(review.id, {
+    state: "succeeded",
+    sessionId: reviewer.id,
+    output: "Read-only review completed.",
+  });
+  store.updateRun(run.id, { state: "awaiting_human" });
+  return {
+    ...state,
+    reviewer,
+    events,
+    report,
+    recordPublication,
+    input: {
+      taskId: run.id,
+      workerSessionId: worker.id,
+      prUrl,
+      identity,
+      headSha,
+      observedAt: new Date().toISOString(),
+      method: "provider_mcp" as const,
+      evidence: "Fresh exact provider PR metadata agrees with the retained publication.",
+      publicationEvidence:
+        "Existing task authority permitted this retained worker's normal push and PR creation.",
+      verification: registration.scope.verification,
+      eligibilityEvidence: registration.eligibilityEvidence,
+    },
   };
 }
 
@@ -778,6 +883,282 @@ describe("authenticated PR maintenance controls", () => {
       });
     },
   );
+
+  it("prepares an unapproved proposal for the retained publisher despite its original explore category", async () => {
+    const { store, service, run, worker, mcp, input, recordPublication } =
+      await retainedPublisher();
+    recordPublication();
+    const sessions = store.listSessions();
+    const steps = store.listRunSteps(run.id);
+    const commands = store.commands.prompts();
+    const events = store.listEvents(worker.id);
+    const dispatch = vi.spyOn(service, "dispatch");
+    const enable = vi.spyOn(store.prMaintenance, "enableFromOperator");
+    const result = await mcp("fleet_prepare_pr_maintenance", input);
+    expect(result.ok, result.text).toBe(true);
+    expect(JSON.parse(result.text), result.text).toMatchObject({
+      status: "awaiting_operator_authorization",
+      taskId: run.id,
+      mode: "repair",
+    });
+    expect(store.prMaintenance.getProposal(run.id)?.registration).toMatchObject({
+      taskId: run.id,
+      workerSessionId: worker.id,
+      identity: input.identity,
+      headSha: input.headSha,
+    });
+    expect(store.prMaintenance.list().records).toEqual([]);
+    expect(store.getRun(run.id)?.state).toBe("awaiting_human");
+    expect(store.listSessions()).toEqual(sessions);
+    expect(store.listRunSteps(run.id)).toEqual(steps);
+    expect(store.commands.prompts()).toEqual(commands);
+    expect(store.listEvents(worker.id)).toEqual(events);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(enable).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "reviewer",
+    "read-only",
+    "read-only-writing",
+    "unrelated",
+    "explore-only",
+    "metadata-only",
+    "failed-push",
+    "tool-error",
+    "denied-report",
+    "unpaired-push",
+    "forced-push",
+    "different-push-ref",
+    "unfinished-turn",
+    "different-head",
+    "different-ref",
+    "different-pr",
+    "different-repository",
+    "different-turn",
+    "different-attempt",
+  ])(
+    "rejects retained publisher eligibility for %s evidence at every entry point",
+    async (kind) => {
+      const f = await retainedPublisher(kind.startsWith("read-only"));
+      const { store, service, run, worker, step, input, events, report } = f;
+      if (kind === "read-only-writing") {
+        store.upsertRunStep(run.id, {
+          stepKey: step.stepKey,
+          title: step.title,
+          prompt: step.prompt,
+          category: "implement",
+        });
+        store.updateRunStep(step.id, { state: "succeeded", sessionId: worker.id });
+      }
+      if (kind === "reviewer") {
+        input.workerSessionId = f.reviewer.id;
+        f.recordPublication(f.reviewer.id);
+      } else if (kind === "unrelated") {
+        const task = store.createRun({
+          workspaceId: run.workspaceId,
+          name: "Unrelated task",
+          objective: "Another task's authorized publication.",
+        });
+        store.updateRun(task.id, { leadSessionId: f.leadId, state: "running" });
+        const session = store.createSession(
+          store.getPlacement(worker.placementId)!,
+          "Unrelated publisher",
+          false,
+          "",
+          { runId: task.id, runRole: "worker" },
+        );
+        const other = store.upsertRunStep(task.id, {
+          stepKey: "publish",
+          title: "Publish",
+          prompt: "Publish another task's change.",
+          category: "implement",
+        });
+        store.updateRunStep(other.id, { sessionId: session.id, state: "succeeded" });
+        store.transitionSession(session.id, "starting");
+        store.transitionSession(session.id, "idle");
+        input.workerSessionId = session.id;
+        f.recordPublication(session.id);
+      } else if (kind !== "explore-only") {
+        if (kind === "metadata-only") events[0]!.payload.detail = "git status --short";
+        if (kind === "failed-push") events[1]!.payload.status = "failed";
+        if (kind === "tool-error") events[1]!.payload.error = "git push failed";
+        if (kind === "denied-report")
+          events[2]!.payload.text = report.replace(
+            "Published PR:",
+            "Publication denied; inspected PR:",
+          );
+        if (kind === "unpaired-push") events[1]!.payload.toolCallId = "another-tool";
+        if (kind === "forced-push")
+          events[0]!.payload.detail = `git push --force-with-lease origin HEAD:${input.identity.headRef}`;
+        if (kind === "different-push-ref")
+          events[0]!.payload.detail = `git push origin HEAD:${input.identity.headRef}-other`;
+        if (kind === "unfinished-turn") events.pop();
+        if (kind === "different-head") input.headSha = "b".repeat(40);
+        if (kind === "different-ref")
+          events[2]!.payload.text = report.replace(
+            input.identity.headRef,
+            `${input.identity.headRef}-other`,
+          );
+        if (kind === "different-pr")
+          events[2]!.payload.text = report.replace(input.prUrl, `${input.prUrl}0`);
+        if (kind === "different-repository")
+          events[2]!.payload.text = report.replace(
+            input.identity.headRepository,
+            `${input.identity.headRepository}-other`,
+          );
+        if (kind === "different-turn")
+          events.splice(2, 0, {
+            type: "turn_complete",
+            payload: { stopReason: "end_turn" },
+          });
+        if (kind === "different-attempt") {
+          const next = store.upsertRunStep(run.id, {
+            stepKey: "later-review",
+            title: "Later review",
+            prompt: "Read only in a later attempt.",
+            category: "review-deep",
+          });
+          store.updateRunStep(next.id, {
+            sessionId: worker.id,
+            state: "succeeded",
+            eventSeqFrom: 2,
+          });
+        }
+        f.recordPublication();
+      }
+      const sessions = store.listSessions();
+      const commands = store.commands.prompts();
+      const dispatch = vi.spyOn(service, "dispatch");
+      const result = await f.mcp("fleet_prepare_pr_maintenance", input);
+      expect(result.ok, result.text).toBe(true);
+      expect(JSON.parse(result.text)).toMatchObject({
+        status: "needs_worker_choice",
+        workers: [],
+      });
+      const registration = {
+        ...f.registration,
+        workerSessionId: input.workerSessionId,
+        identity: input.identity,
+        headSha: input.headSha,
+      };
+      const proposal = await f.mcp("fleet_propose_pr_maintenance", registration);
+      expect(proposal.ok, proposal.text).toBe(false);
+      const enable = await f.app.inject({
+        method: "POST",
+        url: `/api/runs/${run.id}/pr-maintenance`,
+        headers: { "fixture-browser": "yes" },
+        payload: { action: "enable", registration },
+      });
+      expect(enable.statusCode, enable.body).toBe(409);
+      expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+      expect(store.prMaintenance.list().records).toEqual([]);
+      expect(store.listSessions()).toEqual(sessions);
+      expect(store.commands.prompts()).toEqual(commands);
+      expect(store.getRunStep(step.id)?.category).toBe(
+        kind === "read-only-writing" ? "implement" : "explore",
+      );
+      expect(dispatch).not.toHaveBeenCalled();
+    },
+  );
+
+  it("automatically selects the retained publisher but still requires authenticated proposal approval", async () => {
+    const {
+      store,
+      run,
+      worker,
+      step,
+      events,
+      report,
+      input,
+      recordPublication,
+      mcp,
+      app,
+    } = await retainedPublisher();
+    events[0]!.payload.detail = `git push -u origin ${input.identity.headRef.slice("refs/heads/".length)}`;
+    events[2]!.payload.text = report.replace("Published PR:", "Created draft PR:");
+    recordPublication();
+    const result = await mcp("fleet_prepare_pr_maintenance", {
+      ...input,
+      workerSessionId: undefined,
+    });
+    expect(result.ok, result.text).toBe(true);
+    expect(JSON.parse(result.text)).toMatchObject({
+      status: "awaiting_operator_authorization",
+    });
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    expect(proposal.registration.workerSessionId).toBe(worker.id);
+    const payload = {
+      action: "authorize_proposal",
+      proposalId: proposal.id,
+      expectedVersion: proposal.version,
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/runs/${run.id}/pr-maintenance`,
+          payload,
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(store.prMaintenance.list().records).toEqual([]);
+    const approval = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload,
+    });
+    expect(approval.statusCode, approval.body).toBe(200);
+    expect(approval.json()).toMatchObject({
+      workerSessionId: worker.id,
+      identity: input.identity,
+      authorization: { operatorId: "real-browser-principal" },
+    });
+    expect(store.getSession(worker.id)?.readOnly).toBe(false);
+    expect(store.getRunStep(step.id)?.category).toBe("explore");
+    expect(store.getRun(run.id)?.state).toBe("awaiting_human");
+  });
+
+  it("revalidates retained publisher evidence when the operator authorizes its proposal", async () => {
+    const { store, run, worker, step, input, recordPublication, mcp, app } =
+      await retainedPublisher();
+    recordPublication();
+    expect((await mcp("fleet_prepare_pr_maintenance", input)).ok).toBe(true);
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    store.updateRunStep(step.id, { eventSeqFrom: 4 });
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload: {
+        action: "authorize_proposal",
+        proposalId: proposal.id,
+        expectedVersion: proposal.version,
+      },
+    });
+    expect(response.statusCode, response.body).toBe(409);
+    expect(response.body).toContain("durable evidence for this exact PR head/ref");
+    expect(store.prMaintenance.list().records).toEqual([]);
+    expect(store.prMaintenance.getProposal(run.id)).toEqual(proposal);
+    expect(store.getSession(worker.id)?.readOnly).toBe(false);
+  });
+
+  it("does not replace existing task/publication authority with a retained publication report", async () => {
+    const { store, service, run, input, recordPublication, mcp } =
+      await retainedPublisher();
+    recordPublication();
+    const dispatch = vi.spyOn(service, "dispatch");
+    const result = await mcp("fleet_prepare_pr_maintenance", {
+      ...input,
+      publicationEvidence: undefined,
+    });
+    expect(result.ok, result.text).toBe(false);
+    expect(result.text).toContain("publication_evidence_required");
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+    expect(store.prMaintenance.list().records).toEqual([]);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
 
   it("never expands a read-only task into publication or feedback mutations when preparation omits permissions", async () => {
     const { store, run, registration, mcp } = await setup("azure-devops");
