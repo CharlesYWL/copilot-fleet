@@ -102,6 +102,7 @@ import {
 } from "../lib/attachments";
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
 import { toolFilePath } from "../lib/session-files";
+import { saveSentImages } from "../lib/sent-images";
 import { AttachmentStrip } from "./AttachmentStrip";
 import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner } from "./PermissionBanner";
@@ -112,6 +113,7 @@ import { SessionAgentBadge } from "./SessionAgentBadge";
 import { SessionFileDialog } from "./SessionFileDialog";
 import { FileDownloadButton, SessionFilesProvider } from "./SessionFiles";
 import { SessionInfoDialog } from "./SessionInfoDialog";
+import { SentAttachments } from "./SentAttachments";
 import { SlashMenu } from "./SlashMenu";
 import { StatusIndicator } from "./StatusIndicator";
 
@@ -517,25 +519,6 @@ const useStyles = makeStyles({
     color: tokens.colorPaletteRedForeground1,
     fontSize: "11px",
   },
-  blockAttachments: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: "6px",
-    marginTop: "6px",
-  },
-  blockAttachment: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "4px",
-    padding: "2px 7px",
-    borderRadius: tokens.borderRadiusMedium,
-    border: `1px solid ${tokens.colorNeutralStroke2}`,
-    color: tokens.colorNeutralForeground3,
-    fontSize: "11px",
-  },
-  blockAttachmentIcon: {
-    fontSize: "12px",
-  },
 });
 
 /**
@@ -908,12 +891,13 @@ export const TerminalView = ({
 
   const listContext = useMemo<TranscriptListContext>(
     () => ({
+      sessionId: session.id,
       sessionState: session.state,
       expanded,
       onToggle: toggleExpanded,
       working: session.state === "running",
     }),
-    [session.state, expanded, toggleExpanded],
+    [session.id, session.state, expanded, toggleExpanded],
   );
   const followOutput = useCallback(
     (): "auto" | false => (pinnedRef.current ? "auto" : false),
@@ -1018,6 +1002,8 @@ export const TerminalView = ({
     if ((!text && files.length === 0) || !canPrompt || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
+    // Before the request, since the Host's echo of the message can beat its answer.
+    void saveSentImages(session.id, files);
     try {
       const accepted =
         maintenanceWorker && handbackSession === session.id
@@ -1581,6 +1567,7 @@ type TerminalLineProps = {
   block: TerminalBlock;
   /** Absolute block position, so a prompt can be found once it is rendered. */
   index: number;
+  sessionId: string;
   sessionState: SessionState;
   expanded: boolean;
   onToggle: (key: string) => void;
@@ -1588,6 +1575,7 @@ type TerminalLineProps = {
 
 /** What every rendered row shares, kept stable so unchanged rows skip rendering. */
 type TranscriptListContext = {
+  sessionId: string;
   sessionState: SessionState;
   expanded: ReadonlySet<string>;
   onToggle: (key: string) => void;
@@ -1618,6 +1606,7 @@ const TranscriptItem = memo(function TranscriptItem({
           key={tool.key}
           block={tool}
           index={row.index + first + index}
+          sessionId={context.sessionId}
           sessionState={context.sessionState}
           expanded={context.expanded.has(tool.key)}
           onToggle={context.onToggle}
@@ -1690,6 +1679,7 @@ const transcriptComponents = {
 const TerminalLine = memo(function TerminalLine({
   block,
   index,
+  sessionId,
   sessionState,
   expanded,
   onToggle,
@@ -1702,14 +1692,11 @@ const TerminalLine = memo(function TerminalLine({
       <>
         <MarkdownBody text={block.text} copyable />
         {block.attachments?.length ? (
-          <div className={styles.blockAttachments}>
-            {block.attachments.map((attachment, attachmentIndex) => (
-              <span className={styles.blockAttachment} key={attachmentIndex}>
-                <Attach20Regular className={styles.blockAttachmentIcon} />
-                {attachment.name}
-              </span>
-            ))}
-          </div>
+          <SentAttachments
+            sessionId={sessionId}
+            attachments={block.attachments}
+            sentAt={block.createdAt}
+          />
         ) : null}
       </>
     );

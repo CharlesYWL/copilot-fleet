@@ -247,6 +247,11 @@ stored on the Host and replayed to every browser watching a session, so keeping
 the bytes there would turn a few pasted screenshots into a liability; the
 attachment chips under a sent message are the trace that remains.
 
+The browser that sent an image keeps its own copy in IndexedDB, so the image's
+chip under the sent message can still be clicked to view it, including after a
+reload. Other browsers, and this one after **Sign out**, see the name only. The
+browser keeps the latest 60 sent images for up to 30 days.
+
 ## Downloading files from a session
 
 A session's files live on the machine that ran it, which is often not the one

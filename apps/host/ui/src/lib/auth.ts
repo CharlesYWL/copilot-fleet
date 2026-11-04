@@ -12,6 +12,7 @@ import {
   type AuthErrorCode,
   type AuthStatus,
 } from "@fleet/protocol";
+import { clearSentImages } from "./sent-images";
 
 const SIGNED_OUT_EVENT = "fleet:signed-out";
 
@@ -31,6 +32,8 @@ export async function signOut(): Promise<void> {
   });
   if (!response.ok) throw new Error(`Could not sign out (${response.status})`);
   csrfCache = undefined;
+  // Sent images are kept only for whoever sent them; the next person here gets names.
+  await clearSentImages();
   announceSignedOut();
 }
 

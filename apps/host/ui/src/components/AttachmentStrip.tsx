@@ -1,16 +1,5 @@
 import { useState } from "react";
-import {
-  Button,
-  Dialog,
-  DialogActions,
-  DialogBody,
-  DialogContent,
-  DialogSurface,
-  DialogTitle,
-  Text,
-  makeStyles,
-  tokens,
-} from "@fluentui/react-components";
+import { Button, Text, makeStyles, tokens } from "@fluentui/react-components";
 import { Dismiss12Regular, Document20Regular } from "@fluentui/react-icons";
 import {
   attachmentDataUrl,
@@ -18,6 +7,7 @@ import {
   isImageAttachment,
   type DraftAttachment,
 } from "../lib/attachments";
+import { ImagePreviewDialog } from "./ImagePreviewDialog";
 
 const useStyles = makeStyles({
   strip: {
@@ -80,26 +70,6 @@ const useStyles = makeStyles({
     height: "20px",
     padding: 0,
   },
-  previewSurface: {
-    width: "auto",
-    maxWidth: "min(960px, calc(100vw - 32px))",
-  },
-  previewTitle: {
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
-  },
-  previewContent: {
-    display: "flex",
-    justifyContent: "center",
-  },
-  previewImage: {
-    display: "block",
-    maxWidth: "100%",
-    maxHeight: "70vh",
-    objectFit: "contain",
-    borderRadius: tokens.borderRadiusMedium,
-  },
 });
 
 export type AttachmentStripProps = {
@@ -153,32 +123,14 @@ export const AttachmentStrip = ({ attachments, onRemove }: AttachmentStripProps)
           />
         </div>
       ))}
-      <Dialog
-        open={previewed !== undefined}
-        onOpenChange={(_event, data) => {
-          if (!data.open) handleClosePreview();
-        }}
-      >
-        <DialogSurface className={styles.previewSurface}>
-          {previewed ? (
-            <DialogBody>
-              <DialogTitle className={styles.previewTitle}>{previewed.name}</DialogTitle>
-              <DialogContent className={styles.previewContent}>
-                <img
-                  className={styles.previewImage}
-                  src={attachmentDataUrl(previewed)}
-                  alt={previewed.name}
-                />
-              </DialogContent>
-              <DialogActions>
-                <Button appearance="secondary" onClick={handleClosePreview}>
-                  Close
-                </Button>
-              </DialogActions>
-            </DialogBody>
-          ) : null}
-        </DialogSurface>
-      </Dialog>
+      <ImagePreviewDialog
+        image={
+          previewed
+            ? { name: previewed.name, src: attachmentDataUrl(previewed) }
+            : undefined
+        }
+        onClose={handleClosePreview}
+      />
     </div>
   );
 };
