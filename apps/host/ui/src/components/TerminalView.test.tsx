@@ -434,6 +434,54 @@ describe("TerminalView composer", () => {
     },
   );
 
+  it("lets a sent image open again from its chip in the transcript", async () => {
+    const onPrompt = vi.fn().mockResolvedValue(true);
+    function Conversation() {
+      const [draft, setDraft] = useState(EMPTY_DRAFT);
+      const [events, setEvents] = useState<SessionEvent[]>([]);
+      const handlePrompt: ComponentProps<typeof TerminalView>["onPrompt"] = async (
+        prompt,
+        attachments,
+      ) => {
+        setEvents([
+          streamEvent("system", {
+            text: `User: ${prompt}`,
+            attachments: (attachments ?? []).map((attachment) => ({
+              name: attachment.name,
+              mimeType: attachment.mimeType,
+              bytes: atob(attachment.data).length,
+            })),
+          }),
+        ]);
+        return onPrompt(prompt, attachments);
+      };
+      return (
+        <FluentProvider theme={fleetDarkTheme}>
+          <TerminalView
+            session={session()}
+            {...live(events)}
+            onPrompt={handlePrompt}
+            onCancel={vi.fn()}
+            onStop={vi.fn()}
+            onPermission={vi.fn()}
+            draft={draft}
+            onDraftChange={setDraft}
+          />
+        </FluentProvider>
+      );
+    }
+    render(<Conversation />);
+    fireEvent.paste(screen.getByLabelText("Follow-up prompt"), {
+      clipboardData: { files: [new File(["shot"], "image.png", { type: "image/png" })] },
+    });
+    await screen.findByRole("button", { name: "Remove image1.png" });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "View image1.png" }));
+    const preview = await screen.findByRole("img", { name: "image1.png" });
+    expect(preview.getAttribute("src")).toBe(`data:image/png;base64,${btoa("shot")}`);
+  });
+
   it("keeps the pickers inside the composer, under the text box", () => {
     // They used to sit in a band above it; the point of the move is that the
     // composer is one object, so a picker outside the form is the regression.
