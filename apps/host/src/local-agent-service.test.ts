@@ -405,6 +405,116 @@ describe("local agent messages", () => {
   });
 });
 
+describe("local agent task review", () => {
+  const review = (
+    w: ReturnType<typeof world>,
+    taskId: string,
+    overrides: Record<string, unknown> = {},
+  ) =>
+    w.agent.reviewTask(taskId, {
+      operationId: randomUUID(),
+      expectedLeadSessionId: w.lead.id,
+      decision: "approve",
+      ...overrides,
+    });
+  const allow = (w: ReturnType<typeof world>, allowTaskReview = true) => {
+    const config = w.store.getLocalAgentConfig();
+    w.store.setLocalAgentConfig({ ...config, allowTaskReview }, config.revision);
+  };
+
+  it("is refused until an administrator allows it", () => {
+    const w = world();
+    const run = w.ownedTask("awaiting_human");
+    expect(w.store.getLocalAgentConfig().allowTaskReview).toBe(false);
+    expect(w.agent.capabilities()).toMatchObject({ taskReview: false });
+    expect(w.agent.capabilities().operations).not.toContain("review_task");
+    expect(codeOf(() => review(w, run.id))).toBe("task_review_disabled");
+    expect(w.store.getRun(run.id)!.state).toBe("awaiting_human");
+
+    allow(w);
+    expect(w.agent.capabilities()).toMatchObject({ taskReview: true });
+    expect(w.agent.capabilities().operations).toContain("review_task");
+  });
+
+  it("approves a task awaiting review as the operator would, and replays a retry", () => {
+    const w = world();
+    allow(w);
+    const run = w.ownedTask("awaiting_human");
+    const operationId = randomUUID();
+    const approved = review(w, run.id, { operationId, clientLabel: "Harness" });
+    expect(approved.status).toBe(200);
+    expect(approved.body).toMatchObject({
+      task: { id: run.id, state: "completed" },
+      review: { operationId, decision: "approve", clientLabel: "Harness" },
+    });
+    expect(w.store.getRun(run.id)!.state).toBe("completed");
+    expect(w.store.listRunNotes(run.id).at(-1)).toMatchObject({
+      summary: "Task result accepted by local agent",
+      kind: "decision",
+      source: "operator",
+    });
+    expect(w.store.listRunNotes(run.id).at(-1)!.body).toContain('"Harness"');
+    expect(
+      w.store
+        .listSecurityAudit(10)
+        .find((event) => event.eventType === "local_agent_task_approved"),
+    ).toMatchObject({ actorKind: "local_agent", targetId: run.id });
+
+    const again = review(w, run.id, { operationId, clientLabel: "Harness" });
+    expect(again.body).toMatchObject({ replayed: true, task: { id: run.id } });
+    expect(
+      codeOf(() =>
+        review(w, run.id, { operationId, decision: "send_back", note: "Different" }),
+      ),
+    ).toBe("idempotency_conflict");
+    expect(codeOf(() => review(w, run.id))).toBe("not_awaiting_review");
+  });
+
+  it("sends a task back with a required note, which releases held guidance", () => {
+    const w = world();
+    allow(w);
+    const run = w.ownedTask("awaiting_human");
+    const guidance = w.ask(run.id, { intent: "guidance", text: "Also cover logout." });
+    expect(guidance.status).toBe(202);
+    expect(w.deliveries()).toHaveLength(0);
+    expect(w.agent.getRequest(guidance.body.request.operationId).request).toMatchObject({
+      state: "pending",
+      detail: expect.stringMatching(/waiting for a person's review/),
+    });
+
+    expect(codeOf(() => review(w, run.id, { decision: "send_back" }))).toBe(
+      "review_reason_required",
+    );
+    expect(codeOf(() => review(w, run.id, { expectedLeadSessionId: "other" }))).toBe(
+      "stale_owner",
+    );
+    const sent = review(w, run.id, {
+      decision: "send_back",
+      note: "Add the missing migration.",
+    });
+    expect(sent.body).toMatchObject({ task: { state: "running" } });
+    expect(w.store.listRunNotes(run.id).at(-1)!.body).toBe(
+      "Sent back by the operator's local agent: Add the missing migration.",
+    );
+
+    // The send-back reaches the idle orchestrator first, then the held guidance.
+    const [first] = w.deliveries();
+    expect(first?.prompt).toContain('verdict="changes requested"');
+    expect(first?.prompt).toContain("Add the missing migration.");
+    w.receipt(first!.deliveryId, "settled");
+    w.service.commands.pumpLead(w.lead.id);
+    expect(w.deliveries().at(-1)?.prompt).toContain("Also cover logout.");
+  });
+
+  it("refuses a task that is not waiting for review", () => {
+    const w = world();
+    allow(w);
+    const run = w.ownedTask("running");
+    expect(codeOf(() => review(w, run.id))).toBe("not_awaiting_review");
+    expect(codeOf(() => review(w, "missing"))).toBe("not_found");
+  });
+});
+
 describe("local agent request disposition", () => {
   it("withdraws exactly the owed brief, keeping text appended after it", async () => {
     const w = world();
@@ -526,8 +636,20 @@ describe("local agent configuration", () => {
     expect(saved).toMatchObject({
       revision: base.expectedRevision + 1,
       allowedLeadSessionIds: [w.lead.id],
+      allowTaskReview: false,
     });
     expect(codeOf(() => w.agent.updateConfig(base, admin, 8787))).toBe("stale_request");
+    const reviewing = w.agent.updateConfig(
+      { ...base, allowTaskReview: true, expectedRevision: saved.revision },
+      admin,
+      8787,
+    );
+    expect(reviewing.allowTaskReview).toBe(true);
+    // A client that does not know the setting never grants it.
+    expect(
+      w.agent.updateConfig({ ...base, expectedRevision: reviewing.revision }, admin, 8787)
+        .allowTaskReview,
+    ).toBe(false);
   });
 
   it("keeps a saved orchestrator that has since gone, so turning off never waits on it", () => {

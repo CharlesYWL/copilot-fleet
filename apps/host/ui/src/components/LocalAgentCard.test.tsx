@@ -24,6 +24,7 @@ const view = (
     port: 8786,
     allowedLeadSessionIds: [],
     allowedWorkspaceIds: [],
+    allowTaskReview: false,
     revision: 3,
     ...config,
   },
@@ -147,6 +148,7 @@ describe("LocalAgentCard", () => {
         port: 8786,
         allowedLeadSessionIds: [lead.id],
         allowedWorkspaceIds: [],
+        allowTaskReview: false,
         expectedRevision: 3,
       },
     });
@@ -256,6 +258,53 @@ describe("LocalAgentCard", () => {
       port: 8786,
       allowedLeadSessionIds: [lead.id, "lead-gone"],
       allowedWorkspaceIds: [workspace.id],
+      allowTaskReview: false,
+      expectedRevision: 3,
+    });
+  });
+
+  it("allows local review only when its own box is ticked, and saves it", async () => {
+    const fetchMock = host(
+      {
+        config: view(
+          {
+            enabled: true,
+            allowedLeadSessionIds: [lead.id],
+            allowedWorkspaceIds: [workspace.id],
+          },
+          { state: "listening", url: "http://127.0.0.1:8786" },
+        ),
+      },
+      {
+        "PUT /api/local-agent/config": () =>
+          answer(
+            view(
+              {
+                enabled: true,
+                allowedLeadSessionIds: [lead.id],
+                allowedWorkspaceIds: [workspace.id],
+                allowTaskReview: true,
+                revision: 4,
+              },
+              { state: "listening", url: "http://127.0.0.1:8786" },
+            ),
+          ),
+      },
+    );
+    show();
+
+    const review = await screen.findByRole("checkbox", {
+      name: /approve or send back tasks awaiting review/,
+    });
+    expect((review as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByText(/task review off/)).toBeTruthy();
+    fireEvent.click(review);
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(await screen.findByText(/task review allowed/)).toBeTruthy();
+    expect(sent(fetchMock, "PUT", "/api/local-agent/config")?.body).toMatchObject({
+      enabled: true,
+      allowTaskReview: true,
       expectedRevision: 3,
     });
   });

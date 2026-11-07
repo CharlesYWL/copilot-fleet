@@ -21,8 +21,8 @@ import { capacityFor, reservedSessionCount } from "../session-policy.js";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetTools } from "../orchestrator/tools.js";
-import { orchestratorBriefing, owedPrompt } from "../orchestrator/briefing.js";
-import { reviewOutcome } from "../orchestrator/review.js";
+import { orchestratorBriefing } from "../orchestrator/briefing.js";
+import { applyTaskReview } from "../orchestrator/task-review.js";
 import {
   assertTaskAdmissible,
   createTaskOnLead,
@@ -607,11 +607,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
   app.post("/api/runs/:id/review", async (request, reply) => {
     const { id } = request.params as { id: string };
     const input = ReviewSchema.parse(request.body);
-    const run = store.getRun(id);
-    // The task's review is about the task. A PR maintenance decision is
-    // answered in the PRM panel or the orchestrator conversation, never here,
-    // so settling this review can never cancel or settle maintenance intent.
-    const outcome = reviewOutcome(run, input);
+    const outcome = applyTaskReview(service, engine, id, input);
 
     if (outcome.kind === "not_found") {
       return reply.code(404).send({ error: "Task not found" });
@@ -624,46 +620,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         .code(400)
         .send({ error: "Say what needs changing, so the orchestrator can act on it" });
     }
-    store.prMaintenance.assertAdmission({
-      taskId: id,
-      action: outcome.kind === "approve" ? "approve" : "reopen",
-    });
-    if (outcome.kind === "approve") {
-      store.appendRunNote(
-        run!.id,
-        run!.phaseIndex,
-        outcome.note || "The task result was accepted by a person.",
-        { summary: "Task result accepted", kind: "decision", source: "operator" },
-      );
-      service.resolveRunReview(run!.id);
-      const done =
-        run!.workspaceBinding?.effectiveMode === "managed"
-          ? service.worktrees.beginAggregation(run!.id)
-          : store.setRunState(run!.id, "completed")!;
-      service.publishRun(done);
-      engine.tick();
-      return { ok: true, run: done };
-    }
-
-    store.appendRunNote(run!.id, run!.phaseIndex, `Sent back: ${outcome.note}`, {
-      summary: "Guidance sent to the Orchestrator",
-      kind: "decision",
-      source: "operator",
-    });
-    service.resolveRunReview(run!.id);
-    /*
-     * The note is owed rather than sent. Leaving `awaiting_human` is what takes
-     * the approve/send-back controls away, so a prompt dropped because the lead
-     * was mid-turn would strand the task: no steps left to settle, so no wake
-     * could ever be owed, and no control left to try again with.
-     */
-    const reopened = store.updateRun(run!.id, {
-      state: "running",
-      pendingPrompt: owedPrompt(run!.pendingPrompt, outcome.prompt),
-    })!;
-    service.publishRun(reopened);
-    engine.tick();
-    return { ok: true, run: reopened };
+    return { ok: true, run: outcome.run };
   });
 
   /**

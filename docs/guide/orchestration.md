@@ -590,7 +590,8 @@ exposes only what you pick.
    The REST surface is `/v1/capabilities`, `/v1/orchestrators`,
    `/v1/workspaces`, `/v1/tasks`, `/v1/tasks/<id>`,
    `POST /v1/orchestrators/<id>/tasks`,
-   `POST /v1/tasks/<id>/messages`, `/v1/requests/<operationId>` and
+   `POST /v1/tasks/<id>/messages`, `POST /v1/tasks/<id>/review` (only when
+   allowed, see below), `/v1/requests/<operationId>` and
    `/v1/orchestrators/<id>/transcript`. MCP clients use `POST /v1/mcp`; the card
    copies a ready client configuration.
 
@@ -599,12 +600,35 @@ exposes only what you pick.
    asynchronous: poll the request and task, then read the orchestrator's answer
    in its transcript.
 
-A local agent is never a person. A _question_ works on any exposed task,
-including finished ones, and does not reopen it; _guidance_ is held while a task
-is closed or waiting for review. Nothing here approves, publishes, stops,
+By default a local agent is never a person. A _question_ works on any exposed
+task, including finished ones, and does not reopen it; _guidance_ is held while
+a task is closed or waiting for review. Nothing here publishes, stops,
 transfers or resumes anything — use the normal controls for that. The card lists
 recent local requests and lets whoever manages it abandon one that is stuck. See
 [the design and implementation record](../local-agent-api-plan.md).
+
+**Letting a local agent review for you.** If you run a review harness on this
+machine that speaks for you, tick **Allow local agents to approve or send back
+tasks awaiting review** on the same card. The MCP server then offers
+`review_task` (REST: `POST /v1/tasks/<id>/review`), which answers a task in
+**awaiting review** exactly like the task's own buttons:
+
+```json
+{
+  "operationId": "<fresh UUID>",
+  "expectedLeadSessionId": "<the task's orchestrator>",
+  "decision": "send_back",
+  "note": "Add a regression test for the logout path.",
+  "clientLabel": "review-harness"
+}
+```
+
+`approve` accepts the result and closes the task (a managed checkout still needs
+its separate publication approval); `send_back` needs a `note` and reopens the
+task with it as the orchestrator's next turn, which also releases any guidance
+held behind the review. The task's notes and the security audit record which
+client decided. Off by default; turning it on counts as widening the API, so it
+needs a recent sign-in like any other change that leaves the API on.
 
 **Trust model.** Any process that can reach the loopback port — potentially
 including other users on this machine — can read the exposed orchestrators'
