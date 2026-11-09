@@ -37,6 +37,7 @@ import { api, ApiError } from "../hooks/useFleet";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { CopyButton } from "./CopyButton";
 import { terminal } from "../theme";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   card: {
@@ -223,12 +224,12 @@ export const LocalAgentCard = ({
 
   if (!view || !draft) {
     return (
-      <section
+      <SettingsSection
+        title="Local agent API"
         className={styles.card}
         aria-label="Local agent API"
         data-setting-id="security.local-agent"
       >
-        <Text weight="semibold">Local agent API</Text>
         {loadError ? (
           <MessageBar intent="warning">
             <MessageBarBody>{loadError}</MessageBarBody>
@@ -236,7 +237,7 @@ export const LocalAgentCard = ({
         ) : (
           <Spinner size="tiny" label="Loading…" />
         )}
-      </section>
+      </SettingsSection>
     );
   }
 
@@ -408,14 +409,13 @@ export const LocalAgentCard = ({
 
   const badge = STATUS[status.state];
   return (
-    <section
+    <SettingsSection
+      title="Local agent API"
       className={styles.card}
       aria-label="Local agent API"
       data-setting-id="security.local-agent"
     >
       <div>
-        <Text weight="semibold">Local agent API</Text>
-        <br />
         <Text className={styles.caption}>
           Lets an agent on this computer — Hermes, an MCP client, a script — list the
           orchestrators and workspaces chosen here, create tasks, ask about them, and read
@@ -727,6 +727,6 @@ export const LocalAgentCard = ({
           </DialogBody>
         </DialogSurface>
       </Dialog>
-    </section>
+    </SettingsSection>
   );
 };

@@ -10,6 +10,7 @@ import {
   Switch,
   Text,
   makeStyles,
+  mergeClasses,
   tokens,
 } from "@fluentui/react-components";
 import {
@@ -21,6 +22,7 @@ import {
 } from "@fleet/protocol";
 import { CopyButton } from "./CopyButton";
 import { useMessageNotification } from "../hooks/useAppNotifications";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   card: {
@@ -113,14 +115,14 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
   };
 
   return (
-    <section
-      className={`${styles.card} ${isPrimary ? styles.primaryCard : ""}`}
+    <SettingsSection
+      title="Corp direct (private IP)"
+      className={mergeClasses(styles.card, isPrimary ? styles.primaryCard : undefined)}
       aria-label="Corp direct (private IP)"
       data-setting-id="tunnel.provider.corp-direct"
     >
       <div className={styles.row}>
         <div className={styles.heading}>
-          <Text weight="semibold">Corp direct (private IP)</Text>
           <Badge appearance="outline">Private network</Badge>
           {isPrimary && (
             <Badge appearance="filled" color="brand">
@@ -248,6 +250,6 @@ export const CorpDirectCard = ({ info, state, isPrimary, busy, onSetEnabled }: P
           trust. Enabling this does not move existing Nodes or disable other providers.
         </MessageBarBody>
       </MessageBar>
-    </section>
+    </SettingsSection>
   );
 };

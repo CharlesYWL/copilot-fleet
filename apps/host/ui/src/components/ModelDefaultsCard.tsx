@@ -8,6 +8,7 @@ import {
 } from "@fleet/protocol";
 import { observedChoices } from "../lib/session-config";
 import type { ReactNode } from "react";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   card: {
@@ -75,13 +76,14 @@ export function ModelDefaultsCard({
   const effortChoices = observedChoices(agentSessions, "reasoning_effort");
 
   return (
-    <section
+    <SettingsSection
+      title={`Default ${label} model`}
       className={styles.card}
       aria-label={`${label} model defaults`}
       data-setting-id={settingId}
     >
       <div className={styles.row}>
-        <Text weight="semibold">Default {label} model</Text>
+        <Text weight="semibold">Model</Text>
         <Dropdown
           className={styles.dropdown}
           disabled={busy || (modelChoices.length === 0 && model === "")}
@@ -126,6 +128,6 @@ export function ModelDefaultsCard({
         <Text className={styles.caption}>Start a {label} session to load models.</Text>
       )}
       {children}
-    </section>
+    </SettingsSection>
   );
 }

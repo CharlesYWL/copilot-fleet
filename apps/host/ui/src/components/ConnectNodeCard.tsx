@@ -28,6 +28,7 @@ import {
 } from "../lib/enroll-command";
 import { terminal } from "../theme";
 import { CopyButton } from "./CopyButton";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   card: {
@@ -176,10 +177,15 @@ const ConnectionCommandCard = ({ option }: { option: ConnectionOption }) => {
   };
 
   return (
-    <section className={styles.providerCard} aria-label={`Connect via ${option.label}`}>
-      <Text as="h3" weight="semibold" size={400}>
-        {option.label}
-      </Text>
+    <SettingsSection
+      title={
+        <Text as="h3" weight="semibold" size={400}>
+          {option.label}
+        </Text>
+      }
+      className={styles.providerCard}
+      aria-label={`Connect via ${option.label}`}
+    >
       <Field label="Host URL the node should dial" className={styles.urlField}>
         <Input
           value={hostUrl}
@@ -298,7 +304,7 @@ const ConnectionCommandCard = ({ option }: { option: ConnectionOption }) => {
           </div>
         </>
       )}
-    </section>
+    </SettingsSection>
   );
 };
 
@@ -317,16 +323,17 @@ export const ConnectNodeCard = () => {
     ...(enrollment.corpDirectCa ? { corpDirectCa: enrollment.corpDirectCa } : {}),
   };
   return (
-    <section
+    <SettingsSection
+      title={
+        <Title3 as="h2" data-tour="connect-node">
+          Connect a machine
+        </Title3>
+      }
       className={styles.card}
       aria-label="Connect a machine"
       data-setting-id="nodes.connect"
     >
       <div>
-        <Title3 as="h2" data-tour="connect-node">
-          Connect a machine
-        </Title3>
-        <br />
         <Text className={styles.caption}>
           Run this from a Copilot Fleet checkout that has Node.js and a signed-in Copilot
           CLI. The node registers itself under the machine&apos;s own hostname, generates
@@ -355,6 +362,6 @@ export const ConnectNodeCard = () => {
           option={legacy}
         />
       )}
-    </section>
+    </SettingsSection>
   );
 };

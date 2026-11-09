@@ -18,6 +18,7 @@ import {
   Text,
   Title3,
   makeStyles,
+  mergeClasses,
   tokens,
 } from "@fluentui/react-components";
 import { QuestionCircle20Regular } from "@fluentui/react-icons";
@@ -34,6 +35,7 @@ import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { orderTunnelProviders, visibleTunnelProviders } from "../lib/tunnel-order";
 import { CopyButton } from "./CopyButton";
 import { CorpDirectCard } from "./CorpDirectCard";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   panel: {
@@ -210,15 +212,15 @@ const ProviderCard = ({
   const online = state.status === "on" && Boolean(url);
 
   return (
-    <section
-      className={`${styles.card} ${isPrimary ? styles.primaryCard : ""}`}
+    <SettingsSection
+      title={spec.label}
+      className={mergeClasses(styles.card, isPrimary ? styles.primaryCard : undefined)}
       aria-label={spec.label}
       data-setting-id={`tunnel.provider.${spec.id}`}
     >
       <div className={styles.row}>
         <div>
           <div className={styles.heading}>
-            <Text weight="semibold">{spec.label}</Text>
             <ProviderHelpDialog spec={spec} />
             {isPrimary && (
               <Badge appearance="filled" color="brand">
@@ -243,6 +245,7 @@ const ProviderCard = ({
           </Text>
         </div>
         <Switch
+          aria-label={`Enable ${spec.label}`}
           checked={state.enabled || state.status === "on"}
           // A provider with no TLS is never offered for the console. The Host
           // refuses it too — this only saves the operator the round trip.
@@ -325,7 +328,7 @@ const ProviderCard = ({
           Tunnel id: <code className={styles.mono}>{state.tunnelId}</code>
         </Text>
       )}
-    </section>
+    </SettingsSection>
   );
 };
 

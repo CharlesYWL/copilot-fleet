@@ -13,6 +13,7 @@ import { problemsOnly, type LogEntry } from "@fleet/protocol/log-buffer";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import { useSettingsActive, useSettingsPolling } from "../hooks/useSettingsActivity";
+import { SettingsSection } from "./SettingsSection";
 
 /**
  * Recent runtime output, even when the Host runs without a visible terminal.
@@ -138,66 +139,67 @@ export const DiagnosticsPanel = () => {
   )?.slice(-MAX_VISIBLE_LOG_ENTRIES);
 
   return (
-    <section
-      className={styles.panel}
-      aria-label="Diagnostics"
-      data-setting-id="diagnostics"
-    >
-      <div className={styles.head}>
-        <div>
-          <Title3>Host runtime logs</Title3>
-          <Text as="p" className={styles.caption}>
-            Latest {MAX_VISIBLE_LOG_ENTRIES} matching runtime messages. Routine HTTP
-            traffic is omitted; restarting the Host clears the log.
+    <div className={styles.panel}>
+      <SettingsSection
+        title={<Title3>Host runtime logs</Title3>}
+        aria-label="Diagnostics"
+        data-setting-id="diagnostics"
+      >
+        <div className={styles.head}>
+          <div>
+            <Text as="p" className={styles.caption}>
+              Latest {MAX_VISIBLE_LOG_ENTRIES} matching runtime messages. Routine HTTP
+              traffic is omitted; restarting the Host clears the log.
+            </Text>
+          </div>
+          <Button
+            appearance="secondary"
+            icon={<ArrowClockwise20Regular />}
+            onClick={() => void refresh()}
+          >
+            Refresh
+          </Button>
+        </div>
+
+        <Checkbox
+          label="Problems only"
+          checked={onlyProblems}
+          onChange={(_event, data) => setOnlyProblems(data.checked === true)}
+        />
+
+        {error ? (
+          <Text className={styles.error}>{error}</Text>
+        ) : visibleEntries === undefined ? (
+          <Text className={styles.empty}>Loading…</Text>
+        ) : visibleEntries.length === 0 ? (
+          <Text className={styles.empty}>
+            {onlyProblems ? "No warnings or errors recorded." : "Nothing logged yet."}
           </Text>
-        </div>
-        <Button
-          appearance="secondary"
-          icon={<ArrowClockwise20Regular />}
-          onClick={() => void refresh()}
-        >
-          Refresh
-        </Button>
-      </div>
-
-      <Checkbox
-        label="Problems only"
-        checked={onlyProblems}
-        onChange={(_event, data) => setOnlyProblems(data.checked === true)}
-      />
-
-      {error ? (
-        <Text className={styles.error}>{error}</Text>
-      ) : visibleEntries === undefined ? (
-        <Text className={styles.empty}>Loading…</Text>
-      ) : visibleEntries.length === 0 ? (
-        <Text className={styles.empty}>
-          {onlyProblems ? "No warnings or errors recorded." : "Nothing logged yet."}
-        </Text>
-      ) : (
-        <div
-          className={styles.log}
-          ref={viewRef}
-          onScroll={handleScroll}
-          role="log"
-          aria-label="Host runtime logs"
-        >
-          {visibleEntries.map((entry, index) => (
-            <div className={styles.line} key={`${entry.at}-${index}`}>
-              <span className={styles.at}>{clockTime(entry.at)}</span>
-              <span className={styles.at}>[{entry.level.toUpperCase()}]</span>
-              <span
-                className={mergeClasses(
-                  entry.level === "error" ? styles.error : undefined,
-                  entry.level === "warn" ? styles.warn : undefined,
-                )}
-              >
-                {entry.message}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-    </section>
+        ) : (
+          <div
+            className={styles.log}
+            ref={viewRef}
+            onScroll={handleScroll}
+            role="log"
+            aria-label="Host runtime logs"
+          >
+            {visibleEntries.map((entry, index) => (
+              <div className={styles.line} key={`${entry.at}-${index}`}>
+                <span className={styles.at}>{clockTime(entry.at)}</span>
+                <span className={styles.at}>[{entry.level.toUpperCase()}]</span>
+                <span
+                  className={mergeClasses(
+                    entry.level === "error" ? styles.error : undefined,
+                    entry.level === "warn" ? styles.warn : undefined,
+                  )}
+                >
+                  {entry.message}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </SettingsSection>
+    </div>
   );
 };

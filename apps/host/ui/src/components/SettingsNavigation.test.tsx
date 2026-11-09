@@ -81,6 +81,12 @@ const selectTab = async (name: string) => {
   });
 };
 
+const expandSection = (name: string) => {
+  for (const fold of screen.getByRole("region", { name }).querySelectorAll("details")) {
+    if (!fold.open) fireEvent.click(fold.querySelector("summary")!);
+  }
+};
+
 const readCount = (path: string) =>
   vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === path).length;
 
@@ -117,6 +123,8 @@ describe("settings navigation", () => {
     await openSettings();
     expect(screen.queryByRole("textbox", { name: "Heartbeat schedule" })).toBeNull();
     await selectTab("Orchestrator");
+    expandSection("Orchestrator heartbeat");
+    expandSection("Orchestrator agent");
     const schedule = screen.getByRole<HTMLInputElement>("textbox", {
       name: "Heartbeat schedule",
     });
@@ -124,6 +132,41 @@ describe("settings navigation", () => {
     fireEvent.change(schedule, { target: { value: "*/15 * * * *" } });
     await selectTab("General");
     await selectTab("Orchestrator");
+    expect(screen.getByRole("textbox", { name: "Heartbeat schedule" })).toBe(schedule);
+    expect(schedule.value).toBe("*/15 * * * *");
+  });
+
+  it("collapses sections independently without discarding edits or resetting on navigation", async () => {
+    show();
+    await openSettings();
+    await selectTab("Orchestrator");
+    const heartbeat = screen.getByRole("region", { name: "Orchestrator heartbeat" });
+    const fold = heartbeat.querySelector("details");
+    expect(fold?.open).toBe(false);
+    expandSection("Orchestrator heartbeat");
+    expandSection("Orchestrator agent");
+    const schedule = screen.getByRole<HTMLInputElement>("textbox", {
+      name: "Heartbeat schedule",
+    });
+    fireEvent.change(schedule, { target: { value: "*/15 * * * *" } });
+    fireEvent.click(fold!.querySelector("summary")!);
+    expect(fold!.open).toBe(false);
+    expect(schedule.isConnected).toBe(true);
+    expect(
+      screen.getByRole("region", { name: "Orchestrator agent" }).querySelector("details")
+        ?.open,
+    ).toBe(true);
+
+    await selectTab("General");
+    await selectTab("Orchestrator");
+    expect(fold!.open).toBe(false);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Orchestrator" }));
+    });
+    await openSettings();
+    expect(fold!.open).toBe(false);
+    fireEvent.click(fold!.querySelector("summary")!);
+    expect(fold!.open).toBe(true);
     expect(screen.getByRole("textbox", { name: "Heartbeat schedule" })).toBe(schedule);
     expect(schedule.value).toBe("*/15 * * * *");
   });
@@ -157,12 +200,14 @@ describe("settings navigation", () => {
     show();
     await openSettings();
     await selectTab("Workspaces");
+    expandSection("Create workspace");
     const name = screen.getByRole<HTMLInputElement>("textbox", { name: "Name" });
     fireEvent.change(name, { target: { value: "Unfinished workspace" } });
 
     await selectTab("Nodes");
     expect(name.isConnected).toBe(true);
     expect(screen.queryByRole("textbox", { name: "Name" })).toBeNull();
+    expandSection("Connect a machine");
     const hostUrl = screen.getByRole<HTMLInputElement>("textbox", {
       name: "Host URL the node should dial",
     });
@@ -193,22 +238,25 @@ describe("settings navigation", () => {
   it.each([
     {
       tab: "security",
+      section: "Password sign-in",
       button: "Disable password sign-in",
       dialog: "Disable password sign-in?",
     },
     {
       tab: "security",
+      section: "Erase auth settings",
       button: "Erase auth settings",
       dialog: "Erase all Host authentication?",
     },
     {
       tab: "tunnel",
+      section: "Dev Tunnels",
       button: "How to set up Dev Tunnels",
       dialog: "Dev Tunnels",
     },
-  ] satisfies { tab: SettingsTab; button: string; dialog: string }[])(
+  ] satisfies { tab: SettingsTab; section: string; button: string; dialog: string }[])(
     "keeps the $dialog dialog out of inactive sections",
-    async ({ tab, button, dialog }) => {
+    async ({ tab, section, button, dialog }) => {
       const panel = (selectedTab: SettingsTab, active = true) => (
         <FluentProvider theme={fleetDarkTheme}>
           <SettingsPanel
@@ -224,6 +272,8 @@ describe("settings navigation", () => {
         </FluentProvider>
       );
       const view = render(panel(tab));
+      await screen.findByRole("region", { name: section });
+      expandSection(section);
       fireEvent.click(await screen.findByRole("button", { name: button }));
       expect(await screen.findByRole("dialog", { name: dialog })).toBeTruthy();
 

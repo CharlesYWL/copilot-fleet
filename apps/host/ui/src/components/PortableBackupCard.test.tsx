@@ -46,6 +46,21 @@ describe("PortableBackupCard", () => {
     vi.restoreAllMocks();
   });
 
+  it("only makes the backup form collapsible when requested by Settings", () => {
+    const view = show();
+    expect(passphraseField().closest("details")).toBeNull();
+    view.unmount();
+
+    show({ collapsible: true });
+    const fold = passphraseField().closest("details")!;
+    expect(fold.open).toBe(false);
+    fireEvent.click(fold.querySelector("summary")!);
+    expect(fold.open).toBe(true);
+    fireEvent.click(fold.querySelector("summary")!);
+    expect(fold.open).toBe(false);
+    expect(passphraseField().isConnected).toBe(true);
+  });
+
   it("will not export until the passphrase is long enough to be worth deriving", async () => {
     const fetchMock = vi.fn(async (input: URL | RequestInfo) => {
       void input;

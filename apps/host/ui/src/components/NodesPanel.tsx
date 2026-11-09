@@ -46,6 +46,7 @@ import { ConnectNodeCard } from "./ConnectNodeCard";
 import { NodeHealth } from "./NodeHealth";
 import { StatusIndicator } from "./StatusIndicator";
 import { statusDescriptor } from "../lib/status-visuals";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   dialogBody: {
@@ -250,45 +251,46 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
           </Button>
         </div>
       )}
-      <div
-        className={styles.surface}
-        role="region"
-        aria-label="Node inventory, scroll horizontally for more columns"
-        tabIndex={0}
-        data-setting-id="nodes.inventory"
-      >
-        <Table className={styles.table} aria-label="Registered nodes">
-          <TableHeader>
-            <TableRow>
-              <TableHeaderCell className={styles.colStatus}>Status</TableHeaderCell>
-              <TableHeaderCell className={styles.colName}>Name</TableHeaderCell>
-              <TableHeaderCell className={styles.colConnection}>
-                Connection
-              </TableHeaderCell>
-              <TableHeaderCell className={styles.colPlatform}>Platform</TableHeaderCell>
-              <TableHeaderCell className={styles.colCapacity}>Capacity</TableHeaderCell>
-              <TableHeaderCell className={styles.colHealth}>Health</TableHeaderCell>
-              <TableHeaderCell className={styles.colVersion}>Version</TableHeaderCell>
-              <TableHeaderCell className={styles.colActions}>Actions</TableHeaderCell>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {nodes.map((node) => (
-              <NodeRow
-                key={node.id}
-                node={node}
-                now={now}
-                hostRevision={hostRevision}
-                progress={nodeUpdates[node.id]}
-                onRename={renameNode}
-                onDelete={deleteNode}
-                onUpdate={startUpdate}
-                onResync={resyncNodeConsole}
-              />
-            ))}
-          </TableBody>
-        </Table>
-      </div>
+      <SettingsSection title="Registered nodes" data-setting-id="nodes.inventory">
+        <div
+          className={styles.surface}
+          role="region"
+          aria-label="Node inventory, scroll horizontally for more columns"
+          tabIndex={0}
+        >
+          <Table className={styles.table} aria-label="Registered nodes">
+            <TableHeader>
+              <TableRow>
+                <TableHeaderCell className={styles.colStatus}>Status</TableHeaderCell>
+                <TableHeaderCell className={styles.colName}>Name</TableHeaderCell>
+                <TableHeaderCell className={styles.colConnection}>
+                  Connection
+                </TableHeaderCell>
+                <TableHeaderCell className={styles.colPlatform}>Platform</TableHeaderCell>
+                <TableHeaderCell className={styles.colCapacity}>Capacity</TableHeaderCell>
+                <TableHeaderCell className={styles.colHealth}>Health</TableHeaderCell>
+                <TableHeaderCell className={styles.colVersion}>Version</TableHeaderCell>
+                <TableHeaderCell className={styles.colActions}>Actions</TableHeaderCell>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {nodes.map((node) => (
+                <NodeRow
+                  key={node.id}
+                  node={node}
+                  now={now}
+                  hostRevision={hostRevision}
+                  progress={nodeUpdates[node.id]}
+                  onRename={renameNode}
+                  onDelete={deleteNode}
+                  onUpdate={startUpdate}
+                  onResync={resyncNodeConsole}
+                />
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      </SettingsSection>
 
       <Dialog
         open={active && Boolean(blocked)}

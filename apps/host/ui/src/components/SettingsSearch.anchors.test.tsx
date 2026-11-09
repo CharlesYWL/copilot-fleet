@@ -292,7 +292,7 @@ afterEach(() => {
 
 describe("Settings search anchors", () => {
   it.each(settingsSections.map((section) => section.value))(
-    "every %s result has an element to scroll to",
+    "draws every %s search anchor with sections initially collapsed",
     async (tab) => {
       show(tab);
       await settle(tab);
@@ -301,6 +301,17 @@ describe("Settings search anchors", () => {
       expect(
         missingAnchors(tab, ["security.sign-in-setup", ...hiddenByCorpPolicy]),
       ).toEqual([]);
+      const page = document.querySelector(`[data-settings-page="${tab}"]`)!;
+      const folds = page.querySelectorAll<HTMLDetailsElement>("section > details");
+      expect(folds.length).toBeGreaterThan(0);
+      for (const fold of folds) {
+        expect(fold.open, `${tab} sections should start collapsed`).toBe(false);
+      }
+      for (const anchor of page.querySelectorAll("[data-setting-id]")) {
+        const id = anchor.getAttribute("data-setting-id");
+        if (id === tab || id === "nodes.update-all") continue;
+        expect(anchor.closest("details"), `${id} should be collapsible`).toBeTruthy();
+      }
     },
   );
 
@@ -355,6 +366,39 @@ describe("Settings search anchors", () => {
 });
 
 describe("Settings search navigation", () => {
+  it("reopens a collapsed section when a search result lands inside it", async () => {
+    show("general");
+    await settle("general");
+    const target = document.querySelector<HTMLDetailsElement>(
+      settingAnchorSelector("general.managed-worktrees"),
+    );
+    expect(target?.tagName).toBe("DETAILS");
+    expect(target!.open).toBe(false);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Search settings" }), {
+      target: { value: "quotas" },
+    });
+    expect(target!.open).toBe(false);
+    fireEvent.click(
+      await screen.findByRole("option", {
+        name: "Managed retention and quotas, General",
+      }),
+    );
+
+    await vi.waitFor(() => {
+      const quotas = document.querySelector<HTMLDetailsElement>(
+        settingAnchorSelector("general.managed-worktrees.quotas"),
+      );
+      expect(target!.open).toBe(true);
+      expect(quotas?.open).toBe(true);
+      expect(document.activeElement).toBe(quotas);
+    });
+    expect(
+      document.querySelector<HTMLDetailsElement>(settingAnchorSelector("general.yolo"))
+        ?.open,
+    ).toBe(false);
+  });
+
   it("opens the result's page and brings the setting into view", async () => {
     const scrolled = vi.fn();
     Element.prototype.scrollIntoView = scrolled;
@@ -369,10 +413,11 @@ describe("Settings search navigation", () => {
     );
 
     const target = await vi.waitFor(() => {
-      const element = document.querySelector<HTMLElement>(
+      const element = document.querySelector<HTMLDetailsElement>(
         settingAnchorSelector("orchestrator.heartbeat"),
       );
       expect(element).toBeTruthy();
+      expect(element!.open).toBe(true);
       expect(element!.closest("[hidden]")).toBeNull();
       expect(document.activeElement).toBe(element);
       return element!;
@@ -399,6 +444,11 @@ describe("Settings search navigation", () => {
       const row = document.querySelector(settingAnchorSelector("node:n1"));
       expect(row?.tagName).toBe("TR");
       expect(document.activeElement).toBe(row);
+      expect(
+        document.querySelector<HTMLDetailsElement>(
+          settingAnchorSelector("nodes.inventory"),
+        )?.open,
+      ).toBe(true);
     });
   });
 

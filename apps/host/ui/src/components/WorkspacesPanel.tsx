@@ -34,6 +34,7 @@ import {
 import { useCatalog } from "../hooks/useCatalog";
 import { StatusIndicator } from "./StatusIndicator";
 import { statusDescriptor } from "../lib/status-visuals";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   panel: {
@@ -50,6 +51,7 @@ const useStyles = makeStyles({
   columns: {
     display: "grid",
     gridTemplateColumns: "1fr 1fr",
+    alignItems: "start",
     gap: "16px",
     "@media (max-width: 1000px)": {
       gridTemplateColumns: "1fr",
@@ -60,10 +62,6 @@ const useStyles = makeStyles({
     borderRadius: tokens.borderRadiusLarge,
     background: tokens.colorNeutralBackground1,
     padding: "20px",
-  },
-  cardTitle: {
-    display: "block",
-    marginBottom: "14px",
   },
   form: {
     display: "flex",
@@ -273,14 +271,12 @@ export const WorkspacesPanel = ({
       </div>
 
       <div className={styles.columns}>
-        <section className={styles.card} data-setting-id="workspaces.create">
-          <Text
-            weight="semibold"
-            className={styles.cardTitle}
-            data-tour="create-workspace"
-          >
-            Create workspace
-          </Text>
+        <SettingsSection
+          title={<span data-tour="create-workspace">Create workspace</span>}
+          className={styles.card}
+          aria-label="Create workspace"
+          data-setting-id="workspaces.create"
+        >
           <form className={styles.form} onSubmit={handleCreateWorkspace}>
             <Field label="Name" required>
               <Input
@@ -305,12 +301,14 @@ export const WorkspacesPanel = ({
               Create
             </Button>
           </form>
-        </section>
+        </SettingsSection>
 
-        <section className={styles.card} data-setting-id="workspaces.placement">
-          <Text weight="semibold" className={styles.cardTitle} data-tour="add-placement">
-            Add placement
-          </Text>
+        <SettingsSection
+          title={<span data-tour="add-placement">Add placement</span>}
+          className={styles.card}
+          aria-label="Add placement"
+          data-setting-id="workspaces.placement"
+        >
           <form className={styles.form} onSubmit={handleCreatePlacement}>
             <Field label="Workspace" required>
               <Select
@@ -354,10 +352,10 @@ export const WorkspacesPanel = ({
               Add placement
             </Button>
           </form>
-        </section>
+        </SettingsSection>
       </div>
 
-      <div className={styles.list}>
+      <SettingsSection title="Workspace placements" className={styles.list}>
         <section className={styles.nodeTray} aria-label="Nodes">
           <Text className={styles.caption}>
             Drag a node onto a workspace to place it, or drag a placement between
@@ -398,7 +396,7 @@ export const WorkspacesPanel = ({
             nodes={nodes}
           />
         ))}
-      </div>
+      </SettingsSection>
     </div>
   );
 };

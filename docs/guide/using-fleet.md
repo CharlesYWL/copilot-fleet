@@ -23,6 +23,14 @@ pickers along the bottom.
 > any machine without a Copilot login. A real node streams real Copilot output in
 > exactly the same surfaces.
 
+### Settings sections
+
+Click a section heading in **Settings** to collapse or expand it independently.
+Sections start collapsed, keep unfinished edits when collapsed, and retain their
+expanded or collapsed state when you switch tabs or leave and reopen Settings.
+You can also focus a heading and press **Enter** or **Space**. Selecting a Settings
+search result opens any collapsed sections around the setting before focusing it.
+
 ### Node health and session navigation
 
 Status icons use the same meanings in the sidebar, session headers, and dispatched
