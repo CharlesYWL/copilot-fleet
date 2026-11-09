@@ -172,7 +172,29 @@ type TunnelManagerOptions = {
     get: (provider: TunnelProvider) => string | undefined;
     set: (provider: TunnelProvider, id: string) => void;
   };
+  /** Routine tunnel output; defaults to nowhere. */
+  log?: (message: string) => void;
+  /** Tunnel failures; defaults to `log`. */
+  warn?: (message: string) => void;
+  /** How often a serving tunnel's host side is checked with its service. */
+  hostCheckIntervalMs?: number;
+  /** Consecutive "not hosted" answers before the process is rebuilt. */
+  hostCheckMisses?: number;
 };
+
+/** Long enough that a relay's own reconnect is never mistaken for a dead host. */
+export const HOST_CHECK_INTERVAL_MS = 60_000;
+export const HOST_CHECK_MISSES = 3;
+
+/** The tail of a CLI's output, which is where it says what went wrong. */
+function lastLines(output: string, count = 3): string {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-count)
+    .join(" / ");
+}
 
 export class TunnelManager {
   private status: TunnelStatus = "off";
@@ -199,6 +221,11 @@ export class TunnelManager {
   private stopping: Promise<void> | undefined;
   private readonly policy: () => TunnelPolicyKind;
   private readonly builtIn: TunnelManagerOptions["builtIn"];
+  private readonly log: (message: string) => void;
+  private readonly warn: (message: string) => void;
+  private readonly hostCheckIntervalMs: number;
+  private readonly hostCheckMisses: number;
+  private hostCheckTimer: NodeJS.Timeout | undefined;
 
   constructor(options: TunnelManagerOptions) {
     this.builtIn = options.builtIn;
@@ -210,6 +237,10 @@ export class TunnelManager {
     this.readExternal = options.readExternal ?? (() => readExternalTunnel());
     this.probe = options.probe ?? new BinaryProbe();
     this.persistedTunnelId = options.persistedTunnelId;
+    this.log = options.log ?? (() => {});
+    this.warn = options.warn ?? this.log;
+    this.hostCheckIntervalMs = options.hostCheckIntervalMs ?? HOST_CHECK_INTERVAL_MS;
+    this.hostCheckMisses = options.hostCheckMisses ?? HOST_CHECK_MISSES;
     if (options.provider) this.provider = options.provider;
   }
 
@@ -468,7 +499,8 @@ export class TunnelManager {
 
     const onChunk = (chunk: Buffer) => {
       if (this.child !== child) return;
-      this.buffer += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      this.buffer += text;
       if (this.buffer.length > 64_000) this.buffer = this.buffer.slice(-32_000);
       // The id can be printed after the URL, so it is parsed on its own
       // schedule rather than being folded into the URL branch below.
@@ -484,7 +516,14 @@ export class TunnelManager {
         this.persistedTunnelId?.set(this.provider, reported);
       }
       if (!this.inspectUrl) this.inspectUrl = spec.extractInspectUrl?.(this.buffer);
-      if (this.tunnelUrl) return;
+      if (this.tunnelUrl) {
+        // Relay drops and reconnect attempts only ever show up here.
+        if (spec.logOutputWhileServing) {
+          const said = lastLines(text, 5);
+          if (said) this.log(`${spec.binary}: ${said}`);
+        }
+        return;
+      }
       const url = spec.extractUrl(this.buffer);
       if (!url) return;
       this.tunnelUrl = url;
@@ -492,6 +531,8 @@ export class TunnelManager {
       this.error = undefined;
       // A URL means this attempt worked, so the next crash starts backoff over.
       this.restartAttempt = 0;
+      this.log(`${spec.binary} serving ${url}`);
+      this.watchHost(child);
     };
 
     child.stdout?.on("data", onChunk);
@@ -500,6 +541,7 @@ export class TunnelManager {
     child.on("error", (err) => {
       if (this.child !== child) return;
       this.child = undefined;
+      this.stopWatchingHost();
       this.tunnelUrl = undefined;
       this.inspectUrl = undefined;
       this.tunnelId = undefined;
@@ -512,6 +554,7 @@ export class TunnelManager {
     child.on("exit", (code, signal) => {
       if (this.child !== child) return;
       this.child = undefined;
+      this.stopWatchingHost();
       this.tunnelUrl = undefined;
       this.inspectUrl = undefined;
       this.tunnelId = undefined;
@@ -522,10 +565,67 @@ export class TunnelManager {
       }
       this.status = "error";
       this.error = `${spec.binary} exited (code=${code ?? "null"} signal=${signal ?? "null"})`;
+      const said = lastLines(this.buffer);
+      this.warn(`${this.error}${said ? `: ${said}` : ""}`);
       // The operator still wants the tunnel, so recover instead of giving up.
       if (this.wantEnabled) this.scheduleRestart();
       else this.onEnabledCleared?.(this.provider);
     });
+  }
+
+  /**
+   * Rebuilds a tunnel whose process is alive but no longer hosting it.
+   *
+   * `devtunnel host` can lose its relay connection — a sleep, a network or DNS
+   * outage, a relay recycle — and stop trying to reconnect without exiting or
+   * printing anything. The exit handler never fires, so without this the Host
+   * keeps reporting the tunnel as on while every node behind it is cut off
+   * until someone restarts it by hand. Only the provider's service can see
+   * that, so it is asked; an inconclusive answer is not counted, because a
+   * check that cannot reach the service would only fail the rebuild too.
+   */
+  private watchHost(child: ChildProcess): void {
+    this.stopWatchingHost();
+    const spec = providerSpecs[this.provider];
+    if (!spec.checkHosted) return;
+    const checkHosted = spec.checkHosted;
+    let misses = 0;
+    const schedule = () => {
+      const timer = this.setTimer(() => void tick(), this.hostCheckIntervalMs);
+      (timer as { unref?: () => void }).unref?.();
+      this.hostCheckTimer = timer;
+    };
+    const tick = async () => {
+      this.hostCheckTimer = undefined;
+      const tunnelId = this.tunnelId;
+      if (this.child !== child || this.status !== "on" || !tunnelId) return;
+      const result = await checkHosted(tunnelId);
+      if (this.child !== child || this.status !== "on") return;
+      if (result === "hosted") misses = 0;
+      else if (result === "not-hosted") misses += 1;
+      if (misses >= this.hostCheckMisses) {
+        const said = lastLines(this.buffer);
+        this.warn(
+          `${spec.binary} is running but the service reports nothing hosting tunnel ${tunnelId}; restarting it${said ? ` (last output: ${said})` : ""}`,
+        );
+        // The exit handler sees an unexpected exit and restarts with backoff.
+        child.kill();
+        return;
+      }
+      if (result === "not-hosted") {
+        this.warn(
+          `Tunnel ${tunnelId} has no host attached (${misses}/${this.hostCheckMisses})`,
+        );
+      }
+      schedule();
+    };
+    schedule();
+  }
+
+  private stopWatchingHost(): void {
+    if (!this.hostCheckTimer) return;
+    this.clearTimer(this.hostCheckTimer);
+    this.hostCheckTimer = undefined;
   }
 
   private scheduleRestart(): void {
@@ -571,6 +671,7 @@ export class TunnelManager {
     }
     const child = this.child;
     this.child = undefined;
+    this.stopWatchingHost();
     if (!child) {
       this.status = "off";
       this.tunnelUrl = undefined;

@@ -221,6 +221,8 @@ export async function buildServer(
       }),
     localTarget: `http://127.0.0.1:${listenPort}`,
     onEnabledCleared: (provider) => store.setTunnelProviderEnabled(provider, false),
+    log: (message) => app.log.info(message),
+    warn: (message) => app.log.warn(message),
     persistedTunnelId: {
       get: (provider) => store.getSetting(`tunnel.${provider}.id`),
       set: (provider, id) => store.setSetting(`tunnel.${provider}.id`, id),

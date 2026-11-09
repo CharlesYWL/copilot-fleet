@@ -58,6 +58,21 @@ export type ProviderSpec = {
    * URL does not encode it. Only Dev Tunnels needs this today.
    */
   extractId?: (text: string) => string | undefined;
+  /**
+   * Asks the provider's service whether anything is still hosting the tunnel.
+   *
+   * For providers whose CLI can outlive its relay connection: such a process
+   * neither exits nor prints anything when it gives up reconnecting, so the
+   * Host would otherwise keep reporting it as on indefinitely.
+   */
+  checkHosted?: (tunnelId: string) => Promise<HostedCheck>;
+  /**
+   * Whether output printed after the tunnel is ready is rare enough to log.
+   *
+   * True only for CLIs that go quiet once serving; others (ngrok, cloudflared)
+   * log every request or heartbeat and would flood the Host log.
+   */
+  logOutputWhileServing?: boolean;
   /** Shown in the UI when the binary is missing. */
   installHint: string;
   /** Ordered setup steps shown in the provider's help dialog. */
@@ -98,6 +113,29 @@ export type ProviderSpec = {
    */
   microsoftCorpApproved?: boolean;
 };
+
+/**
+ * What a provider's service says about a tunnel's host side. `unknown` means
+ * the question could not be answered, which is not evidence either way.
+ */
+export type HostedCheck = "hosted" | "not-hosted" | "unknown";
+
+/** Reads `hostConnections` out of `devtunnel show <id> --json`. */
+export function parseDevTunnelHosting(output: string): HostedCheck {
+  // The CLI can print a banner before the JSON, so parse from the first brace.
+  const start = output.indexOf("{");
+  if (start < 0) return "unknown";
+  try {
+    const parsed = JSON.parse(output.slice(start)) as {
+      tunnel?: { hostConnections?: unknown };
+    };
+    const count = parsed.tunnel?.hostConnections;
+    if (typeof count !== "number") return "unknown";
+    return count > 0 ? "hosted" : "not-hosted";
+  } catch {
+    return "unknown";
+  }
+}
 
 export type LocalTarget = {
   /** Full loopback URL, e.g. http://127.0.0.1:8787 */
@@ -292,6 +330,21 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     extractUrl: matcher(DEVTUNNEL_URL_RE),
     extractInspectUrl: matcher(DEVTUNNEL_INSPECT_URL_RE),
     extractId: matcher(DEVTUNNEL_ID_RE),
+    // `devtunnel host` can lose its relay connection (sleep, network or DNS
+    // outage) and stop reconnecting while the process stays alive and silent.
+    checkHosted: async (tunnelId) => {
+      try {
+        const { stdout } = await execFileAsync(
+          "devtunnel",
+          ["show", tunnelId, "--json"],
+          { windowsHide: true, timeout: 15_000 },
+        );
+        return parseDevTunnelHosting(stdout);
+      } catch {
+        return "unknown";
+      }
+    },
+    logOutputWhileServing: true,
     installHint: "winget install Microsoft.devtunnel, then run `devtunnel user login`.",
     setupSteps: [
       "Install the CLI: `winget install Microsoft.devtunnel` (or `brew install --cask devtunnel`).",

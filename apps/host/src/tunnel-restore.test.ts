@@ -4,7 +4,12 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HostBackupTunnel, TunnelProvider } from "@fleet/protocol";
 import { FleetStore } from "./store.js";
-import { BinaryProbe, TunnelSupervisor } from "./tunnel.js";
+import {
+  BinaryProbe,
+  HOST_CHECK_INTERVAL_MS,
+  HOST_CHECK_MISSES,
+  TunnelSupervisor,
+} from "./tunnel.js";
 import { providerSpecs } from "./tunnel-providers.js";
 import type { ExternalTunnel } from "./external-tunnel.js";
 
@@ -22,6 +27,9 @@ beforeEach(() => {
   vi.mocked(providerSpecs.devtunnel.prepare!).mockResolvedValue(undefined);
   vi.spyOn(providerSpecs.devtunnel, "newTunnelId");
   vi.mocked(providerSpecs.devtunnel.newTunnelId!).mockReturnValue("fleet-new");
+  // Never ask the real Dev Tunnels service whether a fake tunnel is hosted.
+  vi.spyOn(providerSpecs.devtunnel, "checkHosted");
+  vi.mocked(providerSpecs.devtunnel.checkHosted!).mockResolvedValue("hosted");
   vi.mocked(spawn).mockImplementation(() => {
     const child = new ChildProcess();
     child.stdout = new PassThrough();
@@ -386,5 +394,66 @@ describe("external tunnels during a move", () => {
     await supervisor.stop();
     expect(children[0]!.kill).toHaveBeenCalledOnce();
     expect(supervisor.activeTunnelId()).toBe("fleet-external.usw2");
+  });
+});
+
+describe("a devtunnel host that silently loses its relay", () => {
+  const checkHosted = () => vi.mocked(providerSpecs.devtunnel.checkHosted!);
+
+  async function serving() {
+    vi.useFakeTimers();
+    const { supervisor } = managed("fleet-live.usw2");
+    await supervisor.setEnabled("devtunnel", true);
+    ready(children[0]!, "fleet-live.usw2");
+    return supervisor;
+  }
+
+  const tick = () => vi.advanceTimersByTimeAsync(HOST_CHECK_INTERVAL_MS);
+
+  it("restarts a process that is alive but no longer hosting the tunnel", async () => {
+    checkHosted().mockResolvedValue("not-hosted");
+    const supervisor = await serving();
+    const zombie = children[0]!;
+
+    for (let check = 1; check < HOST_CHECK_MISSES; check += 1) await tick();
+    expect(zombie.kill).not.toHaveBeenCalled();
+    await tick();
+
+    expect(checkHosted()).toHaveBeenCalledWith("fleet-live.usw2");
+    expect(zombie.kill).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(spawn).toHaveBeenLastCalledWith(
+      "devtunnel",
+      ["host", "fleet-live.usw2"],
+      expect.any(Object),
+    );
+    ready(children[1]!, "fleet-live.usw2");
+    expect(supervisor.activeTunnelId()).toBe("fleet-live.usw2");
+  });
+
+  it("needs consecutive misses, and does not count checks it could not answer", async () => {
+    checkHosted()
+      .mockResolvedValueOnce("not-hosted")
+      .mockResolvedValueOnce("unknown")
+      .mockResolvedValueOnce("not-hosted")
+      .mockResolvedValueOnce("hosted")
+      .mockResolvedValueOnce("not-hosted")
+      .mockResolvedValueOnce("not-hosted")
+      .mockResolvedValue("hosted");
+    await serving();
+
+    for (let check = 0; check < 8; check += 1) await tick();
+
+    expect(checkHosted()).toHaveBeenCalledTimes(8);
+    expect(children[0]!.kill).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce();
+  });
+
+  it("stops checking once the tunnel is switched off", async () => {
+    const supervisor = await serving();
+    await supervisor.setEnabled("devtunnel", false);
+    for (let check = 0; check < HOST_CHECK_MISSES + 1; check += 1) await tick();
+    expect(checkHosted()).not.toHaveBeenCalled();
   });
 });

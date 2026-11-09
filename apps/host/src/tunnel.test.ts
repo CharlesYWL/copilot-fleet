@@ -9,6 +9,7 @@ import {
 } from "./tunnel.js";
 import {
   extractTunnelUrl,
+  parseDevTunnelHosting,
   parseLocalTarget,
   providerList,
   providerSpecs,
@@ -622,5 +623,27 @@ describe("provider help content", () => {
     expect(providerSpecs.bore.setupSteps.join(" ")).toMatch(/no TLS|not encrypted/i);
     expect(providerSpecs.devtunnel.setupSteps.join(" ")).toMatch(/--devtunnel/);
     expect(providerSpecs.cloudflare.setupSteps.join(" ")).toMatch(/anyone with the URL/i);
+  });
+});
+
+describe("parseDevTunnelHosting", () => {
+  const show = (hostConnections: unknown) =>
+    JSON.stringify({ tunnel: { tunnelId: "fleet.usw2", hostConnections } });
+
+  it("reads whether anything is hosting the tunnel", () => {
+    expect(parseDevTunnelHosting(show(1))).toBe("hosted");
+    expect(parseDevTunnelHosting(show(0))).toBe("not-hosted");
+  });
+
+  it("skips a banner printed before the JSON", () => {
+    expect(parseDevTunnelHosting(`Welcome to dev tunnels!\n${show(0)}`)).toBe(
+      "not-hosted",
+    );
+  });
+
+  it("treats anything it cannot read as unknown rather than as not hosted", () => {
+    expect(parseDevTunnelHosting("")).toBe("unknown");
+    expect(parseDevTunnelHosting("{ not json")).toBe("unknown");
+    expect(parseDevTunnelHosting(show(undefined))).toBe("unknown");
   });
 });
