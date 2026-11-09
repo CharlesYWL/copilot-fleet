@@ -127,31 +127,68 @@ describe("connectDevTunnel", () => {
     await expect(pending).rejects.toThrow(/winget install Microsoft.devtunnel/);
   });
 
-  it("gives up rather than leaving a node stuck behind a silent tunnel", async () => {
+  it("rebuilds a silent first connect instead of ending the node", async () => {
+    // What took CharlesDevBox4 offline: its Host was not hosting the tunnel, so
+    // `devtunnel connect` waited without printing anything, the node exited
+    // after 60s, and its login service gave up after five attempts. It then
+    // stayed offline after the Host came back.
     vi.useFakeTimers();
-    const child = fakeChild();
+    const children: ReturnType<typeof fakeChild>[] = [];
+    const warnings: string[] = [];
+    let outcome: string | undefined;
     const pending = connectDevTunnel("fleet-abc", {
-      spawnProcess: (() => child) as any,
+      spawnProcess: (() => {
+        const next = fakeChild();
+        children.push(next);
+        return next;
+      }) as any,
       timeoutMs: 1_000,
+      warn: (message) => warnings.push(message),
     });
-    const assertion = expect(pending).rejects.toThrow(/did not report a forwarded port/);
+    pending.then(
+      () => (outcome = "resolved"),
+      () => (outcome = "rejected"),
+    );
+
     await vi.advanceTimersByTimeAsync(1_100);
-    await assertion;
-    expect(child.kill).toHaveBeenCalled();
+    expect(children[0]!.kill).toHaveBeenCalled();
+    expect(warnings.join("\n")).toMatch(/did not report a forwarded port/);
+    expect(warnings.join("\n")).not.toMatch(/user login/);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(children).toHaveLength(2);
+
+    // Every later attempt is just as silent until the Host is back. Clients
+    // spawn at 0s, 2s, 5s and 11s; at 11.1s the last one is still waiting.
+    await vi.advanceTimersByTimeAsync(9_000);
+    expect(children).toHaveLength(4);
+    expect(outcome).toBeUndefined();
+
+    children
+      .at(-1)!
+      .stdout.emit(
+        "data",
+        Buffer.from("Forwarding from 127.0.0.1:8791 to host port 8790.\n"),
+      );
+    await expect(pending).resolves.toMatchObject({ url: "http://127.0.0.1:8791" });
+    const spawned = children.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(children).toHaveLength(spawned);
     vi.useRealTimers();
   });
 
   it("carries what the CLI said into the timeout, not just the elapsed time", async () => {
     vi.useFakeTimers();
     const child = fakeChild();
-    const pending = connectDevTunnel("fleet-abc", {
+    const warnings: string[] = [];
+    const connection = connectDevTunnel("fleet-abc", {
       spawnProcess: (() => child) as any,
       timeoutMs: 1_000,
+      warn: (message) => warnings.push(message),
     });
+    connection.catch(() => {});
     child.stderr.emit("data", Buffer.from("Refreshing tunnel.\n"));
-    const assertion = expect(pending).rejects.toThrow(/Refreshing tunnel/);
     await vi.advanceTimersByTimeAsync(1_100);
-    await assertion;
+    expect(warnings[0]).toMatch(/Refreshing tunnel/);
     vi.useRealTimers();
   });
 });

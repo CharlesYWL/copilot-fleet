@@ -180,6 +180,14 @@ export function connectDevTunnel(
   let requestRespawn: (code?: number | null) => void = () => {};
   /** Assigned once `start` exists; see `rebuildNow`. */
   let startNow: () => void = () => {};
+  /** Bounds how long one first-connect attempt may stay silent. */
+  let readyTimer: NodeJS.Timeout | undefined;
+
+  const endReadyWait = (): void => {
+    if (!readyTimer) return;
+    clearTimer(readyTimer);
+    readyTimer = undefined;
+  };
 
   const endGrace = (): void => {
     if (!graceTimer) return;
@@ -242,6 +250,7 @@ export function connectDevTunnel(
       if (respawnTimer) clearTimer(respawnTimer);
       respawnTimer = undefined;
       endGrace();
+      endReadyWait();
       if (child && !child.killed) child.kill();
     },
   };
@@ -262,25 +271,41 @@ export function connectDevTunnel(
     const settle = (outcome: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimer(timer);
+      endReadyWait();
       outcome();
     };
 
     /** The CLI's own words, ready to append to a message. */
     const detail = () => (said ? `: ${said}` : " with no output");
 
-    const timer = setTimer(() => {
-      settle(() => {
-        connection.stop();
-        reject(
-          new Error(
-            `devtunnel connect ${tunnelId} did not report a forwarded port within ${Math.round(
-              timeoutMs / 1000,
-            )}s${detail()}. Run \`devtunnel user login\` on this machine and check that this account can reach the tunnel.`,
-          ),
+    /**
+     * Rebuilds a first connect that never reports a port, rather than failing.
+     *
+     * `devtunnel connect` waits silently while nothing is hosting the tunnel,
+     * so a Host whose tunnel is down looks exactly like this. Rejecting here
+     * used to end the node: its login service retried five times over about
+     * seven minutes and then gave up, so a Host outage longer than that left
+     * the node offline until someone restarted it by hand, even after the Host
+     * came back. A signed-out CLI or a missing tunnel still fails fast, because
+     * the CLI says so and `fatalConnectReason` recognises it.
+     */
+    const armReadyWait = (active: ChildProcess): void => {
+      endReadyWait();
+      readyTimer = setTimer(() => {
+        readyTimer = undefined;
+        if (settled || stopped || child !== active) return;
+        warn(
+          `devtunnel connect ${tunnelId} did not report a forwarded port within ${Math.round(
+            timeoutMs / 1000,
+          )}s${detail()}. The Host may not be hosting this tunnel right now; rebuilding the client and waiting for it.`,
         );
-      });
-    }, timeoutMs);
+        // Cleared first so the exit handler ignores this kill.
+        child = undefined;
+        endGrace();
+        active.kill();
+        scheduleRespawn();
+      }, timeoutMs);
+    };
 
     const scheduleRespawn = (code?: number | null): void => {
       // A rejected attempt has already been reported to the caller, and the
@@ -315,6 +340,9 @@ export function connectDevTunnel(
       // between spawning and the first "Forwarding from" line, which is exactly
       // when the node is dialing a port that does not exist yet.
       armGrace();
+      // Once a port has been reported the node's own dial failures drive
+      // rebuilds through `recycle`, so this only guards the first connect.
+      if (!settled) armReadyWait(active);
       let buffer = "";
       // Reset per spawn: a respawn may land on a different port, and noticing
       // that is the whole point of watching.
