@@ -659,6 +659,56 @@ describe("local agent MCP", () => {
     expect(text(missing)).toMatchObject({ code: "not_found" });
   });
 
+  it("offers review_task only once an administrator allows local review", async () => {
+    const h = await host();
+    await h.listener.activate();
+    const connect = async () => {
+      const client = new Client({ name: "review-harness", version: "1.0.0" });
+      const transport = new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${h.port}/v1/mcp`),
+        { requestInit: { headers: { [LOCAL_AGENT_HEADER]: "1" } } },
+      );
+      await client.connect(transport as unknown as Parameters<typeof client.connect>[0]);
+      cleanups.push(() => client.close());
+      return client;
+    };
+    const before = await connect();
+    expect((await before.listTools()).tools.map((tool) => tool.name)).not.toContain(
+      "review_task",
+    );
+    expect(before.getInstructions()).toMatch(/cannot approve/);
+
+    const config = h.store.getLocalAgentConfig();
+    h.store.setLocalAgentConfig({ ...config, allowTaskReview: true }, config.revision);
+    const run = h.store.createRun({
+      workspaceId: h.workspace.id,
+      name: "Reviewed",
+      objective: "Done.",
+    });
+    h.store.updateRun(run.id, { leadSessionId: h.lead.id, state: "running" });
+    h.store.updateRun(run.id, { state: "awaiting_human" });
+
+    const client = await connect();
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toContain(
+      "review_task",
+    );
+    expect(client.getInstructions()).toMatch(/review_task/);
+    const reviewed = await client.callTool({
+      name: "review_task",
+      arguments: {
+        taskId: run.id,
+        operationId: randomUUID(),
+        expectedLeadSessionId: h.lead.id,
+        decision: "send_back",
+        note: "Add a regression test.",
+        clientLabel: "Harness",
+      },
+    });
+    expect(reviewed.isError).toBeFalsy();
+    expect(h.store.getRun(run.id)).toMatchObject({ state: "running" });
+    expect(h.store.getRun(run.id)!.pendingPrompt).toContain("Add a regression test.");
+  });
+
   it("is refused to a client that leaves out the marker header", async () => {
     const h = await host();
     await h.listener.activate();

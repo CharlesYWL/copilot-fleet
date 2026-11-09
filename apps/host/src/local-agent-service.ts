@@ -7,7 +7,9 @@ import {
   LocalAgentCreateTaskSchema,
   LocalAgentDispositionSchema,
   LocalAgentMessageSchema,
+  LocalAgentReviewSchema,
   RunStateSchema,
+  WorktreeConflict,
   terminalRunStates,
   terminalSessionStates,
   type FleetSession,
@@ -35,6 +37,8 @@ import {
   findTaskLead,
   taskWouldBeManaged,
 } from "./orchestrator/task-application.js";
+import { applyTaskReview } from "./orchestrator/task-review.js";
+import { PrMaintenanceError } from "./pr-maintenance-store.js";
 import { SessionCleanupPendingError } from "./store.js";
 
 type Query = Record<string, unknown>;
@@ -58,6 +62,7 @@ export const LOCAL_AGENT_OPERATIONS = [
   "get_task",
   "create_task",
   "send_task_message",
+  "review_task",
   "get_request",
   "read_transcript",
 ] as const;
@@ -119,6 +124,16 @@ export function localAgentErrorResponse(error: unknown): {
   });
   if (error instanceof LocalAgentError || error instanceof TaskApplicationError)
     return reply(error.statusCode, error.code, error.message);
+  if (error instanceof PrMaintenanceError)
+    return reply(error.statusCode, error.code, error.message);
+  if (error instanceof WorktreeConflict)
+    return error.code === "idempotency_mismatch"
+      ? reply(
+          409,
+          "idempotency_conflict",
+          "That operationId was already used for a different request. Use a new UUID for new work.",
+        )
+      : reply(error.statusCode, error.code, error.message);
   if (error instanceof ZodError)
     return reply(
       400,
@@ -373,10 +388,15 @@ export class LocalAgentService {
   // ---- reads ---------------------------------------------------------------
 
   capabilities() {
+    const allowTaskReview = this.config().allowTaskReview;
     return {
       version: LOCAL_AGENT_API_VERSION,
       trust: "unauthenticated-loopback" as const,
-      operations: LOCAL_AGENT_OPERATIONS,
+      operations: allowTaskReview
+        ? LOCAL_AGENT_OPERATIONS
+        : LOCAL_AGENT_OPERATIONS.filter((operation) => operation !== "review_task"),
+      /** Whether review_task may approve or send back tasks for the operator. */
+      taskReview: allowTaskReview,
       limits: LOCAL_AGENT_LIMITS,
       mcp: `/${LOCAL_AGENT_API_VERSION}/mcp`,
     };
@@ -903,6 +923,75 @@ export class LocalAgentService {
     };
   }
 
+  /**
+   * The operator's local agent answers a task awaiting review, exactly as the
+   * person would from the browser: approve closes it (publishing stays a
+   * separate approval), send back reopens it with the note as the
+   * orchestrator's next turn. Only when an administrator allowed it.
+   */
+  reviewTask(taskId: string, body: unknown): Reply<unknown> {
+    const input = LocalAgentReviewSchema.parse(body);
+    if (!this.config().allowTaskReview)
+      throw new LocalAgentError(
+        403,
+        "task_review_disabled",
+        "Local agents may not review tasks on this Host. An administrator can allow it in Settings → Security → Local agent API.",
+      );
+    const run = this.exposedTask(taskId) ?? notFound("Task");
+    this.takeWriteToken();
+    const scope = "local-agent-review";
+    const fingerprint = { taskId, ...input };
+    const replayed = this.store.managedApiReplay(scope, input.operationId, fingerprint);
+    if (replayed !== undefined)
+      return { status: 200, body: { ...(replayed as object), replayed: true } };
+    if (run.leadSessionId !== input.expectedLeadSessionId)
+      throw new LocalAgentError(
+        409,
+        "stale_owner",
+        "The task now belongs to another orchestrator. Read it again and address its current owner.",
+      );
+
+    const outcome = applyTaskReview(
+      this.service,
+      this.engine,
+      run.id,
+      { approved: input.decision === "approve", note: input.note },
+      { kind: "local_agent", clientLabel: input.clientLabel },
+    );
+    if (outcome.kind === "not_found") notFound("Task");
+    if (outcome.kind === "not_waiting")
+      throw new LocalAgentError(
+        409,
+        "not_awaiting_review",
+        `The task is ${run.state === "awaiting_human" ? "no longer" : "not"} waiting for review.`,
+      );
+    if (outcome.kind === "needs_reason")
+      throw new LocalAgentError(
+        400,
+        "review_reason_required",
+        "Say what needs changing in `note`, so the orchestrator can act on it.",
+      );
+    const result = {
+      task: this.taskSummary(outcome.run),
+      review: {
+        operationId: input.operationId,
+        decision: input.decision,
+        ...(input.clientLabel ? { clientLabel: input.clientLabel } : {}),
+      },
+    };
+    this.store.recordManagedApiRequest(scope, input.operationId, fingerprint, result);
+    this.audit(
+      input.decision === "approve"
+        ? "local_agent_task_approved"
+        : "local_agent_task_sent_back",
+      {
+        targetId: run.id,
+        detail: `${input.decision === "approve" ? "Approved" : "Sent back"} task "${run.name}" for the operator (operation ${input.operationId}${input.clientLabel ? `, client "${input.clientLabel}"` : ""}).`,
+      },
+    );
+    return { status: 200, body: result };
+  }
+
   // ---- administration --------------------------------------------------------
 
   /** Every receipt, for the administrator: scope does not hide anything here. */
@@ -1098,6 +1187,7 @@ export class LocalAgentService {
         port: input.port,
         allowedLeadSessionIds: leads,
         allowedWorkspaceIds: workspaces,
+        allowTaskReview: input.allowTaskReview ?? false,
       },
       input.expectedRevision,
     );
@@ -1110,7 +1200,7 @@ export class LocalAgentService {
     this.audit("local_agent_config_changed", {
       actorKind: actor.kind,
       actorId: actor.id,
-      detail: `${actor.username} ${saved.enabled ? (previous.enabled ? "updated" : "enabled") : previous.enabled ? "disabled" : "updated"} the local agent API on port ${saved.port}: ${saved.allowedLeadSessionIds.length} orchestrator(s), ${saved.allowedWorkspaceIds.length} workspace(s).`,
+      detail: `${actor.username} ${saved.enabled ? (previous.enabled ? "updated" : "enabled") : previous.enabled ? "disabled" : "updated"} the local agent API on port ${saved.port}: ${saved.allowedLeadSessionIds.length} orchestrator(s), ${saved.allowedWorkspaceIds.length} workspace(s), task review ${saved.allowTaskReview ? "allowed" : "not allowed"}.`,
     });
     return saved;
   }

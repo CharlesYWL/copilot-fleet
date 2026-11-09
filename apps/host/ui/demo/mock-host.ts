@@ -1494,6 +1494,7 @@ class DemoHost {
         port: 8786,
         allowedLeadSessionIds: [],
         allowedWorkspaceIds: [],
+        allowTaskReview: false,
         revision: 0,
       },
       status: { state: "disabled" },

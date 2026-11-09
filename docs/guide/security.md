@@ -53,7 +53,9 @@ The trust boundaries and controls behind sign-in, enrollment, the Node channel, 
   reaches only the orchestrators and workspaces an operator exposed, never the
   main `/api`, `/ws` or lead `/mcp`, and refuses browser, proxy and credential
   headers. Fleet's own tunnel refuses to forward its port. Restore and Host
-  sign-in reset turn it off.
+  sign-in reset turn it off. It cannot approve or send back a task's review
+  unless an administrator separately allows that on the same card; then any
+  local process that reaches the port can answer reviews for exposed tasks.
 - Legacy password sign-in is opt-in, off on a fresh Host, and retired
   automatically by the first Microsoft claim. Disabling it
   deletes the verifier and records the choice, so a stale

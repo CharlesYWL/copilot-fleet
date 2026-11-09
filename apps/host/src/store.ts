@@ -1351,13 +1351,16 @@ export class FleetStore {
       port: LOCAL_AGENT_DEFAULT_PORT,
       allowedLeadSessionIds: [],
       allowedWorkspaceIds: [],
+      allowTaskReview: false,
       revision: 0,
     };
   }
 
   /** Writes the config if it is still at `expectedRevision`; otherwise returns undefined. */
   setLocalAgentConfig(
-    next: Omit<LocalAgentConfig, "revision">,
+    next: Omit<LocalAgentConfig, "revision" | "allowTaskReview"> & {
+      allowTaskReview?: boolean | undefined;
+    },
     expectedRevision: number,
   ): LocalAgentConfig | undefined {
     return this.writeAtomically(() => {

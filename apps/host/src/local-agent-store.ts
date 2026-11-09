@@ -451,7 +451,7 @@ export function guidanceHold(
   if (terminalRunStates.has(run.state))
     return "The task is closed. Guidance is held; a person must reopen the task.";
   if (run.state === "awaiting_human" || run.state === "awaiting_approval")
-    return "The task is waiting for a person's review. Guidance is held until they act.";
+    return "The task is waiting for a person's review. Guidance is held until it is approved or sent back (review_task, when an administrator allows local agents to review).";
   return undefined;
 }
 

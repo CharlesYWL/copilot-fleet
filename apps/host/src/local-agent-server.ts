@@ -12,6 +12,7 @@ import {
   LOCAL_AGENT_LIMITS,
   LocalAgentCreateTaskSchema,
   LocalAgentMessageSchema,
+  LocalAgentReviewSchema,
   errorMessage,
   type LocalAgentListenerStatus,
 } from "@fleet/protocol";
@@ -384,6 +385,10 @@ export class LocalAgentListener {
       const result = agent.sendMessage(params(request).taskId!, request.body);
       return reply.code(result.status).send(result.body);
     });
+    app.post("/v1/tasks/:taskId/review", async (request, reply) => {
+      const result = agent.reviewTask(params(request).taskId!, request.body);
+      return reply.code(result.status).send(result.body);
+    });
 
     // Streamable HTTP MCP, stateless: every POST is a whole exchange, so
     // there is no session for a GET stream or a DELETE to refer to.
@@ -431,21 +436,25 @@ export class LocalAgentListener {
 const Limit = (max: number) => z.number().int().min(1).max(max).optional();
 const Cursor = z.string().max(2_048).optional();
 
-const MCP_INSTRUCTIONS = [
-  "Fleet's local agent API: hand work to, and ask about work held by, the orchestrators an administrator exposed to programs on this machine.",
-  "You act for the operator who exposed these orchestrators. A question or guidance may make the orchestrator reopen a task and dispatch work; it cannot approve a task's review for the operator.",
-  "Writes take an operationId: a fresh UUID for each new request, and the same UUID when retrying one whose outcome you did not see. A replay returns the original receipt.",
-  "Replies are asynchronous. After create_task or send_task_message, poll get_request and get_task, and read the orchestrator's answer with read_transcript.",
-].join("\n");
+const MCP_INSTRUCTIONS = (allowTaskReview: boolean) =>
+  [
+    "Fleet's local agent API: hand work to, and ask about work held by, the orchestrators an administrator exposed to programs on this machine.",
+    allowTaskReview
+      ? "You act for the operator who exposed these orchestrators. A question or guidance may make the orchestrator reopen a task and dispatch work. The administrator also allowed you to review: when a task is awaiting_human, review_task approves it or sends it back with a note, exactly as the operator would. Guidance sent to a task awaiting review is held until it is reviewed."
+      : "You act for the operator who exposed these orchestrators. A question or guidance may make the orchestrator reopen a task and dispatch work; it cannot approve a task's review for the operator.",
+    "Writes take an operationId: a fresh UUID for each new request, and the same UUID when retrying one whose outcome you did not see. A replay returns the original receipt.",
+    "Replies are asynchronous. After create_task or send_task_message, poll get_request and get_task, and read the orchestrator's answer with read_transcript.",
+  ].join("\n");
 
 /** The same operations as the REST routes, as MCP tools over the same service. */
 export function localAgentMcpServer(
   agent: LocalAgentService,
   log: FastifyBaseLogger,
 ): McpServer {
+  const allowTaskReview = agent.config().allowTaskReview;
   const server = new McpServer(
     { name: "fleet-local-agent", version: "1.0.0" },
-    { capabilities: { tools: {} }, instructions: MCP_INSTRUCTIONS },
+    { capabilities: { tools: {} }, instructions: MCP_INSTRUCTIONS(allowTaskReview) },
   );
   const text = (value: unknown) => [
     { type: "text" as const, text: JSON.stringify(value, null, 2) },
@@ -570,5 +579,19 @@ export function localAgentMcpServer(
     },
     ({ taskId, ...body }) => run(() => agent.sendMessage(taskId, body).body),
   );
+  if (allowTaskReview)
+    server.registerTool(
+      "review_task",
+      {
+        title: "Approve or send back a task awaiting review",
+        description:
+          "Answer a task whose state is awaiting_human, on the operator's behalf, exactly as the operator's Approve / Send back buttons do. `approve` accepts the result and closes the task (a managed checkout's publication still needs its own approval). `send_back` reopens it and hands `note` to the orchestrator as its next turn; a note is required. Read the task with get_task first and name its owner as expectedLeadSessionId. Use a fresh UUID operationId; reuse it only to retry this same decision.",
+        inputSchema: {
+          taskId: z.string().min(1).max(200),
+          ...LocalAgentReviewSchema.shape,
+        },
+      },
+      ({ taskId, ...body }) => run(() => agent.reviewTask(taskId, body).body),
+    );
   return server;
 }

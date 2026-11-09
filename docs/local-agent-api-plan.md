@@ -34,7 +34,8 @@ message, a worker started, or the task succeeded.
 - No new orchestrator creation, direct worker prompt/start, arbitrary shell,
   arbitrary file read/download/upload, or generic proxy/RPC endpoint.
 - No stop/resume/transfer/archive/delete, model/profile changes, permission
-  approvals, maintenance authorization or human review decisions through this API.
+  approvals, maintenance authorization or human review decisions through this API
+  (review decisions became an explicit opt-in later; see "Opt-in task review").
 - No second scheduler, second Host process, second store, or alternate ACP client.
 - No Hermes profile provisioning, credential copying, concurrent attachment to a
   native session, or changes to any user's Hermes installation/configuration.
@@ -139,7 +140,10 @@ section describes the code.
    receipt is replayed (`replayed: true`).
 4. MCP: Streamable HTTP, stateless, `POST /v1/mcp` (a GET answers 405). Tools:
    `list_orchestrators`, `list_workspaces`, `list_tasks`, `get_task`,
-   `read_transcript`, `get_request`, `create_task`, `send_task_message` — the
+   `read_transcript`, `get_request`, `create_task`, `send_task_message`, and —
+   only when an administrator ticks **Allow local agents to approve or send back
+   tasks awaiting review** — `review_task` (REST `POST /v1/tasks/:taskId/review`) —
+   the
    same service as REST, with tool errors returned as `isError` results carrying
    the REST error body. The settings card copies this client configuration once
    the API is on:
@@ -170,6 +174,15 @@ section describes the code.
 - **MCP shipped now** (design: P4), because the owner asked for "public API/MCP".
   It is a thin stateless adapter: no sessions, no SSE, no FleetTools, no new
   semantics. It sits behind the same transport admission as REST.
+- **Opt-in task review.** The non-goal "no human review decisions" stays the
+  default. Operators who run a local review harness that speaks for them found
+  its guidance held behind `awaiting_human` with nobody to answer, so a separate
+  `allowTaskReview` setting (off by default, off for clients that omit it, and
+  needing a recent sign-in like any widening) lets `review_task` approve or send
+  back a task through the same `applyTaskReview` the browser's buttons use.
+  Approval never publishes; a managed checkout still needs its own publication
+  approval. Replays use the managed API request ledger, and every decision is
+  noted on the task and in the security audit with the client label.
 - **No-auth Hosts can use it.** The design required a Microsoft administrator,
   which a Host running without sign-in can never have, so the feature would have
   been dead there. In no-auth mode the operator on loopback or a private Dev

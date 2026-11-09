@@ -131,7 +131,7 @@ export type LocalAgentAdminRequest = LocalAgentRequest & {
   owedPreview?: string;
 };
 
-type Draft = { port: string; leads: string[]; workspaces: string[] };
+type Draft = { port: string; leads: string[]; workspaces: string[]; review: boolean };
 
 /** Where an administrator can still step in; the Host decides what that does. */
 const FINISHED = new Set<LocalAgentRequestState>(["settled", "rejected", "abandoned"]);
@@ -154,6 +154,7 @@ const draftOf = (config: LocalAgentConfig): Draft => ({
   port: String(config.port),
   leads: config.allowedLeadSessionIds,
   workspaces: config.allowedWorkspaceIds,
+  review: config.allowTaskReview === true,
 });
 
 const toggle = (list: string[], id: string, on: boolean) =>
@@ -251,7 +252,8 @@ export const LocalAgentCard = ({
   const changed =
     port !== config.port ||
     !sameSet(draft.leads, config.allowedLeadSessionIds) ||
-    !sameSet(draft.workspaces, config.allowedWorkspaceIds);
+    !sameSet(draft.workspaces, config.allowedWorkspaceIds) ||
+    draft.review !== (config.allowTaskReview === true);
 
   const leadChoices: Choice[] = view.choices.orchestrators.map((lead) => ({
     id: lead.id,
@@ -280,6 +282,7 @@ export const LocalAgentCard = ({
               port: Number(scope.port),
               allowedLeadSessionIds: scope.leads,
               allowedWorkspaceIds: scope.workspaces,
+              allowTaskReview: scope.review,
               expectedRevision: config.revision,
             }),
           });
@@ -436,7 +439,8 @@ export const LocalAgentCard = ({
         <Text>
           {config.enabled ? "On" : "Off"} · port {config.port} ·{" "}
           {config.allowedLeadSessionIds.length} orchestrator(s) ·{" "}
-          {config.allowedWorkspaceIds.length} workspace(s) · revision {config.revision}
+          {config.allowedWorkspaceIds.length} workspace(s) · task review{" "}
+          {config.allowTaskReview ? "allowed" : "off"} · revision {config.revision}
         </Text>
       </div>
 
@@ -462,6 +466,17 @@ export const LocalAgentCard = ({
           (workspaces) => setDraft({ ...draft, workspaces }),
         )}
       </div>
+
+      <Field hint="Lets a local agent you trust to speak for you — for example a review harness — answer a task waiting for your review with Approve or Send back, exactly like the buttons on the task. Publishing a managed checkout still needs its own approval.">
+        <Checkbox
+          checked={draft.review}
+          disabled={busy}
+          onChange={(_event, data) =>
+            setDraft({ ...draft, review: data.checked === true })
+          }
+          label="Allow local agents to approve or send back tasks awaiting review"
+        />
+      </Field>
 
       <div className={styles.row}>
         <Field

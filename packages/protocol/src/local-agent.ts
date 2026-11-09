@@ -26,6 +26,8 @@ export const LOCAL_AGENT_LIMITS = {
   transcriptBytes: 256 * 1024,
   notesMax: 50,
   noteChars: 4_000,
+  /** The same limit the browser's send-back note has. */
+  reviewNoteChars: 4_000,
   scopeMax: 100,
   writesPerMinute: 30,
   unresolvedPerLead: 20,
@@ -41,6 +43,11 @@ export const LocalAgentConfigSchema = z
     port: z.number().int().min(1024).max(65_535),
     allowedLeadSessionIds: z.array(Id).max(LOCAL_AGENT_LIMITS.scopeMax),
     allowedWorkspaceIds: z.array(Id).max(LOCAL_AGENT_LIMITS.scopeMax),
+    /**
+     * Whether a local agent may approve or send back a task awaiting review on
+     * the operator's behalf. Off unless an administrator turns it on.
+     */
+    allowTaskReview: z.boolean().default(false),
     /** Bumped on every change, so an editor can refuse to overwrite a newer one. */
     revision: z.number().int().nonnegative(),
   })
@@ -53,6 +60,8 @@ export const LocalAgentConfigUpdateSchema = z
     port: z.number().int().min(1024).max(65_535),
     allowedLeadSessionIds: z.array(Id).max(LOCAL_AGENT_LIMITS.scopeMax),
     allowedWorkspaceIds: z.array(Id).max(LOCAL_AGENT_LIMITS.scopeMax),
+    /** Omitted means off: a client that does not know this setting never grants it. */
+    allowTaskReview: z.boolean().optional(),
     expectedRevision: z.number().int().nonnegative(),
   })
   .strict();
@@ -161,6 +170,20 @@ export const LocalAgentMessageSchema = z
   .strict();
 export type LocalAgentMessage = z.infer<typeof LocalAgentMessageSchema>;
 
+/** A local agent's answer to a task awaiting review, as the operator would give it. */
+export const LocalAgentReviewSchema = z
+  .object({
+    operationId: OperationId,
+    /** The orchestrator the caller believes owns the task; a transfer makes this stale. */
+    expectedLeadSessionId: Id,
+    decision: z.enum(["approve", "send_back"]),
+    /** Required when sending back: the orchestrator acts on it verbatim. */
+    note: z.string().trim().max(LOCAL_AGENT_LIMITS.reviewNoteChars).optional(),
+    clientLabel: ClientLabel.optional(),
+  })
+  .strict();
+export type LocalAgentReview = z.infer<typeof LocalAgentReviewSchema>;
+
 export const LocalAgentDispositionSchema = z
   .object({
     action: z.literal("abandon"),
@@ -189,6 +212,9 @@ export const localAgentErrorCodes = [
   "stale_owner",
   "reopen_required",
   "human_review_required",
+  "task_review_disabled",
+  "not_awaiting_review",
+  "review_reason_required",
   "source_required",
   "source_mismatch",
   "workspace_unreachable",
