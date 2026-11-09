@@ -1159,6 +1159,111 @@ it("refuses self-update before invoking the updater with live sessions or pendin
   }
 });
 
+it.each(["updated", "failed stop", "other active work"] as const)(
+  "waits for preceding session stops before self-update: %s",
+  async (outcome) => {
+    vi.useFakeTimers();
+    vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+    vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+    vi.stubEnv("FLEET_MOCK_AGENT", "1");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { loadCredentials } = await import("./config.js");
+    vi.mocked(loadCredentials).mockResolvedValueOnce({
+      hostUrl: credentials.hostUrl,
+      nodeId: credentials.nodeId,
+      name: credentials.name,
+      authProtocol: "legacy-secret",
+      secret: "test-secret",
+    });
+    const { updateCheckout } = await import("./updater.js");
+    vi.mocked(updateCheckout).mockReset().mockResolvedValue({
+      action: "none",
+      reason: "Already up to date",
+    });
+    const exits = process.listeners("exit");
+    const { main } = await import("./main.js");
+    const runtime = await main([]);
+    try {
+      const socket = sockets[0]!;
+      await socket.open();
+      activeSessionIds = ["session-1", "session-2"];
+      const admission = routerOptions.admission!;
+      const tickets = activeSessionIds.map((id) => admission.enter(`session:${id}`));
+      const finishes: (() => void)[] = [];
+      for (const [index, sessionId] of activeSessionIds.entries()) {
+        const stopped = new Promise<void>((resolve) => finishes.push(resolve));
+        route.mockImplementationOnce(async (command) => {
+          await stopped;
+          tickets[index]!.release();
+          activeSessionIds = activeSessionIds.filter((id) => id !== sessionId);
+          return {
+            commandId: command.commandId,
+            ok: index === 0 || outcome !== "failed stop",
+            ...(index === 1 && outcome === "failed stop"
+              ? { error: "Could not confirm process exit" }
+              : {}),
+          };
+        });
+      }
+      const unrelated =
+        outcome === "other active work"
+          ? admission.enter("session:unrelated")
+          : undefined;
+      const stops = activeSessionIds.map((sessionId) =>
+        socket.receive({
+          type: "command",
+          command: { type: "stop", sessionId, commandId: `stop-${sessionId}` },
+        }),
+      );
+      const update = socket.receive({ type: "update_node", updateId: "stop-and-update" });
+      expect(() => admission.enter("racing launch")).toThrow("self-update");
+      expect(updateCheckout).not.toHaveBeenCalled();
+
+      finishes[0]!();
+      await stops[0];
+      expect(updateCheckout).not.toHaveBeenCalled();
+      expect(admission.reason).toContain("self-update");
+
+      finishes[1]!();
+      await Promise.all([...stops, update]);
+      const statuses = socket.send.mock.calls
+        .map(([text]) => JSON.parse(text) as NodeToHostMessage)
+        .filter((frame) => frame.type === "update_status");
+      if (outcome === "updated") {
+        expect(updateCheckout).toHaveBeenCalledOnce();
+        expect(statuses.map((frame) => frame.stage)).not.toContain("failed");
+        expect(statuses.at(-1)).toMatchObject({ stage: "up_to_date" });
+      } else {
+        expect(updateCheckout).not.toHaveBeenCalled();
+        expect(statuses.at(-1)).toMatchObject({
+          stage: "failed",
+          detail: expect.stringContaining(
+            outcome === "failed stop"
+              ? "Could not confirm process exit"
+              : "Active or launch-in-progress",
+          ),
+        });
+      }
+      unrelated?.release();
+      expect(admission.reason).toBe("");
+      if (outcome !== "updated") {
+        await socket.receive({ type: "update_node", updateId: "retry-after-stop" });
+        expect(updateCheckout).toHaveBeenCalledOnce();
+        expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+          type: "update_status",
+          stage: "up_to_date",
+        });
+      }
+    } finally {
+      await runtime.shutdown();
+      vi.mocked(updateCheckout).mockReset();
+      for (const listener of process.listeners("exit"))
+        if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  },
+);
+
 it("brings the Copilot CLI its sessions launch up to date and reports what became of it", async () => {
   activeSessionIds = [];
   vi.useFakeTimers();
