@@ -51,6 +51,7 @@ import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
 import { LocalAgentCard } from "./LocalAgentCard";
 import { HostMcpCard } from "./HostMcpCard";
+import { SettingsSection } from "./SettingsSection";
 import { MicrosoftSignInSetup } from "./AuthGate";
 import { terminal } from "../theme";
 
@@ -419,9 +420,13 @@ export const SecurityPanel = () => {
             <MessageBarBody>{error}</MessageBarBody>
           </MessageBar>
         )}
-        <div data-setting-id="security.sign-in-setup">
+        <SettingsSection
+          title="Microsoft sign-in setup"
+          className={styles.card}
+          data-setting-id="security.sign-in-setup"
+        >
           <MicrosoftSignInSetup status={data.status} onChanged={load} />
-        </div>
+        </SettingsSection>
       </div>
     );
   }
@@ -454,6 +459,7 @@ export const SecurityPanel = () => {
        * deliberately leaves this Host's security envelope alone.
        */}
       <PortableBackupCard
+        collapsible
         claimed={!data.status.claimCodeRequired}
         onImported={() => window.location.reload()}
       />
@@ -541,12 +547,12 @@ function IdentityCard({
 }) {
   const styles = useStyles();
   return (
-    <section
+    <SettingsSection
+      title="This Host"
       className={styles.card}
       aria-label="This Host"
       data-setting-id="security.host"
     >
-      <Text weight="semibold">This Host</Text>
       <div className={styles.facts}>
         <Text className={styles.caption}>Signed in as</Text>
         <span className={styles.identity}>
@@ -595,7 +601,7 @@ function IdentityCard({
         A Node that has pinned this fingerprint sends nothing to anything that cannot sign
         for the matching key, which is what makes a relay merely a relay.
       </Text>
-    </section>
+    </SettingsSection>
   );
 }
 
@@ -631,12 +637,12 @@ function MicrosoftConfigurationCard({
   };
 
   return (
-    <section
+    <SettingsSection
+      title="Microsoft sign-in configuration"
       className={styles.card}
       aria-label="Microsoft sign-in configuration"
       data-setting-id="security.microsoft-config"
     >
-      <Text weight="semibold">Microsoft sign-in configuration</Text>
       <Text className={styles.caption}>
         The current configuration stays active until you sign in through the new
         registration as the same administrator, with the same directory and object IDs.
@@ -683,7 +689,7 @@ function MicrosoftConfigurationCard({
           </Button>
         </div>
       )}
-    </section>
+    </SettingsSection>
   );
 }
 
@@ -709,12 +715,12 @@ function PasswordCard({
         ? "The passwords do not match."
         : undefined;
   return (
-    <section
+    <SettingsSection
+      title="Password sign-in"
       className={styles.card}
       aria-label="Password sign-in"
       data-setting-id="security.password"
     >
-      <Text weight="semibold">Password sign-in</Text>
       {enabling ? (
         <Text className={styles.caption}>
           Disabled by default after this Host was claimed. Only approved Microsoft
@@ -813,7 +819,7 @@ function PasswordCard({
           </DialogBody>
         </DialogSurface>
       </Dialog>
-    </section>
+    </SettingsSection>
   );
 }
 
@@ -854,12 +860,12 @@ function EraseAuthCard({
   };
 
   return (
-    <section
+    <SettingsSection
+      title="Erase auth settings"
       className={styles.card}
       aria-label="Erase auth settings"
       data-setting-id="security.erase"
     >
-      <Text weight="semibold">Erase auth settings</Text>
       <Text className={styles.caption}>
         Return this Host to sign-in setup without restarting the Host or Nodes. Node
         connections, keys, enrollment, tunnels and other settings are kept.
@@ -919,7 +925,7 @@ function EraseAuthCard({
           </DialogBody>
         </DialogSurface>
       </Dialog>
-    </section>
+    </SettingsSection>
   );
 }
 
@@ -990,22 +996,24 @@ function DeviceFlowCard({
   };
 
   return (
-    <section
+    <SettingsSection
+      title={
+        <>
+          Device sign-in{" "}
+          <Badge
+            appearance="outline"
+            color={status.deviceFlowEnabled ? "success" : "informative"}
+          >
+            {status.deviceFlowEnabled
+              ? "Device sign-in is enabled"
+              : "Device sign-in is off"}
+          </Badge>
+        </>
+      }
       className={styles.card}
       aria-label="Device sign-in"
       data-setting-id="security.device"
     >
-      <div className={styles.row}>
-        <Text weight="semibold">Device sign-in</Text>
-        <Badge
-          appearance="outline"
-          color={status.deviceFlowEnabled ? "success" : "informative"}
-        >
-          {status.deviceFlowEnabled
-            ? "Device sign-in is enabled"
-            : "Device sign-in is off"}
-        </Badge>
-      </div>
       <Text className={styles.caption}>
         The fallback for a browser that cannot reach a loopback listener. Microsoft
         recommends blocking it by default and a tenant&apos;s Conditional Access may, so
@@ -1029,7 +1037,7 @@ function DeviceFlowCard({
           )}
         </>
       )}
-    </section>
+    </SettingsSection>
   );
 }
 
@@ -1043,12 +1051,12 @@ function PendingCard({
   const styles = useStyles();
   if (pending.length === 0) return null;
   return (
-    <section
+    <SettingsSection
+      title="Waiting for approval"
       className={styles.card}
       aria-label="Waiting for approval"
       data-setting-id="security.pending"
     >
-      <Text weight="semibold">Waiting for approval</Text>
       <Text className={styles.caption}>
         Redeeming an invitation only puts an identity forward. Check that this is the
         person you invited — an invitation that leaked would show up here as somebody
@@ -1118,7 +1126,7 @@ function PendingCard({
           </TableBody>
         </Table>
       </div>
-    </section>
+    </SettingsSection>
   );
 }
 
@@ -1207,15 +1215,16 @@ function AdministratorsCard({
   };
 
   return (
-    <section
+    <SettingsSection
+      title={
+        <>
+          Administrators <Badge appearance="outline">{administrators.length}</Badge>
+        </>
+      }
       className={styles.card}
       aria-label="Administrators"
       data-setting-id="security.administrators"
     >
-      <div className={styles.row}>
-        <Text weight="semibold">Administrators</Text>
-        <Badge appearance="outline">{administrators.length}</Badge>
-      </div>
       <Text className={styles.caption}>
         Every administrator has full authority. Fleet keys them by directory and object
         id, never by email — a renamed or re-created account is a different identity.
@@ -1390,7 +1399,7 @@ function AdministratorsCard({
           </DialogBody>
         </DialogSurface>
       </Dialog>
-    </section>
+    </SettingsSection>
   );
 }
 
@@ -1404,12 +1413,12 @@ function NodeMigrationCard({
   const styles = useStyles();
   const { total, mutualAuth, legacy } = enrollment.nodeAuthentication;
   return (
-    <section
+    <SettingsSection
+      title="Node authentication"
       className={styles.card}
       aria-label="Node authentication"
       data-setting-id="security.node-auth"
     >
-      <Text weight="semibold">Node authentication</Text>
       <Text>
         {mutualAuth} of {total} Node{total === 1 ? "" : "s"} authenticate with their own
         key.
@@ -1446,19 +1455,19 @@ function NodeMigrationCard({
           )
         }
       />
-    </section>
+    </SettingsSection>
   );
 }
 
 function AuditCard({ events }: { events: AuditEvent[] }) {
   const styles = useStyles();
   return (
-    <section
+    <SettingsSection
+      title="Security audit"
       className={styles.card}
       aria-label="Security audit"
       data-setting-id="security.audit"
     >
-      <Text weight="semibold">Security audit</Text>
       <Text className={styles.caption}>
         Local to this Host and kept to the newest ten thousand entries. Claim codes,
         tokens, cookies and keys never appear here.
@@ -1534,6 +1543,6 @@ function AuditCard({ events }: { events: AuditEvent[] }) {
           How Conditional Access blocks authentication flows
         </Link>
       </Text>
-    </section>
+    </SettingsSection>
   );
 }

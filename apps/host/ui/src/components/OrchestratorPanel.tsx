@@ -32,6 +32,7 @@ import { useMessageNotification } from "../hooks/useAppNotifications";
 import { terminal } from "../theme";
 import { CopyButton } from "./CopyButton";
 import { ModelDefaultsCard, type ModelDefaultsCardProps } from "./ModelDefaultsCard";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   panel: {
@@ -175,7 +176,8 @@ export function OrchestratorPanel({
           <MessageBarBody>{error}</MessageBarBody>
         </MessageBar>
       )}
-      <section
+      <SettingsSection
+        title="Orchestrator agent"
         className={styles.card}
         aria-label="Orchestrator agent"
         data-setting-id="orchestrator.agent"
@@ -273,7 +275,7 @@ export function OrchestratorPanel({
             Save agent
           </Button>
         </div>
-      </section>
+      </SettingsSection>
       {AgentKindSchema.options.map((kind) => (
         <ModelDefaultsCard
           key={kind}
@@ -352,14 +354,13 @@ function HeartbeatScheduleCard({
         ? `Next: ${upcoming.map(heartbeatTime).join(" \u00b7 ")}`
         : null;
   return (
-    <section
+    <SettingsSection
+      title="Orchestrator heartbeat"
       className={styles.card}
       aria-label="Orchestrator heartbeat"
       data-setting-id="orchestrator.heartbeat"
     >
       <div>
-        <Text weight="semibold">Orchestrator heartbeat</Text>
-        <br />
         <Text className={styles.caption}>
           When an idle orchestrator reviews its open tasks and maintained PRs. Cron times
           (minute, hour, day of month, month, weekday) use the Host&apos;s time zone
@@ -401,6 +402,6 @@ function HeartbeatScheduleCard({
         The default, <code>{DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE}</code>, is hourly
         from 09:00 to 18:00 on weekdays and every two hours otherwise.
       </Text>
-    </section>
+    </SettingsSection>
   );
 }

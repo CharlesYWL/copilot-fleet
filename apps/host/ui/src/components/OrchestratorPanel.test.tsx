@@ -216,8 +216,11 @@ describe("OrchestratorPanel", () => {
       screen.queryByRole("combobox", { name: "Default Hermes reasoning effort" }),
     ).toBeNull();
     expect(
-      screen.getByRole("region", { name: "Hermes model defaults" }).textContent,
-    ).toBe("Default Hermes modelHermes profile's choice");
+      screen
+        .getByRole("region", { name: "Hermes model defaults" })
+        .querySelector("summary")?.textContent,
+    ).toBe("Default Hermes model");
+    expect(hermes.textContent).toBe("Hermes profile's choice");
     fireEvent.click(copilot);
     let option = screen.getByRole("option", { name: "Lead model" });
     expect(option.getAttribute("title")).toBe("lead-model");

@@ -24,6 +24,7 @@ import { api } from "../hooks/useFleet";
 import { useNotify } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { terminal } from "../theme";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   card: {
@@ -39,7 +40,7 @@ const useStyles = makeStyles({
   header: {
     display: "flex",
     alignItems: "center",
-    justifyContent: "space-between",
+    justifyContent: "flex-end",
     gap: "12px",
     flexWrap: "wrap",
   },
@@ -174,15 +175,17 @@ export const HostMcpCard = ({
   const suspended = view?.suspended ?? false;
 
   return (
-    <section
+    <SettingsSection
+      title={
+        <Text weight="semibold" size={400}>
+          Host MCP forwarding
+        </Text>
+      }
       className={styles.card}
       aria-label="Host MCP forwarding"
       data-setting-id="security.host-mcp"
     >
       <div className={styles.header}>
-        <Text weight="semibold" size={400}>
-          Host MCP forwarding
-        </Text>
         <Dialog
           open={active && choosing}
           onOpenChange={(_event, data) => {
@@ -345,6 +348,6 @@ export const HostMcpCard = ({
       {error || view?.catalogError ? (
         <Text className={styles.caption}>{error ?? view?.catalogError}</Text>
       ) : null}
-    </section>
+    </SettingsSection>
   );
 };

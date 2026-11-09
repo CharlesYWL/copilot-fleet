@@ -72,7 +72,10 @@ describe("GeneralPanel", () => {
     );
     const model = await screen.findByRole("combobox", { name: "Default Copilot model" });
     const defaultsCard = screen.getByRole("region", { name: "Copilot model defaults" });
-    expect(defaultsCard.textContent).toContain("Default Copilot modelCopilot's choice");
+    expect(defaultsCard.querySelector("summary")?.textContent).toBe(
+      "Default Copilot model",
+    );
+    expect(model.textContent).toContain("Copilot's choice");
     expect(
       within(defaultsCard).getByRole("button", { name: "Decision settings" }),
     ).toBeDefined();

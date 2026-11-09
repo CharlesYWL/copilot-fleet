@@ -19,6 +19,7 @@ import { errorMessage } from "@fleet/protocol";
 import { useMessageNotification, useNotify } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { csrfToken } from "../lib/auth";
+import { SettingsSection } from "./SettingsSection";
 
 /** The floor the Host enforces, repeated here so the form can refuse first. */
 export const MIN_BACKUP_PASSPHRASE_LENGTH = 14;
@@ -55,6 +56,8 @@ export type PortableBackupCardProps = {
   /** A Host with administrators asks one of them; a fresh one asks its console. */
   claimed: boolean;
   onImported: () => void;
+  /** Sign-in recovery keeps this visible; Settings can fold it away. */
+  collapsible?: boolean;
 };
 
 const stamp = () => new Date().toISOString().slice(0, 10);
@@ -69,7 +72,11 @@ const stamp = () => new Date().toISOString().slice(0, 10);
  * and the fleet, it is never stored anywhere, and it is cleared the moment the
  * request that used it returns.
  */
-export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardProps) => {
+export const PortableBackupCard = ({
+  claimed,
+  onImported,
+  collapsible = false,
+}: PortableBackupCardProps) => {
   const styles = useStyles();
   const active = useSettingsActive();
   const [passphrase, setPassphrase] = useState("");
@@ -206,14 +213,14 @@ export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardPr
   };
 
   return (
-    <section
+    <SettingsSection
+      title={<Text weight="semibold">Move this Host</Text>}
+      collapsible={collapsible}
       className={styles.card}
       aria-label="Move this Host"
       data-setting-id="security.portable-backup"
     >
       <div>
-        <Text weight="semibold">Move this Host</Text>
-        <br />
         <Text className={styles.caption}>
           A portable archive carries the administrator table, the Microsoft registration,
           this Host&apos;s signing key and the keys it derives proofs with, sealed under a
@@ -327,6 +334,6 @@ export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardPr
           </DialogBody>
         </DialogSurface>
       </Dialog>
-    </section>
+    </SettingsSection>
   );
 };

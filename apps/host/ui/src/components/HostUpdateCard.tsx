@@ -26,6 +26,7 @@ import {
 import { ApiError, api } from "../hooks/useFleet";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { sessionLabel } from "../lib/session-label";
+import { SettingsSection } from "./SettingsSection";
 
 const useStyles = makeStyles({
   card: {
@@ -136,15 +137,14 @@ export const HostUpdateCard = ({ status, revision }: HostUpdateCardProps) => {
   };
 
   return (
-    <section
+    <SettingsSection
+      title="Update Host"
       className={styles.card}
       aria-label="Update Host"
       data-setting-id="general.host-update"
     >
       <div className={styles.row}>
         <div>
-          <Text weight="semibold">Update Host</Text>
-          <br />
           <Text className={styles.caption}>
             Pulls the newest commit of the branch this checkout tracks, installs
             dependencies and builds, updates this machine&apos;s Copilot CLI, then
@@ -294,6 +294,6 @@ export const HostUpdateCard = ({ status, revision }: HostUpdateCardProps) => {
           </DialogBody>
         </DialogSurface>
       </Dialog>
-    </section>
+    </SettingsSection>
   );
 };

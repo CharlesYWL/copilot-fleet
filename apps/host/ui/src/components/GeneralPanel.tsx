@@ -31,6 +31,7 @@ import { useMessageNotification } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { HostUpdateCard } from "./HostUpdateCard";
 import { ModelDefaultsCard } from "./ModelDefaultsCard";
+import { SettingsSection } from "./SettingsSection";
 import { WorkerModelRoutingControl } from "./WorkerModelRoutingControl";
 
 const useStyles = makeStyles({
@@ -62,7 +63,7 @@ const useStyles = makeStyles({
     "@media (max-width: 600px)": { flexWrap: "wrap" },
   },
   settingTitle: {
-    display: "flex",
+    display: "inline-flex",
     alignItems: "center",
     flexWrap: "wrap",
     gap: "8px",
@@ -275,15 +276,14 @@ export const GeneralPanel = ({
         </MessageBar>
       )}
 
-      <section
+      <SettingsSection
+        title="Managed worktree isolation"
         className={styles.card}
         aria-label="Managed worktree isolation"
         data-setting-id="general.managed-worktrees"
       >
         <div className={styles.row}>
           <div>
-            <Text weight="semibold">Managed worktree isolation</Text>
-            <br />
             <Text className={styles.caption}>
               Auto creates one isolated Git worktree per new repository task when enabled.
               Implementation, review, testing and fix-up share that task’s checkout and
@@ -315,17 +315,15 @@ export const GeneralPanel = ({
             />
           </details>
         )}
-      </section>
+      </SettingsSection>
 
       {onStartTour && (
-        <section
+        <SettingsSection
+          title={<span data-tour="tour-help">Getting started</span>}
           className={styles.card}
           aria-label="Getting started"
           data-setting-id="general.tour"
         >
-          <Text weight="semibold" data-tour="tour-help">
-            Getting started
-          </Text>
           <Text className={styles.caption}>
             Walk from connecting a machine to your first session and Orchestrator task.
             The guide points out the controls without changing settings or starting agents
@@ -340,18 +338,17 @@ export const GeneralPanel = ({
               Take the tour
             </Button>
           </div>
-        </section>
+        </SettingsSection>
       )}
 
-      <section
+      <SettingsSection
+        title="Long context by default"
         className={styles.card}
         aria-label="Default context window"
         data-setting-id="general.long-context"
       >
         <div className={styles.row}>
           <div>
-            <Text weight="semibold">Long context by default</Text>
-            <br />
             <Text className={styles.caption}>
               Request --context long_context for new Copilot sessions, including Chats,
               Copilot orchestrators, and workers. Extended context can cost more; the
@@ -373,15 +370,16 @@ export const GeneralPanel = ({
           default does not restart running sessions. Some Copilot ACP versions ignore tier
           requests; check the reported window in the session usage popover.
         </Text>
-      </section>
+      </SettingsSection>
 
-      <section className={styles.card} data-setting-id="general.yolo">
+      <SettingsSection
+        title={<span data-tour="session-defaults">YOLO mode</span>}
+        className={styles.card}
+        aria-label="YOLO mode"
+        data-setting-id="general.yolo"
+      >
         <div className={styles.row}>
           <div>
-            <Text weight="semibold" data-tour="session-defaults">
-              YOLO mode
-            </Text>
-            <br />
             <Text className={styles.caption}>
               Starts Copilot with --allow-all so it runs tools, reads paths, and fetches
               URLs without asking.
@@ -395,7 +393,7 @@ export const GeneralPanel = ({
             onChange={(_event, data) => void update({ yolo: data.checked })}
           />
         </div>
-      </section>
+      </SettingsSection>
 
       {yolo && (
         <MessageBar className={styles.warning} intent="warning" layout="multiline">
@@ -404,24 +402,26 @@ export const GeneralPanel = ({
       )}
 
       {agencyModeAvailable && (
-        <section
+        <SettingsSection
+          title={
+            <span className={styles.settingTitle}>
+              Agency mode
+              <Badge
+                className={styles.staffBadge}
+                appearance="outline"
+                size="medium"
+                title="Internal feature for Microsoft corporate accounts"
+              >
+                Staff
+              </Badge>
+            </span>
+          }
           className={styles.card}
           aria-label="Agency mode"
           data-setting-id="general.agency"
         >
           <div className={styles.row}>
             <div>
-              <div className={styles.settingTitle}>
-                <Text weight="semibold">Agency mode</Text>
-                <Badge
-                  className={styles.staffBadge}
-                  appearance="outline"
-                  size="medium"
-                  title="Internal feature for Microsoft corporate accounts"
-                >
-                  Staff
-                </Badge>
-              </div>
               <Text className={styles.caption}>
                 Use Agency Copilot for new and resumed Copilot sessions, including Chats,
                 Copilot orchestrators, and workers. Each node uses its own Agency
@@ -442,14 +442,16 @@ export const GeneralPanel = ({
             launchers. Install and sign in to Agency on each node before enabling this;
             authentication or startup errors are reported, not silently downgraded.
           </Text>
-        </section>
+        </SettingsSection>
       )}
 
-      <section className={styles.card} data-setting-id="general.auto-resume">
+      <SettingsSection
+        title="Reconnect sessions automatically"
+        className={styles.card}
+        data-setting-id="general.auto-resume"
+      >
         <div className={styles.row}>
           <div>
-            <Text weight="semibold">Reconnect sessions automatically</Text>
-            <br />
             <Text className={styles.caption}>
               After a Host or node restart, re-attaches the sessions the node came back
               without, up to its capacity. Re-attaching reopens the conversation and waits
@@ -457,19 +459,22 @@ export const GeneralPanel = ({
             </Text>
           </div>
           <Switch
+            aria-label="Reconnect sessions automatically"
             checked={autoResume}
             disabled={busy}
             label={autoResume ? "On" : "Off"}
             onChange={(_event, data) => void update({ autoResume: data.checked })}
           />
         </div>
-      </section>
+      </SettingsSection>
 
-      <section className={styles.card} data-setting-id="general.lifecycle-notifications">
+      <SettingsSection
+        title="Lifecycle notifications"
+        className={styles.card}
+        data-setting-id="general.lifecycle-notifications"
+      >
         <div className={styles.row}>
           <div>
-            <Text weight="semibold">Lifecycle notifications</Text>
-            <br />
             <Text className={styles.caption}>
               Application fallback for top-level and standalone agents. Dependency workers
               and reviewers remain Off by default unless you explicitly enable them for
@@ -486,7 +491,7 @@ export const GeneralPanel = ({
             }
           />
         </div>
-      </section>
+      </SettingsSection>
 
       <ModelDefaultsCard
         settingId="general.model"
@@ -501,14 +506,13 @@ export const GeneralPanel = ({
 
       {hostUpdate && <HostUpdateCard status={hostUpdate} revision={hostRevision} />}
 
-      <section
+      <SettingsSection
+        title="Export fleet data"
         className={styles.card}
         aria-label="Fleet data archive"
         data-setting-id="general.data"
       >
         <div>
-          <Text weight="semibold">Export fleet data</Text>
-          <br />
           <Text className={styles.caption}>
             Downloads workspaces, nodes, sessions, transcripts and session settings.
             Importing on another machine replaces all of that there. This file{" "}
@@ -549,7 +553,7 @@ export const GeneralPanel = ({
             void handlePickFile(file);
           }}
         />
-      </section>
+      </SettingsSection>
 
       <Dialog
         open={active && confirmOpen}
