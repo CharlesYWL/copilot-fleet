@@ -105,7 +105,7 @@ import {
   acquireInstanceLock,
   shouldReconnectAfterClose,
 } from "./instance-lock.js";
-import { CommandRouter, validateWorkspacePath } from "./router.js";
+import { CommandRouter, validateWorkspacePath, type CommandResult } from "./router.js";
 import { ManagedWorktrees } from "./managed-worktrees.js";
 import { SessionFileReader } from "./session-files.js";
 import { SessionJournal } from "./session-journal.js";
@@ -549,6 +549,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   };
   let shuttingDown = false;
   let updating = false;
+  const pendingSessionStops = new Set<Promise<CommandResult>>();
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
   let usageNegotiated = false;
@@ -1208,6 +1209,13 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       const forceRebuild =
         updateQuarantine.prepareRetry() ||
         !validateSessionConsoleAssets(undefined, REVISION).ok;
+      // Socket handlers overlap: a preceding Stop may still be releasing its tickets.
+      const stops = await Promise.all(pendingSessionStops);
+      const failedStop = stops.find((result) => !result.ok);
+      if (failedStop)
+        throw new Error(
+          `Self-update refused: session stop failed: ${failedStop.error ?? "Unknown stop failure"}`,
+        );
       admission.assertIdle();
       if (
         router.activeSessionIds.length ||
@@ -1964,9 +1972,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       if (frame.value.type !== "command") return;
       const { command } = frame.value;
       log(`< ${command.type} session=${command.sessionId.slice(0, 8)}`);
-      const result = sessionConsoleSupported
-        ? await sessionConsole!.hostCommand(command, frame.value.consoleEpoch)
-        : await router.route(command);
+      const pending = sessionConsoleSupported
+        ? sessionConsole!.hostCommand(command, frame.value.consoleEpoch)
+        : router.route(command);
+      if (command.type === "stop") pendingSessionStops.add(pending);
+      let result: CommandResult;
+      try {
+        result = await pending;
+      } finally {
+        pendingSessionStops.delete(pending);
+      }
       log(
         result.ok
           ? `> ${command.type} ok session=${command.sessionId.slice(0, 8)}`

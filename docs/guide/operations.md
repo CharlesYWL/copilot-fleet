@@ -281,6 +281,8 @@ What it will not do:
   takes every agent on that node with it, so a busy node is refused — but the
   refusal names the sessions in the way, and **Update** then offers to stop them
   and go ahead. Each keeps its transcript and can be resumed afterwards.
+  The Node waits for those stops to finish before checking that maintenance is
+  safe; a failed stop or other active work still prevents the update.
   **Update all** never does this: it skips busy machines rather than deciding
   for you across the fleet.
 - **Keep local work on a node.** The checkout is reset hard onto the branch it
