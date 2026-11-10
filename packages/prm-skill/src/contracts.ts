@@ -233,6 +233,7 @@ const WorkOrderFindingSchema = z
       .object({
         outcome: OutcomeSchema,
         stage: StageSchema,
+        verifiedHeadSha: sha.optional(),
         publishedCommit: sha.optional(),
       })
       .strict()

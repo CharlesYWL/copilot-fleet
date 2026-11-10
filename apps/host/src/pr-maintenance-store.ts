@@ -2802,8 +2802,7 @@ export class PrMaintenanceStore {
   }
 
   /**
-   * Records who supplied the report a batch settled from, once. Only a report
-   * the Host read from the worker's own output can explain a later head move.
+   * Records report provenance once, for lineage audit rather than admission.
    */
   markReportSource(
     id: string,
@@ -3473,6 +3472,7 @@ export class PrMaintenanceStore {
       else this.concludeReview(record, "failed", nowIso(), error);
       return;
     }
+    const previousHead = record.observation?.headSha;
     record.observation = observation;
     if (hostAttemptedAt !== observation.attemptedAt)
       record.observationHostAt = hostAttemptedAt;
@@ -3559,6 +3559,7 @@ export class PrMaintenanceStore {
       }
     }
     if (
+      previousHead !== observation.headSha ||
       record.readyFingerprint !== observation.fingerprint ||
       observation.draft ||
       observation.mergeability !== "mergeable" ||
@@ -3599,15 +3600,9 @@ export class PrMaintenanceStore {
   }
 
   /**
-   * After a maintenance batch published, the next head Fleet observes must be
-   * explained. Provider ancestry evidence (`headLineage`) decides when the
-   * helper supplies it. Otherwise the move is explained when the head is the
-   * resulting commit of the batch's own last known push, in a report the Host
-   * read from the worker itself: a normal push, or the leased conflict rewrite
-   * (unauthorized rewrites were already held when the batch settled). A report
-   * the orchestrator supplied explains nothing. Anything else is unverified. A
-   * rewrite or an unexplained move holds maintenance for a person; an
-   * explained move never does.
+   * Audit how the observed head relates to the last published batch. Neither
+   * ancestry proof nor a matching worker push is required for a same-ref
+   * refresh. Unauthorized worker writes are held separately at settlement.
    */
   private recordLineage(
     record: PrMaintenanceRegistration,
@@ -3645,28 +3640,17 @@ export class PrMaintenanceStore {
         ? `The new head is the commit batch ${batch.id} reported pushing (${pushed.key}${pushed.force ? `, leased on ${pushed.expectedRemoteSha}` : ""}).`
         : `No push in a worker report the Host read explains the move from ${batch.headSha} to ${head}${batch.reportSource === "lead" ? "; this batch settled from a report the orchestrator supplied" : ""}.`;
     batch.lineage = {
+      origin: "observation",
       state,
       fromSha: batch.headSha,
       toSha: head,
       at,
       evidence: evidence.slice(0, 8_192),
     };
-    if (state === "rewritten")
-      this.rewriteHold(
-        record,
-        `The PR head moved from ${batch.headSha} to ${head} without a fast-forward after maintenance batch ${batch.id}. Check the branch history, then Resume.`,
-        at,
-      );
-    else if (state === "unverified")
-      this.rewriteHold(
-        record,
-        `The PR head moved from ${batch.headSha} to ${head} after maintenance batch ${batch.id}, and no push that batch reported explains it. Check the branch history, then Resume.`,
-        at,
-      );
   }
 
   /**
-   * A system hold for an unauthorized or unverifiable branch rewrite. It
+   * A system hold for a worker-reported unauthorized branch rewrite. It
    * replaces an orchestrator pause, which the orchestrator then cannot clear.
    * A hold a person set keeps its kind and gains the reason; the attention
    * notification comes from the batch's recorded lineage.
@@ -3869,8 +3853,8 @@ export class PrMaintenanceStore {
         rewrites.push(
           `${effect.key} was reported as a normal push but replaced ${effect.expectedRemoteSha}, which is neither this batch's head ${batch.headSha} nor an earlier push in it.`,
         );
-      // A push without expectedRemoteSha is still recorded; the next
-      // observation decides whether the head it reported explains the move.
+      // Missing expectedRemoteSha does not erase the push receipt; a later
+      // observation may associate its reported commit for audit only.
       pushedHeads.add(effect.headSha);
     }
     const final = !outstanding.has(update.state);
@@ -4065,6 +4049,7 @@ export class PrMaintenanceStore {
         .at(-1);
       const at = nowIso();
       batch.lineage = {
+        origin: "settlement",
         state: "rewritten",
         fromSha: batch.headSha,
         toSha: pushed?.headSha ?? batch.headSha,

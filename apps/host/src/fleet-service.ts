@@ -1041,10 +1041,13 @@ export class FleetService {
         ...(cursor ? { cursor } : {}),
       });
       for (const record of page.records) {
-        // Facts a person must see, retained or released: a rewritten or
-        // unverifiable branch, and a released turn whose report is missing.
+        // Unsafe worker writes and missing released reports need attention;
+        // informational same-ref head observations do not.
         for (const batch of record.batches) {
-          if (batch.lineage && ["rewritten", "unverified"].includes(batch.lineage.state))
+          if (
+            batch.lineage?.state === "rewritten" &&
+            batch.lineage.origin !== "observation"
+          )
             this.notifications.createPrMaintenanceAttention(record, "attention", {
               key: `${batch.id}:lineage:${batch.lineage.state}`,
               body: `Maintenance batch ${batch.id}: ${batch.lineage.evidence} Check the PR branch history.`,

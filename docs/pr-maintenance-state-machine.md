@@ -103,6 +103,7 @@ batches. Manual requests never write `nextCheckAt`.
 | `idle` | Heartbeat | `nextCheckAt ≤ now`, no hold | `reviewing` | review(`heartbeat`) claimed by `takeDue` |
 | any non-terminal | Manual **Review now** (UI or orchestrator) | no stored hold | `reviewing` | review(`manual`); bypasses `nextCheckAt` without changing it |
 | `reviewing` | Complete observation, merged/closed | — | `merged`/`closed` | pending decision withdrawn as moot |
+| `reviewing` | Source HEAD moves on the same repository/ref | no unknown in-flight writes | `reviewing` | accept current HEAD; invalidate old-head readiness/dispositions; supersede only proven-unsent preparation; no Pause/Resume |
 | `reviewing` | Lead prepares a work order and worker accepts it | no hold, no pending decision, fresh evidence for that head, no direct work running | `working` | review concluded `working` |
 | `reviewing` | Lead escalates a genuine design decision | — | `waiting_for_decision` | notification; review concluded `decision`; task state untouched |
 | `reviewing` | Lead records `review_done` | — | `idle` | review concluded `idle` |
@@ -145,20 +146,21 @@ unrelated review, and never change the task state.
   `--force-with-lease` on the exact HEAD the batch was prepared from. Workers
   report the head each push replaced (`expectedRemoteSha`). Any other forced
   push, or a push that replaced an unexpected head, is recorded as a fact
-  (`batch.lineage` `rewritten`), the batch settles, and a system `paused` hold
+  (`batch.lineage` `rewritten`, `origin: settlement`), the batch settles, and a system `paused` hold
   asks a person to look. It replaces an orchestrator pause (which the orchestrator then
   cannot clear); a person's hold keeps its kind and gains the reason. Either
   way an attention notification is raised, also for released records.
-  The next observation after a published batch records `reported` (or
-  `leased_rewrite`) when the new head is the commit the batch reported
-  pushing in a report the Host read from the worker (`reportSource: host`),
-  even without `expectedRemoteSha`, and maintenance continues; a report the
-  orchestrator recovered (`reportSource: lead`) explains nothing;
-  `fast_forward` needs provider compare evidence (`headLineage`). A move
-  nothing recorded explains is `unverified` and pauses until a person
-  resumes. Fleet does not check ancestry itself. Unknown remote changes,
-  user work, ambiguous conflicts and design questions stop the worker without
-  pushing.
+  Observed same-repository/ref HEAD movement is always a refresh/revalidation
+  event, not a human hold. Its lineage (`origin: observation`) is audit only:
+  no matching batch push or provider ancestry proof is required, including
+  `unverified` or non-fast-forward observations. The new snapshot replaces
+  head-bound checks/reviews, invalidates readiness even if a fingerprint is
+  reused, makes old-head handled dispositions historical, and supersedes only
+  proven-unsent preparation. Settled batches and known/uncertain effects stay
+  immutable and never replay. If the head moves after preparation or a push
+  lease is rejected, the worker stops without pushing and reports `incomplete`
+  for a fresh observation/order. User work, ambiguous conflicts, design
+  questions and genuinely unknown remote writes still stop unattended writes.
 - Maintenance dispatch only: a Node advertising `checkout-precondition`
   refuses the batch prompt unless the checkout is clean and HEAD is the
   batch's head; an older Node is never sent the prompt

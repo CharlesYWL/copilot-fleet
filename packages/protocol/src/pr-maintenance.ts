@@ -559,9 +559,8 @@ export const PrMaintenanceObservationSchema = z
     fingerprint: id.optional(),
     mergeability: z.enum(["mergeable", "conflicting", "unknown"]).default("unknown"),
     /**
-     * Provider compare/ancestry evidence for `headSha` against an earlier head,
-     * when the helper can supply it. Without it a changed head after a
-     * maintenance push is explained only by the push the batch reported.
+     * Optional provider compare/ancestry evidence, retained for audit only.
+     * Same-repository/ref HEAD movement is a refresh, not a human hold.
      */
     headLineage: z
       .object({ fromSha: sha, fastForward: z.boolean(), evidence: text })
@@ -734,11 +733,13 @@ export const PrMaintenanceBatchSchema = PrMaintenancePreparedBatchSchema.extend(
    * How the PR head moved after this batch published: a provider-proven
    * fast-forward, the commit this batch reported pushing (`reported`, or
    * `leased_rewrite` for its leased conflict rewrite), a rewrite, or
-   * unverified when nothing recorded explains it. Only the last two hold
-   * maintenance for a person.
+   * unverified when nothing recorded explains it. Observation lineage is
+   * informational and never holds maintenance. Settlement separately records
+   * unauthorized worker rewrites, which still require a person.
    */
   lineage: z
     .object({
+      origin: z.enum(["observation", "settlement"]).optional(),
       state: z.enum([
         "fast_forward",
         "reported",
@@ -758,8 +759,8 @@ export const PrMaintenanceBatchSchema = PrMaintenancePreparedBatchSchema.extend(
   settlementError: text.optional(),
   /**
    * Who supplied the report this batch settled from: the Host reading the
-   * worker's own output, or the orchestrator's `work_report` recovery. Only a
-   * Host-read report's pushes can explain a later PR head move.
+   * worker's own output, or the orchestrator's `work_report` recovery.
+   * Provenance affects lineage audit, never admission of a same-ref refresh.
    */
   reportSource: z.enum(["host", "lead"]).optional(),
   cancellationRequestedAt: time.optional(),
