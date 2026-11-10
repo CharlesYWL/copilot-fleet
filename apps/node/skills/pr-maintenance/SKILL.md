@@ -410,6 +410,8 @@ identical problems in one batch. The Host builds a `prm.work-order/1` from the r
 head/base, grant scope and permissions, verification, previous dispositions, remaining allowances) and renders the
 **complete immutable follow-up prompt** itself, including the worker contract and the `prm.work-report/1` format.
 You write triage and instructions, not prompt text. Retrying the same `batchId` returns the stored batch.
+If the rendered prompt would exceed the worker prompt limit, the tool refuses with `work_order_too_large`; split the
+findings into smaller batches and prepare them one at a time.
 The lead tool refuses a hand-written `prepare_batch`; work orders are the only way to prepare new work.
 
 Then call `fleet_follow_up` with only `maintenance: {recordId, generation, batchId}` (omit `prompt`; the Host sends
