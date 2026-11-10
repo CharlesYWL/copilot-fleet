@@ -107,6 +107,7 @@ batches. Manual requests never write `nextCheckAt`.
 | `reviewing` | Lead escalates a genuine design decision | — | `waiting_for_decision` | notification; review concluded `decision`; task state untouched |
 | `reviewing` | Lead records `review_done` | — | `idle` | review concluded `idle` |
 | `reviewing` | Observation fails (non-access) | — | `idle` | review concluded `failed`; heartbeat retries; capability recovery wake if applicable |
+| `reviewing` | Helper command never started (preflight, approval or start refused; `ownership: not_started`) | claim predates the open review | `idle` | review concluded `failed`; `lastError` records the refusal; `nextCheckAt` moves to the routine heartbeat so an unchanged Node is not retried in a loop; no observation, incident or failure counter is recorded |
 | `reviewing` | Lead turn ends without outcome | no helper command in flight | `idle` | review concluded `abandoned` |
 | `working` | Worker step settles | — | `reviewing` | Host settles the batch from the worker's `prm.work-report/1`; review(`worker_result`) woken immediately. An unreadable report leaves the batch `reconciling` with `settlementError` (recovered only by `work_report`) |
 | `working` | Same finding group: 3 attempts without progress, or flips back to an earlier state | — | `waiting_for_decision` | Host-raised decision (no cap on total batches) |
