@@ -1580,6 +1580,58 @@ describe("PR maintenance state machine scenarios", () => {
       expect(attentions()).toEqual([]);
     });
 
+    it.each(["unverified", "rewritten"] as const)(
+      "refreshes a same-ref source-head move after a settled repair without Pause or Resume (%s)",
+      (lineage) => {
+        const t = enable();
+        review(t.record.id);
+        dispatchRoutine(t.record.id, t.worker.id);
+        const settled = finishWorker(t, t.record.id).batches[0]!;
+        expect(settled.effects).toEqual([
+          expect.objectContaining({ kind: "push", state: "known", headSha: published }),
+        ]);
+        const currentHead = "d".repeat(40);
+        vi.setSystemTime(Date.now() + 60_000);
+        const record = review(t.record.id, {
+          headSha: currentHead,
+          ...(lineage === "rewritten"
+            ? {
+                headLineage: {
+                  fromSha: headSha,
+                  fastForward: false,
+                  evidence: "The same registered source ref now has divergent history.",
+                },
+              }
+            : {}),
+        });
+        expect(record.observation).toMatchObject({ identity, headSha: currentHead });
+        expect(record.hold).toBeUndefined();
+        expect(phase(record)).toBe("reviewing");
+        expect(prMaintenanceStatus(record).operatorAction).not.toBe("resume");
+        expect(record.batches[0]).toMatchObject({
+          state: "succeeded",
+          executionSettled: true,
+          published: true,
+          effects: settled.effects,
+          findings: settled.findings,
+        });
+        expect(follow(t.record.id, t.worker.id, settled.id).ok).toBe(false);
+        const prepared = checkpoint(t.record.id, plan("fresh-head"));
+        expect(prepared.ok, prepared.text).toBe(true);
+        expect(get(t.record.id).batches[1]).toMatchObject({
+          headSha: currentHead,
+          sources: [source],
+          workOrder: { pr: { headSha: currentHead } },
+        });
+        const dispatched = follow(t.record.id, t.worker.id, "fresh-head");
+        expect(dispatched.ok, dispatched.text).toBe(true);
+        expect(phase(get(t.record.id))).toBe("working");
+        expect(get(t.record.id).batches[0]!.effects).toEqual(settled.effects);
+        world.service.cancelPausedPrMaintenance();
+        expect(attentions()).toEqual([]);
+      },
+    );
+
     it("never lets a recovered report explain another writer's push", () => {
       const t = runningBatch("recovered-1");
       finishWith(t, "Done, but no report.");
