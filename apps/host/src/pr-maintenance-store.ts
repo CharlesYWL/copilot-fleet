@@ -4926,12 +4926,6 @@ export class PrMaintenanceStore {
           hostLatestAt,
         );
         this.releaseTerminal(record);
-        if (
-          observation.complete &&
-          record.lifecycle === "active" &&
-          !record.ownershipReleasedAt
-        )
-          record.nextCheckAt = nowIso();
       } else {
         // Settling exact evidence cannot revive a hold or promote late/stale feedback.
         record.lastAttempt = observation;

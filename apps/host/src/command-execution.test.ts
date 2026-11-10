@@ -3055,6 +3055,29 @@ describe("PR maintenance with durable commands", () => {
       expect(CheckpointPrMaintenanceSchema.safeParse(invalid).success).toBe(false);
   });
 
+  it("schedules the next heartbeat an hour out after admitting a complete receipt", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const result = await observeFixture(fixtureInput(new Date().toISOString()));
+    h.finish(result);
+    const admitted = h.f.store.prMaintenance.get(h.record.id)!;
+    expect(admitted.observation).toEqual(result.observation);
+    expect(Date.parse(admitted.nextCheckAt)).toBeGreaterThanOrEqual(
+      Date.parse(admitted.lastSuccessAt!) + 60 * 60_000,
+    );
+    const idle = h.f.store.prMaintenance.checkpoint(
+      h.f.lead.id,
+      admitted.id,
+      admitted.version,
+      { kind: "review_done", summary: "Nothing actionable." },
+    );
+    expect(idle.review).toMatchObject({ outcome: "idle" });
+    const engine = new OrchestratorEngine(h.f.service);
+    for (const minutes of [0, 1, 5, 30]) engine.tick(Date.now() + minutes * 60_000);
+    expect(h.f.store.prMaintenance.get(h.record.id)!.review?.id).toBe(idle.review!.id);
+    expect(h.f.store.prMaintenance.openDueReviews(idle.nextCheckAt)).toBe(1);
+  });
+
   it("admits once before the completion wake despite review version churn, then never replays over later work", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const h = await observationCommand();
