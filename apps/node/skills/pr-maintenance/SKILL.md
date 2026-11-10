@@ -186,11 +186,14 @@ human decisions. Review the new pinned proposal while authenticated; the old gra
 Reauthorization starts a review immediately. Terminal/released jobs cannot be revived this way;
 do not release ownership or replace the worker automatically. Existing execution approvals remain effective.
 Never delete user work, deploy, change credentials/access, introduce unapproved designs, or merge the PR / enable
-auto-complete. History is rewritten only for a straightforward merge conflict: the worker rebases the PR branch onto the current base,
-verifies, and force-pushes to the same PR branch with an exact lease (`--force-with-lease=<headRef>:<pr.headSha>`), reporting the
-push with `force: true` and `expectedRemoteSha`. It stops without pushing on unknown remote changes, user work, ambiguous conflicts
-or design questions. Other rewrites, and head moves that no push the batch reported explains, get a system pause only the person
-clears; tell them. Without a specific reviewer grant, consume external reviews and notify the human once: do not choose reviewers or add a blanket review stage.
+auto-complete. Only straightforward conflicts permit rewriting history: rebase onto the current base, verify,
+then force-push to the same ref with `--force-with-lease=<headRef>:<pr.headSha>`, reporting `force: true` and
+`expectedRemoteSha`. Unauthorized worker rewrites still get a system pause only the person clears.
+Source HEAD movement on the same registered repository/ref is a refresh/revalidation event, never Pause/Resume,
+even without ancestry proof or a matching batch push. Revalidate observations, checks, reviews and handled
+dispositions at the exact new HEAD; supersede unsent preparation, never replay settled batches or known/uncertain
+effects, and never overwrite an externally moved branch. Without a specific reviewer grant, consume external
+reviews and notify the human once: do not choose reviewers or add a blanket review stage.
 
 Held registrations keep ownership/retention. After 30 days on hold, the Host notifies once to resume or release;
 unknown work never expires, but Release always succeeds and keeps it as history. A portable restore is held for one
@@ -414,10 +417,9 @@ the stored one). The Host atomically links the accepted attempt. End the lead tu
 turn merely to wait for CI/review or check a PR. New feedback while accepted stays pending; never overwrite the prompt.
 While the accepted turn runs, `takeDue` does not offer that PR; its settled result requests the next review.
 A prepared batch, or an accepted attempt the Host proves was never dispatched and has no effects, does not block fresh
-observations; dispatch the same immutable batch at the same head. A fresh observation of a different head or pinned
-conflict base supersedes the undispatched batch and cancels its pending step. Drafts, unplanned conflicts and
-unresolved access or identity incidents refuse execution. Dispatched/uncertain execution and unsettled effects
-prevent late receipts from promoting observations or reviving work.
+observations; dispatch the same immutable batch at the same head. A new head or pinned conflict base supersedes
+undispatched work and cancels its pending step. Drafts, unplanned conflicts and unresolved access/identity incidents
+refuse execution; dispatched/uncertain execution and unsettled effects prevent late receipts from reviving work.
 
 **The Host settles from the work report.** When the attempt's terminal RunStep is recorded, the Host reads the
 worker's tagged `<prm-work-report>` from that attempt, validates it against the stored work order, maps
@@ -429,12 +431,10 @@ recovered from the worker or PR evidence, or omit it to retry reading the attemp
 claim: the next complete observation confirms it. `needs_human` findings raise the PR's design decision.
 Unconfirmed writes stay `uncertain`.
 
-For routine conflicts the worker fetches the base, confirms the checkout is clean and on exactly `pr.headSha`, rebases
-the PR branch onto the current base, resolves only straightforward hunks that keep both sides' accepted behavior,
-verifies, and publishes with `git push --force-with-lease=<headRef>:<pr.headSha>` to the exact head repository and
-ref. It stops without pushing — reporting `needs_human` — when the remote head is no longer `pr.headSha` or the lease
-is rejected, the checkout holds work it did not make, or a conflict is ambiguous or raises a design question. The
-Host accepts a forced push only in a `conflictResolution` batch whose report leases exactly the batch's head.
+For routine conflicts, use a clean checkout at `pr.headSha`, rebase onto the current base, verify, then publish to
+the exact repository/ref with `git push --force-with-lease=<headRef>:<pr.headSha>` in a `conflictResolution` batch.
+If the head moves or the lease is rejected, do not push: report `incomplete` and request a fresh observation/order.
+User work, ambiguous conflicts and design questions still stop with `needs_human`; unknown writes stay reconciling.
 
 ## Worker publication and settlement
 
@@ -456,8 +456,8 @@ Stop, human and permission holds still win for maintenance batches, as do manage
 - **Do not publish:** the user said local-only, authority is missing, required review covers an older candidate, or a real hold exists. PASS cannot clear these gates.
 
 Immediately before any push/reply/resolution, recheck PR identity/open state, exact remote head/base refs/SHAs,
-current scope and newly material design facts. Only the verified tree may be published. Unknown/interleaved user
-changes or external pushes block unattended publication; preserve interrupted dirty work. Use existing permitted tools
+current scope and design facts. Only the verified tree may be published. A moved head requires a fresh order, not
+an overwrite; unknown writes and interleaved user changes still block publication. Preserve interrupted dirty work. Use permitted tools
 for ordinary push to the **explicit head repository and ref** (a leased force-push only in the conflict procedure), verify the remote commit, then reply in original threads.
 Resolve evidenced fixed/already-satisfied findings unless the operator turned resolution off; resolution does not satisfy reviewer approval.
 Keep sensitive security evidence out of public replies. Return provider IDs, actor/content identity, batch markers

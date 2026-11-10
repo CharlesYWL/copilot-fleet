@@ -1615,13 +1615,21 @@ describe("PR maintenance state machine scenarios", () => {
           effects: settled.effects,
           findings: settled.findings,
         });
-        expect(follow(t.record.id, t.worker.id, settled.id).ok).toBe(false);
+        const dispatch = vi.spyOn(world.service, "dispatch");
+        const settledStep = world.store.getRunStep(t.step.id);
+        const replay = follow(t.record.id, t.worker.id, settled.id);
+        expect(replay.text).toContain("no prompt was sent");
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(world.store.getRunStep(t.step.id)).toEqual(settledStep);
         const prepared = checkpoint(t.record.id, plan("fresh-head"));
         expect(prepared.ok, prepared.text).toBe(true);
         expect(get(t.record.id).batches[1]).toMatchObject({
           headSha: currentHead,
           sources: [source],
-          workOrder: { pr: { headSha: currentHead } },
+          workOrder: {
+            pr: { headSha: currentHead },
+            findings: [{ previous: { verifiedHeadSha: published } }],
+          },
         });
         const dispatched = follow(t.record.id, t.worker.id, "fresh-head");
         expect(dispatched.ok, dispatched.text).toBe(true);
@@ -1665,7 +1673,10 @@ describe("PR maintenance state machine scenarios", () => {
         toSha: other,
       });
       expect(record.batches[0]!.lineage?.evidence).toMatch(/orchestrator supplied/);
-      expect(record.hold).toMatchObject({ kind: "paused", actor: "system" });
+      expect(record.hold).toBeUndefined();
+      expect(phase(record)).toBe("reviewing");
+      world.service.cancelPausedPrMaintenance();
+      expect(attentions()).toEqual([]);
     });
 
     it("maintains a PR while its task awaits a human, without touching the task", () => {
@@ -1745,32 +1756,57 @@ describe("PR maintenance state machine scenarios", () => {
         expect(checkpoint(t.record.id, plan("after-rewrite", true)).ok).toBe(false);
       });
 
-      it("stops on unknown remote changes, user work or an ambiguous conflict", () => {
-        const t = conflicted();
-        expect(checkpoint(t.record.id, plan("rebase-3", true)).ok).toBe(true);
-        expect(follow(t.record.id, t.worker.id, "rebase-3").ok).toBe(true);
-        finishWith(
-          t,
-          reportText({
-            batchId: "rebase-3",
-            mutationAttempts: 0,
-            findings: [
-              {
-                sourceId: source.id,
-                revision: source.revision,
-                outcome: "needs_human",
-                stage: "inspected",
-                evidence: ["The remote head moved past pr.headSha; nothing was pushed."],
-                nextAction: "Ask whether to keep the other writer's commits.",
-              },
-            ],
-          }),
-        );
-        const record = get(t.record.id);
-        expect(record.batches[0]).toMatchObject({ effects: [], published: false });
-        expect(record.decision).toMatchObject({ state: "pending" });
-        expect(phase(record)).toBe("waiting_for_decision");
-      });
+      it.each(["incomplete", "needs_human"] as const)(
+        "does not overwrite a moved head, user work or an ambiguous conflict (%s)",
+        (outcome) => {
+          const t = conflicted();
+          expect(checkpoint(t.record.id, plan("rebase-3", true)).ok).toBe(true);
+          expect(follow(t.record.id, t.worker.id, "rebase-3").ok).toBe(true);
+          finishWith(
+            t,
+            reportText({
+              batchId: "rebase-3",
+              mutationAttempts: 0,
+              findings: [
+                {
+                  sourceId: source.id,
+                  revision: source.revision,
+                  outcome,
+                  stage: "inspected",
+                  evidence: [
+                    outcome === "incomplete"
+                      ? "The remote head moved past pr.headSha; nothing was pushed."
+                      : "The conflict overlaps user work; nothing was pushed.",
+                  ],
+                  nextAction:
+                    outcome === "incomplete"
+                      ? "Refresh and prepare a work order at the new head."
+                      : "Ask which behavior the ambiguous conflict should preserve.",
+                },
+              ],
+            }),
+          );
+          const record = get(t.record.id);
+          expect(record.batches[0]).toMatchObject({ effects: [], published: false });
+          if (outcome === "needs_human") {
+            expect(record.decision).toMatchObject({ state: "pending" });
+            expect(phase(record)).toBe("waiting_for_decision");
+          } else {
+            expect(record.decision).toBeUndefined();
+            expect(record.hold).toBeUndefined();
+            expect(phase(record)).toBe("reviewing");
+            vi.setSystemTime(Date.now() + 60_000);
+            review(t.record.id, {
+              headSha: "d".repeat(40),
+              mergeability: "conflicting",
+            });
+            const prepared = checkpoint(t.record.id, plan("rebase-current", true));
+            expect(prepared.ok, prepared.text).toBe(true);
+            expect(get(t.record.id).batches[1]!.headSha).toBe("d".repeat(40));
+            expect(get(t.record.id).batches[0]!.effects).toEqual([]);
+          }
+        },
+      );
 
       it("records a forced push outside a conflict-resolution batch, or an unreported rewrite, and holds", () => {
         vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
@@ -1805,7 +1841,7 @@ describe("PR maintenance state machine scenarios", () => {
         expect(record.hold?.reason).toMatch(/reported as a normal push but replaced/);
       });
 
-      it("settles a push reported without the head it replaced; its reported commit explains the next head", () => {
+      it("settles a push without the replaced head and refreshes any later same-ref head", () => {
         vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
         const pushedWithoutLease = (observed: string) => {
           const t = enable();
@@ -1831,14 +1867,9 @@ describe("PR maintenance state machine scenarios", () => {
         expect(explained.hold).toBeUndefined();
         const unexplained = pushedWithoutLease("d".repeat(40));
         expect(unexplained.batches[0]!.lineage?.state).toBe("unverified");
-        expect(unexplained.hold).toMatchObject({ kind: "paused", actor: "system" });
-        expect(unexplained.hold?.reason).toMatch(
-          /no push that batch reported explains it/,
-        );
+        expect(unexplained.hold).toBeUndefined();
         world.service.cancelPausedPrMaintenance();
-        expect(attentions().map((entry) => entry.body)).toEqual([
-          expect.stringContaining("No push in a worker report the Host read"),
-        ]);
+        expect(attentions()).toEqual([]);
       });
 
       it("lets a rewrite replace an orchestrator pause, which the orchestrator then cannot clear", () => {
@@ -1891,7 +1922,7 @@ describe("PR maintenance state machine scenarios", () => {
         ]);
       });
 
-      it("checks the next head after a published batch: fast-forward, leased rewrite, rewrite or unverified", () => {
+      it("audits the next same-ref head without holding for ancestry or push provenance", () => {
         vi.spyOn(world.service, "tickRun").mockImplementation(() => {});
         const run = (
           head: string,
@@ -1918,6 +1949,7 @@ describe("PR maintenance state machine scenarios", () => {
             headSha: head,
             ...(lineage ? { headLineage: lineage } : {}),
           });
+          expect(observed.batches[0]!.lineage?.origin).toBe("observation");
           // One registration per PR: release before the next scenario.
           pm().operatorAction(
             t.record.id,
@@ -1935,16 +1967,13 @@ describe("PR maintenance state machine scenarios", () => {
           toSha: published,
         });
         expect(reported.hold).toBeUndefined();
-        // Nothing recorded explains this head: a person checks the branch.
+        // An unrelated same-ref head is revalidated, not held for a person.
         const unverified = run("d".repeat(40), undefined);
         expect(unverified.batches[0]!.lineage).toMatchObject({
           state: "unverified",
           toSha: "d".repeat(40),
         });
-        expect(unverified.hold).toMatchObject({ kind: "paused", actor: "system" });
-        expect(unverified.hold?.reason).toMatch(
-          /no push that batch reported explains it/,
-        );
+        expect(unverified.hold).toBeUndefined();
         const forward = run(published, {
           fromSha: headSha,
           fastForward: true,
@@ -1958,13 +1987,15 @@ describe("PR maintenance state machine scenarios", () => {
           evidence: "compare: diverged",
         });
         expect(rewritten.batches[0]!.lineage?.state).toBe("rewritten");
-        expect(rewritten.hold?.reason).toMatch(/without a fast-forward/);
+        expect(rewritten.hold).toBeUndefined();
         const leased = run(published, undefined, true);
         expect(leased.batches[0]!.lineage?.state).toBe("leased_rewrite");
         expect(leased.hold).toBeUndefined();
         const movedPastLease = run("d".repeat(40), undefined, true);
         expect(movedPastLease.batches[0]!.lineage?.state).toBe("unverified");
-        expect(movedPastLease.hold?.kind).toBe("paused");
+        expect(movedPastLease.hold).toBeUndefined();
+        world.service.cancelPausedPrMaintenance();
+        expect(attentions()).toEqual([]);
       });
     });
 

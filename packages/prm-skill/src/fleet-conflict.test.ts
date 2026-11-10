@@ -80,6 +80,9 @@ describe("Fleet conflict rebase contract", () => {
     const rules = workOrder.rules.join("\n");
     expect(rules).toContain("rebase the PR head branch");
     expect(rules).toContain("--force-with-lease=<headRef>:<pr.headSha>");
+    expect(rules).toContain(
+      "report incomplete with nextAction requesting a fresh observation",
+    );
     expect(rules).toMatch(/Stop without pushing and report needs_human/);
     expect(rules).toContain("Never merge the PR");
     // Ordinary orders still forbid history rewrites.

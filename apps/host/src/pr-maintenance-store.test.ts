@@ -449,42 +449,46 @@ describe("authenticated routine work on the retained worker", () => {
     },
   );
 
-  it("supersedes and refunds an undispatched exact-base repair when the target moves", () => {
-    const f = setup();
-    const observed = observe(
-      f,
-      f.store.prMaintenance.enableFromOperator(f.input, "operator"),
-      { mergeability: "conflicting" },
-    );
-    const prepared = f.store.prMaintenance.checkpoint(
-      f.lead.id,
-      observed.id,
-      observed.version,
-      {
-        kind: "prepare_batch",
-        batch: {
-          id: "conflict",
-          kind: "repair",
-          sources: [source],
-          headSha: sha,
-          baseSha: otherSha,
-          conflictResolution: true,
-          prompt:
-            "Merge the pinned target into the maintained source; do not force-push.",
-          scope: scope.baseline,
-          reservedMutations: 1,
+  it.each(["headSha", "baseSha"])(
+    "supersedes and refunds an undispatched exact-base repair when %s moves",
+    (moving) => {
+      const f = setup();
+      const observed = observe(
+        f,
+        f.store.prMaintenance.enableFromOperator(f.input, "operator"),
+        { mergeability: "conflicting" },
+      );
+      const prepared = f.store.prMaintenance.checkpoint(
+        f.lead.id,
+        observed.id,
+        observed.version,
+        {
+          kind: "prepare_batch",
+          batch: {
+            id: "conflict",
+            kind: "repair",
+            sources: [source],
+            headSha: sha,
+            baseSha: otherSha,
+            conflictResolution: true,
+            prompt:
+              "Merge the pinned target into the maintained source; do not force-push.",
+            scope: scope.baseline,
+            reservedMutations: 1,
+          },
         },
-      },
-    );
-    const changed = observe(f, prepared, { baseSha: "c".repeat(40) });
-    expect(changed.batches[0]).toMatchObject({
-      state: "superseded",
-      executionSettled: true,
-    });
-    expect(changed.counters.repairBatches).toBe(0);
-    expect(changed.counters.mutationAttempts).toBe(0);
-    expect(() => accept(f, changed, "conflict")).toThrow(PrMaintenanceError);
-  });
+      );
+      const changed = observe(f, prepared, { [moving]: "c".repeat(40) });
+      expect(changed.hold).toBeUndefined();
+      expect(changed.batches[0]).toMatchObject({
+        state: "superseded",
+        executionSettled: true,
+      });
+      expect(changed.counters.repairBatches).toBe(0);
+      expect(changed.counters.mutationAttempts).toBe(0);
+      expect(() => accept(f, changed, "conflict")).toThrow(PrMaintenanceError);
+    },
+  );
 });
 
 describe("bounded alternate PR observations", () => {
@@ -1978,9 +1982,8 @@ describe("durable PR maintenance registry", () => {
     let record = observe(f, publishedRepair(f), {
       headSha: otherSha,
       fingerprint: "head-B",
-      // Provider compare evidence; without it the move would pause for a person.
-      headLineage: { fromSha: sha, fastForward: true, evidence: "compare: ahead 1" },
     });
+    expect(record.hold).toBeUndefined();
     expect(() => prepare(f, record, "duplicate-B", "repair", otherSha)).toThrow(
       /unchanged/,
     );
@@ -2005,6 +2008,7 @@ describe("durable PR maintenance registry", () => {
         },
       ],
     });
+    expect(record.hold).toBeUndefined();
     expect(() =>
       f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
         kind: "ready",
@@ -2637,12 +2641,40 @@ describe("durable PR maintenance registry", () => {
     expect(record.counters.mutationAttempts).toBe(1);
   });
 
-  it("requires current HEAD check/review evidence for nonterminal readiness", () => {
-    const f = setup();
-    let record = observe(
-      f,
-      f.store.prMaintenance.enableFromOperator(f.input, "operator"),
-      {
+  it.each(["checks", "reviews"] as const)(
+    "requires current HEAD check/review evidence for nonterminal readiness (%s)",
+    (staleEvidence) => {
+      const f = setup();
+      let record = observe(
+        f,
+        f.store.prMaintenance.enableFromOperator(f.input, "operator"),
+        {
+          sources: [],
+          mergeability: "mergeable",
+          checksComplete: true,
+          reviewsComplete: true,
+          checks: [{ key: "unit", state: "passed", headSha: sha, evidence: "ci:passed" }],
+          reviews: [
+            {
+              key: "review",
+              reviewer: "owner",
+              state: "changes_requested",
+              headSha: sha,
+              revision: "1",
+              evidence: "github:review",
+            },
+          ],
+        },
+      );
+      const ready = {
+        kind: "ready" as const,
+        fingerprint: "fingerprint-1",
+        evidence: "All requirements considered",
+      };
+      expect(() =>
+        f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, ready),
+      ).toThrow(/Readiness/);
+      record = observe(f, record, {
         sources: [],
         mergeability: "mergeable",
         checksComplete: true,
@@ -2652,51 +2684,56 @@ describe("durable PR maintenance registry", () => {
           {
             key: "review",
             reviewer: "owner",
-            state: "changes_requested",
+            state: "approved",
             headSha: sha,
-            revision: "1",
-            evidence: "github:review",
+            revision: "2",
+            evidence: "github:approval",
           },
         ],
-      },
-    );
-    const ready = {
-      kind: "ready" as const,
-      fingerprint: "fingerprint-1",
-      evidence: "All requirements considered",
-    };
-    expect(() =>
-      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, ready),
-    ).toThrow(/Readiness/);
-    record = observe(f, record, {
-      sources: [],
-      mergeability: "mergeable",
-      checksComplete: true,
-      reviewsComplete: true,
-      checks: [{ key: "unit", state: "passed", headSha: sha, evidence: "ci:passed" }],
-      reviews: [
-        {
-          key: "review",
-          reviewer: "owner",
-          state: "approved",
-          headSha: sha,
-          revision: "2",
-          evidence: "github:approval",
-        },
-      ],
-    });
-    record = f.store.prMaintenance.checkpoint(
-      f.lead.id,
-      record.id,
-      record.version,
-      ready,
-    );
-    expect(record.lifecycle).toBe("active");
-    expect(record.readyFingerprint).toBe("fingerprint-1");
-    expect(record.ownershipReleasedAt).toBeUndefined();
-    record = observe(f, record, { headSha: otherSha, fingerprint: "different-head" });
-    expect(record.readyFingerprint).toBeUndefined();
-  });
+      });
+      record = f.store.prMaintenance.checkpoint(
+        f.lead.id,
+        record.id,
+        record.version,
+        ready,
+      );
+      expect(record.lifecycle).toBe("active");
+      expect(record.readyFingerprint).toBe("fingerprint-1");
+      expect(record.ownershipReleasedAt).toBeUndefined();
+      const previous = record.observation!;
+      const current = {
+        headSha: otherSha,
+        sources: [],
+        mergeability: "mergeable",
+        checksComplete: true,
+        reviewsComplete: true,
+        checks: [
+          { key: "unit", state: "passed", headSha: otherSha, evidence: "ci:new passed" },
+        ],
+        reviews: [
+          {
+            key: "review",
+            reviewer: "owner",
+            state: "approved",
+            headSha: otherSha,
+            revision: "3",
+            evidence: "github:new approval",
+          },
+        ],
+      };
+      // Even a reused fingerprint cannot keep readiness from a different HEAD.
+      record = observe(f, record, current);
+      expect(record.observation?.headSha).toBe(otherSha);
+      expect(record.readyFingerprint).toBeUndefined();
+      record = observe(f, record, {
+        ...current,
+        [staleEvidence]: previous[staleEvidence],
+      });
+      expect(() =>
+        f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, ready),
+      ).toThrow(/Readiness/);
+    },
+  );
 });
 
 describe("moving maintenance with its task", () => {
