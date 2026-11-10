@@ -5179,6 +5179,40 @@ describe("PR maintenance with durable commands", () => {
     const saved = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
     expect(saved.ok, saved.text).toBe(true);
     const record = h.f.store.prMaintenance.get(h.record.id)!;
+    const findings: {
+      sourceId: string;
+      revision: string;
+      task: "repair";
+      instructions: string;
+    }[] = result.observation.sources
+      .slice(0, 50)
+      .map((source: { id: string; revision: string }) => ({
+        sourceId: source.id,
+        revision: source.revision,
+        task: "repair",
+        instructions: "Repair within approved scope.",
+      }));
+    expect(findings).toHaveLength(50);
+    const oversized = await h.call("fleet_checkpoint_pr_maintenance", {
+      recordId: record.id,
+      expectedVersion: record.version,
+      checkpoint: {
+        kind: "prepare_work_order",
+        plan: {
+          batchId: "oversized-repair",
+          summary: "Repair within approved scope.",
+          reservedMutations: 1,
+          findings: findings.map((finding) => ({
+            ...finding,
+            instructions: "Repair within approved scope. ".repeat(70),
+          })),
+        },
+      },
+    });
+    expect(oversized.ok).toBe(false);
+    expect(oversized.text).toContain("work_order_too_large");
+    expect(oversized.text).toContain("Split these findings into smaller batches");
+    expect(h.f.store.prMaintenance.get(record.id)).toEqual(record);
     const batch = { id: "async-repair" };
     const args = {
       recordId: record.id,
@@ -5189,19 +5223,15 @@ describe("PR maintenance with durable commands", () => {
           batchId: batch.id,
           summary: "Repair within approved scope.",
           reservedMutations: 1,
-          findings: result.observation.sources
-            .slice(0, 50)
-            .map((source: { id: string; revision: string }) => ({
-              sourceId: source.id,
-              revision: source.revision,
-              task: "repair",
-              instructions: "Repair within approved scope.",
-            })),
+          findings,
         },
       },
     };
     const prepared = await h.call("fleet_checkpoint_pr_maintenance", args);
     expect(prepared.ok, prepared.text).toBe(true);
+    expect(
+      h.f.store.prMaintenance.get(record.id)!.batches[0]!.prompt.length,
+    ).toBeGreaterThan(32_768);
     const followUp = {
       sessionId: record.workerSessionId,
       maintenance: {

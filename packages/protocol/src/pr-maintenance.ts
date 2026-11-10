@@ -50,6 +50,8 @@ export const PR_MAINTENANCE_RECOVERY_LIMITS = Object.freeze({
   attempts: 3,
   evidenceAgeMs: 30 * 60 * 1_000,
 });
+/** A batch prompt is sent verbatim as one worker turn, so it shares the session prompt limit. */
+export const PR_MAINTENANCE_BATCH_PROMPT_MAX = 100_000;
 const hostname = z
   .string()
   .trim()
@@ -709,7 +711,7 @@ export const PrMaintenancePreparedBatchSchema = z
     headSha: sha,
     baseSha: sha.optional(),
     conflictResolution: z.boolean().optional(),
-    prompt: z.string().min(1).max(32_768),
+    prompt: z.string().min(1).max(PR_MAINTENANCE_BATCH_PROMPT_MAX),
     scope: text,
     reservedMutations: z.number().int().min(0).max(1_000),
   })

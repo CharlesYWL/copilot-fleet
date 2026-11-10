@@ -5,6 +5,7 @@ import {
   AGENT_NODE_ID_ENV,
   CriterionOutcomeSchema,
   HOST_YOLO_CAPABILITY,
+  PR_MAINTENANCE_BATCH_PROMPT_MAX,
   PR_MAINTENANCE_WAKE_LIMITS,
   WorkspaceModeSchema,
   AccessIntentSchema,
@@ -1546,6 +1547,11 @@ export class FleetTools {
         createdAt: new Date().toISOString(),
       }),
     );
+    if (batch.prompt.length > PR_MAINTENANCE_BATCH_PROMPT_MAX)
+      throw new PrMaintenanceError(
+        "work_order_too_large",
+        `The rendered work order is ${batch.prompt.length} characters, over the ${PR_MAINTENANCE_BATCH_PROMPT_MAX}-character worker prompt limit. Split these findings into smaller batches (fewer findings or shorter instructions) and prepare them one at a time.`,
+      );
     return registry.checkpoint(
       this.leadSessionId,
       recordId,
