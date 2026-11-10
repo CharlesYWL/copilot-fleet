@@ -3823,6 +3823,72 @@ describe("PR maintenance with durable commands", () => {
     expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(admitted);
   });
 
+  it("fails the review and waits for the heartbeat when the helper never starts", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand(":memory:", false, undefined, 0, {
+      deferPreparation: true,
+    });
+    const before = h.f.store.prMaintenance.get(h.record.id)!;
+    const reviewId = before.review!.id;
+    const gitError =
+      "Git rev-parse failed (1): error launching git: The system cannot find the path specified.";
+    expect(
+      h.f.service.commands.handleNodeMessage(h.f.node.id, {
+        type: "command_execution_prepared",
+        executionId: h.execution.id,
+        attemptId: h.execution.attemptId,
+        ok: false,
+        error: gitError,
+      }),
+    ).toBe(true);
+    expect(h.f.store.commands.get(h.execution.id)).toMatchObject({
+      state: "failed",
+      ownership: "not_started",
+      outcomeKnown: false,
+    });
+    const engine = new OrchestratorEngine(h.f.service);
+    for (const minutes of [0, 1, 5, 30]) engine.tick(Date.now() + minutes * 60_000);
+    const record = h.f.store.prMaintenance.get(h.record.id)!;
+    expect(record.review).toMatchObject({ id: reviewId, outcome: "failed" });
+    expect(record.lastError).toContain(gitError);
+    expect(record.lastError).toContain("no provider was contacted");
+    expect(Date.parse(record.nextCheckAt)).toBeGreaterThanOrEqual(
+      Date.now() + 60 * 60_000,
+    );
+    // Nothing implies the helper or provider ran, and settled work is untouched.
+    expect(record.lastAttempt).toBeUndefined();
+    expect(record.observation).toEqual(before.observation);
+    expect(record.incidents).toEqual(before.incidents);
+    expect(record.counters).toEqual(before.counters);
+    expect(record.batches).toEqual(before.batches);
+    expect(
+      h.f.store.commands
+        .prompts()
+        .filter((prompt) => prompt.delivery.prompt.includes("<fleet-pr-review")),
+    ).toEqual([]);
+    expect(
+      h.f.store.commands
+        .list({ limit: 100 })
+        .filter((execution) => execution.maintenanceObservation),
+    ).toHaveLength(1);
+    // Recovery replays are no-ops.
+    const replay = await h.call("fleet_checkpoint_pr_maintenance", h.checkpoint());
+    expect(replay.ok, replay.text).toBe(true);
+    expect(h.f.store.prMaintenance.get(h.record.id)!.version).toBe(record.version);
+    // Review now retries at once; otherwise the routine heartbeat does.
+    const manual = h.f.store.prMaintenance.operatorAction(
+      record.id,
+      record.version,
+      { action: "review", requestId: randomUUID() },
+      "operator",
+    );
+    expect(manual.review).toMatchObject({ source: "manual" });
+    expect(manual.review!.concludedAt).toBeUndefined();
+    expect(h.f.store.prMaintenance.pendingReviewWakes().map((entry) => entry.id)).toEqual(
+      [record.id],
+    );
+  });
+
   it("never admits delayed command evidence over a newer observation", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const h = await observationCommand();

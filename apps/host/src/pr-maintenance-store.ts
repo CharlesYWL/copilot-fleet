@@ -15,6 +15,7 @@ import {
   prMaintenanceSources,
   prMaintenanceStatus,
   prMaintenanceProviderKey,
+  terminalCommandExecutionStates,
   terminalRunStepStates,
   PrMaintenanceAdmissionSchema,
   PrMaintenanceBackupSchema,
@@ -4704,6 +4705,12 @@ export class PrMaintenanceStore {
           "receipt_claim_conflict",
           "Execution/attempt does not match the persisted observation claim.",
         );
+      if (
+        execution.settledAt &&
+        execution.ownership === "not_started" &&
+        terminalCommandExecutionStates.has(execution.state)
+      )
+        return this.deferUnstartedObservation(record, claim.claimedAt, execution);
       if (execution.outputBytes > 1_048_576)
         refuse("receipt_overflow", "Helper output exceeds 1 MiB.");
       if (
@@ -4954,6 +4961,49 @@ export class PrMaintenanceStore {
       this.store.commands.markObservationChecked(execution.id);
       return saved;
     });
+  }
+
+  /**
+   * The helper never launched: Node preflight, approval or start refused it, so
+   * no provider was contacted and there is no observation to record. The review
+   * fails and the next unattended look waits for the routine heartbeat, because
+   * reopening at once re-runs the same refused command against an unchanged
+   * Node in a tight loop. Review now still retries immediately.
+   */
+  private deferUnstartedObservation(
+    record: PrMaintenanceRegistration,
+    claimedAt: string,
+    execution: CommandExecution,
+  ): PrMaintenanceRegistration {
+    const settledAt = execution.settledAt!;
+    const error = [
+      `The observation helper never started (${execution.state}${execution.reasonCode ? `, ${execution.reasonCode}` : ""}); no provider was contacted.`,
+      execution.error,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .slice(0, 8_192);
+    let changed = false;
+    if (record.lastError !== error) {
+      record.lastError = error;
+      changed = true;
+    }
+    // A late recovery call must not fail a review opened after this claim.
+    if (
+      record.review &&
+      !record.review.concludedAt &&
+      record.review.requestedAt <= claimedAt
+    ) {
+      this.concludeReview(record, "failed", settledAt, error);
+      changed = true;
+    }
+    const next = this.routineCheckAt(settledAt);
+    if (record.lifecycle === "active" && record.nextCheckAt < next) {
+      record.nextCheckAt = next;
+      changed = true;
+    }
+    this.store.commands.markObservationChecked(execution.id);
+    return changed ? this.save(record) : record;
   }
 
   remainingWake(leadSessionId: string, wakeId: string, at = nowIso()) {
