@@ -457,6 +457,77 @@ describe("PR maintenance task controls", () => {
     await waitFor(() => expect(review).toHaveBeenCalledExactlyOnceWith(true, ""));
   });
 
+  describe("deleting a task that PR maintenance still owns", () => {
+    const openDelete = (onDelete: () => Promise<boolean>) => {
+      const model = buildRunViewModels({
+        runs: [{ ...task, state: "completed" }],
+        stepsByRun: {},
+        sessions: [],
+      })[0]!;
+      render(
+        <FluentProvider theme={fleetDarkTheme}>
+          <OrchestratorTaskDetail
+            model={model}
+            notes={[]}
+            sessions={[]}
+            onBack={vi.fn()}
+            onOpenLead={vi.fn()}
+            onOpenWorker={vi.fn()}
+            onReview={vi.fn()}
+            onArchive={vi.fn()}
+            onReopen={vi.fn()}
+            onDelete={onDelete}
+          />
+        </FluentProvider>,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Task details" }));
+      fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+      return screen.getByRole("dialog");
+    };
+
+    it("warns, then releases maintenance and deletes the task in one click", async () => {
+      const record = registration();
+      serve(record);
+      vi.mocked(actOnTaskMaintenance).mockResolvedValue({
+        ...record,
+        ownershipReleasedAt: at,
+      });
+      const remove = vi.fn().mockResolvedValue(true);
+      const dialog = openDelete(remove);
+      expect(
+        await within(dialog).findByText(/PR maintenance is still on for this task/),
+      ).toBeTruthy();
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Close PRM and continue" }),
+      );
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(1));
+      expect(actOnTaskMaintenance).toHaveBeenCalledExactlyOnceWith(
+        task.id,
+        expect.objectContaining({ id: record.id, version: record.version }),
+        { action: "release", reason: expect.any(String) },
+      );
+      expect(vi.mocked(actOnTaskMaintenance).mock.invocationCallOrder[0]).toBeLessThan(
+        remove.mock.invocationCallOrder[0]!,
+      );
+    });
+
+    it("keeps the task and shows why when the release is refused", async () => {
+      serve(registration());
+      vi.mocked(actOnTaskMaintenance).mockRejectedValue(
+        new Error("An authenticated operator must release maintenance."),
+      );
+      const remove = vi.fn().mockResolvedValue(true);
+      const dialog = openDelete(remove);
+      fireEvent.click(
+        await within(dialog).findByRole("button", { name: "Close PRM and continue" }),
+      );
+      expect((await within(dialog).findByRole("alert")).textContent).toContain(
+        "An authenticated operator must release maintenance.",
+      );
+      expect(remove).not.toHaveBeenCalled();
+    });
+  });
+
   it("derives the task overview from one maintenance status", () => {
     const model = (state: Run["state"]) =>
       buildRunViewModels({
