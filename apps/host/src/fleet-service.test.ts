@@ -1745,6 +1745,71 @@ describe("what a session starts on", () => {
     ]);
   });
 
+  it("prefers the model picked for the session over the Host default", () => {
+    const { store, service } = setup();
+    store.setDefaultModel("default-model");
+    store.setDefaultReasoningEffort("medium");
+
+    expect(
+      service.startupConfigFor({ runRole: "", model: "picked", reasoningEffort: "high" }),
+    ).toEqual([
+      { id: "model", value: "picked" },
+      { id: "reasoning_effort", value: "high" },
+    ]);
+    expect(service.startupConfigFor({ runRole: "", model: "picked" })).toEqual([
+      { id: "model", value: "picked" },
+      { id: "reasoning_effort", value: "medium" },
+    ]);
+    expect(service.startupConfigFor({ runRole: "" })).toEqual([
+      { id: "model", value: "default-model" },
+      { id: "reasoning_effort", value: "medium" },
+    ]);
+  });
+
+  it("starts and resumes a session on the model it was created with", () => {
+    const { store, service, enroll } = setup();
+    try {
+      store.setDefaultModel("default-model");
+      const wire = enroll("box", ["copilot-acp"]);
+      store.setNodeOnline(wire.nodeId, true, 0);
+      const workspace = store.createWorkspace("repo", "");
+      const placement = store.createPlacement(workspace.id, wire.nodeId, "C:\\repo");
+      const started = service.createAndStartSession({
+        placement,
+        prompt: "hello",
+        yolo: false,
+        model: "picked",
+        reasoningEffort: "high",
+      });
+      if (!started.ok) throw new Error(started.error);
+      const picked = {
+        config: [
+          { id: "model", value: "picked" },
+          { id: "reasoning_effort", value: "high" },
+        ],
+      };
+      expect(wire.sent.at(-1)).toMatchObject({
+        command: { type: "start_session", ...picked },
+      });
+
+      service.handleEvent({
+        eventId: "agent",
+        sessionId: started.session.id,
+        sequence: 1,
+        type: "agent_session",
+        payload: { agentSessionId: "conversation" },
+        createdAt: new Date().toISOString(),
+      });
+      store.transitionSession(started.session.id, "stopped");
+      expect(service.resumeSession(started.session.id).ok).toBe(true);
+      expect(wire.sent.at(-1)).toMatchObject({
+        command: { type: "resume_session", ...picked },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   it("never applies either set of Copilot defaults to Hermes", () => {
     const { store, service } = setup();
     store.setDefaultModel("worker-model");

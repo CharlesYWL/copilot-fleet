@@ -58,7 +58,7 @@ import { EmptySessions } from "./components/EmptySessions";
 import { AgentBulkStopDialog } from "./components/AgentBulkStopDialog";
 import { ManageFavoritesDialog } from "./components/ManageFavoritesDialog";
 import { OrchestratorCleanupDialog } from "./components/OrchestratorCleanupDialog";
-import { NewSessionDialog } from "./components/NewSessionDialog";
+import { NewSessionDialog, type SessionModelChoice } from "./components/NewSessionDialog";
 import { SessionFocusDialog } from "./components/SessionFocusDialog";
 import { SessionGrid } from "./components/SessionGrid";
 import { SettingsPanel, type SettingsTab } from "./components/SettingsPanel";
@@ -600,10 +600,18 @@ export function App() {
     prompt: string,
     yolo: boolean,
     name: string,
+    { model, reasoningEffort }: SessionModelChoice,
   ) => {
     const result = await request<FleetSession>("/api/sessions", {
       method: "POST",
-      body: JSON.stringify({ placementId, prompt, yolo, name }),
+      body: JSON.stringify({
+        placementId,
+        prompt,
+        yolo,
+        name,
+        ...(model ? { model } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+      }),
     });
     if (!result.ok) return false;
     setSelectedSessionId(result.data.id);
@@ -1824,6 +1832,7 @@ export function App() {
         <NewSessionDialog
           open={dialogOpen}
           placements={eligiblePlacements}
+          sessions={snapshot.sessions}
           defaultYolo={defaultYolo}
           onOpenChange={setDialogOpen}
           onCreate={handleCreateSession}

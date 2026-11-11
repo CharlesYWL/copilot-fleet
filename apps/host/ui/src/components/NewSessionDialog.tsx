@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   Button,
   Dialog,
@@ -15,7 +15,13 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import { SESSION_NAME_MAX_LENGTH, type Placement } from "@fleet/protocol";
+import {
+  SESSION_NAME_MAX_LENGTH,
+  type AgentParams,
+  type Placement,
+  type SessionConfigOption,
+} from "@fleet/protocol";
+import { observedChoices } from "../lib/session-config";
 
 const useStyles = makeStyles({
   form: {
@@ -49,9 +55,17 @@ const useStyles = makeStyles({
   },
 });
 
+/** Empty means the Fleet default from Settings. */
+export type SessionModelChoice = { model: string; reasoningEffort: string };
+
 type NewSessionDialogProps = {
   open: boolean;
   placements: Placement[];
+  /** Where the model choices come from; see `observedChoices`. */
+  sessions: readonly {
+    configOptions: SessionConfigOption[];
+    agentParams?: AgentParams | undefined;
+  }[];
   defaultYolo: boolean;
   onOpenChange: (open: boolean) => void;
   onCreate: (
@@ -59,12 +73,14 @@ type NewSessionDialogProps = {
     prompt: string,
     yolo: boolean,
     name: string,
+    choice: SessionModelChoice,
   ) => Promise<boolean>;
 };
 
 export const NewSessionDialog = ({
   open,
   placements,
+  sessions,
   defaultYolo,
   onOpenChange,
   onCreate,
@@ -73,14 +89,34 @@ export const NewSessionDialog = ({
   const [placementId, setPlacementId] = useState("");
   const [prompt, setPrompt] = useState("");
   const [name, setName] = useState("");
+  const [model, setModel] = useState("");
+  const [reasoningEffort, setReasoningEffort] = useState("");
   const [yoloOverride, setYoloOverride] = useState<boolean>();
   const yolo = yoloOverride ?? defaultYolo;
   const [submitting, setSubmitting] = useState(false);
+  // This dialog only starts Copilot sessions, so only Copilot's pickers apply.
+  const copilotSessions = useMemo(
+    () =>
+      sessions.filter(
+        (session) => (session.agentParams?.kind ?? "copilot") === "copilot",
+      ),
+    [sessions],
+  );
+  const modelChoices = useMemo(
+    () => observedChoices(copilotSessions, "model"),
+    [copilotSessions],
+  );
+  const effortChoices = useMemo(
+    () => observedChoices(copilotSessions, "reasoning_effort"),
+    [copilotSessions],
+  );
 
   useEffect(() => {
     if (!open) return;
     setPrompt("");
     setName("");
+    setModel("");
+    setReasoningEffort("");
     setYoloOverride(undefined);
   }, [open]);
 
@@ -99,7 +135,10 @@ export const NewSessionDialog = ({
     event.preventDefault();
     if (!placementId || prompt.trim().length === 0) return;
     setSubmitting(true);
-    const created = await onCreate(placementId, prompt.trim(), yolo, name.trim());
+    const created = await onCreate(placementId, prompt.trim(), yolo, name.trim(), {
+      model,
+      reasoningEffort,
+    });
     setSubmitting(false);
     if (created) onOpenChange(false);
   };
@@ -156,6 +195,42 @@ export const NewSessionDialog = ({
                   resize="vertical"
                 />
               </Field>
+              <Field
+                label="Model"
+                {...(modelChoices.length === 0
+                  ? { hint: "Models appear once a Copilot session has run." }
+                  : {
+                      hint: "Applied before the first prompt, and again whenever the session resumes.",
+                    })}
+              >
+                <Select
+                  value={model}
+                  disabled={modelChoices.length === 0}
+                  onChange={(_event, data) => setModel(data.value)}
+                >
+                  <option value="">Fleet default</option>
+                  {modelChoices.map((choice) => (
+                    <option key={choice.value} value={choice.value}>
+                      {choice.name}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              {effortChoices.length > 0 && (
+                <Field label="Reasoning effort">
+                  <Select
+                    value={reasoningEffort}
+                    onChange={(_event, data) => setReasoningEffort(data.value)}
+                  >
+                    <option value="">Fleet default</option>
+                    {effortChoices.map((choice) => (
+                      <option key={choice.value} value={choice.value}>
+                        {choice.name}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              )}
               <Field label="YOLO mode">
                 <Switch
                   checked={yolo}
