@@ -9,6 +9,8 @@ import {
   DialogTitle,
   Field,
   Link,
+  MessageBar,
+  MessageBarBody,
   Spinner,
   Textarea,
   makeStyles,
@@ -39,7 +41,7 @@ import {
   latestReviewNote,
   taskOverview,
 } from "../../lib/task-overview";
-import type { TaskMaintenanceView } from "../../lib/pr-maintenance";
+import { actOnTaskMaintenance, type TaskMaintenanceView } from "../../lib/pr-maintenance";
 import { semanticColors, statusVisuals, terminal } from "../../theme";
 import { MarkdownBody } from "../MarkdownBody";
 import { RunStatusIndicator } from "./RunStatusIndicator";
@@ -344,6 +346,9 @@ export const OrchestratorTaskDetail = ({
     maintenanceState?.taskId === run.id ? maintenanceState.view : undefined;
 
   const record = currentMaintenance(maintenance?.records ?? []);
+  // Deleting is refused while PRM retains ownership, so the dialog releases it first.
+  const retainedMaintenance =
+    maintenance?.records.filter((entry) => !entry.ownershipReleasedAt) ?? [];
   const report = latestReviewNote(notes);
   const overview = taskOverview(model, notes, maintenance, nowMs);
   const finished = ["completed", "cancelled", "failed"].includes(run.state);
@@ -368,6 +373,24 @@ export const OrchestratorTaskDetail = ({
     setNote("");
     setActionError("");
     setReviewOpen(true);
+  };
+  const deleteTask = async () => {
+    setBusy(true);
+    setActionError("");
+    try {
+      for (const entry of retainedMaintenance)
+        await actOnTaskMaintenance(run.id, entry, {
+          action: "release",
+          reason: "Released to delete the task.",
+        });
+      if (await onDelete()) setDeleteOpen(false);
+    } catch (error) {
+      setActionError(
+        error instanceof Error ? error.message : "PR maintenance could not be released.",
+      );
+    } finally {
+      setBusy(false);
+    }
   };
   const answer = async (approved: boolean) => {
     if (busy || reviewChanged || !reviewContext || actionError) return;
@@ -705,6 +728,7 @@ export const OrchestratorTaskDetail = ({
                     icon={<Delete20Regular />}
                     onClick={() => {
                       setDetailsOpen(false);
+                      setActionError("");
                       setDeleteOpen(true);
                     }}
                   >
@@ -828,13 +852,31 @@ export const OrchestratorTaskDetail = ({
                 started. Nothing about it is kept.
               </p>
               <p>
-                Archive instead if the record is worth keeping. Retained PR ownership or
-                unsettled effects block deletion until explicitly released.
+                Archive instead if the record is worth keeping. Unsettled effects block
+                deletion until they settle.
               </p>
+              {retainedMaintenance.length ? (
+                <MessageBar intent="warning">
+                  <MessageBarBody>
+                    PR maintenance is still on for this task. Continuing releases it
+                    first: Fleet stops maintaining the PR, cancels queued maintenance work
+                    and keeps its history.
+                  </MessageBarBody>
+                </MessageBar>
+              ) : null}
+              {actionError ? (
+                <p role="alert" className={styles.error}>
+                  {actionError}
+                </p>
+              ) : null}
               {busy ? (
                 <div className={styles.deleteProgress} role="status" aria-live="polite">
                   <Spinner size="tiny" aria-hidden />
-                  <span>Deleting the task and closing its sessions…</span>
+                  <span>
+                    {retainedMaintenance.length
+                      ? "Releasing PR maintenance, then deleting the task…"
+                      : "Deleting the task and closing its sessions…"}
+                  </span>
                 </div>
               ) : null}
             </DialogContent>
@@ -846,16 +888,13 @@ export const OrchestratorTaskDetail = ({
                 appearance="primary"
                 disabled={busy}
                 {...(busy ? { icon: <Spinner size="tiny" aria-hidden /> } : {})}
-                onClick={() => {
-                  setBusy(true);
-                  void onDelete()
-                    .then((ok) => {
-                      if (ok) setDeleteOpen(false);
-                    })
-                    .finally(() => setBusy(false));
-                }}
+                onClick={() => void deleteTask()}
               >
-                {busy ? "Deleting…" : "Delete task"}
+                {busy
+                  ? "Deleting…"
+                  : retainedMaintenance.length
+                    ? "Close PRM and continue"
+                    : "Delete task"}
               </Button>
             </DialogActions>
           </DialogBody>
