@@ -103,6 +103,7 @@ import {
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
 import { toolFilePath } from "../lib/session-files";
 import { saveSentImages } from "../lib/sent-images";
+import { pasteWithLinks } from "../lib/paste-links";
 import { AttachmentStrip } from "./AttachmentStrip";
 import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner } from "./PermissionBanner";
@@ -1061,9 +1062,13 @@ export const TerminalView = ({
 
   const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const files = [...event.clipboardData.files];
-    if (files.length === 0) return;
-    // Pasted text keeps its normal behaviour; only files are intercepted, or
-    // copying an image out of a document would stop pasting its caption too.
+    if (files.length === 0) {
+      pasteWithLinks(event);
+      return;
+    }
+    // Pasted text keeps its normal behaviour, save for keeping its links; only
+    // files are intercepted, or copying an image out of a document would stop
+    // pasting its caption too.
     event.preventDefault();
     void addFiles(files, "clipboard");
   };

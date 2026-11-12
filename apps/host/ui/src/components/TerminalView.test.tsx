@@ -434,6 +434,33 @@ describe("TerminalView composer", () => {
     },
   );
 
+  it("keeps the links of rich text pasted into the composer", () => {
+    // jsdom has no execCommand; a browser that refuses insertText takes the
+    // same fallback.
+    document.execCommand = vi.fn(() => false);
+    let current: SessionDraft = { prompt: "See ", attachments: [] };
+    show({}, current, [], vi.fn(), (update) => {
+      current = update(current);
+    });
+    const box = screen.getByLabelText("Follow-up prompt") as HTMLTextAreaElement;
+    box.setSelectionRange(4, 4);
+    const clipboard: Record<string, string> = {
+      "text/plain": "the spinbutton docs",
+      "text/html": '<p>the <a href="https://x.test/spin">spinbutton</a> docs</p>',
+    };
+    fireEvent.paste(box, {
+      clipboardData: { files: [], getData: (type: string) => clipboard[type] ?? "" },
+    });
+    const linked = "the [spinbutton](https://x.test/spin) docs";
+    expect(document.execCommand).toHaveBeenCalledExactlyOnceWith(
+      "insertText",
+      false,
+      linked,
+    );
+    expect(current.prompt).toBe(`See ${linked}`);
+    Reflect.deleteProperty(document, "execCommand");
+  });
+
   it("lets a sent image open again from its chip in the transcript", async () => {
     const onPrompt = vi.fn().mockResolvedValue(true);
     function Conversation() {
