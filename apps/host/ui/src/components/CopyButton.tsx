@@ -11,6 +11,8 @@ const useStyles = makeStyles({
 
 type CopyButtonProps = {
   text: string;
+  /** An HTML flavour of `text`, built only when copied, for apps that paste rich text. */
+  html?: () => string;
   label?: string;
   size?: "small" | "medium";
   showText?: boolean;
@@ -19,6 +21,7 @@ type CopyButtonProps = {
 
 export const CopyButton = ({
   text,
+  html,
   label = "Copy",
   showText = false,
   size = showText ? "medium" : "small",
@@ -37,7 +40,16 @@ export const CopyButton = ({
   const handleCopy = async () => {
     if (!text) return;
     try {
-      await navigator.clipboard.writeText(text);
+      if (html) {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            "text/plain": new Blob([text], { type: "text/plain" }),
+            "text/html": new Blob([html()], { type: "text/html" }),
+          }),
+        ]);
+      } else {
+        await navigator.clipboard.writeText(text);
+      }
       setCopied(true);
     } catch {
       notify("Could not copy to the clipboard.", "error");

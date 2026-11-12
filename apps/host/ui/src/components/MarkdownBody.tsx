@@ -6,6 +6,8 @@ import {
   type ReactNode,
   type ComponentPropsWithoutRef,
 } from "react";
+import { flushSync } from "react-dom";
+import { createRoot } from "react-dom/client";
 import ReactMarkdown, {
   defaultUrlTransform,
   type Components,
@@ -185,7 +187,7 @@ export const MarkdownBody = memo(function MarkdownBody({
     >
       {copyable && text.trim().length > 0 && (
         <span className={styles.messageCopy}>
-          <CopyButton text={text} label="Copy message" />
+          <CopyButton text={text} html={() => markdownHtml(text)} label="Copy message" />
         </span>
       )}
       <ReactMarkdown
@@ -198,6 +200,26 @@ export const MarkdownBody = memo(function MarkdownBody({
     </div>
   );
 });
+
+/**
+ * The message as HTML, for pasting into Teams, Outlook or Word, which read a
+ * link or a list from HTML but show markdown as the characters typed.
+ *
+ * It is the same parse and URL sanitising the transcript shows, without the
+ * transcript's own chrome: code-block headers and file links mean nothing
+ * outside it. Rendered into a detached root, as React suggests for HTML on
+ * the client.
+ */
+function markdownHtml(text: string): string {
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  flushSync(() =>
+    root.render(<ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>),
+  );
+  const html = container.innerHTML;
+  root.unmount();
+  return html;
+}
 
 /**
  * Keeps a link to a file on the session's machine for {@link MarkdownLink},

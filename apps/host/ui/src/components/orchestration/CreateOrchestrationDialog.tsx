@@ -17,6 +17,7 @@ import {
 } from "@fluentui/react-components";
 import type { Placement, Workspace, WorkspaceMode } from "@fleet/protocol";
 import { api } from "../../hooks/useFleet";
+import { pasteWithLinks } from "../../lib/paste-links";
 
 const useStyles = makeStyles({
   /** What pressing the button does, said once, where the decision is made. */
@@ -175,6 +176,7 @@ export const CreateOrchestrationDialog = ({
                     rows={4}
                     placeholder="Describe the outcome. The orchestrator decides the phases and dispatches the work."
                     onChange={(_, data) => setObjective(data.value)}
+                    onPaste={pasteWithLinks}
                   />
                 </Field>
                 <Field label="Repository">

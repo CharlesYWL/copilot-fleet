@@ -22,6 +22,7 @@ import {
   type SessionConfigOption,
 } from "@fleet/protocol";
 import { observedChoices } from "../lib/session-config";
+import { pasteWithLinks } from "../lib/paste-links";
 
 const useStyles = makeStyles({
   form: {
@@ -191,6 +192,7 @@ export const NewSessionDialog = ({
                 <Textarea
                   value={prompt}
                   onChange={(_event, data) => setPrompt(data.value)}
+                  onPaste={pasteWithLinks}
                   placeholder="Describe the first task for this agent…"
                   resize="vertical"
                 />
