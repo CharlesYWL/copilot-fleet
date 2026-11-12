@@ -66,6 +66,8 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       prompt: input.prompt,
       yolo: input.yolo ?? store.getDefaultYolo(),
       ...(input.name === undefined ? {} : { name: input.name }),
+      ...(input.model ? { model: input.model } : {}),
+      ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
     });
     if (!result.ok) {
       return reply.code(result.status).send({

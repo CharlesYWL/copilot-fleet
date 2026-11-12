@@ -543,6 +543,13 @@ export type RunRole = z.infer<typeof RunRoleSchema>;
 export const SessionSchema = z.object({
   executionBinding: ExecutionBindingSchema.optional(),
   workerSelection: WorkerSelectionSchema.optional(),
+  /**
+   * The model and effort the operator chose when creating the session, applied
+   * before its first prompt and again on every resume. Absent means the Host
+   * default.
+   */
+  model: z.string().max(120).optional(),
+  reasoningEffort: z.string().max(60).optional(),
   id: z.string().min(1),
   workspaceId: z.string().min(1),
   workspaceName: z.string().min(1),
@@ -3080,6 +3087,9 @@ export const CreateSessionSchema = z.object({
   /** Omitted means "use the Host default". */
   yolo: z.boolean().optional(),
   name: z.string().max(SESSION_NAME_MAX_LENGTH).default(""),
+  /** Omitted means "use the Host default"; raw Copilot values, as in the defaults. */
+  model: z.string().max(120).optional(),
+  reasoningEffort: z.string().max(60).optional(),
 });
 
 /** Empty clears the name, so the label falls back to the initial prompt. */

@@ -1175,6 +1175,9 @@ export class FleetService {
     dispatchAttempt?: string;
     executionBinding?: ExecutionBinding;
     workerSelection?: WorkerSelection;
+    /** The operator's per-session model; overrides the Host default. */
+    model?: string;
+    reasoningEffort?: string;
     stepId?: string;
   }):
     | { ok: true; session: FleetSession }
@@ -1259,6 +1262,8 @@ export class FleetService {
           operatorUsername: input.operatorUsername ?? "",
           agentParams,
           ...(input.workerSelection ? { workerSelection: input.workerSelection } : {}),
+          ...(input.model ? { model: input.model } : {}),
+          ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
         },
       );
       if (input.stepId)
@@ -1786,11 +1791,17 @@ export class FleetService {
    *
    * **Model and effort are a preference**, so they are only sent when someone
    * has expressed one, and a machine that cannot honour them says so and
-   * carries on.
+   * carries on. A choice made when the session was created beats the Host
+   * default, because ACP's `session/new` has no model of its own.
    */
   startupConfigFor(
     session: Pick<FleetSession, "runRole" | "agentParams"> &
-      Partial<Pick<FleetSession, "workerSelection" | "configOptions">>,
+      Partial<
+        Pick<
+          FleetSession,
+          "workerSelection" | "configOptions" | "model" | "reasoningEffort"
+        >
+      >,
   ): StartupConfig[] {
     const kind = session.agentParams?.kind ?? "copilot";
     const config: StartupConfig[] = [];
@@ -1836,14 +1847,14 @@ export class FleetService {
       session.runRole === "lead"
         ? this.store.getOrchestratorModel(kind)
         : kind === "copilot"
-          ? this.store.getDefaultModel()
+          ? session.model || this.store.getDefaultModel()
           : "";
     if (model) config.push({ id: "model", value: model });
     if (kind !== "copilot") return config;
     const effort =
       session.runRole === "lead"
         ? this.store.getOrchestratorReasoningEffort()
-        : this.store.getDefaultReasoningEffort();
+        : session.reasoningEffort || this.store.getDefaultReasoningEffort();
     if (effort) config.push({ id: "reasoning_effort", value: effort });
     return config;
   }

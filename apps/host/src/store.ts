@@ -965,6 +965,8 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "commands", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "config_options", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "worker_selection", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "model", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "reasoning_effort", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("run_steps", "routing", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "usage", "TEXT NOT NULL DEFAULT '{}'");
     this.addColumnIfMissing("placements", "position", "INTEGER NOT NULL DEFAULT 0");
@@ -2701,8 +2703,9 @@ export class FleetStore {
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
             config_options,position,run_id,run_role,additional_directories,
-            stop_requested,dismissed,favorite,last_activity_at,usage,operator_username,read_only,agent_params)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            stop_requested,dismissed,favorite,last_activity_at,usage,operator_username,read_only,agent_params,
+            model,reasoning_effort)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         session.id,
         session.workspaceId,
@@ -2731,6 +2734,8 @@ export class FleetStore {
         session.operatorUsername ?? "",
         session.readOnly ? 1 : 0,
         session.agentParams ? JSON.stringify(session.agentParams) : "",
+        session.model ?? "",
+        session.reasoningEffort ?? "",
       );
       if (session.workerSelection)
         this.setSessionWorkerSelection(session.id, session.workerSelection);
@@ -4582,6 +4587,8 @@ export class FleetStore {
       readOnly?: boolean;
       operatorUsername?: string;
       workerSelection?: WorkerSelection;
+      model?: string;
+      reasoningEffort?: string;
     } = {},
   ): FleetSession {
     if (run.runId) this.assertRunMutable(run.runId);
@@ -4589,8 +4596,8 @@ export class FleetStore {
     const id = randomUUID();
     this.statement(
       `INSERT INTO sessions
-       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only,last_activity_at,operator_username,agent_params,worker_selection)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only,last_activity_at,operator_username,agent_params,worker_selection,model,reasoning_effort)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       placement.workspaceId,
@@ -4613,6 +4620,8 @@ export class FleetStore {
       run.workerSelection
         ? JSON.stringify(WorkerSelectionSchema.parse(run.workerSelection))
         : "",
+      run.model ?? "",
+      run.reasoningEffort ?? "",
     );
     return this.getSession(id)!;
   }
@@ -6887,6 +6896,8 @@ function sessionFromRow(row: Row): FleetSession {
     executionBinding: row.execution_binding
       ? JSON.parse(String(row.execution_binding))
       : undefined,
+    ...(row.model ? { model: String(row.model) } : {}),
+    ...(row.reasoning_effort ? { reasoningEffort: String(row.reasoning_effort) } : {}),
     id: String(row.id),
     workspaceId: String(row.workspace_id),
     workspaceName: String(row.workspace_name),
