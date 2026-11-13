@@ -108,6 +108,37 @@ const streamEvent = (
 });
 
 describe("TerminalView composer", () => {
+  it("keeps the assigned orchestrator visible when human control is selected", () => {
+    const onChange = vi.fn();
+    const props = {
+      session: session({
+        runId: "task",
+        runRole: "worker",
+        orchestratorControlled: false,
+      }),
+      orchestrator: session({ id: "lead", name: "Release coordinator", runRole: "lead" }),
+      onOrchestratorControlChange: onChange,
+      onPrompt: vi.fn(),
+      onCancel: vi.fn(),
+      onStop: vi.fn(),
+      draft: EMPTY_DRAFT,
+      onDraftChange: vi.fn(),
+    };
+    const { rerender } = render(<TerminalView {...props} />);
+    const toggle = screen.getByRole("switch", { name: "Controlled by orchestrator" });
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByText("Bound to Release coordinator")).toBeTruthy();
+    fireEvent.click(toggle);
+    expect(onChange).toHaveBeenCalledWith(true);
+    rerender(<TerminalView {...props} session={session()} />);
+    expect(
+      screen.queryByRole("switch", { name: "Controlled by orchestrator" }),
+    ).toBeNull();
+    rerender(<TerminalView {...props} session={props.orchestrator} />);
+    expect(
+      screen.queryByRole("switch", { name: "Controlled by orchestrator" }),
+    ).toBeNull();
+  });
   it.each(["running", "starting", "cancelling"] as const)(
     "accepts and queues a follow-up while %s, without clearing newer edits",
     async (state) => {

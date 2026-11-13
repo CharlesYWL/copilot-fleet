@@ -42,6 +42,8 @@ type SessionFocusDialogProps = {
     handback?: "ongoing" | "after_turn",
   ) => Promise<boolean>;
   maintenanceWorker?: boolean | undefined;
+  orchestrator?: FleetSession | undefined;
+  onOrchestratorControlChange?: ((controlled: boolean) => void) | undefined;
   onCancel: () => void;
   onStop: () => void;
   onDismiss: () => void;
@@ -71,6 +73,8 @@ export const SessionFocusDialog = ({
   onOpenChange,
   onPrompt,
   maintenanceWorker,
+  orchestrator,
+  onOrchestratorControlChange,
   onCancel,
   onStop,
   onDismiss,
@@ -103,6 +107,8 @@ export const SessionFocusDialog = ({
           pendingPermission={pendingPermission}
           onPrompt={onPrompt}
           maintenanceWorker={maintenanceWorker}
+          orchestrator={orchestrator}
+          onOrchestratorControlChange={onOrchestratorControlChange}
           onCancel={onCancel}
           onStop={onStop}
           onDismiss={onDismiss}

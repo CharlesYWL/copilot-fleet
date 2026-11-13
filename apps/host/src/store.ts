@@ -977,6 +977,16 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "run_role", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "read_only", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "stop_requested", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing(
+      "sessions",
+      "orchestrator_controlled",
+      "INTEGER NOT NULL DEFAULT 1",
+    );
+    this.addColumnIfMissing(
+      "sessions",
+      "orchestrator_control_attempt",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
     this.addColumnIfMissing("sessions", "dismissed", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "favorite", "INTEGER NOT NULL DEFAULT 0");
     if (
@@ -2704,8 +2714,8 @@ export class FleetStore {
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
             config_options,position,run_id,run_role,additional_directories,
             stop_requested,dismissed,favorite,last_activity_at,usage,operator_username,read_only,agent_params,
-            model,reasoning_effort)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            model,reasoning_effort,orchestrator_controlled,orchestrator_control_attempt)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         session.id,
         session.workspaceId,
@@ -2736,6 +2746,8 @@ export class FleetStore {
         session.agentParams ? JSON.stringify(session.agentParams) : "",
         session.model ?? "",
         session.reasoningEffort ?? "",
+        session.orchestratorControlled === false ? 0 : 1,
+        session.orchestratorControlAttempt ?? 0,
       );
       if (session.workerSelection)
         this.setSessionWorkerSelection(session.id, session.workerSelection);
@@ -6255,6 +6267,39 @@ export class FleetStore {
     return this.getSession(id)!;
   }
 
+  setSessionOrchestratorControl(
+    id: string,
+    controlled: boolean,
+    fenceAttempt = !controlled,
+  ): FleetSession {
+    const session = this.getSession(id);
+    if (!session) throw new Error("Session not found");
+    this.assertSessionMutable(id);
+    if (
+      !session.runId ||
+      (session.runRole !== "worker" && session.runRole !== "reviewer") ||
+      !this.getRun(session.runId)?.leadSessionId
+    )
+      throw new Error("Only a worker assigned to an orchestrator task has this control");
+    return this.transaction(() => {
+      const step = this.getRunStepBySession(id);
+      this.statement(
+        `UPDATE sessions SET orchestrator_controlled=?,orchestrator_control_attempt=?,
+         updated_at=? WHERE id=?`,
+      ).run(
+        controlled ? 1 : 0,
+        fenceAttempt
+          ? (step?.attempts ?? session.orchestratorControlAttempt ?? 0)
+          : (session.orchestratorControlAttempt ?? 0),
+        new Date().toISOString(),
+        id,
+      );
+      // Changing the switch never replays a turn that already finished.
+      this.clearSessionTurnCompletion(id);
+      return this.getSession(id)!;
+    });
+  }
+
   setSessionFavorite(id: string, favorite: boolean): FleetSession {
     if (!this.getSession(id)) throw new Error("Session not found");
     this.assertSessionMutable(id);
@@ -6922,6 +6967,12 @@ function sessionFromRow(row: Row): FleetSession {
     usage: JSON.parse(String(row.usage ?? "{}")),
     runId: String(row.run_id ?? ""),
     runRole: String(row.run_role ?? ""),
+    ...(row.run_id && ["worker", "reviewer"].includes(String(row.run_role))
+      ? {
+          orchestratorControlled: Number(row.orchestrator_controlled ?? 1) === 1,
+          orchestratorControlAttempt: Number(row.orchestrator_control_attempt ?? 0),
+        }
+      : {}),
     operatorUsername: String(row.operator_username ?? ""),
     stopRequested: Boolean(row.stop_requested),
     dismissed: Boolean(row.dismissed),

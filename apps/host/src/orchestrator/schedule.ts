@@ -112,6 +112,7 @@ export type ScheduleAction =
 /** Why a pending step was left pending, in the terms the planner used. */
 export type StepHoldCode =
   | "task_held"
+  | "manual_control"
   | "nodes_unknown"
   | "dependencies"
   | "workspace_not_ready"
@@ -333,6 +334,13 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
 
   for (const step of steps) {
     if (terminalRunStepStates.has(step.state)) continue;
+    const worker = sessionById.get(step.sessionId);
+    if (
+      worker &&
+      (worker.orchestratorControlled === false ||
+        step.attempts <= (worker.orchestratorControlAttempt ?? 0))
+    )
+      continue;
 
     let phase: RunStepState = step.state;
 
@@ -448,6 +456,8 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
 
   for (const step of steps) {
     if (effectiveState(step) !== "pending") continue;
+    const worker = sessionById.get(step.sessionId);
+    if (worker && step.attempts <= (worker.orchestratorControlAttempt ?? 0)) continue;
     const blocked = failedDependency(step);
     if (!blocked) continue;
     settled.set(step.id, "skipped");
@@ -522,6 +532,15 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
 
   for (const step of steps) {
     if (effectiveState(step) !== "pending") continue;
+    const worker = sessionById.get(step.sessionId);
+    if (worker && step.attempts <= (worker.orchestratorControlAttempt ?? 0)) {
+      hold(step, {
+        code: "manual_control",
+        detail:
+          "The person interrupted this assignment. A new orchestrator follow-up can take control when the session is free.",
+      });
+      continue;
+    }
     if (heldByHuman && !input.maintenanceStepIds?.has(step.id)) {
       hold(step, awaitingPerson);
       continue;
@@ -561,6 +580,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
           occupant.id === step.sessionId ||
           !heldBy(occupant) ||
           occupant.runRole === "lead" ||
+          occupant.orchestratorControlled === false ||
           occupant.state !== "idle" ||
           occupant.stopRequested ||
           checkoutLockKey(occupant) !== desiredKey

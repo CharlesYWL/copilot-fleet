@@ -20,6 +20,7 @@ export const StepAdmissionCodeSchema = z.enum([
   "checkout_busy",
   "node_offline",
   "stop_pending",
+  "manual_control",
   "dismissed",
   "cleanup_pending",
   "task_held",

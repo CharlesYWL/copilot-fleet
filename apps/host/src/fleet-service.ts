@@ -1702,9 +1702,11 @@ export class FleetService {
       this.commands.pumpLead(sessionId);
       return { ok: true };
     }
-    const provenance: [undefined?, SupervisorCommand?] = manual
+    const provenance: [(string | undefined)?, SupervisorCommand?] = manual
       ? [undefined, manual]
-      : [];
+      : session.runId && ["worker", "reviewer"].includes(session.runRole)
+        ? [`direct:${randomUUID()}`]
+        : [];
     const dispatched = this.dispatch(
       session.nodeId,
       { type: "prompt", sessionId, prompt: input.prompt, attachments: input.attachments },
@@ -1894,7 +1896,7 @@ export class FleetService {
     fallback?: DispatchFallback,
     attemptOverride?: string,
     supervisor?: SupervisorCommand,
-    options: { preservePendingPrompts?: boolean } = {},
+    options: { preservePendingPrompts?: boolean; orchestratorPrompt?: boolean } = {},
   ): DispatchResult {
     if (
       this.console.blocked(nodeId) &&
@@ -2037,6 +2039,20 @@ export class FleetService {
         // A new attempt must not inherit a stop/cancel or completion receipt
         // from the old one, and its sequence boundary must be durable before send.
         this.store.writeAtomically(() => {
+          if (options.orchestratorPrompt && session.orchestratorControlled === false)
+            this.store.setSessionOrchestratorControl(session.id, true);
+          if (
+            attempt.startsWith("direct:") &&
+            this.store.getRun(session.runId)?.leadSessionId &&
+            ["starting", "running"].includes(
+              this.store.getRunStepBySession(session.id)?.state ?? "",
+            )
+          )
+            this.store.setSessionOrchestratorControl(
+              session.id,
+              session.orchestratorControlled !== false,
+              true,
+            );
           if (supervisor) {
             if (request.type !== supervisor.kind)
               throw new PrMaintenanceError(
@@ -2126,10 +2142,13 @@ export class FleetService {
             consoleEpoch: this.store.sessionConsole.get(session.id)?.controlEpoch,
           }),
         );
+        if (options.orchestratorPrompt)
+          this.publishSession(this.store.getSession(session.id)!);
         if (supervisor && session.runId) {
           this.publishSnapshot();
           this.publishRunSteps(session.runId, this.store.listRunSteps(session.runId));
         }
+
         return { sent: true };
       }
       if (request.type !== "delete_session") {
@@ -2174,6 +2193,16 @@ export class FleetService {
       (settled) => this.publishSession(settled),
     );
     return { sent: false, session };
+  }
+
+  releaseSessionToHuman(sessionId: string): void {
+    const session = this.store.getSession(sessionId);
+    if (
+      session?.runId &&
+      ["worker", "reviewer"].includes(session.runRole) &&
+      this.store.getRun(session.runId)?.leadSessionId
+    )
+      this.publishSession(this.store.setSessionOrchestratorControl(sessionId, false));
   }
 
   /**
@@ -3229,7 +3258,13 @@ export class FleetService {
       context.step !== undefined &&
       !terminalRunStepStates.has(context.step.state) &&
       ["idle", "completed", "failed", "stopped"].includes(session.state);
-    if (!stepConsumesReceipt) {
+    const reportsTurn =
+      !intent &&
+      session.orchestratorControlled !== false &&
+      session.runId &&
+      ["worker", "reviewer"].includes(session.runRole) &&
+      session.state === "idle";
+    if (!stepConsumesReceipt && !reportsTurn) {
       this.store.clearSessionTurnCompletion(session.id);
     }
   }

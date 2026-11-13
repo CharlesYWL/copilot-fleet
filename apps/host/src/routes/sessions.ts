@@ -131,6 +131,7 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
         .code(400)
         .send({ error: "Orchestrator conversations cannot be bulk stopped as agents" });
     }
+    for (const session of selected) service.releaseSessionToHuman(session.id);
     const result = stopSessions(service, selected);
     return reply.code(result.requested > 0 ? 202 : 200).send({ ok: true, ...result });
   });
@@ -343,6 +344,7 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     if (session.state !== "running") {
       return reply.code(409).send({ error: "Session is not running" });
     }
+    service.releaseSessionToHuman(id);
     service.publishSession(service.beginSessionCancellation(id));
     const dispatched = service.dispatch(
       session.nodeId,
@@ -356,6 +358,7 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     const { id } = request.params as { id: string };
     const session = store.getSession(id);
     if (!session) return reply.code(404).send({ error: "Session not found" });
+    service.releaseSessionToHuman(id);
     if (session.runRole !== "lead")
       store.prMaintenance.stopForSession(id, "The retained worker was stopped.");
     // Idempotent: dismissing a corpse from the UI should not toast an error.
@@ -371,6 +374,23 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       sessionId: id,
     });
     return reply.code(dispatched.sent ? 202 : 200).send({ ok: true });
+  });
+
+  app.post("/api/sessions/:id/orchestrator-control", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { controlled } = z.object({ controlled: z.boolean() }).parse(request.body);
+    const session = store.getSession(id);
+    if (!session) return reply.code(404).send({ error: "Session not found" });
+    if (request.fleetNodeId)
+      return reply.code(403).send({ error: "This control requires a browser operator" });
+    if (
+      !session.runId ||
+      !["worker", "reviewer"].includes(session.runRole) ||
+      !store.getRun(session.runId)?.leadSessionId
+    )
+      return reply.code(409).send({ error: "Session has no assigned orchestrator task" });
+    service.publishSession(store.setSessionOrchestratorControl(id, controlled));
+    return { ok: true };
   });
 
   app.delete("/api/sessions/:id", async (request, reply) => {

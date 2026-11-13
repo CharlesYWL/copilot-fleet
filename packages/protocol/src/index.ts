@@ -603,6 +603,10 @@ export const SessionSchema = z.object({
    */
   runId: z.string().default(""),
   runRole: RunRoleSchema.default(""),
+  /** Reports worker turns to its existing task owner; manual Stop/Cancel disables it. */
+  orchestratorControlled: z.boolean().optional(),
+  /** Attempts at or below this fence were interrupted by manual control. */
+  orchestratorControlAttempt: z.number().int().nonnegative().optional(),
   /** Login identity that owns publication naming for an orchestrator lead. */
   operatorUsername: z.string().max(320).optional(),
   /**

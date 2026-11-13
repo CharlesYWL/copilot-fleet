@@ -1346,6 +1346,10 @@ describe("PR maintenance orchestration", () => {
           sessionId: worker.id,
           checkoutPrecondition: { headSha, requireClean: true },
         }),
+        undefined,
+        undefined,
+        undefined,
+        { orchestratorPrompt: true },
       );
       expect(world.store.getRunStep(step.id)).toMatchObject({
         category: history.category,
@@ -1420,6 +1424,10 @@ describe("PR maintenance orchestration", () => {
         sessionId: worker.id,
         checkoutPrecondition: { headSha, requireClean: true },
       }),
+      undefined,
+      undefined,
+      undefined,
+      { orchestratorPrompt: true },
     );
     expect(world.store.getSession(worker.id)).toMatchObject({
       readOnly: true,

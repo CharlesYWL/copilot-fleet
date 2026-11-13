@@ -477,6 +477,10 @@ export function App() {
   const activeSession = snapshot.sessions.find(
     (session) => session.id === selectedSessionId,
   );
+  const activeTask = snapshot.runs.find((run) => run.id === activeSession?.runId);
+  const boundOrchestrator = snapshot.sessions.find(
+    (session) => session.id === activeTask?.leadSessionId,
+  );
   const notificationPreference = useNotificationPreference(activeSession?.id, request);
 
   // A dismissed or cleared session takes its unsent draft with it.
@@ -1633,6 +1637,13 @@ export function App() {
                       )}
                       <TerminalView
                         session={activeSession}
+                        orchestrator={boundOrchestrator}
+                        onOrchestratorControlChange={(controlled) =>
+                          void command(
+                            `/api/sessions/${activeSession.id}/orchestrator-control`,
+                            { controlled },
+                          )
+                        }
                         messageQueue={
                           <SessionMessageQueue
                             key={activeSession.id}
@@ -1755,6 +1766,12 @@ export function App() {
         {view === "overview" && activeSession && (
           <SessionFocusDialog
             session={activeSession}
+            orchestrator={boundOrchestrator}
+            onOrchestratorControlChange={(controlled) =>
+              void command(`/api/sessions/${activeSession.id}/orchestrator-control`, {
+                controlled,
+              })
+            }
             messageQueue={
               focusOpen ? (
                 <SessionMessageQueue
