@@ -6300,6 +6300,28 @@ export class FleetStore {
     });
   }
 
+  /**
+   * A person's own turn takes an assigned worker from its orchestrator until
+   * the orchestrator prompts it again. Only an in-flight assignment is fenced;
+   * a follow-up still waiting to start takes control back when it is sent.
+   * Returns whether the session changed.
+   */
+  yieldSessionToHumanTurn(id: string): boolean {
+    const session = this.getSession(id);
+    if (
+      !session?.runId ||
+      (session.runRole !== "worker" && session.runRole !== "reviewer") ||
+      !this.getRun(session.runId)?.leadSessionId
+    )
+      return false;
+    const inFlight = ["starting", "running"].includes(
+      this.getRunStepBySession(id)?.state ?? "",
+    );
+    if (session.orchestratorControlled === false && !inFlight) return false;
+    this.setSessionOrchestratorControl(id, false, inFlight);
+    return true;
+  }
+
   setSessionFavorite(id: string, favorite: boolean): FleetSession {
     if (!this.getSession(id)) throw new Error("Session not found");
     this.assertSessionMutable(id);

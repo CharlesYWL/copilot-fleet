@@ -491,20 +491,25 @@ follow-ups are persisted and scheduled in the same session. Queued, busy,
 stopping or offline does not mean replacement is needed; a repeated pending
 follow-up is not sent twice, and a different prompt cannot overwrite it.
 
-**Controlling a worker yourself.** Assigned worker conversations show **Controlled by
-orchestrator** and the name of their bound orchestrator. **Cancel turn** or **Stop**
-automatically switches this off before interrupting the worker. While off, your
-turns do not send `<fleet-wake>` messages, and the interrupted assignment cannot
-complete, unlock dependent work, retry, or resume itself. The task and orchestrator
-binding stay unchanged; ordinary sessions without an assigned task have no switch.
+**Controlling a worker yourself.** An assigned worker's header shows who controls it:
+a robot icon for its orchestrator, a person icon for you, and a switch beside
+them. Hover for the bound orchestrator's name. Sending your own message to the
+worker, **Cancel turn** or **Stop** automatically switches control to you. While
+you control it, its turns do not send `<fleet-wake>` messages, the scheduler does
+not park it to free its checkout, and an assignment you interrupted cannot
+complete, unlock dependent work, retry, or resume itself.
+The task and orchestrator binding stay unchanged; ordinary sessions without an
+assigned task have no switch.
 
-You can still talk to either conversation. A new `fleet_follow_up` queues behind
-your active turn and switches control on only when its prompt is dispatched.
-Previously queued work cannot take control back. Switching on yourself does not
-resume old work or replay old notifications. While on, subsequent direct turns
-also report to the orchestrator, without claiming that the assigned task succeeded.
-Internal system cancellation (such as sending a queued message now) does not
-change the switch.
+You can still talk to either conversation. The last prompt decides control: a
+`fleet_follow_up` queues behind your active turn and switches control back to
+the orchestrator only when its prompt is dispatched, and a follow-up that was
+already waiting still does so after your message. Work queued before you
+cancelled or stopped cannot take control back. Switching on yourself hands the
+worker back without resuming old work or replaying old notifications; a turn
+still running when you switch on reports to the orchestrator when it ends,
+without claiming that the assigned task succeeded. Internal system cancellation
+(such as sending a queued message now) does not change the switch.
 
 **Why a queued follow-up waits, and "Resume now".** Every queued step carries
 the scheduler's own reason — the same pass that decides dispatch records it — in

@@ -184,10 +184,11 @@ describe("session message queue", () => {
             command.prompt.includes("<fleet-wake"),
         );
       let sequence = 0;
-      const turn = (text: string) => {
+      const turn = (text: string, handBack = false) => {
         expect(
           f.service.promptSession(worker.id, { prompt: text, attachments: [] }),
         ).toEqual({ ok: true });
+        if (handBack) f.store.setSessionOrchestratorControl(worker.id, true);
         f.event(++sequence, "state", { state: "running" }, worker.id);
         f.event(++sequence, "agent_text", { text }, worker.id);
         f.event(++sequence, "turn_complete", { stopReason: "end_turn" }, worker.id);
@@ -258,20 +259,14 @@ describe("session message queue", () => {
       }
     });
 
-    it("reports each enabled direct turn once, suppresses manual turns, and does not replay when enabled", async () => {
+    it("hands the worker to a person for their own turns until the orchestrator prompts it again", async () => {
       const f = await assigned();
+      f.store.updateRunStep(f.step.id, { state: "succeeded" });
       f.store.transitionSession(f.worker.id, "idle");
-      const { turn } = f;
-      turn("First direct result");
-      expect(f.wakes()).toHaveLength(1);
+      f.turn("Human-only result");
+      expect(f.store.getSession(f.worker.id)?.orchestratorControlled).toBe(false);
       f.engine.tick();
-      expect(f.wakes()).toHaveLength(1);
-      turn("Second direct result");
-      expect(f.wakes()).toHaveLength(2);
-      expect(f.store.getRunStep(f.step.id)?.state).toBe("running");
-      f.service.releaseSessionToHuman(f.worker.id);
-      turn("Human-only result");
-      expect(f.wakes()).toHaveLength(2);
+      expect(f.wakes()).toEqual([]);
       const response = await f.app.inject({
         method: "POST",
         url: `/api/sessions/${f.worker.id}/orchestrator-control`,
@@ -279,14 +274,35 @@ describe("session message queue", () => {
       });
       expect(response.statusCode).toBe(200);
       f.engine.tick();
-      expect(f.wakes()).toHaveLength(2);
-      turn("Back to reporting");
-      expect(f.wakes()).toHaveLength(3);
+      f.turn("Another human result");
+      f.engine.tick();
+      expect(f.wakes()).toEqual([]);
+      expect(f.store.getSession(f.worker.id)?.orchestratorControlled).toBe(false);
+      // A follow-up already waiting still runs after the person's turn and takes control back.
+      f.store.retryRunStepInSession(
+        f.run.id,
+        {
+          stepKey: f.step.stepKey,
+          title: f.step.title,
+          prompt: "New assignment",
+          category: "explore",
+        },
+        f.worker.id,
+        f.store.maxEventSequence(f.worker.id),
+      );
+      f.turn("Human turn before the follow-up starts");
+      f.engine.tick();
+      expect(f.sent.at(-1)).toMatchObject({
+        type: "prompt",
+        sessionId: f.worker.id,
+        prompt: expect.stringContaining("New assignment"),
+      });
+      expect(f.store.getSession(f.worker.id)?.orchestratorControlled).toBe(true);
       expect(f.store.getRun(f.run.id)?.settleSeq).toBe(0);
     });
 
     it.each([false, true])(
-      "retains direct reports behind a busy lead after task completion (durable=%s)",
+      "retains reports of turns handed back mid-turn behind a busy lead after task completion (durable=%s)",
       async (durable) => {
         const f = await assigned();
         f.store.updateRunStep(f.step.id, { state: "succeeded" });
@@ -297,8 +313,8 @@ describe("session message queue", () => {
           vi.spyOn(f.service.commands, "durableLead").mockReturnValue(true);
           vi.spyOn(f.service.commands, "pumpLead").mockImplementation(() => {});
         }
-        f.turn("First retained report");
-        f.turn("Second retained report");
+        f.turn("First retained report", true);
+        f.turn("Second retained report", true);
         f.engine.tick();
         expect(f.wakes()).toHaveLength(0);
         if (durable) {
