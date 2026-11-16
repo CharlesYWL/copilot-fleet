@@ -274,9 +274,6 @@ is this computer or one on the other side of a tunnel:
   such as `` `C:\work\report.docx` ``, downloads the same way.
 - **Edit steps** that finished writing a file show a download button at the end
   of their row.
-- **Download a file** (the arrow in the session header) takes any path, absolute
-  or relative to the session's working directory, for files an agent only
-  mentioned in passing.
 
 A click checks the file first, so a missing or refused file is explained in a
 notification instead of a failed download; the bytes then go to the browser's
