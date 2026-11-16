@@ -191,7 +191,8 @@ export class SessionFileReader {
 /**
  * Whether a resolved file may be relayed, given the resolved roots.
  *
- * A protected folder blocks a file inside it unless the root that grants the
+ * Any file may be relayed except those in a protected folder. A protected
+ * folder blocks a file inside it unless the root that grants the
  * file sits strictly inside that same folder. Equal is not inside: a session
  * working in Fleet's configuration directory itself still cannot hand out the
  * identity stored at its top.
@@ -202,20 +203,19 @@ function assertPermitted(
   guarded: readonly string[],
 ): void {
   const holders = granted.filter((root) => containedPath(root, target));
-  if (holders.length === 0) {
-    throw new Refusal(
-      "forbidden",
-      "That file is outside the folders this session works in, so it cannot be downloaded from here.",
-    );
-  }
-  const reachable = holders.some(
-    (root) =>
-      !guarded.some(
-        (folder) =>
-          (folder === target || containedPath(folder, target)) &&
-          !containedPath(folder, root),
-      ),
-  );
+  // Files outside the session's folders are allowed; only Fleet's and
+  // Copilot's own configuration stays off limits.
+  const reachable =
+    holders.length === 0
+      ? !guarded.some((folder) => folder === target || containedPath(folder, target))
+      : holders.some(
+          (root) =>
+            !guarded.some(
+              (folder) =>
+                (folder === target || containedPath(folder, target)) &&
+                !containedPath(folder, root),
+            ),
+        );
   if (!reachable) {
     throw new Refusal(
       "forbidden",
