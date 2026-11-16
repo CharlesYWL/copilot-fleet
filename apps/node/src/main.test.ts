@@ -247,6 +247,7 @@ vi.mock("./repository-participation.js", () => ({
     resolve = vi.fn(async () => ({}));
     acquire = vi.fn(async () => [{ release: maintenanceRelease }]);
     activate = vi.fn(async () => {});
+    sweepAbandoned = vi.fn(() => ({ removed: 0, registries: 0 }));
   },
 }));
 vi.mock("./command-execution-manager.js", () => ({
