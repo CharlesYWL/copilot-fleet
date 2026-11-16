@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { WorktreeConflict, type CheckoutIdentity } from "@fleet/protocol";
 import { assertIdentity, canonicalPath } from "./canonical-path.js";
@@ -52,6 +52,28 @@ export async function resolveRepositoryTarget(
   };
 }
 
+function readIndex(file: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+    return Array.isArray(parsed)
+      ? parsed.filter((entry): entry is string => typeof entry === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** True unless the OS says no such process (or process group) exists. */
+function processAlive(pid: number, group: boolean): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(group && process.platform !== "win32" ? -pid : pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
 function registryDirectory(target: RepositoryTarget): string {
   return join(
     target.repository.path,
@@ -63,6 +85,8 @@ type Participant = {
   token: string;
   owner: string;
   incarnation: string;
+  /** PID of the Node that wrote this record; absent on records from older Nodes. */
+  nodePid?: number;
   mode: "shared" | "exclusive" | "command";
   tracked: boolean;
   processPending: boolean;
@@ -74,15 +98,64 @@ type Participant = {
 export class RepositoryParticipation {
   readonly incarnation = randomUUID();
 
-  constructor(private readonly resolveTarget = resolveRepositoryTarget) {}
+  /**
+   * @param indexFile Where this Node remembers which registries it has written
+   *   to, so startup can sweep records an earlier incarnation left behind.
+   */
+  constructor(
+    private readonly resolveTarget = resolveRepositoryTarget,
+    private readonly indexFile?: string,
+  ) {}
 
   resolve(path: string): Promise<RepositoryTarget> {
     return this.resolveTarget(path);
   }
 
+  private remember(directory: string): void {
+    if (!this.indexFile) return;
+    const known = readIndex(this.indexFile);
+    if (known.includes(directory)) return;
+    mkdirSync(dirname(this.indexFile), { recursive: true });
+    writeFileSync(this.indexFile, JSON.stringify([...known, directory], null, 2));
+  }
+
+  /**
+   * Startup recovery: reclaims abandoned session records in every registry this
+   * Node has used. Unreadable or vanished registries are dropped from the index;
+   * a busy one is skipped and retried on the next acquire.
+   */
+  sweepAbandoned(options: { includeOwn?: boolean } = {}): {
+    removed: number;
+    registries: number;
+  } {
+    if (!this.indexFile) return { removed: 0, registries: 0 };
+    const kept: string[] = [];
+    let removed = 0;
+    for (const directory of readIndex(this.indexFile)) {
+      const file = join(directory, "participation.db");
+      if (!existsSync(file)) continue;
+      kept.push(directory);
+      let db: DatabaseSync | undefined;
+      try {
+        db = new DatabaseSync(file);
+        db.exec("PRAGMA busy_timeout=1000;");
+        db.exec("BEGIN IMMEDIATE");
+        removed += this.reclaimAbandoned(db, options.includeOwn);
+        db.exec("COMMIT");
+      } catch {
+        if (db?.isTransaction) db.exec("ROLLBACK");
+      } finally {
+        db?.close();
+      }
+    }
+    writeFileSync(this.indexFile, JSON.stringify(kept, null, 2));
+    return { removed, registries: kept.length };
+  }
+
   private open(target: RepositoryTarget): DatabaseSync {
     const directory = registryDirectory(target);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
+    this.remember(directory);
     const db = new DatabaseSync(join(directory, "participation.db"));
     db.exec(`
       PRAGMA busy_timeout=1000;
@@ -160,6 +233,7 @@ export class RepositoryParticipation {
       token: randomUUID(),
       owner,
       incarnation: this.incarnation,
+      nodePid: process.pid,
       mode,
       tracked: true,
       processPending: false,
@@ -169,6 +243,7 @@ export class RepositoryParticipation {
     try {
       db.exec("BEGIN IMMEDIATE");
       db.prepare("UPDATE policy SET enabled=1 WHERE id=1").run();
+      this.reclaimAbandoned(db);
       const others = db
         .prepare("SELECT data FROM participants")
         .all()
@@ -267,6 +342,46 @@ export class RepositoryParticipation {
         );
       },
     };
+  }
+
+  /**
+   * Removes records a previous Node incarnation left behind once nothing they
+   * name can still be running.
+   *
+   * A Node that is killed, crashes, or cannot prove quiescence during shutdown
+   * leaves its records here, and an `unknown` one blocks the whole checkout
+   * until someone deletes it by hand. A record is abandoned only when it comes
+   * from another incarnation, its writing Node is gone (or was never recorded),
+   * and every recorded agent process is gone. On Windows the recorded PID is
+   * the Job Object supervisor, whose exit closes the job and kills the tree; on
+   * POSIX it is the process-group leader, so the whole group is checked. PID
+   * reuse can only make a dead owner look alive, which keeps the lock, never
+   * the reverse. A record caught mid-spawn (no PID yet) is never reclaimed.
+   * With `includeOwn`, this Node's own session records qualify too; that is
+   * only for shutdown, after every session slot has been stopped.
+   *
+   * Must run inside the caller's write transaction.
+   */
+  private reclaimAbandoned(db: DatabaseSync, includeOwn = false): number {
+    let removed = 0;
+    for (const row of db.prepare("SELECT token,data FROM participants").all()) {
+      let record: Participant;
+      try {
+        record = JSON.parse(String(row.data)) as Participant;
+      } catch {
+        continue;
+      }
+      const own = record.incarnation === this.incarnation;
+      if (own && !includeOwn) continue;
+      if (!record.owner.startsWith("session:")) continue;
+      if (!own && record.nodePid !== undefined && processAlive(record.nodePid, false))
+        continue;
+      if (record.processPending) continue;
+      if (record.processes.some((pid) => processAlive(pid, true))) continue;
+      db.prepare("DELETE FROM participants WHERE token=?").run(String(row.token));
+      removed++;
+    }
+    return removed;
   }
 
   async participate(

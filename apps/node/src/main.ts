@@ -618,7 +618,17 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       return assets.ok ? undefined : assets.error;
     },
   );
-  const repositories = new RepositoryParticipation();
+  const repositories = new RepositoryParticipation(
+    undefined,
+    join(configDirectory(), "participation-registries.json"),
+  );
+  {
+    const swept = repositories.sweepAbandoned();
+    if (swept.removed)
+      log(
+        `Reclaimed ${swept.removed} abandoned checkout participation record(s) across ${swept.registries} registr${swept.registries === 1 ? "y" : "ies"}`,
+      );
+  }
   const journal = new CommandJournal(join(configDirectory(), "remote-commands"));
   if (settings.commandPermissionRules.some((rule) => rule.command === undefined)) {
     const recovered = recoverCommandPermissionText(
@@ -2302,6 +2312,15 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         await worktrees.shutdown();
       } catch (error) {
         errors.push(error);
+      }
+      // Sessions whose stop could not prove quiescence leave `unknown` records
+      // that would otherwise block their checkout for later Nodes. Drop any of
+      // ours whose processes are already gone; the next startup sweep handles
+      // processes that were still exiting.
+      try {
+        repositories.sweepAbandoned({ includeOwn: true });
+      } catch (error) {
+        warn(`Participation cleanup at shutdown failed: ${errorMessage(error)}`);
       }
     }
     if (!errors.length && !journalsClosed) {

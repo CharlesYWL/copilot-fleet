@@ -93,6 +93,24 @@ const NOTIFICATION_TEXT_LIMIT = 200;
 
 const boundedLabel = (value: string): string => value.slice(0, NOTIFICATION_TEXT_LIMIT);
 
+/**
+ * Failure bodies stay controlled text: session activity can carry agent output,
+ * so only reasons the Node itself authors are surfaced, never raw activity.
+ */
+const KNOWN_FAILURE_REASONS: readonly [prefix: string, body: string][] = [
+  [
+    "Checkout busy:",
+    "The session could not start: its folder is held by another Fleet participant, or by a stale record a previous Node left behind. The Node clears stale records whose processes have exited; retry Resume.",
+  ],
+  [
+    "Process cleanup failed",
+    "The agent process could not be proven stopped, so its checkout stays locked until the Node reconciles it.",
+  ],
+];
+const failureBody = (activity: string): string =>
+  KNOWN_FAILURE_REASONS.find(([prefix]) => activity.startsWith(prefix))?.[1] ??
+  "The agent session ended unexpectedly.";
+
 const titledLabel = (prefix: string, value: string): string =>
   `${prefix}${value.slice(0, NOTIFICATION_TEXT_LIMIT - prefix.length)}`;
 
@@ -369,7 +387,7 @@ export class NotificationService {
         : titledLabel("", `${agentName} session failed`),
       body: completed
         ? "The agent finished a turn and is ready for follow-up."
-        : "The agent session ended unexpectedly.",
+        : failureBody(input.session.currentActivity),
       subject: run && step ? subjectForStep(run, step) : subjectForAgent(input.session),
       navigation:
         run && step

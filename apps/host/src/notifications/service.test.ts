@@ -75,6 +75,29 @@ describe("NotificationService", () => {
     });
   });
 
+  it("explains a busy checkout instead of a generic failure, without echoing activity", () => {
+    const { store, service, placement } = setup();
+    const session = {
+      ...store.createSession(placement, "prompt", false, "Lead"),
+      currentActivity:
+        "Checkout busy: repository has active or unknown Fleet participation.",
+    };
+    const result = service.createAgentLifecycle({
+      kind: "agent_failure",
+      session,
+      transition: {
+        eventId: "busy",
+        sequence: 1,
+        createdAt: "2026-09-01T18:00:00.000Z",
+        from: "starting",
+        to: "failed",
+        source: "session_event",
+      },
+    });
+    expect(result?.notification.body).toMatch(/folder is held/);
+    expect(result?.notification.body).not.toContain("unknown Fleet participation");
+  });
+
   it("uses the operator-assigned agent name in lifecycle notifications", () => {
     const { store, service, placement } = setup();
     const session = store.createSession(

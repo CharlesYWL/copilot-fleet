@@ -319,4 +319,89 @@ describe("shared cross-installation participation", () => {
     const exclusive = await f.second.acquire([f.target], "command", "exclusive", true);
     exclusive[0]!.release();
   });
+
+  describe("abandoned record recovery", () => {
+    const DEAD_PID = 2 ** 30 + 7;
+    function plant(f: Awaited<ReturnType<typeof repository>>, record: object) {
+      const db = new DatabaseSync(
+        join(f.target.repository.path, "fleet-participation-v1", "participation.db"),
+      );
+      try {
+        const token = randomUUID();
+        db.prepare("INSERT INTO participants VALUES (?,?)").run(
+          token,
+          JSON.stringify({
+            token,
+            owner: "session:previous",
+            incarnation: "previous-node",
+            mode: "shared",
+            tracked: true,
+            processPending: false,
+            processes: [DEAD_PID],
+            unknown:
+              "WorktreeConflict: Repository participation requires verified quiescence.",
+            ...record,
+          }),
+        );
+      } finally {
+        db.close();
+      }
+    }
+    function count(f: Awaited<ReturnType<typeof repository>>): number {
+      const db = new DatabaseSync(
+        join(f.target.repository.path, "fleet-participation-v1", "participation.db"),
+      );
+      try {
+        return Number(db.prepare("SELECT count(*) AS n FROM participants").get()!.n);
+      } finally {
+        db.close();
+      }
+    }
+
+    it("reclaims an unknown session record from a dead earlier Node on acquire", async () => {
+      const f = await repository();
+      f.first.enabled(f.target);
+      plant(f, {});
+      const { leases } = await f.second.participate([f.target.cwd], "session:resumed");
+      expect(count(f)).toBe(1);
+      leases[0]!.release();
+    });
+
+    it("keeps records whose agent process or writing Node is still alive", async () => {
+      const f = await repository();
+      f.first.enabled(f.target);
+      plant(f, { processes: [process.pid] });
+      plant(f, { nodePid: process.pid, processes: [DEAD_PID] });
+      await expect(
+        f.second.participate([f.target.cwd], "session:resumed"),
+      ).rejects.toThrow("Checkout busy");
+      expect(count(f)).toBe(2);
+    });
+
+    it("never reclaims mid-spawn, command, or this incarnation's records", async () => {
+      const f = await repository();
+      f.first.enabled(f.target);
+      plant(f, { processPending: true, processes: [] });
+      plant(f, { owner: "command:previous" });
+      plant(f, { incarnation: f.second.incarnation });
+      await expect(
+        f.second.participate([f.target.cwd], "session:resumed"),
+      ).rejects.toThrow("Checkout busy");
+      expect(count(f)).toBe(3);
+    });
+
+    it("sweeps registries listed in the index at startup and on shutdown", async () => {
+      const f = await repository();
+      const index = join(f.directory, "index.json");
+      const node = new RepositoryParticipation(async () => f.target, index);
+      node.enabled(f.target);
+      plant(f, {});
+      plant(f, { incarnation: node.incarnation, nodePid: process.pid, unknown: "" });
+      expect(
+        new RepositoryParticipation(async () => f.target, index).sweepAbandoned(),
+      ).toEqual({ removed: 1, registries: 1 });
+      expect(node.sweepAbandoned({ includeOwn: true }).removed).toBe(1);
+      expect(count(f)).toBe(0);
+    });
+  });
 });
