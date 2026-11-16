@@ -108,7 +108,7 @@ const streamEvent = (
 });
 
 describe("TerminalView composer", () => {
-  it("keeps the assigned orchestrator visible when human control is selected", () => {
+  it("shows who controls an assigned worker beside its actions", async () => {
     const onChange = vi.fn();
     const props = {
       session: session({
@@ -127,9 +127,18 @@ describe("TerminalView composer", () => {
     const { rerender } = render(<TerminalView {...props} />);
     const toggle = screen.getByRole("switch", { name: "Controlled by orchestrator" });
     expect((toggle as HTMLInputElement).checked).toBe(false);
-    expect(screen.getByText("Bound to Release coordinator")).toBeTruthy();
+    const human = screen.getByRole("img", { name: "You are in control" });
+    fireEvent.pointerEnter(human.parentElement!);
+    expect(await screen.findByText(/do not report to Release coordinator/)).toBeTruthy();
     fireEvent.click(toggle);
     expect(onChange).toHaveBeenCalledWith(true);
+    rerender(
+      <TerminalView
+        {...props}
+        session={{ ...props.session, orchestratorControlled: true }}
+      />,
+    );
+    expect(screen.getByRole("img", { name: "Orchestrator in control" })).toBeTruthy();
     rerender(<TerminalView {...props} session={session()} />);
     expect(
       screen.queryByRole("switch", { name: "Controlled by orchestrator" }),

@@ -2032,6 +2032,11 @@ export class FleetService {
         const attempt = supervisor
           ? `manual:${commandId}`
           : (attemptOverride ?? this.dispatchAttemptKey(session));
+        // A person's own prompt, retained-maintenance input included.
+        const humanTurn =
+          request.type === "prompt" &&
+          (supervisor !== undefined || attempt.startsWith("direct:"));
+        let controlChanged = false;
         const eventSeqFrom =
           request.type === "resume_session"
             ? request.sequenceOffset
@@ -2041,18 +2046,7 @@ export class FleetService {
         this.store.writeAtomically(() => {
           if (options.orchestratorPrompt && session.orchestratorControlled === false)
             this.store.setSessionOrchestratorControl(session.id, true);
-          if (
-            attempt.startsWith("direct:") &&
-            this.store.getRun(session.runId)?.leadSessionId &&
-            ["starting", "running"].includes(
-              this.store.getRunStepBySession(session.id)?.state ?? "",
-            )
-          )
-            this.store.setSessionOrchestratorControl(
-              session.id,
-              session.orchestratorControlled !== false,
-              true,
-            );
+          if (humanTurn) controlChanged = this.store.yieldSessionToHumanTurn(session.id);
           if (supervisor) {
             if (request.type !== supervisor.kind)
               throw new PrMaintenanceError(
@@ -2142,7 +2136,7 @@ export class FleetService {
             consoleEpoch: this.store.sessionConsole.get(session.id)?.controlEpoch,
           }),
         );
-        if (options.orchestratorPrompt)
+        if (options.orchestratorPrompt || controlChanged)
           this.publishSession(this.store.getSession(session.id)!);
         if (supervisor && session.runId) {
           this.publishSnapshot();

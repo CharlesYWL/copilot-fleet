@@ -25,6 +25,7 @@ import {
   Switch,
   Text,
   Textarea,
+  Tooltip,
   makeStyles,
   mergeClasses,
   shorthands,
@@ -36,6 +37,7 @@ import {
   ArrowSwap16Regular,
   Clock16Regular,
   Attach20Regular,
+  Bot20Regular,
   Brain16Regular,
   Checkmark16Regular,
   ChevronDown16Regular,
@@ -47,6 +49,7 @@ import {
   ErrorCircle16Regular,
   Globe16Regular,
   Info16Regular,
+  Person20Regular,
   Rename20Regular,
   RecordStop20Regular,
   Search16Regular,
@@ -197,6 +200,18 @@ const useStyles = makeStyles({
   },
   headerActionLabel: {
     "@media (max-width: 1400px)": { display: "none" },
+  },
+  control: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "2px",
+    color: tokens.colorNeutralForeground2,
+  },
+  controlIndicator: {
+    marginLeft: "4px",
+    marginRight: 0,
+    marginTop: 0,
+    marginBottom: 0,
   },
   headerAction: {
     "@media (max-width: 1400px)": {
@@ -974,6 +989,14 @@ export const TerminalView = ({
     !session.cleanupRequested;
   const willQueue = session.state !== "idle";
   const isEnded = terminalSessionStates.has(session.state);
+  const assignedOrchestrator =
+    session.runId && ["worker", "reviewer"].includes(session.runRole)
+      ? orchestrator
+      : undefined;
+  const orchestratorName =
+    assignedOrchestrator &&
+    (assignedOrchestrator.name || assignedOrchestrator.id.slice(0, 8));
+  const orchestratorControlled = session.orchestratorControlled !== false;
   // Offline and terminal sessions can be re-attached via Copilot's session/load.
   const canResume =
     !controlsDisabled &&
@@ -1237,22 +1260,41 @@ export const TerminalView = ({
             {session.workspaceName} · {session.nodeName} · {session.id.slice(0, 8)} ·{" "}
             {session.currentActivity}
           </Text>
-          {session.runId &&
-            ["worker", "reviewer"].includes(session.runRole) &&
-            orchestrator && (
-              <span>
-                <Switch
-                  label="Controlled by orchestrator"
-                  checked={session.orchestratorControlled !== false}
-                  disabled={controlsDisabled || !onOrchestratorControlChange}
-                  onChange={(_, data) => onOrchestratorControlChange?.(data.checked)}
-                />
-                <Text size={200}>
-                  Bound to {orchestrator.name || orchestrator.id.slice(0, 8)}
-                </Text>
-              </span>
-            )}
         </div>
+        {assignedOrchestrator && (
+          <Tooltip
+            relationship="description"
+            withArrow
+            content={
+              orchestratorControlled
+                ? `Controlled by orchestrator ${orchestratorName}. Its turns report back to it; sending your own message hands control to you.`
+                : `You control this session. Its turns do not report to ${orchestratorName} until it sends a new follow-up or you switch this on.`
+            }
+          >
+            <span className={styles.control}>
+              {orchestratorControlled ? (
+                <Bot20Regular
+                  role="img"
+                  aria-hidden={false}
+                  aria-label="Orchestrator in control"
+                />
+              ) : (
+                <Person20Regular
+                  role="img"
+                  aria-hidden={false}
+                  aria-label="You are in control"
+                />
+              )}
+              <Switch
+                aria-label="Controlled by orchestrator"
+                indicator={{ className: styles.controlIndicator }}
+                checked={orchestratorControlled}
+                disabled={controlsDisabled || !onOrchestratorControlChange}
+                onChange={(_, data) => onOrchestratorControlChange?.(data.checked)}
+              />
+            </span>
+          </Tooltip>
+        )}
         <SessionInfoDialog
           key={session.id}
           session={session}

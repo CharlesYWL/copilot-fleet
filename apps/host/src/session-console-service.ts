@@ -418,7 +418,11 @@ export class SessionConsoleService {
     session: FleetSession,
     operation: ConsoleOperation,
   ): void {
+    const controlled = this.store.getSession(session.id)?.orchestratorControlled;
     this.store.writeAtomically(() => this.applyOperation(nodeId, session, operation));
+    const updated = this.store.getSession(session.id);
+    if (updated && updated.orchestratorControlled !== controlled)
+      this.service.publishSession(updated);
   }
 
   private applyOperation(
@@ -478,6 +482,7 @@ export class SessionConsoleService {
             operation.afterSequence,
           );
         }
+        this.store.yieldSessionToHumanTurn(session.id);
         this.store.clearSessionTurnCompletion(session.id);
         this.store.setSessionDispatchAttempt(session.id, {
           commandId: operation.id,
