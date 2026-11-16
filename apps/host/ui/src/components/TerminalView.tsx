@@ -22,6 +22,7 @@ import {
   Badge,
   Button,
   Input,
+  Switch,
   Text,
   Textarea,
   makeStyles,
@@ -585,6 +586,8 @@ type TerminalViewProps = {
     handback?: "ongoing" | "after_turn",
   ) => Promise<boolean>;
   maintenanceWorker?: boolean | undefined;
+  orchestrator?: FleetSession | undefined;
+  onOrchestratorControlChange?: ((controlled: boolean) => void) | undefined;
   onCancel: () => void;
   onStop: () => void;
   onPermission?:
@@ -613,6 +616,8 @@ export const TerminalView = ({
   pendingPermission: knownPermission,
   onPrompt,
   maintenanceWorker,
+  orchestrator,
+  onOrchestratorControlChange,
   onCancel,
   onStop,
   onPermission,
@@ -1232,6 +1237,21 @@ export const TerminalView = ({
             {session.workspaceName} · {session.nodeName} · {session.id.slice(0, 8)} ·{" "}
             {session.currentActivity}
           </Text>
+          {session.runId &&
+            ["worker", "reviewer"].includes(session.runRole) &&
+            orchestrator && (
+              <span>
+                <Switch
+                  label="Controlled by orchestrator"
+                  checked={session.orchestratorControlled !== false}
+                  disabled={controlsDisabled || !onOrchestratorControlChange}
+                  onChange={(_, data) => onOrchestratorControlChange?.(data.checked)}
+                />
+                <Text size={200}>
+                  Bound to {orchestrator.name || orchestrator.id.slice(0, 8)}
+                </Text>
+              </span>
+            )}
         </div>
         <SessionInfoDialog
           key={session.id}

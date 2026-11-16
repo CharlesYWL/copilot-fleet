@@ -152,7 +152,12 @@ export class OrchestratorEngine {
       );
     if (!step) return;
     const session = this.store.getSession(sessionId);
-    if (!session) return;
+    if (
+      !session ||
+      session.orchestratorControlled === false ||
+      step.attempts <= (session.orchestratorControlAttempt ?? 0)
+    )
+      return;
     const attempt = notificationAttemptKey(session, {
       step,
       run: this.store.getRun(step.runId),
@@ -210,6 +215,7 @@ export class OrchestratorEngine {
     this.service.cancelPausedPrMaintenance(at);
     this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
+    this.reportWorkerTurns();
     const runs = this.store.listRuns();
     for (const runId of this.holdsByRun.keys())
       if (!runs.some((run) => run.id === runId)) this.holdsByRun.delete(runId);
@@ -274,6 +280,16 @@ export class OrchestratorEngine {
       !(run.state === "completed" && maintenanceSteps.size)
     ) {
       this.holdsByRun.delete(runId);
+      const lead = this.store.getSession(run.leadSessionId);
+      if (
+        run.state === "completed" &&
+        run.pendingPrompt &&
+        lead &&
+        !lead.stopRequested &&
+        !this.store.getSessionTransitionIntent(lead.id) &&
+        !this.service.console.blocked(lead.nodeId)
+      )
+        this.deliverPrompt(run, run.pendingPrompt, nowMs);
       return;
     }
     const syncing = this.store
@@ -325,6 +341,12 @@ export class OrchestratorEngine {
       }
       const step = this.store.getRunStepBySession(session.id);
       if (!step || step.runId !== runId) continue;
+      if (
+        session.orchestratorControlled === false ||
+        step.attempts <= (session.orchestratorControlAttempt ?? 0) ||
+        this.store.getSessionDispatchAttempt(session.id)?.attempt.startsWith("direct:")
+      )
+        continue;
       if (
         session.runRole !== "worker" &&
         session.runRole !== "reviewer" &&
@@ -723,18 +745,24 @@ export class OrchestratorEngine {
     });
     this.store.commands.recordStepEvidence(run.id, step.id);
     /*
-     * A completion receipt remembered from an earlier turn — a person's own
-     * prompt into this worker carries the same attempt key — must not be read
-     * as this prompt's completion before the Node has even acknowledged it.
+     * A completion remembered from an earlier turn must not be read as this
+     * prompt's completion before the Node has even acknowledged it.
      */
     this.turnComplete.delete(session.id);
-    const sent = this.service.dispatch(session.nodeId, {
-      type: "prompt",
-      sessionId: session.id,
-      prompt: action.prompt,
-      attachments: [],
-      ...(precondition ? { checkoutPrecondition: precondition } : {}),
-    });
+    const sent = this.service.dispatch(
+      session.nodeId,
+      {
+        type: "prompt",
+        sessionId: session.id,
+        prompt: action.prompt,
+        attachments: [],
+        ...(precondition ? { checkoutPrecondition: precondition } : {}),
+      },
+      undefined,
+      undefined,
+      undefined,
+      { orchestratorPrompt: true },
+    );
     if (!sent.sent) {
       this.store.updateRunStep(step.id, { state: "pending", dispatchedAt: "" });
       return true;
@@ -798,6 +826,7 @@ export class OrchestratorEngine {
     const session = this.store.getSession(sessionId);
     if (
       !session ||
+      session.orchestratorControlled === false ||
       session.cleanupRequested ||
       terminalSessionStates.has(session.state)
     ) {
@@ -806,6 +835,90 @@ export class OrchestratorEngine {
     // Stop, not cancel: cancel ends the turn and leaves the process holding a
     // slot on its node.
     stopSessions(this.service, [session]);
+  }
+
+  /** Direct turns report without falsely completing the worker's assigned step. */
+  private reportWorkerTurns(): void {
+    for (const session of this.store.listSessions()) {
+      if (
+        session.orchestratorControlled === false ||
+        !session.runId ||
+        !["worker", "reviewer"].includes(session.runRole) ||
+        session.state !== "idle" ||
+        session.stopRequested
+      )
+        continue;
+      const completion = this.store.getSessionTurnCompletion(session.id);
+      if (!completion) continue;
+      const step = this.store.getRunStepBySession(session.id);
+      if (
+        !step ||
+        (!completion.attempt.startsWith("direct:") &&
+          (!terminalRunStepStates.has(step.state) ||
+            step.attempts <= (session.orchestratorControlAttempt ?? 0)))
+      )
+        continue;
+      const run = this.store.getRun(session.runId);
+      const lead = run && this.store.getSession(run.leadSessionId);
+      if (
+        !run ||
+        (terminalRunStates.has(run.state) && run.state !== "completed") ||
+        !lead ||
+        lead.stopRequested ||
+        lead.dismissed ||
+        lead.cleanupRequested ||
+        terminalSessionStates.has(lead.state) ||
+        this.store.getSessionTransitionIntent(lead.id)
+      )
+        continue;
+      const durable = this.service.commands.durableLead(lead.id);
+      const dispatch = this.store.getSessionDispatchAttempt(session.id);
+      const prompt = wakeEnvelope({
+        runId: run.id,
+        task: run.name,
+        wakes: run.wakeSeq,
+        maxWakes: run.policy.maxWakes,
+        settled: [
+          {
+            title: step.title,
+            category: step.category,
+            state: "turn_complete",
+            output: `A direct worker turn ended; this does not complete or reopen its task.\n${truncateMiddle(
+              workerOutput(
+                this.store.listEventsAfter(
+                  session.id,
+                  dispatch?.eventSeqFrom ?? step.eventSeqFrom,
+                ),
+                session,
+              ),
+              run.policy.maxOutputChars,
+            )}`,
+            sessionId: session.id,
+          },
+        ],
+        running: [],
+      });
+      if (durable) {
+        this.store.writeAtomically(() => {
+          this.service.commands.queueLeadPrompt(
+            lead.id,
+            prompt,
+            `worker-turn:${completion.eventId}`,
+          );
+          this.store.clearSessionTurnCompletion(session.id);
+        });
+        this.service.commands.pumpLead(lead.id);
+      } else {
+        this.store.writeAtomically(() => {
+          this.store.updateRun(run.id, {
+            pendingPrompt: [run.pendingPrompt, prompt].filter(Boolean).join("\n\n"),
+          });
+          this.store.clearSessionTurnCompletion(session.id);
+        });
+      }
+      this.turnComplete.delete(session.id);
+      if (durable) this.promptedThisTick.add(lead.id);
+    }
   }
 
   /**

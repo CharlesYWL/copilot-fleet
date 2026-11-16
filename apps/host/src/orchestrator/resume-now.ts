@@ -147,6 +147,14 @@ export class WorkerResumeService {
       conflicts: [] as StepAdmissionConflict[],
       resumable: Boolean(step.sessionId && session),
     };
+    if (session && step.attempts <= (session.orchestratorControlAttempt ?? 0))
+      return {
+        ...base,
+        state: "blocked",
+        code: "manual_control",
+        detail:
+          "The person interrupted this assignment. A new orchestrator follow-up can take control when the session is free.",
+      };
     if (step.state === "running")
       return {
         ...base,
@@ -395,6 +403,8 @@ export class WorkerResumeService {
     const session = this.store.getSession(step.sessionId);
     if (!session || session.runId !== run.id)
       return "The step's retained worker session is no longer available.";
+    if (step.attempts <= (session.orchestratorControlAttempt ?? 0))
+      return "The person interrupted this assignment. A new orchestrator follow-up is required.";
     if (!terminalSessionStates.has(session.state))
       return `The worker is ${session.state}, so there is nothing to resume.`;
     if (!session.agentSessionId)

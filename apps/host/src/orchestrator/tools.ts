@@ -3080,6 +3080,23 @@ export class FleetTools {
           "The worker is still stopping. Wait for the Stop acknowledgement; do not start a replacement.",
       };
     }
+    if (
+      (session.orchestratorControlled === false ||
+        step.attempts <= (session.orchestratorControlAttempt ?? 0)) &&
+      !(
+        step.state === "pending" &&
+        step.attempts > (session.orchestratorControlAttempt ?? 0)
+      )
+    ) {
+      const needsResume =
+        terminalSessionStates.has(session.state) || session.state === "offline";
+      if (!needsResume || session.agentSessionId)
+        return {
+          action: needsResume ? "resume" : "follow_up",
+          reason:
+            "The person controls this worker. A new follow-up queues without interrupting their turn and restores orchestrator control when it starts.",
+        };
+    }
     if (!terminalRunStepStates.has(step.state)) {
       if (step.attempts > 1) {
         return step.state === "pending"

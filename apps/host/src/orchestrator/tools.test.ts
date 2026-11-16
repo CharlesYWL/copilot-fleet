@@ -524,6 +524,61 @@ describe("FleetTools", () => {
     expect(store.getSession(step.sessionId)?.state).toBe("idle");
   });
 
+  it("queues a new follow-up behind human control and reclaims only on dispatch", () => {
+    start({ task: "Manual steering" });
+    const run = tasks()[0]!;
+    const step = store.listRunSteps(run.id)[0]!;
+    store.transitionSession(step.sessionId, "starting");
+    store.transitionSession(step.sessionId, "running");
+    service.releaseSessionToHuman(step.sessionId);
+
+    const input = { sessionId: step.sessionId, prompt: "New orchestrator instruction" };
+    const result = tools().followUp(input);
+    expect(result.ok, result.text).toBe(true);
+    expect(store.getRunStep(step.id)).toMatchObject({ state: "pending", attempts: 2 });
+    expect(store.getSession(step.sessionId)).toMatchObject({
+      orchestratorControlled: false,
+      runId: run.id,
+      runRole: "worker",
+    });
+    expect(tools().followUp(input).ok).toBe(true);
+    expect(store.getRunStep(step.id)?.attempts).toBe(2);
+    expect(tools().followUp({ ...input, prompt: "Do not replace queued work" }).ok).toBe(
+      false,
+    );
+
+    store.transitionSession(step.sessionId, "idle");
+    service.tickRun(run.id);
+    expect(store.getRunStep(step.id)).toMatchObject({ state: "starting", attempts: 2 });
+    expect(store.getSession(step.sessionId)?.orchestratorControlled).toBe(true);
+    expect(store.getRun(run.id)?.leadSessionId).toBe(leadId);
+  });
+
+  it("does not revive a pre-cancel queued follow-up even when the switch is enabled", () => {
+    start({ task: "Stale follow-up" });
+    const run = tasks()[0]!;
+    const step = store.listRunSteps(run.id)[0]!;
+    store.transitionSession(step.sessionId, "starting");
+    store.transitionSession(step.sessionId, "running");
+    service.releaseSessionToHuman(step.sessionId);
+    expect(tools().followUp({ sessionId: step.sessionId, prompt: "Now stale" }).ok).toBe(
+      true,
+    );
+    service.releaseSessionToHuman(step.sessionId);
+    store.setSessionOrchestratorControl(step.sessionId, true);
+    store.transitionSession(step.sessionId, "idle");
+    service.tickRun(run.id);
+    expect(store.getRunStep(step.id)).toMatchObject({
+      state: "pending",
+      attempts: 2,
+      dispatchedAt: "",
+    });
+    expect(
+      tools().followUp({ sessionId: step.sessionId, prompt: "Fresh request" }).ok,
+    ).toBe(true);
+    expect(store.getRunStep(step.id)).toMatchObject({ state: "starting", attempts: 3 });
+  });
+
   it("does not resume a writer beside another writer on the same checkout", () => {
     start({ task: "Fix Beta", category: "implement" });
     const run = store.listRuns().find((entry) => entry.name === "Fix Beta")!;

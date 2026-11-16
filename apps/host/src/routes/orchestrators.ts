@@ -886,6 +886,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         .code(400)
         .send({ error: "Every selected agent must belong to this orchestrator" });
     }
+    for (const candidate of selected) service.releaseSessionToHuman(candidate.id);
     const result = stopSessions(service, selected);
     return reply.code(result.requested > 0 ? 202 : 200).send({ ok: true, ...result });
   });

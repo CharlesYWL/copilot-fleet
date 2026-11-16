@@ -126,6 +126,248 @@ describe("session message queue", () => {
     expect((await f.list())[0]).not.toHaveProperty("recovery");
   });
 
+  describe("worker orchestration control", () => {
+    const assigned = async () => {
+      const f = await setup();
+      const lead = f.store.createSession(
+        f.placement,
+        "coordinate",
+        false,
+        "Coordinator",
+        { runRole: "lead" },
+      );
+      for (const state of ["starting", "running", "idle"] as const)
+        f.store.transitionSession(lead.id, state);
+      const run = f.store.createRun({
+        workspaceId: f.placement.workspaceId,
+        name: "Assigned task",
+        objective: "work",
+        policy: { wakePolicy: "on_any_settle" },
+      });
+      f.store.updateRun(run.id, { state: "running", leadSessionId: lead.id });
+      f.store.replaceRunSteps(run.id, [
+        { stepKey: "work", title: "Work", prompt: "work", category: "explore" },
+        {
+          stepKey: "after",
+          title: "Dependent",
+          prompt: "next",
+          category: "explore",
+          dependsOn: ["work"],
+        },
+      ]);
+      const worker = f.store.createSession(f.placement, "work", false, "Worker", {
+        runId: run.id,
+        runRole: "worker",
+        readOnly: true,
+      });
+      const step = f.store.listRunSteps(run.id)[0]!;
+      f.store.updateRunStep(step.id, {
+        sessionId: worker.id,
+        state: "running",
+        dispatchedAt: new Date().toISOString(),
+      });
+      f.service.dispatch(worker.nodeId, {
+        type: "prompt",
+        sessionId: worker.id,
+        prompt: "work",
+        attachments: [],
+      });
+      f.store.transitionSession(worker.id, "starting");
+      f.store.transitionSession(worker.id, "running");
+      const engine = new OrchestratorEngine(f.service);
+      f.service.onSessionEvent((event) => engine.handleSessionEvent(event));
+      const wakes = () =>
+        f.sent.filter(
+          (command) =>
+            command.type === "prompt" &&
+            command.sessionId === lead.id &&
+            command.prompt.includes("<fleet-wake"),
+        );
+      let sequence = 0;
+      const turn = (text: string) => {
+        expect(
+          f.service.promptSession(worker.id, { prompt: text, attachments: [] }),
+        ).toEqual({ ok: true });
+        f.event(++sequence, "state", { state: "running" }, worker.id);
+        f.event(++sequence, "agent_text", { text }, worker.id);
+        f.event(++sequence, "turn_complete", { stopReason: "end_turn" }, worker.id);
+        f.event(++sequence, "state", { state: "idle" }, worker.id);
+      };
+      return { ...f, lead, run, worker, step, engine, wakes, turn };
+    };
+
+    it.each(["cancel", "stop"])(
+      "hands over before a synchronous %s acknowledgement, without settling work",
+      async (action) => {
+        const f = await assigned();
+        const dispatch = f.service.dispatch.bind(f.service);
+        vi.spyOn(f.service, "dispatch").mockImplementation((...args) => {
+          const result = dispatch(...args);
+          if (args[1].type === action) {
+            expect(f.store.getSession(f.worker.id)?.orchestratorControlled).toBe(false);
+            f.event(1, "turn_complete", { stopReason: "cancelled" }, f.worker.id);
+            f.event(
+              2,
+              "state",
+              { state: action === "cancel" ? "idle" : "stopped" },
+              f.worker.id,
+            );
+          }
+          return result;
+        });
+        const response = await f.app.inject({
+          method: "POST",
+          url: `/api/sessions/${f.worker.id}/${action}`,
+        });
+        expect(response.statusCode).toBe(202);
+        f.engine.tick(Date.now() + 2 * f.run.policy.stepTimeoutMs);
+        expect(f.wakes()).toEqual([]);
+        expect(f.store.getRunStep(f.step.id)?.state).toBe("running");
+        expect(f.store.listRunSteps(f.run.id)[1]).toMatchObject({
+          state: "pending",
+          sessionId: "",
+        });
+        expect(f.store.getRun(f.run.id)?.settleSeq).toBe(0);
+        expect(f.store.getSession(f.worker.id)).toMatchObject({
+          runId: f.run.id,
+          runRole: "worker",
+          orchestratorControlled: false,
+        });
+        expect(f.store.getRun(f.run.id)?.leadSessionId).toBe(f.lead.id);
+      },
+    );
+
+    it("persists manual control and its attempt fence through reopen and backup restore", async () => {
+      const f = await assigned();
+      f.service.releaseSessionToHuman(f.worker.id);
+      const backup = f.store.exportHostBackup({ enrollmentToken: "test" });
+      const restored = new FleetStore(":memory:");
+      const reopened = new FleetStore(f.file);
+      try {
+        restored.replaceHostBackup(backup);
+        for (const store of [restored, reopened])
+          expect(store.getSession(f.worker.id)).toMatchObject({
+            orchestratorControlled: false,
+            orchestratorControlAttempt: f.step.attempts,
+            runId: f.run.id,
+            runRole: "worker",
+          });
+      } finally {
+        restored.close();
+        reopened.close();
+      }
+    });
+
+    it("reports each enabled direct turn once, suppresses manual turns, and does not replay when enabled", async () => {
+      const f = await assigned();
+      f.store.transitionSession(f.worker.id, "idle");
+      const { turn } = f;
+      turn("First direct result");
+      expect(f.wakes()).toHaveLength(1);
+      f.engine.tick();
+      expect(f.wakes()).toHaveLength(1);
+      turn("Second direct result");
+      expect(f.wakes()).toHaveLength(2);
+      expect(f.store.getRunStep(f.step.id)?.state).toBe("running");
+      f.service.releaseSessionToHuman(f.worker.id);
+      turn("Human-only result");
+      expect(f.wakes()).toHaveLength(2);
+      const response = await f.app.inject({
+        method: "POST",
+        url: `/api/sessions/${f.worker.id}/orchestrator-control`,
+        payload: { controlled: true },
+      });
+      expect(response.statusCode).toBe(200);
+      f.engine.tick();
+      expect(f.wakes()).toHaveLength(2);
+      turn("Back to reporting");
+      expect(f.wakes()).toHaveLength(3);
+      expect(f.store.getRun(f.run.id)?.settleSeq).toBe(0);
+    });
+
+    it.each([false, true])(
+      "retains direct reports behind a busy lead after task completion (durable=%s)",
+      async (durable) => {
+        const f = await assigned();
+        f.store.updateRunStep(f.step.id, { state: "succeeded" });
+        f.store.setRunState(f.run.id, "completed");
+        f.store.transitionSession(f.worker.id, "idle");
+        f.store.transitionSession(f.lead.id, "running");
+        if (durable) {
+          vi.spyOn(f.service.commands, "durableLead").mockReturnValue(true);
+          vi.spyOn(f.service.commands, "pumpLead").mockImplementation(() => {});
+        }
+        f.turn("First retained report");
+        f.turn("Second retained report");
+        f.engine.tick();
+        expect(f.wakes()).toHaveLength(0);
+        if (durable) {
+          const prompts = f.store.commands.prompts(f.lead.id);
+          expect(prompts).toHaveLength(2);
+          expect(prompts.map((record) => record.delivery.prompt).join("\n")).toContain(
+            "First retained report",
+          );
+          expect(prompts[1]?.delivery.prompt).toContain("Second retained report");
+        } else {
+          expect(f.store.getRun(f.run.id)?.pendingPrompt).toContain(
+            "First retained report",
+          );
+          expect(f.store.getRun(f.run.id)?.pendingPrompt).toContain(
+            "Second retained report",
+          );
+          f.store.transitionSession(f.lead.id, "idle");
+          new OrchestratorEngine(f.service).tick();
+          expect(f.wakes()).toHaveLength(1);
+          expect(f.store.getRun(f.run.id)?.pendingPrompt).toBe("");
+        }
+        expect(f.store.getSessionTurnCompletion(f.worker.id)).toBeUndefined();
+        expect(f.store.getRun(f.run.id)?.state).toBe("completed");
+        expect(f.store.getRunStep(f.step.id)?.state).toBe("succeeded");
+      },
+    );
+
+    it("settles new orchestrator work normally after reclaiming a manual worker", async () => {
+      const f = await assigned();
+      f.service.releaseSessionToHuman(f.worker.id);
+      f.store.retryRunStepInSession(
+        f.run.id,
+        {
+          stepKey: f.step.stepKey,
+          title: f.step.title,
+          prompt: "New assignment",
+          category: "explore",
+        },
+        f.worker.id,
+        f.store.maxEventSequence(f.worker.id),
+      );
+      f.store.transitionSession(f.worker.id, "idle");
+      f.engine.tick();
+      expect(f.store.getSession(f.worker.id)?.orchestratorControlled).toBe(true);
+      f.event(1, "state", { state: "running" }, f.worker.id);
+      f.event(2, "agent_text", { text: "New work complete" }, f.worker.id);
+      f.event(3, "turn_complete", { stopReason: "end_turn" }, f.worker.id);
+      f.event(4, "state", { state: "idle" }, f.worker.id);
+      expect(f.store.getRunStep(f.step.id)?.state).toBe("succeeded");
+      expect(f.store.getRun(f.run.id)?.settleSeq).toBe(1);
+      f.engine.tick();
+      expect(f.wakes()).toHaveLength(1);
+    });
+
+    it("does not treat internal cancellation as human takeover and rejects unassigned sessions", async () => {
+      const f = await assigned();
+      f.service.dispatch(f.worker.nodeId, { type: "cancel", sessionId: f.worker.id });
+      expect(f.store.getSession(f.worker.id)?.orchestratorControlled).toBe(true);
+      for (const id of [f.session.id, f.lead.id]) {
+        const response = await f.app.inject({
+          method: "POST",
+          url: `/api/sessions/${id}/orchestrator-control`,
+          payload: { controlled: true },
+        });
+        expect(response.statusCode).toBe(409);
+      }
+    });
+  });
+
   it("leaves a refusal without a recovery, or for another command, as it was", async () => {
     const f = await setup();
     await f.submit("Delivered normally");
