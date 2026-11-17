@@ -1712,7 +1712,6 @@ export function App() {
                             preference={notificationPreference.preference}
                             loading={notificationPreference.loading}
                             onSet={notificationPreference.setLifecycleEnabled}
-                            onReset={notificationPreference.reset}
                           />
                         }
                         draft={draftFor(drafts, activeSession.id)}
@@ -1838,7 +1837,6 @@ export function App() {
                 preference={notificationPreference.preference}
                 loading={notificationPreference.loading}
                 onSet={notificationPreference.setLifecycleEnabled}
-                onReset={notificationPreference.reset}
               />
             }
             draft={draftFor(drafts, activeSession.id)}

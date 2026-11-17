@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { describe, expect, it, vi } from "vitest";
 import type { EffectiveNotificationPreference } from "../hooks/useNotificationPreference";
@@ -55,7 +55,7 @@ describe("lifecyclePreferenceLabel", () => {
 });
 
 describe("LifecycleNotificationControl", () => {
-  it("persists explicit choices through the Host and restores inheritance", async () => {
+  it("toggles notifications with an icon-only button and persists the choice", async () => {
     let stored = inherited();
     const requestMock = vi.fn(async (_path: string, init?: RequestInit) => {
       if (init?.method === "PUT") {
@@ -68,7 +68,6 @@ describe("LifecycleNotificationControl", () => {
           explicitOverride: body.lifecycleEnabled,
         });
       }
-      if (init?.method === "DELETE") stored = inherited();
       return { ok: true as const, data: stored };
     });
     const request: FleetRequest = async <T,>(path: string, init?: RequestInit) =>
@@ -81,7 +80,6 @@ describe("LifecycleNotificationControl", () => {
           preference={preference.preference}
           loading={preference.loading}
           onSet={preference.setLifecycleEnabled}
-          onReset={preference.reset}
         />
       );
     };
@@ -93,25 +91,33 @@ describe("LifecycleNotificationControl", () => {
     );
     const inheritedButton = await screen.findByRole("button", {
       name: "Lifecycle notifications: Off by default for dependency agents",
+      pressed: false,
     });
+    expect(inheritedButton.textContent).toBe("");
+    expect(inheritedButton.querySelector(".fui-AlertOff20Regular")).not.toBeNull();
+    expect(inheritedButton.title).toBe(
+      "Lifecycle notifications: Off by default for dependency agents",
+    );
     fireEvent.click(inheritedButton);
-    fireEvent.click(screen.getByRole("menuitemradio", { name: "On for this agent" }));
 
-    await screen.findByRole("button", {
+    const enabledButton = await screen.findByRole("button", {
       name: "Lifecycle notifications: On for this agent",
+      pressed: true,
     });
+    expect(enabledButton.textContent).toBe("");
+    expect(enabledButton.querySelector(".fui-Alert20Regular")).not.toBeNull();
+    expect(screen.queryByRole("menu")).toBeNull();
     expect(requestMock).toHaveBeenCalledWith(
       "/api/notifications/preferences/worker-1",
-      expect.objectContaining({ method: "PUT" }),
-    );
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "Lifecycle notifications: On for this agent",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ lifecycleEnabled: true }),
       }),
     );
-    fireEvent.click(screen.getByRole("menuitemradio", { name: "Off for this agent" }));
+    fireEvent.click(enabledButton);
     await screen.findByRole("button", {
       name: "Lifecycle notifications: Off for this agent",
+      pressed: false,
     });
     expect(requestMock).toHaveBeenLastCalledWith(
       "/api/notifications/preferences/worker-1",
@@ -129,20 +135,9 @@ describe("LifecycleNotificationControl", () => {
     );
     const explicitButton = await screen.findByRole("button", {
       name: "Lifecycle notifications: Off for this agent",
+      pressed: false,
     });
-    fireEvent.click(explicitButton);
-    fireEvent.click(screen.getByRole("menuitem", { name: "Use inherited default" }));
-
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", {
-          name: "Lifecycle notifications: Off by default for dependency agents",
-        }),
-      ).toBeTruthy(),
-    );
-    expect(requestMock).toHaveBeenCalledWith(
-      "/api/notifications/preferences/worker-1",
-      expect.objectContaining({ method: "DELETE" }),
-    );
+    expect(explicitButton.textContent).toBe("");
+    expect(explicitButton.querySelector(".fui-AlertOff20Regular")).not.toBeNull();
   });
 });
