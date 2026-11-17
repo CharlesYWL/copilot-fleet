@@ -22,7 +22,10 @@ self-contained, static page with no build or server requirement.
    the Node.
 3. Open **Sessions**, select the Fleet conversation, and chat with its existing
    worker. Online actions go through Host's existing admission and queueing
-   services. The Node is not a second scheduler.
+   services. The Node is not a second scheduler. Loaded sessions appear in
+   running, idle, then stopped order, newest update first within each group.
+   Queued, starting, and cancelling sessions join the running group; offline,
+   completed, and failed sessions join the stopped group. Stopped titles are gray.
 4. During an ordinary Host connection outage, continue from that Node page.
    Eligible running workers can execute local prompts immediately or queue them
    behind their current turn. On reconnect, wait for synchronization before

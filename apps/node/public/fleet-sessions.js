@@ -1,5 +1,17 @@
 import { $, el, showPanel } from "./ui.js";
 
+const sessionStateOrder = {
+  queued: 0,
+  starting: 0,
+  running: 0,
+  cancelling: 0,
+  idle: 1,
+  offline: 2,
+  stopped: 2,
+  completed: 2,
+  failed: 2,
+};
+
 // Match Host's derived labels while keeping the metadata list a native module.
 export const fleetSessionLabel = (session) => {
   const name = session.name?.trim();
@@ -37,11 +49,18 @@ export const initFleetSessions = () => {
   };
   const render = () => {
     const query = $("fleetSessionSearch").value.trim().toLocaleLowerCase();
-    const visible = sessions.filter((session) =>
-      [session.name, session.initialPrompt, session.workspaceName, session.id].some(
-        (value) => value?.toLocaleLowerCase().includes(query),
-      ),
-    );
+    const visible = sessions
+      .filter((session) =>
+        [session.name, session.initialPrompt, session.workspaceName, session.id].some(
+          (value) => value?.toLocaleLowerCase().includes(query),
+        ),
+      )
+      .sort(
+        (left, right) =>
+          sessionStateOrder[left.state] - sessionStateOrder[right.state] ||
+          Date.parse(right.updatedAt) - Date.parse(left.updatedAt) ||
+          left.id.localeCompare(right.id),
+      );
     $("fleetSessionList").replaceChildren(
       ...(visible.length
         ? visible.map((session) =>

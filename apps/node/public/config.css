@@ -390,6 +390,10 @@ h3 {
   margin-bottom: 3px;
 }
 
+.session-item[data-state="stopped"] .session-item-title {
+  color: var(--muted);
+}
+
 .session-item-meta {
   color: var(--muted);
   font-size: 12px;

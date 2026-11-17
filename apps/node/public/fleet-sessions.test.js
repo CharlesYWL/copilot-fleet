@@ -50,6 +50,138 @@ afterEach(() => {
 });
 
 describe("lazy Node session shell", () => {
+  it("orders loaded sessions by activity group, then newest update, including more pages and search", async () => {
+    const session = (id, state, updatedAt) => ({
+      id,
+      name: id,
+      workspaceName: "Workspace",
+      state,
+      updatedAt,
+    });
+    const older = "2026-11-16T12:00:00Z";
+    const newer = "2026-11-17T12:00:00Z";
+    vi.mocked(fetch)
+      .mockImplementationOnce(() =>
+        reply({
+          sessions: [
+            session("stopped-new", "stopped", newer),
+            session("idle-old", "idle", older),
+            session("running-old", "running", older),
+            session("stopped-old", "stopped", older),
+            session("idle-new", "idle", newer),
+          ],
+          nextCursor: "next-page",
+        }),
+      )
+      .mockImplementationOnce(() =>
+        reply({
+          sessions: [session("running-new", "running", newer)],
+        }),
+      );
+    const ids = () =>
+      [...$("fleetSessionList").querySelectorAll("[data-fleet-session-id]")].map(
+        (row) => row.dataset.fleetSessionId,
+      );
+    initFleetSessions();
+    await vi.waitFor(() =>
+      expect(ids()).toEqual([
+        "running-old",
+        "idle-new",
+        "idle-old",
+        "stopped-new",
+        "stopped-old",
+      ]),
+    );
+    $("fleetSessionMore").click();
+    await vi.waitFor(() =>
+      expect(ids()).toEqual([
+        "running-new",
+        "running-old",
+        "idle-new",
+        "idle-old",
+        "stopped-new",
+        "stopped-old",
+      ]),
+    );
+    $("fleetSessionSearch").value = "new";
+    $("fleetSessionSearch").dispatchEvent(new Event("input"));
+    expect(ids()).toEqual(["running-new", "idle-new", "stopped-new"]);
+  });
+
+  it("keeps transitional sessions before idle and inactive sessions after it", async () => {
+    const states = [
+      "stopped",
+      "offline",
+      "idle",
+      "failed",
+      "completed",
+      "starting",
+      "running",
+      "queued",
+      "cancelling",
+    ];
+    vi.mocked(fetch).mockImplementation(() =>
+      reply({
+        sessions: states.map((state) => ({
+          id: state,
+          name: state,
+          workspaceName: "Workspace",
+          state,
+          updatedAt: "2026-11-17T12:00:00Z",
+        })),
+      }),
+    );
+    initFleetSessions();
+    await vi.waitFor(() =>
+      expect(
+        [...$("fleetSessionList").querySelectorAll("[data-state]")].map(
+          (row) => row.dataset.state,
+        ),
+      ).toEqual([
+        "cancelling",
+        "queued",
+        "running",
+        "starting",
+        "idle",
+        "completed",
+        "failed",
+        "offline",
+        "stopped",
+      ]),
+    );
+  });
+
+  it("grays stopped titles without disabling selection or dimming idle titles", async () => {
+    vi.mocked(fetch).mockImplementation(() =>
+      reply({
+        sessions: [
+          { id: "idle", name: "Idle", workspaceName: "Workspace", state: "idle" },
+          {
+            id: "stopped",
+            name: "Stopped",
+            workspaceName: "Workspace",
+            state: "stopped",
+          },
+        ],
+      }),
+    );
+    initFleetSessions();
+    await vi.waitFor(() =>
+      expect($("fleetSessionList").textContent).toContain("Stopped"),
+    );
+    const titleColor = (id) =>
+      getComputedStyle(
+        document.querySelector(`[data-fleet-session-id="${id}"] .session-item-title`),
+      ).color;
+    expect(titleColor("stopped")).toBe("var(--muted)");
+    expect(titleColor("idle")).not.toBe("var(--muted)");
+    document.querySelector('[data-fleet-session-id="stopped"]').click();
+    expect($("fleetSessionList").querySelector(".selected").dataset.fleetSessionId).toBe(
+      "stopped",
+    );
+    expect(titleColor("stopped")).toBe("var(--muted)");
+  });
+
   it.each([
     ["queued", "#8994ab"],
     ["starting", "#6c8cff"],
