@@ -132,7 +132,7 @@ describe("session file reader", () => {
     expect(refusal(next).code).toBe("changed");
   });
 
-  it("refuses files outside the session's folders, however they are reached", async () => {
+  it("reads files outside the session's folders, however they are reached", async () => {
     const { workspace, outside, options } = await fixture();
     const reader = new SessionFileReader(options);
     await symlink(
@@ -145,9 +145,18 @@ describe("session file reader", () => {
       "../outside/secret.txt",
       join("escape", "secret.txt"),
     ]) {
+      const result = await reader.read(request({ path, roots: [workspace] }));
+      expect(result.ok).toBe(true);
+    }
+  });
+
+  it("still refuses Fleet's or Copilot's configuration outside the session's folders", async () => {
+    const { workspace, config, copilotHome, options } = await fixture();
+    const reader = new SessionFileReader(options);
+    for (const path of [join(config, "node.json"), join(copilotHome, "config.json")]) {
       expect(refusal(await reader.read(request({ path, roots: [workspace] })))).toEqual({
         code: "forbidden",
-        error: expect.stringContaining("outside the folders"),
+        error: expect.stringContaining("own configuration"),
       });
     }
   });
