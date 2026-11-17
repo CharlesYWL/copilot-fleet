@@ -231,29 +231,8 @@ describe("downloads from a session view", () => {
     expect(downloadSessionFile).toHaveBeenCalledWith("s1", "C:\\work\\report.md");
   });
 
-  it("downloads any path from the header, and keeps the dialog open to explain a refusal", async () => {
+  it("does not offer a manual-path download button in the header", () => {
     terminal([]);
-    fireEvent.click(screen.getByRole("button", { name: "Download a file" }));
-    const input = await screen.findByRole("textbox", { name: /File on build-box/ });
-    expect(screen.getByText(/relative to C:\\work/)).toBeTruthy();
-
-    vi.mocked(downloadSessionFile).mockRejectedValueOnce(
-      new Error("That file is outside the folders this session works in."),
-    );
-    fireEvent.change(input, { target: { value: "  ..\\secret.txt  " } });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Download" }));
-    });
-    expect(downloadSessionFile).toHaveBeenLastCalledWith("s1", "..\\secret.txt");
-    expect(await screen.findByText(/outside the folders/)).toBeTruthy();
-
-    fireEvent.change(input, { target: { value: "docs/report.docx" } });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Download" }));
-    });
-    expect(downloadSessionFile).toHaveBeenLastCalledWith("s1", "docs/report.docx");
-    await waitFor(() =>
-      expect(screen.queryByRole("textbox", { name: /File on build-box/ })).toBeNull(),
-    );
+    expect(screen.queryByRole("button", { name: "Download a file" })).toBeNull();
   });
 });

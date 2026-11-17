@@ -115,7 +115,6 @@ import { PromptRail } from "./PromptRail";
 import { SessionConfigBar } from "./SessionConfigBar";
 import { SessionUsageBar } from "./SessionUsageBar";
 import { SessionAgentBadge } from "./SessionAgentBadge";
-import { SessionFileDialog } from "./SessionFileDialog";
 import { FileDownloadButton, SessionFilesProvider } from "./SessionFiles";
 import { SessionInfoDialog } from "./SessionInfoDialog";
 import { SentAttachments } from "./SentAttachments";
@@ -1299,12 +1298,6 @@ export const TerminalView = ({
           key={session.id}
           session={session}
           node={node}
-          placement={placement}
-          className={styles.headerAction}
-        />
-        <SessionFileDialog
-          key={`files-${session.id}`}
-          session={session}
           placement={placement}
           className={styles.headerAction}
         />
