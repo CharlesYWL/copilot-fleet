@@ -17,6 +17,7 @@ import {
   type ConsoleRequest,
   type ConsoleSessionView,
   type FleetSession,
+  type NodeConsoleSync,
 } from "@fleet/protocol";
 import type { FleetService, NodeLink } from "./fleet-service.js";
 import { HOST_IDENTITY_ID_SETTING } from "./auth/host-identity.js";
@@ -24,6 +25,8 @@ import { HOST_IDENTITY_ID_SETTING } from "./auth/host-identity.js";
 type Peer = {
   link: NodeLink;
   syncing: boolean;
+  /** Whether this connection already sent `initialize`; another one is a resync. */
+  initialized: boolean;
   active: string[];
   busy: string[];
   subscriptions: Set<string>;
@@ -33,6 +36,17 @@ type Peer = {
   pendingReplayBytes: number;
   replayFailed: boolean;
 };
+
+/**
+ * A reconnect this soon after a drop continues the same synchronization
+ * episode; Nodes retry every 2 s. A Node returning after a real outage starts
+ * a new one rather than reporting the outage as time spent synchronizing.
+ */
+const SYNC_EPISODE_RECONNECT_MS = 60_000;
+const SYNC_DROPPED = "The connection dropped before synchronization finished";
+/** Why Host work waits on a synchronizing Node, and where to watch it finish. */
+export const NODE_HISTORY_SYNCING =
+  "Node history is synchronizing (progress is shown in Settings › Nodes)";
 
 export class ConsoleRequestError extends Error {
   constructor(
@@ -46,6 +60,11 @@ export class ConsoleRequestError extends Error {
 /** A scoped client of the existing Fleet services, never an administrator proxy. */
 export class SessionConsoleService {
   private readonly peers = new Map<string, Peer>();
+  /** Outlives a dropped connection, so the reconnect continues the same episode. */
+  private readonly episodes = new Map<
+    string,
+    { status: NodeConsoleSync; droppedAt?: number }
+  >();
   constructor(private readonly service: FleetService) {}
   private get store() {
     return this.service.store;
@@ -55,6 +74,7 @@ export class SessionConsoleService {
     this.peers.set(nodeId, {
       link,
       syncing: true,
+      initialized: false,
       active,
       busy,
       subscriptions: new Set(),
@@ -64,12 +84,65 @@ export class SessionConsoleService {
       pendingReplayBytes: 0,
       replayFailed: false,
     });
+    this.beginAttempt(nodeId);
   }
   detach(nodeId: string): void {
+    const peer = this.peers.get(nodeId);
     this.peers.delete(nodeId);
+    const episode = this.episodes.get(nodeId);
+    if (!peer || !episode) return;
+    episode.droppedAt = Date.now();
+    if (episode.status.phase !== "failed")
+      episode.status = { ...episode.status, error: SYNC_DROPPED };
   }
   blocked(nodeId: string): boolean {
     return this.peers.get(nodeId)?.syncing === true;
+  }
+  /** The synchronization a connected Node is still working through, if any. */
+  syncStatus(nodeId: string): NodeConsoleSync | undefined {
+    return this.peers.has(nodeId) ? this.episodes.get(nodeId)?.status : undefined;
+  }
+  private beginAttempt(nodeId: string): void {
+    const now = Date.now();
+    const at = new Date(now).toISOString();
+    const previous = this.episodes.get(nodeId);
+    const continued =
+      previous &&
+      (previous.droppedAt === undefined ||
+        now - previous.droppedAt <= SYNC_EPISODE_RECONNECT_MS)
+        ? previous.status
+        : undefined;
+    this.episodes.set(nodeId, {
+      status: {
+        phase: "waiting",
+        since: continued?.since ?? at,
+        attempts: (continued?.attempts ?? 0) + 1,
+        updatedAt: at,
+        sentEvents: 0,
+        ...(continued?.error ? { error: continued.error } : {}),
+      },
+    });
+  }
+  /** Records progress from the connection that made it, and shows it in Settings. */
+  private progress(
+    nodeId: string,
+    peer: Peer,
+    change: (status: NodeConsoleSync) => NodeConsoleSync,
+  ): void {
+    const episode = this.episodes.get(nodeId);
+    if (!episode || this.peers.get(nodeId) !== peer) return;
+    episode.status = { ...change(episode.status), updatedAt: new Date().toISOString() };
+    this.announce(nodeId);
+  }
+  private announce(nodeId: string): void {
+    const node = this.store.getNode(nodeId);
+    if (node) this.service.publishNode(node);
+  }
+  /** A refusal leaves the Node blocked, so it is shown even after an earlier sync. */
+  private fail(nodeId: string, peer: Peer, error: string): void {
+    if (this.peers.get(nodeId) !== peer) return;
+    if (!this.episodes.has(nodeId)) this.beginAttempt(nodeId);
+    this.progress(nodeId, peer, (status) => ({ ...status, phase: "failed", error }));
   }
   enabled(nodeId: string): boolean {
     return this.peers.has(nodeId);
@@ -177,14 +250,11 @@ export class SessionConsoleService {
       ) {
         peer.replayFailed = true;
         peer.syncing = true;
+        const error = "Session event window is full; retain and reconcile local history";
+        this.fail(nodeId, peer, error);
         this.service.send(peer.link, {
           type: "session_console_response",
-          response: {
-            requestId,
-            ok: false,
-            status: 429,
-            error: "Session event window is full; retain and reconcile local history",
-          },
+          response: { requestId, ok: false, status: 429, error },
         });
         return;
       }
@@ -238,6 +308,8 @@ export class SessionConsoleService {
         });
         if (request.kind === "synchronized" && peer.link.readyState === peer.link.OPEN) {
           peer.syncing = false;
+          this.episodes.delete(nodeId);
+          this.announce(nodeId);
           this.service.commands.reconnect(nodeId);
           this.service.reconcile(nodeId, peer.active, peer.busy);
           for (const id of new Set(
@@ -253,6 +325,8 @@ export class SessionConsoleService {
         peer.replayFailed = true;
         peer.syncing = true;
       }
+      if (["initialize", "replay", "synchronized"].includes(raw.kind))
+        this.fail(nodeId, peer, errorMessage(error));
       if (this.peers.get(nodeId) === peer)
         this.service.send(peer.link, {
           type: "session_console_response",
@@ -289,6 +363,9 @@ export class SessionConsoleService {
     request: ConsoleRequest,
   ): Promise<unknown> {
     if (request.kind === "initialize") {
+      // A second initialize on one connection is an operator-requested resync.
+      if (peer.initialized) this.beginAttempt(nodeId);
+      peer.initialized = true;
       peer.syncing = true;
       peer.replayFailed = false;
       for (const id of [...request.activeSessionIds, ...request.busySessionIds])
@@ -316,6 +393,20 @@ export class SessionConsoleService {
           );
         grants.push(this.grant(session));
       }
+      const granted = new Set(grants.map((grant) => grant.session.id));
+      let totalEvents = 0;
+      let reported = true;
+      for (const entry of request.sessions) {
+        if (!granted.has(entry.sessionId)) continue;
+        if (entry.pendingEvents === undefined) reported = false;
+        else totalEvents += entry.pendingEvents;
+      }
+      this.progress(nodeId, peer, ({ totalEvents: _previous, ...status }) => ({
+        ...status,
+        phase: "replaying",
+        sentEvents: 0,
+        ...(reported ? { totalEvents } : {}),
+      }));
       return { grants, unavailableSessionIds };
     }
     if (request.kind === "catalog") {
@@ -406,6 +497,10 @@ export class SessionConsoleService {
           );
       }
       applyOperations(this.store.maxEventSequence(session.id));
+      this.progress(nodeId, peer, (status) => ({
+        ...status,
+        sentEvents: status.sentEvents + request.events.length,
+      }));
       return { throughSequence: this.store.maxEventSequence(session.id) };
     }
     if (request.kind === "action")

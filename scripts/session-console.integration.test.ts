@@ -142,12 +142,12 @@ async function fixture(enable = true, journalBatchMs = 2) {
   makeNode();
   service.attachNode(node.id, link);
   store.setNodeOnline(node.id, true, 0);
-  const connect = async () => {
+  const connect = async (reportProgress = true) => {
     online = true;
     service.attachNode(node.id, link);
     store.setNodeOnline(node.id, true, router.activeSessionIds.length);
     service.console.attach(node.id, link, router.activeSessionIds, router.busySessionIds);
-    await controller.connected(true);
+    await controller.connected(true, { reportProgress });
   };
   if (enable) await connect();
   const disconnect = () => {
@@ -941,6 +941,86 @@ describe("shared online and offline Node session control", () => {
     expect(new Set(events.map((event) => event.sequence)).size).toBe(events.length);
   });
 
+  it("shows synchronization progress across a dropped connection until it is confirmed", async () => {
+    const f = await fixture();
+    const id = await f.create();
+    await f.settled(id);
+    f.disconnect();
+    for (let index = 0; index < 1_200; index++)
+      f.journal.append({
+        eventId: randomUUID(),
+        sessionId: id,
+        sequence: index + 1,
+        type: "agent_text",
+        payload: { text: ` ${index}` },
+        createdAt: new Date().toISOString(),
+      });
+    await f.journal.flush();
+    const totalEvents = f.journal.countEvents(
+      id,
+      f.journal.get(id)!.acknowledgedSequence,
+    );
+    const status = () =>
+      f.service.listNodes().find((node) => node.id === f.node.id)?.consoleSync;
+
+    f.holdReplayReplies();
+    void f.connect();
+    await vi.waitFor(() =>
+      expect(status()).toMatchObject({
+        phase: "replaying",
+        attempts: 1,
+        sentEvents: 512,
+        totalEvents,
+      }),
+    );
+    const { since } = status()!;
+
+    f.disconnect();
+    f.releaseReplayReplies();
+    f.holdReplayReplies();
+    void f.connect();
+    await vi.waitFor(() =>
+      expect(status()).toMatchObject({
+        phase: "replaying",
+        since,
+        attempts: 2,
+        sentEvents: 512,
+        totalEvents,
+        error: expect.stringContaining("connection dropped"),
+      }),
+    );
+
+    f.releaseReplayReplies();
+    await f.settled(id);
+    expect(status()).toBeUndefined();
+    expect(f.service.console.blocked(f.node.id)).toBe(false);
+  });
+
+  it("omits pending-event counts for a Host that did not announce it accepts them", async () => {
+    const f = await fixture();
+    const id = await f.create();
+    await f.settled(id);
+    f.disconnect();
+    f.journal.append({
+      eventId: randomUUID(),
+      sessionId: id,
+      sequence: 1,
+      type: "agent_text",
+      payload: { text: "offline" },
+      createdAt: new Date().toISOString(),
+    });
+    await f.journal.flush();
+    const from = f.requests.length;
+    await f.connect(false);
+    const initialize = f.requests
+      .slice(from)
+      .find((entry) => entry.request.kind === "initialize")!.request;
+    expect(initialize).toMatchObject({
+      sessions: [{ sessionId: id, grantId: expect.any(String) }],
+    });
+    expect(JSON.stringify(initialize)).not.toContain("pendingEvents");
+  });
+
   it("replays an individual tool-sized event larger than the normal batch budget", async () => {
     const f = await fixture();
     const id = await f.create();
@@ -1114,6 +1194,12 @@ describe("shared online and offline Node session control", () => {
         response: { ok: false, status: 404 },
       });
       expect(f.service.console.blocked(f.node.id)).toBe(true);
+      expect(
+        f.service.listNodes().find((node) => node.id === f.node.id)?.consoleSync,
+      ).toMatchObject({
+        phase: "failed",
+        error: "Session is not available on this Node",
+      });
     },
   );
 

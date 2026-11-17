@@ -82,12 +82,16 @@ describe("startPresenceMonitor", () => {
     vi.setSystemTime(t0);
     const { store, service, nodeId } = setup();
     service.recordPresence(nodeId, []);
-    const timer = startPresenceMonitor(service, 15_000);
+    const drops: [string, number][] = [];
+    const timer = startPresenceMonitor(service, 15_000, undefined, (node, silentMs) =>
+      drops.push([node.id, silentMs]),
+    );
     cleanups.push(() => clearInterval(timer));
 
     vi.advanceTimersByTime(20_000);
 
     expect(store.getNode(nodeId)?.online).toBe(false);
+    expect(drops).toEqual([[nodeId, 20_000]]);
   });
 
   it("does not blame Nodes for a stall of the Host's own event loop", () => {

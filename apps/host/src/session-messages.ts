@@ -11,6 +11,7 @@ import {
 import type { FleetService } from "./fleet-service.js";
 import type { QueuedSessionMessage } from "./store.js";
 import { CommandConflict } from "./command-execution-store.js";
+import { NODE_HISTORY_SYNCING } from "./session-console-service.js";
 
 type PromptInput = {
   prompt: string;
@@ -49,7 +50,7 @@ export class SessionMessages {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false as const, status: 404, error: "Session not found" };
     if (this.service.console?.blocked(session.nodeId))
-      return { ok: false as const, status: 409, error: "Node history is synchronizing" };
+      return { ok: false as const, status: 409, error: NODE_HISTORY_SYNCING };
     if (
       session.state === "idle" &&
       this.store.queuedMessages(sessionId).length === 0 &&

@@ -520,6 +520,20 @@ export class SessionJournal {
     });
   }
 
+  /** Committed events a replay after `afterSequence` would send. */
+  countEvents(sessionId: string, afterSequence: number): number {
+    integer(afterSequence);
+    return this.read(() =>
+      Number(
+        this.db
+          .prepare(
+            "SELECT count(*) AS count FROM events WHERE session_id=? AND sequence>? AND data IS NOT NULL",
+          )
+          .get(sessionId, afterSequence)!.count,
+      ),
+    );
+  }
+
   acknowledge(sessionId: string, throughSequence: number): void {
     this.writable();
     integer(throughSequence);

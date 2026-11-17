@@ -312,6 +312,29 @@ export const NodeHealthSchema = z.object({
 });
 export type NodeHealth = z.infer<typeof NodeHealthSchema>;
 
+/**
+ * How far a connected Node has got with session-console synchronization, the
+ * barrier that holds new Host work back until its local history is reconciled.
+ *
+ * One episode spans every reconnect until a synchronization is confirmed, so a
+ * connection that keeps dropping mid-sync shows a growing `attempts` and an
+ * unchanged `since` instead of a clock that restarts. `failed` means the Host
+ * refused the Node's history; it stays blocked until reconciled or reconnected.
+ */
+export const NodeConsoleSyncSchema = z.object({
+  phase: z.enum(["waiting", "replaying", "failed"]),
+  since: z.string().datetime(),
+  attempts: z.number().int().positive(),
+  /** When this Node last moved synchronization forward. */
+  updatedAt: z.string().datetime(),
+  sentEvents: z.number().int().nonnegative(),
+  /** Events the Node held at the start of this attempt; older Nodes do not say. */
+  totalEvents: z.number().int().nonnegative().optional(),
+  /** Why this attempt failed, or why the previous attempt ended. */
+  error: z.string().optional(),
+});
+export type NodeConsoleSync = z.infer<typeof NodeConsoleSyncSchema>;
+
 export const NodeSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -341,6 +364,8 @@ export const NodeSchema = z.object({
   homeDir: z.string().default(""),
   /** Ephemeral telemetry; older Nodes and restored archives need not carry it. */
   health: NodeHealthSchema.optional(),
+  /** Present only while a connected Node is synchronizing its session history. */
+  consoleSync: NodeConsoleSyncSchema.optional(),
   /** Last successfully authenticated connection, if this Host can identify it. */
   connection: NodeConnectionSchema.optional(),
   /**
@@ -1327,6 +1352,8 @@ export const ConsoleRequestSchema = z.discriminatedUnion("kind", [
             .object({
               sessionId: z.string().min(1),
               grantId: z.string().uuid(),
+              /** Unacknowledged events to replay; sent only to a `consoleSyncProgress` Host. */
+              pendingEvents: z.number().int().nonnegative().optional(),
             })
             .strict(),
         )
@@ -1741,6 +1768,11 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("welcome"),
     usageSnapshots: z.boolean().optional(),
     sessionConsole: z.boolean().optional(),
+    /**
+     * This Host accepts `pendingEvents` in session-console `initialize` entries.
+     * Those entries are strict, so an older Host would refuse the whole sync.
+     */
+    consoleSyncProgress: z.boolean().optional(),
     /** This Host accepts `native_session_import`; see NATIVE_SESSION_SYNC_CAPABILITY. */
     nativeSessionSync: z.boolean().optional(),
     nodeId: z.string().min(1),

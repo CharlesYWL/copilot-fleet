@@ -304,7 +304,7 @@ export class OrchestratorEngine {
         code: "node_offline",
         nodeId: syncing.nodeId,
         detail:
-          "Node history and local control are synchronizing; scheduling waits for reconciliation.",
+          "Node history and local control are synchronizing; scheduling waits for reconciliation (progress is shown in Settings › Nodes).",
       });
     }
     const commandFence = this.store.commands.fence(runId);

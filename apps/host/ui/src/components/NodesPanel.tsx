@@ -44,6 +44,7 @@ import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { sessionLabel } from "../lib/session-label";
 import { ConnectNodeCard } from "./ConnectNodeCard";
 import { NodeHealth } from "./NodeHealth";
+import { NodeSyncStatus } from "./NodeSyncStatus";
 import { StatusIndicator } from "./StatusIndicator";
 import { statusDescriptor } from "../lib/status-visuals";
 import { SettingsSection } from "./SettingsSection";
@@ -104,6 +105,12 @@ const useStyles = makeStyles({
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
+  },
+  nameStack: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "4px",
+    minWidth: 0,
   },
   nameEdit: {
     display: "flex",
@@ -395,9 +402,12 @@ const NodeRow = ({
       </TableCell>
       <TableCell className={styles.colName}>
         {draft === undefined ? (
-          <Text weight="semibold" className={styles.nameText} title={node.name}>
-            {node.name}
-          </Text>
+          <span className={styles.nameStack}>
+            <Text weight="semibold" className={styles.nameText} title={node.name}>
+              {node.name}
+            </Text>
+            {node.consoleSync && <NodeSyncStatus sync={node.consoleSync} now={now} />}
+          </span>
         ) : (
           <span className={styles.nameEdit}>
             <Input

@@ -190,7 +190,14 @@ export class NodeSessionConsole {
     this.connection();
   }
 
-  async connected(supported: boolean): Promise<void> {
+  /**
+   * `reportProgress` is the Host's `consoleSyncProgress` welcome flag: only such
+   * a Host accepts the pending-event counts it shows while this Node catches up.
+   */
+  async connected(
+    supported: boolean,
+    { reportProgress = false }: { reportProgress?: boolean } = {},
+  ): Promise<void> {
     if (this.hostIdentity !== this.options.hostId()) {
       this.views.clear();
       for (const viewers of this.viewers.values())
@@ -240,6 +247,14 @@ export class NodeSessionConsole {
             sessions: pending.map((entry) => ({
               sessionId: entry.session.id,
               grantId: entry.grantId,
+              ...(reportProgress
+                ? {
+                    pendingEvents: this.journal.countEvents(
+                      entry.session.id,
+                      entry.acknowledgedSequence,
+                    ),
+                  }
+                : {}),
             })),
           }),
         );
