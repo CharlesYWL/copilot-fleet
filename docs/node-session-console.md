@@ -37,12 +37,28 @@ the outage; lead mutations and session resume require Host.
 | --- | --- |
 | Online | Host owns the shared projection and normal control path. Opened Node views receive scoped updates from Host. |
 | Offline | Node shows its locally journaled history and controls the existing eligible worker. Host cannot show new local output until reconnect. |
-| Synchronizing | Recovery batches and local-control receipts are reconciled before ordinary Host work is admitted; new local submissions pause. |
+| Synchronizing | Recovery batches and local-control receipts are reconciled before ordinary Host work is admitted; new local submissions pause. Host **Settings › Nodes** shows the progress under the Node's name. |
 | Conflict / unavailable | Evidence is retained and affected control is blocked. Inspect the reported identity, binding or storage error instead of starting a duplicate worker. |
 
 A Node restart preserves journal data, not the running process. Host must use
 current process inventory and normal resume rules after synchronization. A lost
 acknowledgment is not permission to invoke the prompt again.
+
+### Watching synchronization
+
+While a connected Node is synchronizing, **Settings › Nodes** shows a line under
+its name: whether Host is still waiting for the Node to start, how many events
+have arrived out of how many the Node reported, how long it has taken, and which
+attempt this is. Reconnects within a minute continue the same count and clock, so
+a connection that keeps dropping shows a rising attempt number, with the reason
+the previous attempt ended in the tooltip. No progress for 30 seconds is called
+out. If Host refuses the history, the line reports the refusal; use
+**Reconcile session history** on that row to retry once the cause is fixed.
+
+Event totals require a Host that announces `consoleSyncProgress` in its welcome:
+the `initialize` entries are strict, so a Node never sends counts to an older
+Host. An older Node does not send them either, and its row shows events received
+without a total.
 
 ## Ownership and lazy loading
 

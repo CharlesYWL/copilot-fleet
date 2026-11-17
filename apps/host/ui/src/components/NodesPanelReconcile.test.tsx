@@ -96,3 +96,74 @@ describe("Nodes panel session-history reconcile action", () => {
     expect(screen.queryByRole("button", { name: buttonName })).toBeNull();
   });
 });
+
+describe("Nodes panel session-history synchronization", () => {
+  const now = Date.parse("2026-10-15T12:05:00.000Z");
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows how far a reconnecting Node has got and why earlier attempts ended", () => {
+    vi.useFakeTimers({ now, toFake: ["Date"] });
+    show({
+      ...node,
+      consoleSync: {
+        phase: "replaying",
+        since: new Date(now - 130_000).toISOString(),
+        attempts: 7,
+        updatedAt: new Date(now - 2_000).toISOString(),
+        sentEvents: 300,
+        totalEvents: 700,
+        error: "The connection dropped before synchronization finished",
+      },
+    });
+    const summary = screen.getByText(
+      "Syncing history: 300 of 700 events · 2m 10s · attempt 7",
+    );
+    expect(summary.closest("[title]")?.getAttribute("title")).toContain(
+      "previous attempt: The connection dropped before synchronization finished",
+    );
+    expect(
+      screen
+        .getByRole("progressbar", { name: "Session history synchronization" })
+        .getAttribute("aria-valuenow"),
+    ).toBe(String(300 / 700));
+  });
+
+  it("calls out a stalled wait and a refused sync", () => {
+    vi.useFakeTimers({ now, toFake: ["Date"] });
+    const since = new Date(now - 90_000).toISOString();
+    const { unmount } = show({
+      ...node,
+      consoleSync: {
+        phase: "waiting",
+        since,
+        attempts: 1,
+        updatedAt: since,
+        sentEvents: 0,
+      },
+    });
+    expect(
+      screen.getByText(
+        "Syncing history: waiting for the Node · 1m 30s · no progress for 1m 30s",
+      ),
+    ).toBeTruthy();
+    unmount();
+    show({
+      ...node,
+      consoleSync: {
+        phase: "failed",
+        since,
+        attempts: 1,
+        updatedAt: since,
+        sentEvents: 0,
+        error: "History synchronization is incomplete",
+      },
+    });
+    expect(
+      screen.getByText("History sync failed: History synchronization is incomplete"),
+    ).toBeTruthy();
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.getByRole("button", { name: buttonName })).toBeTruthy();
+  });
+});

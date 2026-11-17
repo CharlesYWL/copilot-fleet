@@ -293,7 +293,7 @@ export function registerNodeGateway(
       service.send(input.link, {
         type: "welcome",
         ...(usageSnapshots ? { usageSnapshots: true } : {}),
-        ...(sessionConsole ? { sessionConsole: true } : {}),
+        ...(sessionConsole ? { sessionConsole: true, consoleSyncProgress: true } : {}),
         ...(nativeSessionSync ? { nativeSessionSync: true } : {}),
         nodeId,
         reconcileAfterOutbox: awaitingOutboxFlush,

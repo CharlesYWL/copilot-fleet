@@ -74,7 +74,10 @@ import { SessionFileService } from "./session-files.js";
 import { TranscriptProjections } from "./transcript-projections.js";
 import { SessionMessages } from "./session-messages.js";
 import { checkoutOccupants } from "./orchestrator/schedule.js";
-import { SessionConsoleService } from "./session-console-service.js";
+import {
+  NODE_HISTORY_SYNCING,
+  SessionConsoleService,
+} from "./session-console-service.js";
 import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
 import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
@@ -316,7 +319,7 @@ export class FleetService {
   /** Why nothing new may start on this Node right now, if something prevents it. */
   nodeWorkBlocked(nodeId: string): string | undefined {
     return this.console.blocked(nodeId)
-      ? "Node history is synchronizing"
+      ? NODE_HISTORY_SYNCING
       : this.hostUpdate?.blocksNodeWork(nodeId);
   }
 
@@ -421,11 +424,13 @@ export class FleetService {
   private withNodeTelemetry(node: FleetNode): FleetNode {
     const health = this.nodeHealth.get(node.id);
     const connection = this.nodeConnections.get(node.id);
-    if (!health && !connection) return node;
+    const consoleSync = this.console.syncStatus(node.id);
+    if (!health && !connection && !consoleSync) return node;
     return {
       ...node,
       ...(health ? { health } : {}),
       ...(connection ? { connection } : {}),
+      ...(consoleSync ? { consoleSync } : {}),
     };
   }
 
@@ -1186,7 +1191,7 @@ export class FleetService {
       return {
         ok: false,
         status: 409,
-        error: "Node history is synchronizing; no new worker was started",
+        error: `${NODE_HISTORY_SYNCING}; no new worker was started`,
       };
     if (input.runRole !== "lead") {
       const maintenance = this.store.prMaintenance.admission({
@@ -1412,7 +1417,7 @@ export class FleetService {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false, status: 404, error: "Session not found" };
     if (this.console.blocked(session.nodeId))
-      return { ok: false, status: 409, error: "Node history is synchronizing" };
+      return { ok: false, status: 409, error: NODE_HISTORY_SYNCING };
     if (session.externalAttachment)
       return {
         ok: false,

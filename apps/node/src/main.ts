@@ -597,6 +597,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   };
   const consoleSlot: { current?: NodeSessionConsole } = {};
   let sessionConsoleSupported = false;
+  let consoleSyncProgress = false;
   const admission = new NodeAdmission();
   const sessionJournal = new SessionJournal(join(configDirectory(), "session-history"), {
     onEvents: (events) => consoleSlot.current?.committed(events),
@@ -909,7 +910,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   });
   consoleSlot.current = sessionConsole;
   const finishSessionReconnect = async () => {
-    await sessionConsole.connected(sessionConsoleSupported);
+    await sessionConsole.connected(sessionConsoleSupported, {
+      reportProgress: consoleSyncProgress,
+    });
     if (sessionConsoleSupported && !sessionConsole.readyForHostWork) return;
     router.setMcpAvailable(true);
     await router.refreshMcpSessions();
@@ -1704,6 +1707,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         posixCommandShellNegotiated =
           commandExecutionsNegotiated && frame.value.posixCommandShell === true;
         sessionConsoleSupported = !!channel && frame.value.sessionConsole === true;
+        consoleSyncProgress = frame.value.consoleSyncProgress === true;
         usageNegotiated = !!channel && frame.value.usageSnapshots === true;
         usageInFlight = false;
         pumpUsage();
@@ -2245,7 +2249,17 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let recovering = false;
   let recovery: Promise<void> | undefined;
   let journalsClosed = false;
+  let lastBeatAt = Date.now();
   const heartbeatTimer = setInterval(() => {
+    const beatAt = Date.now();
+    const lateMs = beatAt - lastBeatAt - 5_000;
+    lastBeatAt = beatAt;
+    // Nothing is sent while the loop is blocked, and the Host drops a Node that
+    // is silent for 15 s; without this the Node log shows only the close code.
+    if (lateMs >= 5_000)
+      warn(
+        `Event loop was blocked for about ${Math.round(lateMs / 1000)} s; heartbeats to the Host were late`,
+      );
     if (commands.unsettled && !recovering) {
       recovering = true;
       recovery = commands

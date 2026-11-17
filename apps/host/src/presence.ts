@@ -48,6 +48,8 @@ export function startPresenceMonitor(
   service: FleetService,
   timeoutMs: number,
   onStall?: (stalledMs: number) => void,
+  /** The only trace of a drop on the Host; the Node sees just a close code 4000. */
+  onDrop?: (node: FleetNode, silentMs: number) => void,
 ): NodeJS.Timeout {
   const interval = sweepInterval(timeoutMs);
   let lastTick = Date.now();
@@ -59,7 +61,8 @@ export function startPresenceMonitor(
       onStall?.(stalledMs);
       return;
     }
-    sweepStaleNodes(service, timeoutMs, now);
+    for (const node of sweepStaleNodes(service, timeoutMs, now))
+      onDrop?.(node, now - Date.parse(node.lastHeartbeat));
   }, interval);
   timer.unref();
   return timer;

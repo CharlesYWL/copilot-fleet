@@ -600,11 +600,19 @@ export async function buildServer(
     identity: hostIdentity,
     endpoints: () => tunnel.allTunnelEndpoints(),
   });
-  const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs, (stalledMs) =>
-    app.log.warn(
-      { stalledMs },
-      "Host event loop stalled; deferring the Node heartbeat sweep one interval",
-    ),
+  const presenceTimer = startPresenceMonitor(
+    service,
+    heartbeatTimeoutMs,
+    (stalledMs) =>
+      app.log.warn(
+        { stalledMs },
+        "Host event loop stalled; deferring the Node heartbeat sweep one interval",
+      ),
+    (node, silentMs) =>
+      app.log.warn(
+        { nodeId: node.id, node: node.name, silentMs, lastHeartbeat: node.lastHeartbeat },
+        "Disconnected a Node that sent no heartbeat within the timeout",
+      ),
   );
   const notificationRetentionTimer = startNotificationRetentionMonitor(service, app.log);
   const sessionRetentionTimer = startSessionRetentionMonitor(
