@@ -963,15 +963,30 @@ export class PrMaintenanceStore {
           "This task is already reserved for PR maintenance. V1 supports one PR per task; release it before registering another.",
         );
       }
+      const binding = {
+        taskId: task.id,
+        leadSessionId: lead.id,
+        workerSessionId: worker.id,
+        placementId: worker.placementId,
+        checkoutKey:
+          worker.executionBinding?.checkoutKey ?? `placement:${worker.placementId}`,
+        bindingGeneration: worker.executionBinding?.generation ?? 0,
+      };
+      const bindingReason = this.binding(binding);
+      // Only a reviewed direct binding can enroll during a turn. Dispatch still
+      // requires a prepared batch and waits for direct work on the worker or checkout.
+      const canEnrollDuringTurn =
+        approvedProposal &&
+        worker.state === "running" &&
+        !worker.stopRequested &&
+        task.state !== "cancelled" &&
+        task.workspaceBinding?.effectiveMode !== "managed" &&
+        !worker.executionBinding?.worktreeId &&
+        !bindingReason;
       if (
-        !["idle", "completed", "stopped"].includes(worker.state) ||
-        this.directWorkActive({
-          taskId: task.id,
-          workerSessionId: worker.id,
-          placementId: worker.placementId,
-          checkoutKey:
-            worker.executionBinding?.checkoutKey ?? `placement:${worker.placementId}`,
-        })
+        !canEnrollDuringTurn &&
+        (!["idle", "completed", "stopped"].includes(worker.state) ||
+          this.directWorkActive(binding))
       ) {
         refuse(
           "worker_busy",
@@ -1007,13 +1022,7 @@ export class PrMaintenanceStore {
         version: 1,
         generation,
         identity: parsed.identity,
-        taskId: task.id,
-        leadSessionId: lead.id,
-        workerSessionId: worker.id,
-        placementId: worker.placementId,
-        checkoutKey:
-          worker.executionBinding?.checkoutKey ?? `placement:${worker.placementId}`,
-        bindingGeneration: worker.executionBinding?.generation ?? 0,
+        ...binding,
         eligibilityEvidence: parsed.eligibilityEvidence,
         authorization: {
           id: randomUUID(),
@@ -1061,7 +1070,6 @@ export class PrMaintenanceStore {
       if (worker.stopRequested || task.state === "cancelled")
         this.setHold(record, "stopped", "The retained worker or task is stopped.", now);
       else {
-        const bindingReason = this.binding(record);
         if (bindingReason)
           this.setHold(
             record,

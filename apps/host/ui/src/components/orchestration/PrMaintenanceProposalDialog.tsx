@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import {
   Button,
   Checkbox,
@@ -28,6 +29,7 @@ const useStyles = makeStyles({
     "@media (max-width: 480px)": { gridTemplateColumns: "1fr" },
   },
   muted: { color: tokens.colorNeutralForeground2 },
+  error: { color: tokens.colorPaletteRedForeground1 },
   details: {
     marginBlock: tokens.spacingVerticalM,
     "& summary": { cursor: "pointer", color: tokens.colorNeutralForeground2 },
@@ -66,6 +68,10 @@ export function PrMaintenanceProposalDialog({
   onClose: () => void;
 }) {
   const styles = useStyles();
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (error) errorRef.current?.focus();
+  }, [error]);
   const candidate = proposal.registration;
   const worker = sessions.find((entry) => entry.id === candidate.workerSessionId);
   const matchesTask = candidate.taskId === taskId && worker?.runId === taskId;
@@ -86,14 +92,14 @@ export function PrMaintenanceProposalDialog({
         <DialogBody>
           <DialogTitle>Maintain this PR</DialogTitle>
           <DialogContent>
-            {changed && !busy ? (
+            {changed && !busy && !error ? (
               <p role="alert">
                 This proposal changed or was already handled. Close this dialog and review
                 the current proposal before authorizing.
               </p>
             ) : null}
             {error ? (
-              <p role="alert">
+              <p ref={errorRef} tabIndex={-1} role="alert" className={styles.error}>
                 {error} Close this dialog and refresh before authorizing again.
               </p>
             ) : null}

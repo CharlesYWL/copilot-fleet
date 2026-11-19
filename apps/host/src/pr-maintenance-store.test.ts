@@ -1712,6 +1712,38 @@ describe("durable PR maintenance registry", () => {
     },
   );
 
+  it("keeps a direct attempt unowned and defers the exact maintenance batch until it settles", () => {
+    const f = setup();
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+    f.store.transitionSession(f.worker.id, "running");
+    f.store.updateRunStep(f.step.id, { state: "running" });
+    const direct = f.store.getRunStep(f.step.id)!;
+    const pm = f.store.prMaintenance;
+    const record = pm.authorizeProposal(
+      f.task.id,
+      proposal.id,
+      proposal.version,
+      "operator",
+    );
+    expect(f.store.getRunStep(f.step.id)).toEqual(direct);
+    expect(pm.referenceForStep(direct.id, direct.attempts)).toBeUndefined();
+    expect(pm.admission({ action: "dispatch", sessionId: f.worker.id })).toEqual({
+      allowed: true,
+    });
+
+    const prepared = prepare(f, observe(f, record));
+    expect(() => accept(f, prepared)).toThrow(/direct_work_active/);
+    expect(f.store.getRunStep(f.step.id)).toEqual(direct);
+    expect(pm.get(record.id)?.batches[0]).toMatchObject({
+      state: "prepared",
+      effects: [],
+    });
+
+    f.store.updateRunStep(f.step.id, { state: "succeeded" });
+    f.store.transitionSession(f.worker.id, "idle");
+    expect(accept(f, prepared).batches[0]).toMatchObject({ state: "accepted" });
+  });
+
   it.each([
     "owner",
     "head",

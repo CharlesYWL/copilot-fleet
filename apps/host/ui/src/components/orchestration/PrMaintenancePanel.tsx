@@ -250,7 +250,8 @@ export function PrMaintenancePanel({
   const [view, setView] = useState<TaskMaintenanceView>();
   const loadedTaskId = useRef<string | undefined>(undefined);
   const lastView = useRef<TaskMaintenanceView | undefined>(undefined);
-  const [error, setError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const error = actionError || view?.statusError || "";
   const [busy, setBusy] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [prUrl, setPrUrl] = useState("");
@@ -281,6 +282,7 @@ export function PrMaintenancePanel({
       setProposal(undefined);
       setRelease(undefined);
       setConfirmed(false);
+      setActionError("");
       setMessage("");
       setPrUrl("");
       setRoutineWork("");
@@ -295,7 +297,6 @@ export function PrMaintenancePanel({
         lastView.current = next;
         setView(next);
         onChange(next);
-        setError("");
       })
       .catch((reason: unknown) => {
         if (!active) return;
@@ -307,7 +308,6 @@ export function PrMaintenancePanel({
           canAuthorize: false,
           statusError,
         };
-        setError(statusError);
         setView(unavailable);
         onChange(unavailable);
       });
@@ -323,7 +323,7 @@ export function PrMaintenancePanel({
     if (pendingAction.current || busy || !view?.canAuthorize) return;
     pendingAction.current = true;
     setBusy(true);
-    setError("");
+    setActionError("");
     setMessage("");
     try {
       await action();
@@ -333,7 +333,9 @@ export function PrMaintenancePanel({
       setMessage(successMessage);
       setRefreshKey((current) => current + 1);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Maintenance action failed.");
+      setActionError(
+        reason instanceof Error ? reason.message : "Maintenance action failed.",
+      );
       // A failed approval must be reviewed again, never silently replayed.
       setConfirmed(false);
     } finally {
@@ -444,7 +446,7 @@ export function PrMaintenancePanel({
           {...restoreFocusTarget}
           disabled={!canAct}
           onClick={() => {
-            setError("");
+            setActionError("");
             setRelease(record);
             setReleaseReason("");
           }}
@@ -769,7 +771,7 @@ export function PrMaintenancePanel({
                     blocksPreparation
                   }
                   onClick={() => {
-                    setError("");
+                    setActionError("");
                     setProposal(view.proposal);
                     setConfirmed(false);
                   }}
@@ -892,11 +894,13 @@ export function PrMaintenancePanel({
           onConfirmedChange={setConfirmed}
           onClose={() => setProposal(undefined)}
           onAuthorize={() =>
-            void execute(() =>
-              authorizeTaskMaintenanceProposal(run.id, {
-                id: proposal.id,
-                version: proposal.version,
-              }),
+            void execute(
+              () =>
+                authorizeTaskMaintenanceProposal(run.id, {
+                  id: proposal.id,
+                  version: proposal.version,
+                }),
+              "PR maintenance authorized.",
             )
           }
         />

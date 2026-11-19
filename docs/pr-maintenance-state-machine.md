@@ -99,7 +99,7 @@ batches. Manual requests never write `nextCheckAt`.
 
 | From | Event | Guard | To | Side effects |
 | --- | --- | --- | --- | --- |
-| — | Operator authorizes proposal | exact owned task + retained session + valid checkout binding | `reviewing` | review(`enable`) queued; no task-state or historical-role inheritance |
+| — | Operator authorizes proposal | exact owned task + retained session + valid checkout binding | `reviewing` | review(`enable`) queued; no task-state or historical-role inheritance. An eligible direct worker can finish its current turn before maintenance dispatch, without adopting that turn |
 | `idle` | Heartbeat | `nextCheckAt ≤ now`, no hold | `reviewing` | review(`heartbeat`) claimed by `takeDue` |
 | any non-terminal | Manual **Review now** (UI or orchestrator) | no stored hold | `reviewing` | review(`manual`); bypasses `nextCheckAt` without changing it |
 | `reviewing` | Complete observation, merged/closed | — | `merged`/`closed` | pending decision withdrawn as moot |

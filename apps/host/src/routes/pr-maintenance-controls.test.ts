@@ -1189,6 +1189,41 @@ describe("authenticated PR maintenance controls", () => {
     },
   );
 
+  it("registers the reviewed proposal while its retained worker is on a direct turn", async () => {
+    const { app, store, service, run, worker, step, registration, mcp } =
+      await setup("azure-devops");
+    expect((await mcp("fleet_propose_pr_maintenance", registration)).ok).toBe(true);
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    store.transitionSession(worker.id, "running");
+    store.updateRunStep(step.id, { state: "running" });
+    const dispatch = vi.spyOn(service, "dispatch");
+    const accepted = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload: {
+        action: "authorize_proposal",
+        proposalId: proposal.id,
+        expectedVersion: proposal.version,
+      },
+    });
+    expect(accepted.statusCode, accepted.body).toBe(200);
+    expect(accepted.json()).toMatchObject({
+      ...proposal.binding,
+      identity: registration.identity,
+      workerSessionId: worker.id,
+      authorization: {
+        operatorId: "real-browser-principal",
+        sourceProposal: { id: proposal.id, version: 1 },
+      },
+      review: { source: "enable" },
+      batches: [],
+    });
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+    expect(store.getRunStep(step.id)?.state).toBe("running");
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
   it("requires a versioned proposal replacement and rejects authorization of the older scope", async () => {
     const { app, store, run, registration, mcp } = await setup();
     await mcp("fleet_propose_pr_maintenance", registration);

@@ -106,7 +106,7 @@ export function PrMaintenanceApprovalReview({
     }
   }
 
-  if ((!proposal || readError || stale) && !busy) {
+  if ((!proposal || (!error && (readError || stale))) && !busy) {
     return (
       <Dialog open onOpenChange={(_, data) => !data.open && onClose()}>
         <DialogSurface>

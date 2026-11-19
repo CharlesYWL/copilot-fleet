@@ -919,6 +919,51 @@ describe("PR maintenance task controls", () => {
     expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
   });
 
+  it("keeps the Commands authorization refusal when the approval disappears", async () => {
+    const pending = proposal();
+    const approval = PrMaintenanceApprovalSchema.parse({
+      proposalId: pending.id,
+      version: pending.version,
+      taskId: task.id,
+      leadSessionId: pending.leadSessionId,
+      identity: pending.registration.identity,
+      mode: "repair",
+      createdAt: at,
+    });
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [],
+      proposal: pending,
+      canAuthorize: true,
+    });
+    vi.mocked(authorizeTaskMaintenanceProposal).mockRejectedValueOnce(
+      new Error("The Host refused this authorization."),
+    );
+    const onAuthorized = vi.fn();
+    const review = (currentApproval: typeof approval | undefined) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenanceApprovalReview
+          approval={approval}
+          currentApproval={currentApproval}
+          sessions={[worker]}
+          connected
+          snapshotRevision={currentApproval ? 0 : 1}
+          onClose={vi.fn()}
+          onAuthorized={onAuthorized}
+        />
+      </FluentProvider>
+    );
+    const rendered = render(review(approval));
+    const submit = await screen.findByRole("button", { name: "Maintain this PR" });
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(submit);
+    await screen.findByText(/Host refused/);
+    rendered.rerender(review(undefined));
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("The Host refused this authorization.");
+    expect(document.activeElement).toBe(alert);
+    expect(onAuthorized).not.toHaveBeenCalled();
+  });
+
   it.each([
     { connected: false, canAuthorize: true },
     { connected: true, canAuthorize: false },
@@ -1149,6 +1194,9 @@ describe("PR maintenance task controls", () => {
       ).getAttribute("href"),
     ).toBe(url);
     expect(enableTaskMaintenance).not.toHaveBeenCalled();
+    expect(
+      (await screen.findByText("PR maintenance authorized.")).getAttribute("role"),
+    ).toBe("status");
   });
 
   it.each(["worker", "reviewer"] as const)(
@@ -1247,6 +1295,51 @@ describe("PR maintenance task controls", () => {
     expect(within(dialog).getByText(/Run regression tests/)).toBeTruthy();
     fireEvent.click(authorize);
     expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
+  });
+
+  it("keeps a submitted authorization refusal visible and focused across a successful refresh", async () => {
+    const pending = { records: [], proposal: proposal(), canAuthorize: true };
+    vi.mocked(getTaskMaintenance).mockResolvedValue(pending);
+    vi.mocked(authorizeTaskMaintenanceProposal).mockRejectedValueOnce(
+      new Error("The retained checkout binding changed."),
+    );
+    const onChange = vi.fn();
+    const panel = (snapshotRevision: number) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenancePanel
+          run={task}
+          sessions={[worker]}
+          onChange={onChange}
+          snapshotRevision={snapshotRevision}
+        />
+      </FluentProvider>
+    );
+    const rendered = render(panel(0));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Review PR maintenance proposal" }),
+    );
+    const dialog = within(screen.getByRole("dialog"));
+    const submit = dialog.getByRole("button", { name: "Maintain this PR" });
+    expect(submit).toHaveProperty("disabled", true);
+    fireEvent.click(submit);
+    expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
+
+    fireEvent.click(dialog.getByRole("checkbox"));
+    fireEvent.click(submit);
+    expect((await dialog.findByRole("alert")).textContent).toContain("binding changed");
+    onChange.mockClear();
+    rendered.rerender(panel(1));
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith(pending));
+
+    const alert = dialog.getByRole("alert");
+    expect(alert.textContent).toContain("binding changed");
+    expect(document.activeElement).toBe(alert);
+    expect(submit).toHaveProperty("disabled", true);
+    expect(authorizeTaskMaintenanceProposal).toHaveBeenCalledExactlyOnceWith(task.id, {
+      id: pending.proposal.id,
+      version: pending.proposal.version,
+    });
+    expect(screen.queryByText("PR maintenance authorized.")).toBeNull();
   });
 
   it("refreshes maintenance-only snapshot revisions without a task timestamp change", async () => {
