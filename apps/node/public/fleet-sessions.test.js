@@ -371,6 +371,75 @@ describe("lazy Node session shell", () => {
     );
   });
 
+  it("follows the selected chat's live state without waiting for the list", async () => {
+    initFleetSessions();
+    await vi.waitFor(() => expect($("fleetSessionList").textContent).toContain("First"));
+    document.querySelector('[data-fleet-session-id="one"]').click();
+    const frame = $("fleetChat").querySelector("iframe");
+    const report = (source, state) =>
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: location.origin,
+          source,
+          data: { type: "node-session-state", sessionId: "one", state },
+        }),
+      );
+    report(window, "cancelling");
+    const row = () => document.querySelector('[data-fleet-session-id="one"]');
+    expect(row().dataset.state).toBe("idle");
+    report(frame.contentWindow, "running");
+    expect(row().dataset.state).toBe("running");
+    expect(row().querySelector(".session-item-status").textContent).toBe("running");
+  });
+
+  it("refreshes every loaded page while Sessions is open", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const pages = {
+        "/api/fleet-sessions?limit=50": {
+          sessions: [{ id: "a", name: "A", workspaceName: "W", state: "idle" }],
+          nextCursor: "a",
+        },
+        "/api/fleet-sessions?limit=50&cursor=a": {
+          sessions: [{ id: "b", name: "B", workspaceName: "W", state: "idle" }],
+          nextCursor: "b",
+        },
+      };
+      vi.mocked(fetch).mockImplementation((path) => reply(structuredClone(pages[path])));
+      const status = (id) => document.querySelector(`[data-fleet-session-id="${id}"]`);
+      initFleetSessions();
+      await vi.waitFor(() => expect(status("a")).toBeTruthy());
+      $("fleetSessionMore").click();
+      await vi.waitFor(() => expect(status("b")).toBeTruthy());
+      const focused = status("a");
+      focused.focus();
+      vi.mocked(fetch).mockClear();
+
+      vi.advanceTimersByTime(5_000);
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+      expect(status("a")).toBe(focused);
+      expect(document.activeElement).toBe(focused);
+
+      pages["/api/fleet-sessions?limit=50&cursor=a"].sessions[0].state = "running";
+      vi.advanceTimersByTime(5_000);
+      await vi.waitFor(() => expect(status("b").dataset.state).toBe("running"));
+      expect(vi.mocked(fetch).mock.calls.map(([path]) => path)).toEqual([
+        "/api/fleet-sessions?limit=50",
+        "/api/fleet-sessions?limit=50&cursor=a",
+        "/api/fleet-sessions?limit=50",
+        "/api/fleet-sessions?limit=50&cursor=a",
+      ]);
+      expect($("fleetSessionMore").classList.contains("hidden")).toBe(false);
+
+      showPanel("settingsPanel");
+      vi.mocked(fetch).mockClear();
+      vi.advanceTimersByTime(5_000);
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("opens newly adopted Fleet IDs without rediscovering native history", async () => {
     initFleetSessions();
     await vi.waitFor(() => expect($("fleetSessionList").textContent).toContain("First"));
