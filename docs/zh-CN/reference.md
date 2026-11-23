@@ -1143,7 +1143,8 @@ Orchestrator 可以用 `fleet_run_command` 请求在节点执行有限时长的 
 `git status --short` 与 `git status --branch` 共用 `git status`，但不授权 `git reset`；
 `npm run build` 与 `npm run deploy` 也不同。审批框会显示实际将保存的规则。
 外部命令的规则还绑定实际可执行文件；更新或替换该文件后需要重新批准。
-有待批准请求时，Commands 按钮显示琥珀色脉冲和数量；启用减少动态效果时保留静态高亮。
+有待批准请求时，**Commands** 按钮右上角的徽标会显示数量，琥珀色边框外的光环会扩散并淡出。
+启用减少动态效果时，保留静态高亮和数量，不播放动画。
 弹窗将 **Waiting approval** 与 **Request history** 分开，优先显示待批准请求。
 无人决定就已过期的请求会自动移入 **Request history**；过期后才到达的决定不会生效。
 审批冲突后会刷新当前状态，不会自动重提决定。升级后若旧浏览器页报告无法识别的命令字段，请重新加载页面。

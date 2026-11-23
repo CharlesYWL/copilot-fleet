@@ -113,31 +113,45 @@ const useStyles = makeStyles({
     minWidth: "auto",
     ...shorthands.padding("4px", "8px"),
   },
+  commandEntry: {
+    display: "flex",
+    minWidth: 0,
+    // Keep the badge aligned to the button's right edge when space runs out.
+    justifyContent: "flex-end",
+    position: "relative",
+  },
   commandButton: { minWidth: "auto" },
   commandAttention: {
+    minHeight: "34px",
     color: permissionSurface.accent,
-    backgroundColor: permissionSurface.background,
-    ...shorthands.borderColor(permissionSurface.border),
+    backgroundColor: `color-mix(in srgb, ${permissionSurface.background} 80%, ${permissionSurface.accent})`,
+    ...shorthands.borderColor(permissionSurface.accent),
     animationName: {
-      "0%,100%": { boxShadow: `0 0 0 0 ${statusVisuals.attention.surface}` },
-      "50%": {
-        backgroundColor: statusVisuals.attention.surface,
-        boxShadow: `0 0 0 4px ${statusVisuals.attention.surface}`,
-      },
+      "0%,100%": { boxShadow: "0 0 0 0 transparent" },
+      "50%": { boxShadow: `0 0 0 4px ${statusVisuals.attention.border}` },
     },
-    animationDuration: "1.8s",
+    animationDuration: "2.4s",
     animationTimingFunction: "ease-in-out",
     animationIterationCount: "infinite",
     "@media (prefers-reduced-motion: reduce)": { animationName: "none" },
   },
   commandCount: {
-    minWidth: "20px",
-    padding: "1px 5px",
+    position: "absolute",
+    top: 0,
+    right: 0,
+    transform: "translate(50%, -50%)",
+    minWidth: "14px",
+    padding: "0 3px",
     borderRadius: tokens.borderRadiusCircular,
     backgroundColor: permissionSurface.accent,
+    boxShadow: `0 0 0 1px ${tokens.colorNeutralBackground2}`,
     color: permissionSurface.onAccent,
+    fontSize: tokens.fontSizeBase100,
     fontWeight: tokens.fontWeightBold,
     fontVariantNumeric: "tabular-nums",
+    lineHeight: "14px",
+    textAlign: "center",
+    pointerEvents: "none",
   },
   commandLabel: { "@media (max-width: 900px)": { display: "none" } },
   warn: { color: semanticColors.permission },
@@ -378,23 +392,27 @@ export const TopBar = ({
           />
         )}
         {onOpenCommandExecutions && (
-          <Button
-            {...restoreFocusTarget}
-            appearance={approvalCount > 0 ? "secondary" : "subtle"}
-            size="small"
-            className={mergeClasses(
-              styles.commandButton,
-              approvalCount > 0 && styles.commandAttention,
-            )}
-            icon={<Code20Regular />}
-            onClick={onOpenCommandExecutions}
-            aria-label={`${maintenanceApprovalCount ? "Commands and approvals" : "Command executions"}${approvalCount ? `, ${approvalCount} awaiting approval` : ""}`}
-          >
-            <span className={styles.commandLabel}>Commands</span>
+          <span className={styles.commandEntry}>
+            <Button
+              {...restoreFocusTarget}
+              appearance={approvalCount > 0 ? "secondary" : "subtle"}
+              size="small"
+              className={mergeClasses(
+                styles.commandButton,
+                approvalCount > 0 && styles.commandAttention,
+              )}
+              icon={<Code20Regular />}
+              onClick={onOpenCommandExecutions}
+              aria-label={`${maintenanceApprovalCount ? "Commands and approvals" : "Command executions"}${approvalCount ? `, ${approvalCount} awaiting approval` : ""}`}
+            >
+              <span className={styles.commandLabel}>Commands</span>
+            </Button>
             {approvalCount > 0 && (
-              <span className={styles.commandCount}>{approvalCount}</span>
+              <span className={styles.commandCount} aria-hidden="true">
+                {approvalCount}
+              </span>
             )}
-          </Button>
+          </span>
         )}
         <NotificationCenter
           notifications={[...notifications, ...(appNotifications?.notifications ?? [])]}

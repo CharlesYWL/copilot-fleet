@@ -678,9 +678,11 @@ not the entire command line. Recognized ordinary flags may differ:
 is different. `npm run build` and `npm run deploy` are different identities.
 The approval dialog shows the exact rule being granted. Reusable rules are broad
 within that identity; they are not a claim that every argument is read-only.
-The Commands button highlights pending approvals with an amber pulse and count
-(a steady highlight when reduced motion is enabled). The dialog prioritizes
-**Waiting approval**; **Request history** keeps reviewed and other requests separate.
+The Commands button shows the pending count in a badge at its top-right corner,
+with a bright amber outline and a pulsing halo around the button. With reduced
+motion enabled, the outline and badge stay visible without the pulse. The dialog
+prioritizes **Waiting approval**; **Request history** keeps reviewed and other
+requests separate.
 A request that expires before anyone decides moves to **Request history** on its
 own, and a decision that arrives after expiry is not applied.
 If an approval conflicts with another update, Fleet refreshes its current state

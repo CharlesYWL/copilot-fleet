@@ -31,20 +31,21 @@ describe("TopBar counts", () => {
     const button = screen.getByRole("button", {
       name: "Commands and approvals, 1 awaiting approval",
     });
-    expect(button.textContent).toBe("Commands1");
+    expect(button.textContent).toBe("Commands");
+    expect(within(button.parentElement!).getByText("1")).toBeTruthy();
     expect(getComputedStyle(button).animationIterationCount).toBe("infinite");
     fireEvent.click(button);
     expect(open).toHaveBeenCalledOnce();
     first.unmount();
     show({
       onOpenCommandExecutions: open,
-      commandApprovalCount: 2,
+      commandApprovalCount: 12,
       maintenanceApprovalCount: 1,
     });
-    expect(
-      screen.getByRole("button", { name: "Commands and approvals, 3 awaiting approval" })
-        .textContent,
-    ).toBe("Commands3");
+    const combined = screen.getByRole("button", {
+      name: "Commands and approvals, 13 awaiting approval",
+    });
+    expect(within(combined.parentElement!).getByText("13")).toBeTruthy();
   });
 
   it("highlights pending commands with a persistent count and a reduced-motion-safe pulse", () => {
@@ -53,7 +54,7 @@ describe("TopBar counts", () => {
     const button = screen.getByRole("button", {
       name: "Command executions, 3 awaiting approval",
     });
-    expect(button.textContent).toBe("Commands3");
+    expect(within(button.parentElement!).getByText("3")).toBeTruthy();
     expect(getComputedStyle(button).animationIterationCount).toBe("infinite");
     const reduced = [...document.styleSheets]
       .flatMap((sheet) => [...sheet.cssRules])
@@ -73,7 +74,7 @@ describe("TopBar counts", () => {
     view.unmount();
     show({ onOpenCommandExecutions: open, commandApprovalCount: 0 });
     const quiet = screen.getByRole("button", { name: "Command executions" });
-    expect(quiet.textContent).toBe("Commands");
+    expect(quiet.parentElement?.textContent).toBe("Commands");
     expect(getComputedStyle(quiet).animationIterationCount).not.toBe("infinite");
   });
 
