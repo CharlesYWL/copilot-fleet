@@ -64,6 +64,15 @@ export function App() {
   }, [sessionId, notify]);
 
   const snapshot = view.snapshot?.session.id === sessionId ? view.snapshot : undefined;
+  const liveState = snapshot?.session.state;
+  // The shell's session list is a separate document; keep its row in step with the live chat.
+  useEffect(() => {
+    if (liveState)
+      parent.postMessage(
+        { type: "node-session-state", sessionId, state: liveState },
+        location.origin,
+      );
+  }, [sessionId, liveState]);
   const allowed = Boolean(
     snapshot &&
     (view.status === "online" ||

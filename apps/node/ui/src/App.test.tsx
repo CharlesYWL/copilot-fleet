@@ -249,4 +249,25 @@ describe("Node shared chat entry", () => {
       operationId: expect.any(String),
     });
   });
+
+  it("reports the selected session's live state to the shell list once per change", () => {
+    const post = vi.spyOn(window.parent, "postMessage");
+    show();
+    change("s1");
+    const reports = () =>
+      post.mock.calls.filter(([data]) => data?.type === "node-session-state");
+    expect(reports()).toEqual([]);
+    act(() => publish(view()));
+    act(() => publish({ ...view(), detail: "Streaming" }));
+    const running = view();
+    running.snapshot!.session.state = "running";
+    act(() => publish(running));
+    expect(reports()).toEqual([
+      [{ type: "node-session-state", sessionId: "s1", state: "idle" }, location.origin],
+      [
+        { type: "node-session-state", sessionId: "s1", state: "running" },
+        location.origin,
+      ],
+    ]);
+  });
 });

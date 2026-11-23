@@ -1,5 +1,7 @@
 import { $, el, showPanel } from "./ui.js";
 
+const POLL_MS = 5_000;
+
 const sessionStateOrder = {
   queued: 0,
   starting: 0,
@@ -30,6 +32,7 @@ export const initFleetSessions = () => {
   let sessions = [];
   let selected = "";
   let nextCursor = "";
+  let pages = 0;
   let loaded = false;
   let request;
   let frame;
@@ -98,30 +101,44 @@ export const initFleetSessions = () => {
     );
     $("fleetSessionMore").classList.toggle("hidden", !nextCursor);
   };
-  const load = async (append = false) => {
+  const fetchPage = async (cursor, signal) => {
+    const query = new URLSearchParams({ limit: "50" });
+    if (cursor) query.set("cursor", cursor);
+    const response = await fetch(`/api/fleet-sessions?${query}`, { signal });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Could not load Fleet sessions");
+    return data;
+  };
+  /**
+   * `append` adds the next page; `poll` silently re-reads every loaded page so
+   * row states follow Host without resetting pagination or stealing focus.
+   */
+  const load = async ({ append = false, poll = false } = {}) => {
     if (!active() || request) return;
     const controller = new AbortController();
     request = controller;
-    $("fleetSessionRefresh").disabled = true;
+    if (!poll) $("fleetSessionRefresh").disabled = true;
     try {
-      const query = new URLSearchParams({ limit: "50" });
-      if (append && nextCursor) query.set("cursor", nextCursor);
-      const response = await fetch(`/api/fleet-sessions?${query}`, {
-        signal: controller.signal,
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Could not load Fleet sessions");
-      if (controller.signal.aborted) return;
       const byId = new Map(
         (append ? sessions : []).map((session) => [session.id, session]),
       );
-      for (const session of data.sessions || []) byId.set(session.id, session);
+      let cursor = append ? nextCursor : "";
+      let read = 0;
+      do {
+        const data = await fetchPage(cursor, controller.signal);
+        if (controller.signal.aborted) return;
+        for (const session of data.sessions || []) byId.set(session.id, session);
+        cursor = data.nextCursor || "";
+        read += 1;
+      } while (poll && cursor && read < pages);
+      const previous = JSON.stringify([sessions, nextCursor]);
       sessions = [...byId.values()];
-      nextCursor = data.nextCursor || "";
+      nextCursor = cursor;
+      pages = append ? pages + 1 : read;
       loaded = true;
-      render();
+      if (!poll || JSON.stringify([sessions, nextCursor]) !== previous) render();
     } catch (error) {
-      if (!controller.signal.aborted)
+      if (!controller.signal.aborted && !poll)
         $("fleetSessionList").replaceChildren(
           el("div", { className: "msg err", textContent: error.message }),
         );
@@ -152,7 +169,11 @@ export const initFleetSessions = () => {
   });
   $("fleetSessionSearch").addEventListener("input", render);
   $("fleetSessionRefresh").addEventListener("click", () => void load());
-  $("fleetSessionMore").addEventListener("click", () => void load(true));
+  $("fleetSessionMore").addEventListener("click", () => void load({ append: true }));
+  const poll = setInterval(() => {
+    if (loaded) void load({ poll: true });
+  }, POLL_MS);
+  lifetime.signal.addEventListener("abort", () => clearInterval(poll));
   document.addEventListener(
     "node-panel-change",
     () => {
@@ -188,6 +209,13 @@ export const initFleetSessions = () => {
       if (event.origin !== location.origin || event.source !== frame?.contentWindow)
         return;
       if (event.data?.type === "node-session-ready") showSelection();
+      if (event.data?.type === "node-session-state") {
+        const session = sessions.find((entry) => entry.id === event.data.sessionId);
+        if (session && session.state !== event.data.state) {
+          session.state = event.data.state;
+          render();
+        }
+      }
     },
     { signal: lifetime.signal },
   );
